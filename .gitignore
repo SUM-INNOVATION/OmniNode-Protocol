@@ -1,22 +1,61 @@
-### AL ###
-#Template for AL projects for Dynamics 365 Business Central
-#launch.json folder
+# Rust
+/target/
+**/*.rs.bk
+# Cargo.lock is committed — workspace contains binary crate (omni-node)
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+/dist/
+/build/
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# maturin build output
+python/omni_bridge/
+target/wheels/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# IDE
+.idea/
+*.iml
 .vscode/
-#Cache folder
-.alcache/
-#Symbols folder
-.alpackages/
-#Snapshots folder
-.snapshots/
-#Testing Output folder
-.output/
-#Extension App-file
-*.app
-#Rapid Application Development File
-rad.json
-#Translation Base-file
-*.g.xlf
-#License-file
-*.flf
-#Test results file
-TestResults.xml
+*.swp
+*.swo
+*~
+.fleet/
+
+# Keys & Secrets
+*.pem
+*.key
+*.secret
+node_key
+peer_id.json
+
+# Debug & Profiling
+*.log
+flamegraph.svg
+perf.data
+perf.data.old

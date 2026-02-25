@@ -1,0 +1,111 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/omni-types",
+    "crates/omni-net",
+    "crates/omni-store",
+    "crates/omni-bridge",
+    "crates/omni-pipeline",
+    "crates/omni-zkml",
+    "crates/omni-node",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/SUM-INNOVATION/OmniNode-Protocol"
+rust-version = "1.85"
+
+# ─── Shared Dependencies ──────────────────────────────────────────────────────
+
+[workspace.dependencies]
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Serialization
+serde       = { version = "1.0",         features = ["derive"] }
+serde_json  = "1.0"
+bincode     = "2.0.0-rc.3"
+ciborium    = "0.2"
+
+# Error handling
+thiserror = "2.0"
+anyhow    = "1.0"
+
+# Logging / tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# ─── Phase 1: Networking ──────────────────────────────────────────────────────
+
+libp2p = { version = "0.55", features = [
+    "macros",
+    "tokio",
+    "noise",
+    "quic",
+    "tcp",
+    "dns",
+    "kad",
+    "mdns",
+    "gossipsub",
+    "identify",
+    "autonat",
+    "relay",
+    "dcutr",
+    "request-response",
+] }
+
+libp2p-identity = "0.2"
+prost           = "0.13"
+prost-build     = "0.13"
+
+# ─── Phase 2: Storage ────────────────────────────────────────────────────────
+
+iroh       = "0.32"
+iroh-blobs = "0.32"
+memmap2    = "0.9"
+blake3     = "1.5"
+cid        = "0.11"
+multihash  = "0.19"
+tempfile   = "3.14"
+
+# ─── Phase 3: FFI ────────────────────────────────────────────────────────────
+
+pyo3 = { version = "0.23", features = ["extension-module"] }
+
+# ─── Phase 4: Pipeline ───────────────────────────────────────────────────────
+
+safetensors    = "0.7"
+ndarray        = "0.16"
+tokio-util     = "0.7"
+dashmap        = "6.1"
+priority-queue = "2.1"
+petgraph       = "0.7"
+
+# ─── Phase 5: zkML ───────────────────────────────────────────────────────────
+# ezkl and risc0 are added directly in crates/omni-zkml/Cargo.toml when Phase 5
+# begins — their build requirements are too heavy for workspace-level pre-loading.
+
+# ─── Async Utilities ─────────────────────────────────────────────────────────
+
+# Provides StreamExt::select_next_some() used in the libp2p Swarm event loop
+futures = "0.3"
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
+
+bytes   = "1.9"
+uuid    = { version = "1.11", features = ["v4"] }
+clap    = { version = "4.5",  features = ["derive"] }
+rand    = "0.9"
+chrono  = { version = "0.4",  features = ["serde"] }
+
+# ─── Internal Crates ─────────────────────────────────────────────────────────
+
+omni-types    = { path = "crates/omni-types" }
+omni-net      = { path = "crates/omni-net" }
+omni-store    = { path = "crates/omni-store" }
+omni-bridge   = { path = "crates/omni-bridge" }
+omni-pipeline = { path = "crates/omni-pipeline" }
+omni-zkml     = { path = "crates/omni-zkml" }
