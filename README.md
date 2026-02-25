@@ -68,26 +68,48 @@ The protocol is constructed strictly bottom-up. Each phase produces a working mi
 
 ### Phase 1: P2P Mesh Networking
 
-**Crate:** `omni-net` | **Foundation:** `omni-types`
+**Crate:** `omni-net` | **Foundation:** `omni-types` | **Status: ✅ Phase 1a complete — pending two-Mac LAN verification**
 
 Build the communication substrate. Nodes discover each other, advertise hardware capabilities, and establish encrypted, low-latency connections.
 
-| Component | Implementation |
-|---|---|
-| Transport | QUIC (UDP-based, NAT-friendly) + Noise protocol encryption |
-| LAN Discovery | mDNS — zero-configuration local peer discovery |
-| WAN Discovery | Kademlia DHT — distributed hash table for internet-scale peer lookup |
-| Messaging | Gossipsub pub/sub — capability heartbeats, shard announcements, pipeline coordination |
-| Capability Ads | Custom request-response protocol — nodes advertise GPU, RAM, compute FLOPS, loaded layers |
-| NAT Traversal | AutoNAT detection → Circuit Relay → DCUtR hole-punching → relay fallback |
+#### Phase 1a — LAN Mesh (Implemented)
+
+| Component | Implementation | Status |
+|---|---|---|
+| Transport | QUIC/v1 over UDP (TLS 1.3 built-in, no separate Noise step) | ✅ Done |
+| LAN Discovery | mDNS — zero-configuration local peer discovery | ✅ Done |
+| Messaging | Gossipsub pub/sub with signed messages (`ValidationMode::Strict`) | ✅ Done |
+| Peer Exchange | Identify protocol — `/omni-node/0.1.0` | ✅ Done |
+| Node API | `OmniNet` handle: `publish()`, `next_event()`, `shutdown()` over async channels | ✅ Done |
+| CLI | `omni-node listen` / `omni-node send "<message>"` (two-Mac test harness) | ✅ Done |
+
+#### Phase 1b — WAN & Capabilities (Deferred)
+
+| Component | Implementation | Status |
+|---|---|---|
+| WAN Discovery | Kademlia DHT — internet-scale peer lookup | ⏳ Deferred |
+| NAT Traversal | AutoNAT detection → Circuit Relay → DCUtR hole-punching | ⏳ Deferred |
+| TCP Fallback | TCP + Noise transport for non-QUIC peers | ⏳ Deferred |
+| Capability Ads | Custom request-response protocol — advertise RAM, platform, loaded layers | ⏳ Deferred |
+| Codec | Custom request-response framing codec | ⏳ Deferred |
 
 **Gossipsub Topics:**
+- `omni/test/v1` — integration test messages
 - `omni/capability/v1` — periodic hardware capability heartbeats
 - `omni/shard/v1` — shard availability announcements
 - `omni/pipeline/v1` — pipeline coordination messages
 - `omni/proof/v1` — zk proof announcements
 
-**Milestone:** CLI command `omni-node --discover` displays connected peers and their hardware capabilities.
+**Verification (pending):**
+```bash
+# Mac 1 (listener)
+RUST_LOG=info cargo run --bin omni-node -- listen
+
+# Mac 2 (sender)
+RUST_LOG=info cargo run --bin omni-node -- send "Hello from OmniNode"
+```
+
+**Milestone:** Two Apple Silicon Macs on the same LAN discover each other via mDNS and exchange a Gossipsub message on `omni/test/v1`.
 
 ---
 
@@ -456,6 +478,7 @@ OmniNode-Protocol/
 | Crate | Version | Purpose |
 |---|---|---|
 | `libp2p` | 0.55 | Core P2P framework |
+| — feature `macros` | — | `#[derive(NetworkBehaviour)]` proc-macro (required 0.53+) |
 | — feature `noise` | — | Noise protocol encrypted channels |
 | — feature `quic` | — | QUIC transport (UDP, NAT-friendly) |
 | — feature `tcp` | — | TCP fallback transport |
@@ -470,6 +493,7 @@ OmniNode-Protocol/
 | — feature `request-response` | — | Custom request-response protocols |
 | — feature `tokio` | — | Tokio runtime integration |
 | `libp2p-identity` | 0.2 | Peer identity / keypair management |
+| `futures` | 0.3 | `StreamExt::select_next_some()` for the swarm event loop |
 | `prost` | 0.13 | Protobuf serialization |
 | `prost-build` | 0.13 | Build-time protobuf codegen |
 | `bincode` | 2.0.0-rc.3 | Binary serialization for capability structs |
@@ -609,9 +633,12 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
+# Async stream utilities
+futures = "0.3"
+
 # Networking (Phase 1)
 libp2p = { version = "0.55", features = [
-    "tokio", "noise", "quic", "tcp", "dns",
+    "macros", "tokio", "noise", "quic", "tcp", "dns",
     "kad", "mdns", "gossipsub", "identify",
     "autonat", "relay", "dcutr", "request-response",
 ] }
