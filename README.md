@@ -15,7 +15,7 @@ The protocol is built on four pillars:
 | Pillar | Mechanism | Outcome |
 |---|---|---|
 | **Compute** | Pipeline parallelism shards model layers across devices, routing hidden state tensors over a low-latency P2P mesh | Consumer devices pool their unified memory to run models that no single device could hold |
-| **Storage** | Model weights (GGUF files) are chunked by transformer block, content-addressed (CID), and distributed via IPFS. Nodes dynamically fetch only the shards they need | No centralized model hosting. Weights are resilient, deduplicated, and globally available |
+| **Storage** | Model weights (GGUF files) are chunked by transformer block, content-addressed (BLAKE3 → CIDv1), and distributed via a custom 64 MiB sliding-window protocol over libp2p request-response | No centralized model hosting. Weights are resilient, deduplicated, and globally available |
 | **Privacy** | Federated Learning allows contributors to train locally on private data, uploading only mathematical weight gradients — never raw data | Data sovereignty is preserved. No central entity sees user data |
 | **Incentives** | zkML (Zero-Knowledge Machine Learning) cryptographically proves correct inference. A Financial RLHF system stakes tokens, rewards quality, and slashes dishonest nodes | Trustless verification. Economic alignment between node operators and end users |
 
@@ -43,7 +43,7 @@ The protocol is built on four pillars:
     │  │  │                                                        │
     │  │  │  ┌──────────────┐    ┌──────────────┐                  │
     │  │  │  │  omni-store   │    │  omni-net     │                  │
-    │  │  │  │  (IPFS/iroh)  │    │  (libp2p)     │                  │
+    │  │  │  │  (sharding)   │    │  (libp2p)     │                  │
     │  │  │  └──────┬────────┘    └──────┬────────┘                  │
     │  │  │         │                    │                            │
     │  │  │  ┌──────┴────────────────────┘                            │
@@ -62,17 +62,69 @@ The protocol is built on four pillars:
 
 ---
 
+## Current Status
+
+| Phase | Crate | Status |
+|---|---|---|
+| **Phase 1** — P2P Mesh Networking | `omni-net` | **Complete** |
+| **Phase 2** — GGUF Model Sharding | `omni-store` | **Complete** |
+| Phase 3 — FFI Bridge & Local Inference | `omni-bridge` | Planned |
+| Phase 4 — Pipeline Parallelism | `omni-pipeline` | Planned |
+| Phase 5 — zkML & Tokenomics | `omni-zkml` | Planned |
+
+---
+
+## Quick Start
+
+```bash
+# Prerequisites: Rust 1.85+ (edition 2024)
+git clone https://github.com/SUM-INNOVATION/OmniNode-Protocol.git
+cd OmniNode-Protocol
+cargo build --workspace
+
+# Run all tests
+cargo test --workspace
+```
+
+### CLI Commands
+
+```bash
+# Listen for mesh events and serve shard requests
+RUST_LOG=info cargo run --bin omni-node -- listen
+
+# Ingest a GGUF model: parse, chunk, store shards, announce on mesh
+RUST_LOG=info cargo run --bin omni-node -- shard path/to/model.gguf
+
+# Fetch a shard by CID from a LAN peer
+RUST_LOG=info cargo run --bin omni-node -- fetch <cid>
+
+# Send a test Gossipsub message
+RUST_LOG=info cargo run --bin omni-node -- send "Hello from OmniNode"
+```
+
+### Two-Mac LAN Demo
+
+```bash
+# Mac 1 — ingest model and serve shards
+RUST_LOG=info cargo run --bin omni-node -- shard tinyllama.gguf
+
+# Mac 2 — fetch a shard by CID (from Mac 1's manifest output)
+RUST_LOG=info cargo run --bin omni-node -- fetch bafkr4i...
+```
+
+---
+
 ## 5-Phase Implementation Roadmap
 
 The protocol is constructed strictly bottom-up. Each phase produces a working milestone that can be demonstrated independently.
 
-### Phase 1: P2P Mesh Networking
+### Phase 1: P2P Mesh Networking — Complete
 
-**Crate:** `omni-net` | **Foundation:** `omni-types` | **Status: ✅ Phase 1a complete — pending two-Mac LAN verification**
+**Crate:** `omni-net` | **Foundation:** `omni-types`
 
-Build the communication substrate. Nodes discover each other, advertise hardware capabilities, and establish encrypted, low-latency connections.
+Build the communication substrate. Nodes discover each other on the local network, establish encrypted QUIC connections, and exchange messages via Gossipsub pub/sub.
 
-#### Phase 1a — LAN Mesh (Implemented)
+#### Phase 1a — LAN Mesh (Complete)
 
 | Component | Implementation | Status |
 |---|---|---|
@@ -80,8 +132,11 @@ Build the communication substrate. Nodes discover each other, advertise hardware
 | LAN Discovery | mDNS — zero-configuration local peer discovery | ✅ Done |
 | Messaging | Gossipsub pub/sub with signed messages (`ValidationMode::Strict`) | ✅ Done |
 | Peer Exchange | Identify protocol — `/omni-node/0.1.0` | ✅ Done |
-| Node API | `OmniNet` handle: `publish()`, `next_event()`, `shutdown()` over async channels | ✅ Done |
-| CLI | `omni-node listen` / `omni-node send "<message>"` (two-Mac test harness) | ✅ Done |
+| Shard Transfer | `request-response` protocol — `/omni/shard-xfer/1` with `ShardCodec` | ✅ Done |
+| Node API | `OmniNet` handle: `publish()`, `request_shard_chunk()`, `respond_shard()`, `next_event()`, `shutdown()` over async channels | ✅ Done |
+| CLI | `omni-node listen` / `send` / `shard` / `fetch` | ✅ Done |
+
+**Key design:** The swarm runs in a background `tokio` task, communicating with the `OmniNet` API handle via two async MPSC channels (256-slot capacity): commands flow in, events flow out. This keeps the libp2p internals fully encapsulated.
 
 #### Phase 1b — WAN & Capabilities (Deferred)
 
@@ -91,53 +146,75 @@ Build the communication substrate. Nodes discover each other, advertise hardware
 | NAT Traversal | AutoNAT detection → Circuit Relay → DCUtR hole-punching | ⏳ Deferred |
 | TCP Fallback | TCP + Noise transport for non-QUIC peers | ⏳ Deferred |
 | Capability Ads | Custom request-response protocol — advertise RAM, platform, loaded layers | ⏳ Deferred |
-| Codec | Custom request-response framing codec | ⏳ Deferred |
 
 **Gossipsub Topics:**
 - `omni/test/v1` — integration test messages
 - `omni/capability/v1` — periodic hardware capability heartbeats
-- `omni/shard/v1` — shard availability announcements
+- `omni/shard/v1` — shard availability announcements (bincode-serialized `ShardAnnouncement`)
 - `omni/pipeline/v1` — pipeline coordination messages
 - `omni/proof/v1` — zk proof announcements
 
-**Verification (pending):**
-```bash
-# Mac 1 (listener)
-RUST_LOG=info cargo run --bin omni-node -- listen
-
-# Mac 2 (sender)
-RUST_LOG=info cargo run --bin omni-node -- send "Hello from OmniNode"
-```
-
-**Milestone:** Two Apple Silicon Macs on the same LAN discover each other via mDNS and exchange a Gossipsub message on `omni/test/v1`.
-
 ---
 
-### Phase 2: IPFS Model Sharding
+### Phase 2: GGUF Model Sharding — Complete
 
 **Crate:** `omni-store` | **Depends on:** `omni-net`, `omni-types`
 
-Chunk model weight files, content-address each chunk, distribute them across the mesh, and stream them into memory on demand.
+Chunk GGUF model weight files by transformer block, content-address each shard with BLAKE3 → CIDv1, distribute them across the mesh via a custom 64 MiB sliding-window streaming protocol, and serve them from memory-mapped storage on demand.
+
+#### The iroh Pivot
+
+The original design called for [iroh](https://github.com/n0-computer/iroh) (n0.computer's BLAKE3-native blob storage) for shard distribution. During implementation, we discovered an **unresolvable `hickory-resolver` feature conflict** between iroh (any version) and libp2p 0.55. Both crates pull in `hickory-resolver` but require mutually exclusive feature sets — no version combination resolves.
+
+**Solution:** We dropped iroh entirely and built a custom shard transfer protocol directly on top of `libp2p::request_response`. This eliminated the dependency conflict while giving us tighter control over the wire format, chunk windowing, and backpressure.
+
+#### Storage Architecture
 
 | Component | Implementation |
 |---|---|
-| GGUF Parsing | Custom zero-copy parser — memory-maps the file, reads header/metadata/tensor index without loading tensor data |
-| Chunking Strategy | Layer-wise — each chunk contains all tensors for N consecutive transformer blocks (preserves inference locality) |
-| Content Addressing | BLAKE3 hash → CIDv1 for each chunk |
-| Distribution | iroh blob protocol — efficient large-blob transfer with range requests over QUIC |
-| Memory Streaming | `memmap2` — memory-mapped shard files, OS pages in data on demand |
-| Shard Registry | Distributed via Kademlia DHT — maps CID → list of PeerIds that hold the shard |
+| GGUF Parsing | Custom zero-copy parser (`gguf.rs`) — `memmap2` maps the file, parser reads header/metadata/tensor index without touching tensor data. Supports GGUF v2 and v3, all 13 metadata value types |
+| Layer-Wise Chunking | `chunker.rs` classifies tensors by name (`token_embd.*`, `blk.{N}.*`, `output.*`) and groups them into shards by `layers_per_shard` (default: 4). Embedding → first shard, output head → last shard |
+| Content Addressing | BLAKE3 (multicodec `0x1e`) → CIDv1 with raw codec (`0x55`), base32lower encoding. Deterministic: same data always produces the same CID |
+| On-Disk Store | `store.rs` — filesystem store at `~/.omninode/store/<cid>.shard`. Write-once, content-addressed (no race conditions) |
+| Manifest | `manifest.rs` — CBOR-serialized `ModelManifest` listing every shard's CID, layer range, size, and BLAKE3 hash |
+| Integrity | `verify.rs` — BLAKE3 hash and CID verification on every received shard |
+| Memory Streaming | `mmap.rs` — memory-mapped shard files via `memmap2`, OS pages in data on demand |
 
-**Chunking Example (LLaMA 7B, 32 layers):**
+#### 64 MiB Sliding-Window Shard Transfer
+
+Large shards (hundreds of MB) are transferred in multiple request-response round-trips with offset/length windowing:
+
 ```
-Chunk 0: embedding layer + blocks 0-3    → CID_0  (~510 MB)
-Chunk 1: blocks 4-7                       → CID_1
-Chunk 2: blocks 8-11                      → CID_2
+Requester                                  Responder
+─────────                                  ─────────
+ShardRequest{cid, offset=0, max=64MB}      →
+                                           ← ShardResponse{total=350MB, data=[64MB]}
+ShardRequest{cid, offset=64MB, max=64MB}   →
+                                           ← ShardResponse{total=350MB, data=[64MB]}
+... repeat until all bytes received ...
+Reassemble → verify BLAKE3 → verify CID → store to disk
+```
+
+- **Wire format:** `[u32 BE length][bincode payload]` over QUIC substreams
+- **Peak RAM:** ~128 MiB (one send + one receive buffer)
+- **Chunk size:** Configurable via `StoreConfig::max_shard_msg_bytes` (default 64 MiB)
+- **Safety limit:** Codec rejects any single message > 256 MiB
+- **Request timeout:** 120 seconds per round-trip
+
+The `FetchManager` state machine orchestrates multi-chunk fetches: tracks in-progress transfers, accumulates chunks, requests the next window automatically, and verifies + stores the reassembled shard on completion.
+
+#### Chunking Example (LLaMA 7B, 32 layers, 4 per shard)
+
+```
+Shard 0: embedding + global + blocks 0-3     → CID_0  (~510 MB)
+Shard 1: blocks 4-7                           → CID_1
+Shard 2: blocks 8-11                          → CID_2
   ...
-Chunk 8: blocks 28-31 + output head       → CID_8
+Shard 7: blocks 28-31 + output head           → CID_7
 ```
 
-**Shard Manifest Format:**
+#### Shard Manifest Format
+
 ```json
 {
   "model_name": "llama-7b-q4_k_m",
@@ -146,12 +223,14 @@ Chunk 8: blocks 28-31 + output head       → CID_8
   "total_layers": 32,
   "quantization": "Q4_K_M",
   "total_size_bytes": 4080218931,
+  "gguf_version": 3,
   "shards": [
     {
       "shard_index": 0,
-      "cid": "bafybeig...",
-      "layer_range": [0, 3],
+      "cid": "bafkr4i...",
+      "layer_range": { "start": 0, "end": 3 },
       "includes_embedding": true,
+      "includes_output_head": false,
       "size_bytes": 510027366,
       "blake3_hash": "deadbeef..."
     }
@@ -159,13 +238,7 @@ Chunk 8: blocks 28-31 + output head       → CID_8
 }
 ```
 
-**Why iroh over rust-ipfs:**
-1. Actively maintained by n0.computer (rust-ipfs is unmaintained)
-2. BLAKE3-native content addressing (faster than SHA-256)
-3. Built-in QUIC connectivity that complements the libp2p mesh
-4. `iroh-blobs` provides efficient large-blob transfer with range requests
-
-**Milestone:** CLI command `omni-node --shard <model.gguf>` chunks a model, distributes shards across the mesh, and reconstructs them on a different node.
+**Milestone:** CLI command `omni-node shard <model.gguf>` chunks a model, stores shards locally, announces them on the mesh, and serves them to peers. `omni-node fetch <cid>` fetches and verifies a shard from a LAN peer.
 
 ---
 
@@ -287,6 +360,28 @@ RewardDistributor
 
 ---
 
+## Data Flow: End-to-End Shard Transfer
+
+```
+Node A: omni-node shard model.gguf
+  1. mmap model.gguf
+  2. Parse GGUF header, metadata, tensor index (zero-copy)
+  3. Classify tensors: token_embd → embedding, blk.N → block N, output → head
+  4. Plan chunks: group by layers_per_shard (default 4)
+  5. For each chunk: slice bytes → BLAKE3 hash → CIDv1 → write <cid>.shard
+  6. Build ModelManifest (CBOR) with all shard descriptors
+  7. Wait for mDNS peer → publish ShardAnnouncement per shard on omni/shard/v1
+
+Node B: omni-node fetch <cid>
+  1. Listen for ShardAnnouncement on omni/shard/v1, or discover peer via mDNS
+  2. Send ShardRequest{cid, offset=0, max_bytes=64MB} via request-response
+  3. Node A: mmap shard → slice [0..64MB] → ShardResponse
+  4. Node B: accumulate chunk → request next window → repeat
+  5. All chunks received → verify BLAKE3 → verify CID → write <cid>.shard
+```
+
+---
+
 ## Workspace Directory Structure
 
 ```
@@ -295,12 +390,6 @@ OmniNode-Protocol/
 ├── Cargo.toml                          # Workspace manifest
 ├── Cargo.lock
 ├── rust-toolchain.toml                 # Rust 2024 edition, MSRV 1.85+
-├── deny.toml                           # cargo-deny: license & advisory audit
-│
-├── .github/
-│   └── workflows/
-│       ├── ci.yml                      # Lint → test → build (all crates)
-│       └── release.yml                 # Tagged release builds
 │
 ├── crates/
 │   ├── omni-types/                     # Shared types, errors, config
@@ -308,148 +397,177 @@ OmniNode-Protocol/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── node.rs                 # NodeId, PeerId wrappers, NodeCapability
-│   │       ├── model.rs                # ModelManifest, ShardDescriptor, LayerRange
-│   │       ├── pipeline.rs             # PipelineStage, MicroBatch, HiddenState
-│   │       ├── error.rs                # Unified error types
-│   │       └── config.rs              # Global configuration structs
+│   │       ├── model.rs                # ModelManifest, ShardDescriptor, LayerRange, GgmlType
+│   │       ├── pipeline.rs             # PipelineStage, MicroBatch, HiddenState (stub)
+│   │       ├── error.rs                # Unified error types (Network, Storage, GgufParse, ...)
+│   │       └── config.rs              # NetConfig, StoreConfig
 │   │
-│   ├── omni-net/                       # Phase 1: P2P mesh networking
+│   ├── omni-net/                       # Phase 1: P2P mesh networking (libp2p 0.55)
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── transport.rs            # QUIC + Noise transport
-│   │       ├── discovery.rs            # mDNS (LAN) + Kademlia (WAN)
-│   │       ├── capability.rs           # Custom capability advertisement protocol
-│   │       ├── gossip.rs               # Gossipsub pub/sub layer
-│   │       ├── nat.rs                  # AutoNAT, relay, DCUtR
-│   │       ├── behaviour.rs            # Composed NetworkBehaviour
-│   │       ├── swarm.rs                # Swarm lifecycle management
-│   │       ├── codec.rs                # Request-response codec
-│   │       └── events.rs              # Network event types and handlers
+│   │       ├── lib.rs                  # OmniNet API handle (publish, request_shard_chunk, respond_shard)
+│   │       ├── behaviour.rs            # Composed NetworkBehaviour: mDNS + Gossipsub + Identify + ShardXfer
+│   │       ├── swarm.rs                # Swarm lifecycle, event loop, command dispatch
+│   │       ├── codec.rs                # ShardCodec: [u32 BE len][bincode] wire format for /omni/shard-xfer/1
+│   │       ├── discovery.rs            # mDNS event handling and peer registration
+│   │       ├── gossip.rs               # GossipManager: topic subscriptions and publishing
+│   │       ├── events.rs               # OmniNetEvent enum (clean domain events, no raw libp2p)
+│   │       ├── capability.rs           # Custom capability advertisement protocol (deferred)
+│   │       ├── nat.rs                  # AutoNAT, relay, DCUtR (deferred)
+│   │       └── transport.rs           # TCP/Noise fallback transport (deferred)
 │   │
-│   ├── omni-store/                     # Phase 2: IPFS model sharding
+│   ├── omni-store/                     # Phase 2: GGUF model sharding & shard storage
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── gguf.rs                 # GGUF file parser (zero-copy, from spec)
-│   │       ├── chunker.rs              # Layer-wise chunking logic
-│   │       ├── cid.rs                  # BLAKE3 → CIDv1 generation
-│   │       ├── manifest.rs             # Shard manifest (CBOR-serialized registry)
-│   │       ├── ipfs.rs                 # iroh blob integration
-│   │       ├── mmap.rs                 # Memory-mapped shard streaming
-│   │       ├── registry.rs             # Distributed shard → peer registry
-│   │       └── verification.rs        # CID integrity verification on download
+│   │       ├── lib.rs                  # OmniStore API (ingest_model, announce_shards, fetch, serve)
+│   │       ├── gguf.rs                 # Zero-copy GGUF v2/v3 parser (memmap2, all 13 metadata types)
+│   │       ├── chunker.rs              # Layer-wise tensor classification and chunk planning
+│   │       ├── content_id.rs           # BLAKE3 → CIDv1 content addressing
+│   │       ├── manifest.rs             # ModelManifest build, CBOR serialization, JSON export
+│   │       ├── store.rs                # On-disk shard store (~/.omninode/store/<cid>.shard)
+│   │       ├── mmap.rs                 # Memory-mapped file I/O
+│   │       ├── verify.rs               # BLAKE3 and CID integrity verification
+│   │       ├── announce.rs             # Gossipsub shard announcements (bincode on omni/shard/v1)
+│   │       ├── fetch.rs                # FetchManager: windowed 64MB chunk fetching state machine
+│   │       ├── serve.rs                # Inbound request handler: mmap → slice → respond
+│   │       └── error.rs               # StoreError enum (crate-local)
 │   │
-│   ├── omni-bridge/                    # Phase 3: Rust↔Python FFI
-│   │   ├── Cargo.toml                  # crate-type = ["cdylib"]
-│   │   ├── pyproject.toml              # maturin build config
-│   │   └── src/
-│   │       ├── lib.rs                  # #[pymodule] definition
-│   │       ├── shard_loader.rs         # Expose mmap'd buffers as numpy arrays
-│   │       ├── inference.rs            # Bidirectional inference FFI
-│   │       ├── memory.rs               # Unified memory management
-│   │       └── config.rs              # Runtime config across FFI boundary
-│   │
-│   ├── omni-pipeline/                  # Phase 4: Pipeline parallelism
+│   ├── omni-bridge/                    # Phase 3: Rust↔Python FFI (stub)
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── scheduler.rs            # GPipe / 1F1B micro-batch scheduling
-│   │       ├── router.rs               # Layer-to-node mapping
-│   │       ├── tensor_serde.rs         # Hidden state serialization (safetensors)
-│   │       ├── stage.rs                # Pipeline stage execution
-│   │       ├── latency.rs              # RTT-aware scheduling
-│   │       ├── fault.rs                # Heartbeat, re-routing on node dropout
-│   │       ├── coordinator.rs          # Pipeline lifecycle orchestrator
-│   │       └── placement.rs           # DP-based layer placement algorithm
+│   │       └── lib.rs
 │   │
-│   ├── omni-zkml/                      # Phase 5: Zero-knowledge proofs
+│   ├── omni-pipeline/                  # Phase 4: Pipeline parallelism (stub)
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── prover.rs               # ezkl / RISC Zero proof generation
-│   │       ├── verifier.rs             # Local proof verification
-│   │       ├── aggregator.rs           # Multi-stage proof aggregation
-│   │       ├── onnx.rs                 # Model → ONNX export for ezkl
-│   │       └── receipt.rs             # RISC Zero receipt types
+│   │       └── lib.rs
 │   │
-│   └── omni-node/                      # Binary: full node executable
+│   ├── omni-zkml/                      # Phase 5: Zero-knowledge proofs (stub)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── lib.rs
+│   │
+│   └── omni-node/                      # Binary: CLI entry point
 │       ├── Cargo.toml
 │       └── src/
-│           ├── main.rs                 # CLI entry point (clap)
-│           ├── cli.rs                  # CLI argument definitions
-│           ├── daemon.rs               # Long-running node daemon
-│           ├── api.rs                  # Local HTTP API for node management
-│           └── metrics.rs             # Prometheus metrics exporter
+│           └── main.rs                # listen | shard <path> | fetch <cid> | send <msg>
 │
-├── python/
-│   ├── omninode/                       # Python ML package
-│   │   ├── __init__.py
-│   │   ├── inference/
-│   │   │   ├── __init__.py
-│   │   │   ├── engine.py               # Abstract InferenceEngine ABC
-│   │   │   ├── llama_engine.py         # llama-cpp-python backend
-│   │   │   ├── mlx_engine.py           # MLX backend (Apple Silicon)
-│   │   │   └── weight_loader.py       # Load weights from Rust mmap'd buffers
-│   │   ├── pipeline/
-│   │   │   ├── __init__.py
-│   │   │   ├── stage_worker.py         # Python-side pipeline stage worker
-│   │   │   └── tensor_io.py           # Hidden state (de)serialization
-│   │   └── utils/
-│   │       ├── __init__.py
-│   │       ├── device.py               # Device detection (CUDA, MPS, CPU)
-│   │       └── memory.py              # Memory profiling utilities
-│   ├── tests/
-│   │   ├── test_inference.py
-│   │   ├── test_weight_loading.py
-│   │   └── test_pipeline_stage.py
-│   ├── pyproject.toml
-│   └── requirements.txt
+├── python/                            # Python ML package (Phase 3)
+│   └── omninode/
 │
 ├── contracts/                          # Phase 5: SUM Chain smart contracts
-│   ├── README.md                       # SUM Chain integration notes
-│   ├── src/
-│   │   ├── staking.sol                 # Staking / slashing logic
-│   │   ├── verifier.sol                # On-chain zk proof verifier
-│   │   ├── rewards.sol                 # Financial RLHF reward distribution
-│   │   └── registry.sol               # On-chain node + model registry
-│   └── test/
 │
 ├── proto/                              # Protobuf schema definitions
-│   ├── capability.proto                # Node capability advertisement
-│   ├── pipeline.proto                  # Pipeline stage messages
-│   └── manifest.proto                 # Model manifest schema
 │
-├── docs/
-│   ├── architecture.md
-│   ├── phase1-networking.md
-│   ├── phase2-storage.md
-│   ├── phase3-ffi.md
-│   ├── phase4-pipeline.md
-│   ├── phase5-zkml.md
-│   ├── glossary.md
-│   └── threat-model.md
+├── docs/                              # Architecture documentation
 │
-├── scripts/
-│   ├── dev-setup.sh                    # Developer environment setup
-│   ├── run-local-cluster.sh            # Spin up N local nodes for testing
-│   └── benchmark.sh                   # End-to-end benchmark runner
+├── scripts/                           # Development scripts
 │
 ├── tests/                              # Workspace-level integration tests
-│   └── integration/
-│       ├── mesh_formation.rs
-│       ├── shard_distribution.rs
-│       └── pipeline_inference.rs
 │
 ├── benches/                            # Workspace-level benchmarks (criterion)
-│   ├── shard_throughput.rs
-│   ├── tensor_serde.rs
-│   └── mesh_latency.rs
 │
-├── README.md
-├── LICENSE                             # MIT OR Apache-2.0
-├── CONTRIBUTING.md
-└── CHANGELOG.md
+└── README.md
+```
+
+---
+
+## Workspace Cargo.toml
+
+```toml
+[workspace]
+resolver = "2"
+members = [
+    "crates/omni-types",
+    "crates/omni-net",
+    "crates/omni-store",
+    "crates/omni-bridge",
+    "crates/omni-pipeline",
+    "crates/omni-zkml",
+    "crates/omni-node",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/SUM-INNOVATION/OmniNode-Protocol"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Serialization
+serde       = { version = "1.0",         features = ["derive"] }
+serde_json  = "1.0"
+bincode     = { version = "2.0.0-rc.3", features = ["serde"] }
+ciborium    = "0.2"
+
+# Error handling
+thiserror = "2.0"
+anyhow    = "1.0"
+
+# Logging / tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# ─── Phase 1: Networking ──────────────────────────────────────────────────────
+
+libp2p = { version = "0.55", features = [
+    "macros", "tokio", "noise", "quic", "tcp", "dns",
+    "kad", "mdns", "gossipsub", "identify",
+    "autonat", "relay", "dcutr", "request-response",
+] }
+
+libp2p-identity = "0.2"
+prost           = "0.13"
+prost-build     = "0.13"
+
+# ─── Phase 2: Storage ────────────────────────────────────────────────────────
+# iroh removed — unresolvable hickory-resolver conflict with libp2p 0.55.
+# Shard transfer uses libp2p request-response instead.
+
+memmap2    = "0.9"
+blake3     = "1.5"
+cid        = "0.11"
+multihash  = "0.19"
+tempfile   = "3.14"
+
+# ─── Phase 3: FFI ────────────────────────────────────────────────────────────
+
+pyo3 = { version = "0.23", features = ["extension-module"] }
+
+# ─── Phase 4: Pipeline ───────────────────────────────────────────────────────
+
+safetensors    = "0.7"
+ndarray        = "0.16"
+tokio-util     = "0.7"
+dashmap        = "6.1"
+priority-queue = "2.1"
+petgraph       = "0.7"
+
+# ─── Async Utilities ─────────────────────────────────────────────────────────
+
+futures     = "0.3"
+async-trait = "0.1"
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
+
+bytes   = "1.9"
+uuid    = { version = "1.11", features = ["v4"] }
+clap    = { version = "4.5",  features = ["derive"] }
+rand    = "0.9"
+chrono  = { version = "0.4",  features = ["serde"] }
+
+# ─── Internal Crates ─────────────────────────────────────────────────────────
+
+omni-types    = { path = "crates/omni-types" }
+omni-net      = { path = "crates/omni-net" }
+omni-store    = { path = "crates/omni-store" }
+omni-bridge   = { path = "crates/omni-bridge" }
+omni-pipeline = { path = "crates/omni-pipeline" }
+omni-zkml     = { path = "crates/omni-zkml" }
 ```
 
 ---
@@ -463,10 +581,14 @@ OmniNode-Protocol/
 | `tokio` | 1.43 | Async runtime (features: full) |
 | `serde` | 1.0 | Serialization framework (features: derive) |
 | `serde_json` | 1.0 | JSON serialization |
+| `bincode` | 2.0.0-rc.3 | Binary serialization (features: serde) |
+| `ciborium` | 0.2 | CBOR serialization for shard manifests |
 | `thiserror` | 2.0 | Ergonomic error type derivation |
 | `anyhow` | 1.0 | Application-level error handling |
 | `tracing` | 0.1 | Structured logging and instrumentation |
 | `tracing-subscriber` | 0.3 | Log subscriber (features: fmt, env-filter) |
+| `futures` | 0.3 | Async stream utilities (`StreamExt::select_next_some()`) |
+| `async-trait` | 0.1 | Async trait methods (used by libp2p Codec impl) |
 | `bytes` | 1.9 | Efficient byte buffer type |
 | `clap` | 4.5 | CLI argument parser (features: derive) |
 | `uuid` | 1.11 | Unique identifiers (features: v4) |
@@ -490,28 +612,23 @@ OmniNode-Protocol/
 | — feature `autonat` | — | NAT detection |
 | — feature `relay` | — | Circuit relay |
 | — feature `dcutr` | — | Direct Connection Upgrade through Relay |
-| — feature `request-response` | — | Custom request-response protocols |
+| — feature `request-response` | — | Custom request-response protocols (shard transfer) |
 | — feature `tokio` | — | Tokio runtime integration |
 | `libp2p-identity` | 0.2 | Peer identity / keypair management |
-| `futures` | 0.3 | `StreamExt::select_next_some()` for the swarm event loop |
 | `prost` | 0.13 | Protobuf serialization |
 | `prost-build` | 0.13 | Build-time protobuf codegen |
-| `bincode` | 2.0.0-rc.3 | Binary serialization for capability structs |
 
-### Phase 2: IPFS Model Sharding (`omni-store`)
+### Phase 2: GGUF Model Sharding (`omni-store`)
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `iroh` | 0.32 | Content-addressed blob storage (BLAKE3-native) |
-| `iroh-blobs` | 0.32 | Blob transfer protocol with range requests |
-| `memmap2` | 0.9 | Memory-mapped file I/O for weight streaming |
-| `blake3` | 1.5 | BLAKE3 hashing for CID computation |
-| `cid` | 0.11 | CID construction and parsing |
+| `memmap2` | 0.9 | Memory-mapped file I/O for zero-copy GGUF parsing and shard streaming |
+| `blake3` | 1.5 | BLAKE3 hashing for content addressing |
+| `cid` | 0.11 | CIDv1 construction (BLAKE3 hash → content identifier) |
 | `multihash` | 0.19 | Multihash encoding for CID compatibility |
-| `ciborium` | 0.2 | CBOR serialization for shard manifests |
-| `tempfile` | 3.14 | Temporary files during chunking operations |
+| `tempfile` | 3.14 | Temporary files for tests |
 
-> **Note:** The GGUF parser is implemented from scratch within `omni-store`. No mature Rust GGUF crate exists. The parser is built directly from the [GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md).
+> **Note:** The GGUF parser is implemented from scratch within `omni-store`. No mature Rust GGUF crate exists. The parser is built directly from the [GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md), supports v2 and v3, and handles all 13 metadata value types.
 
 ### Phase 3: FFI Bridge (`omni-bridge`)
 
@@ -569,10 +686,9 @@ OmniNode-Protocol/
 Phase 1: omni-net (P2P Mesh)
     │
     │  omni-store uses Gossipsub for shard announcements,
-    │  request-response for shard fetching,
-    │  Kademlia DHT as distributed shard registry
+    │  request-response for shard transfer
     ▼
-Phase 2: omni-store (IPFS Sharding)
+Phase 2: omni-store (Model Sharding)
     │
     │  omni-bridge receives mmap'd weight buffers from omni-store,
     │  exposes them as zero-copy numpy arrays across FFI
@@ -593,94 +709,12 @@ Phase 5: omni-zkml + contracts (Verification & Tokenomics)
 
 ---
 
-## Workspace Cargo.toml
-
-```toml
-[workspace]
-resolver = "2"
-members = [
-    "crates/omni-types",
-    "crates/omni-net",
-    "crates/omni-store",
-    "crates/omni-bridge",
-    "crates/omni-pipeline",
-    "crates/omni-zkml",
-    "crates/omni-node",
-]
-
-[workspace.package]
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/SUM-INNOVATION/OmniNode-Protocol"
-rust-version = "1.85"
-
-[workspace.dependencies]
-# Async runtime
-tokio = { version = "1.43", features = ["full"] }
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bincode = "2.0.0-rc.3"
-ciborium = "0.2"
-
-# Error handling
-thiserror = "2.0"
-anyhow = "1.0"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-
-# Async stream utilities
-futures = "0.3"
-
-# Networking (Phase 1)
-libp2p = { version = "0.55", features = [
-    "macros", "tokio", "noise", "quic", "tcp", "dns",
-    "kad", "mdns", "gossipsub", "identify",
-    "autonat", "relay", "dcutr", "request-response",
-] }
-
-# Content-addressed storage (Phase 2)
-iroh = "0.32"
-iroh-blobs = "0.32"
-memmap2 = "0.9"
-blake3 = "1.5"
-
-# FFI (Phase 3)
-pyo3 = { version = "0.23", features = ["extension-module"] }
-
-# Tensor serialization (Phase 4)
-safetensors = "0.7"
-
-# Utilities
-bytes = "1.9"
-uuid = { version = "1.11", features = ["v4"] }
-clap = { version = "4.5", features = ["derive"] }
-rand = "0.9"
-chrono = { version = "0.4", features = ["serde"] }
-dashmap = "6.1"
-
-# Internal crates
-omni-types = { path = "crates/omni-types" }
-omni-net = { path = "crates/omni-net" }
-omni-store = { path = "crates/omni-store" }
-omni-bridge = { path = "crates/omni-bridge" }
-omni-pipeline = { path = "crates/omni-pipeline" }
-omni-zkml = { path = "crates/omni-zkml" }
-```
-
----
-
 ## Risk Assessment
 
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Hidden state transfer latency dominates inference time | Pipeline parallelism slower than single-node | F16 quantized hidden states (halve transfer size); prioritize LAN peers; tensor compression |
 | GGUF format evolution (llama.cpp breaking changes) | Parser breaks on new models | Version the parser; GGUF v3+ support; format version detection |
-| iroh API instability (pre-1.0) | Breakage on updates | Pin exact version; wrap iroh in abstraction layer; maintain fork if needed |
 | Apple Silicon unified memory path is MLX-version-dependent | Zero-copy fails on some MLX versions | Fallback to explicit copy path; runtime feature detection |
 | ezkl proof generation too slow for real-time inference | Users wait minutes for proof | Async/background proof generation; RISC Zero for faster (larger) proofs; proof caching |
 | NAT traversal failure rate | Nodes behind strict NATs can't participate | Deploy relay infrastructure; WebRTC transport as fallback |
@@ -695,64 +729,61 @@ omni-zkml = { path = "crates/omni-zkml" }
 1. **libp2p** — Modular peer-to-peer networking framework.
    [GitHub: libp2p/rust-libp2p](https://github.com/libp2p/rust-libp2p) | [Docs](https://docs.rs/libp2p/latest/libp2p/)
 
-2. **iroh** — Content-addressed blob storage and connectivity by n0.computer.
-   [GitHub: n0-computer/iroh](https://github.com/n0-computer/iroh) | [Docs](https://docs.rs/iroh)
-
-3. **llama.cpp** — LLM inference in C/C++; defines the GGUF format.
+2. **llama.cpp** — LLM inference in C/C++; defines the GGUF format.
    [GitHub: ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
 
-4. **llama-cpp-python** — Python bindings for llama.cpp.
+3. **llama-cpp-python** — Python bindings for llama.cpp.
    [GitHub: abetlen/llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
 
-5. **PyO3** — Rust bindings for the Python interpreter.
+4. **PyO3** — Rust bindings for the Python interpreter.
    [GitHub: PyO3/pyo3](https://github.com/PyO3/pyo3) | [Docs](https://pyo3.rs/)
 
-6. **maturin** — Build and publish PyO3 crates as Python packages.
+5. **maturin** — Build and publish PyO3 crates as Python packages.
    [GitHub: PyO3/maturin](https://github.com/PyO3/maturin)
 
-7. **safetensors** — Safe, zero-copy tensor serialization by Hugging Face.
+6. **safetensors** — Safe, zero-copy tensor serialization by Hugging Face.
    [GitHub: huggingface/safetensors](https://github.com/huggingface/safetensors)
 
-8. **ezkl** — zkML engine for proving neural network inference via Halo2.
+7. **ezkl** — zkML engine for proving neural network inference via Halo2.
    [GitHub: zkonduit/ezkl](https://github.com/zkonduit/ezkl)
 
-9. **RISC Zero** — General-purpose zero-knowledge virtual machine.
+8. **RISC Zero** — General-purpose zero-knowledge virtual machine.
    [GitHub: risc0/risc0](https://github.com/risc0/risc0) | [Docs](https://dev.risczero.com/)
 
 ### Reference Projects
 
-10. **Exo** — Distributed AI inference on consumer hardware using pipeline parallelism. Key reference for placement engine design, heterogeneous device coordination, and MLX integration.
+9. **Exo** — Distributed AI inference on consumer hardware using pipeline parallelism. Key reference for placement engine design, heterogeneous device coordination, and MLX integration.
     [GitHub: exo-explore/exo](https://github.com/exo-explore/exo)
 
-11. **Petals** — Collaborative LLM inference ("BitTorrent for LLMs"). Reference for the concept of distributed layer hosting across untrusted peers.
+10. **Petals** — Collaborative LLM inference ("BitTorrent for LLMs"). Reference for the concept of distributed layer hosting across untrusted peers.
     [GitHub: bigscience-workshop/petals](https://github.com/bigscience-workshop/petals)
 
 ### Academic Papers
 
-12. McMahan, B. et al. (2017). **"Communication-Efficient Learning of Deep Networks from Decentralized Data."** AISTATS 2017. [arXiv:1602.05629](https://arxiv.org/abs/1602.05629)
+11. McMahan, B. et al. (2017). **"Communication-Efficient Learning of Deep Networks from Decentralized Data."** AISTATS 2017. [arXiv:1602.05629](https://arxiv.org/abs/1602.05629)
     — Foundational federated learning paper. Informs OmniNode's decentralized training architecture.
 
-13. Huang, Y. et al. (2019). **"GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism."** NeurIPS 2019. [arXiv:1811.06965](https://arxiv.org/abs/1811.06965)
+12. Huang, Y. et al. (2019). **"GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism."** NeurIPS 2019. [arXiv:1811.06965](https://arxiv.org/abs/1811.06965)
     — Defines the micro-batch pipeline parallelism strategy used in Phase 4.
 
-14. Narayanan, D. et al. (2019). **"PipeDream: Generalized Pipeline Parallelism for DNN Training."** SOSP 2019.
+13. Narayanan, D. et al. (2019). **"PipeDream: Generalized Pipeline Parallelism for DNN Training."** SOSP 2019.
     — Introduces 1F1B scheduling. Informs pipeline schedule design for inference workloads.
 
 ### Specifications
 
-15. **GGUF Format Specification** — Binary format for quantized LLM weights.
+14. **GGUF Format Specification** — Binary format for quantized LLM weights.
     [Spec: ggml-org/ggml](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md)
 
-16. **Noise Protocol Framework** — Cryptographic handshake protocol used by libp2p.
+15. **Noise Protocol Framework** — Cryptographic handshake protocol used by libp2p.
     [noiseprotocol.org](http://www.noiseprotocol.org/)
 
-17. **QUIC (RFC 9000)** — UDP-based transport with built-in encryption and multiplexing.
+16. **QUIC (RFC 9000)** — UDP-based transport with built-in encryption and multiplexing.
     [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000)
 
-18. **CIDv1 Specification** — Content Identifier format for content-addressed systems.
+17. **CIDv1 Specification** — Content Identifier format for content-addressed systems.
     [multiformats/cid](https://github.com/multiformats/cid)
 
-19. Maymounkov, P. and Mazieres, D. (2002). **"Kademlia: A Peer-to-peer Information System Based on the XOR Metric."** IPTPS 2002.
+18. Maymounkov, P. and Mazieres, D. (2002). **"Kademlia: A Peer-to-peer Information System Based on the XOR Metric."** IPTPS 2002.
     — Distributed hash table algorithm used for WAN peer discovery.
 
 ---
