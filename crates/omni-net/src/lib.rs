@@ -2,7 +2,7 @@
 
 pub mod behaviour;
 pub mod capability;  // deferred — WAN capability advertisement protocol
-pub mod codec;       // deferred — custom request-response codec
+pub mod codec;
 pub mod discovery;
 pub mod events;
 pub mod gossip;
@@ -16,10 +16,12 @@ pub use events::OmniNetEvent;
 pub use gossip::{
     TOPIC_CAPABILITY, TOPIC_PIPELINE, TOPIC_PROOF, TOPIC_SHARD, TOPIC_TEST,
 };
+pub use codec::{ShardCodec, ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL};
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
 use anyhow::Result;
+use libp2p::PeerId;
 use tokio::sync::mpsc;
 
 use omni_types::config::NetConfig;
@@ -37,7 +39,7 @@ const CHANNEL_CAPACITY: usize = 256;
 /// Owns two async channels that communicate with a background `tokio` task
 /// running the [`swarm::OmniSwarm`] event loop:
 ///
-/// - `cmd_tx`   — send commands (publish, shutdown) **into** the loop
+/// - `cmd_tx`   — send commands (publish, shutdown, shard ops) **into** the loop
 /// - `event_rx` — receive [`OmniNetEvent`]s **from** the loop
 ///
 /// # Example
@@ -79,6 +81,8 @@ impl OmniNet {
         Ok(Self { cmd_tx, event_rx })
     }
 
+    // ── Phase 1: Gossipsub ──────────────────────────────────────────────
+
     /// Publish `data` to the named Gossipsub topic.
     /// Sends the command to the background task and returns immediately.
     pub async fn publish(&self, topic: &str, data: Vec<u8>) -> Result<()> {
@@ -90,6 +94,48 @@ impl OmniNet {
             .await
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot publish"))
     }
+
+    // ── Phase 2: Shard transfer ─────────────────────────────────────────
+
+    /// Request a shard chunk from a remote peer.
+    ///
+    /// - `peer_id`:   the peer to request from (learned via gossipsub announcement)
+    /// - `cid`:       CIDv1 string identifying the shard
+    /// - `offset`:    byte offset within the shard (`None` = from beginning)
+    /// - `max_bytes`: max bytes to return (`None` = entire shard)
+    ///
+    /// The response arrives later as [`OmniNetEvent::ShardReceived`].
+    pub async fn request_shard_chunk(
+        &self,
+        peer_id: PeerId,
+        cid: String,
+        offset: Option<u64>,
+        max_bytes: Option<u64>,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::RequestShard {
+                peer_id,
+                request: ShardRequest { cid, offset, max_bytes },
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot request shard"))
+    }
+
+    /// Send a shard response on a pending response channel.
+    ///
+    /// `channel_id` is the ID received in [`OmniNetEvent::ShardRequested`].
+    pub async fn respond_shard(
+        &self,
+        channel_id: u64,
+        response: ShardResponse,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::SendShardResponse { channel_id, response })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot respond shard"))
+    }
+
+    // ── Lifecycle ───────────────────────────────────────────────────────
 
     /// Receive the next event from the mesh.
     /// Returns `None` when the swarm task has stopped and the buffer is drained.

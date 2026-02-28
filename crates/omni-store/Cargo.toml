@@ -8,3 +8,18 @@ rust-version.workspace = true
 
 [dependencies]
 omni-types = { workspace = true }
+omni-net   = { workspace = true }
+libp2p     = { workspace = true }
+memmap2    = { workspace = true }
+blake3     = { workspace = true }
+cid        = { workspace = true }
+multihash  = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+ciborium   = { workspace = true }
+bincode    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -13,8 +13,10 @@ path = "src/main.rs"
 [dependencies]
 omni-types         = { workspace = true }
 omni-net           = { workspace = true }
+omni-store         = { workspace = true }
 tokio              = { workspace = true }
 clap               = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
+serde_json         = { workspace = true }

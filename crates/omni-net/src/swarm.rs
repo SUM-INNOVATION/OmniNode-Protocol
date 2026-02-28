@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
     gossipsub, identify, mdns,
+    request_response::{self, ProtocolSupport, ResponseChannel},
     swarm::SwarmEvent,
-    Multiaddr, SwarmBuilder,
+    Multiaddr, PeerId, SwarmBuilder,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -14,6 +16,7 @@ use omni_types::config::NetConfig;
 
 use crate::{
     behaviour::{LocalMeshBehaviour, LocalMeshBehaviourEvent},
+    codec::{ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL},
     discovery,
     events::OmniNetEvent,
     gossip::GossipManager,
@@ -26,6 +29,13 @@ use crate::{
 pub enum SwarmCommand {
     /// Publish bytes to a named Gossipsub topic.
     Publish { topic: String, data: Vec<u8> },
+
+    /// Send a shard request to a remote peer.
+    RequestShard { peer_id: PeerId, request: ShardRequest },
+
+    /// Send a shard response on a stored response channel.
+    SendShardResponse { channel_id: u64, response: ShardResponse },
+
     /// Exit the event loop cleanly.
     Shutdown,
 }
@@ -37,13 +47,19 @@ pub enum SwarmCommand {
 pub struct OmniSwarm {
     inner:  libp2p::Swarm<LocalMeshBehaviour>,
     gossip: GossipManager,
+
+    /// Stores response channels received from inbound shard requests.
+    /// Keyed by an internal monotonic ID passed to the caller via
+    /// `OmniNetEvent::ShardRequested`.
+    pending_shard_channels: HashMap<u64, ResponseChannel<ShardResponse>>,
+    next_channel_id: u64,
 }
 
 impl OmniSwarm {
     /// Construct and configure the Swarm via the libp2p 0.55 `SwarmBuilder` API.
     ///
     /// Transport:  QUIC (TLS 1.3 baked-in — no separate Noise step required)
-    /// Behaviour:  mDNS + Gossipsub + Identify
+    /// Behaviour:  mDNS + Gossipsub + Identify + request-response (shard xfer)
     /// Listener:   `0.0.0.0:<config.listen_port>` (0 = OS-assigned)
     pub fn build(config: &NetConfig) -> Result<Self> {
         let gossip_cfg = gossipsub::ConfigBuilder::default()
@@ -74,7 +90,13 @@ impl OmniSwarm {
                     key.public(),
                 ));
 
-                Ok(LocalMeshBehaviour { mdns, gossipsub, identify })
+                let shard_xfer = request_response::Behaviour::new(
+                    [(SHARD_XFER_PROTOCOL.to_string(), ProtocolSupport::Full)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(120)),
+                );
+
+                Ok(LocalMeshBehaviour { mdns, gossipsub, identify, shard_xfer })
             })?
             .with_swarm_config(|c| {
                 // Keep idle QUIC connections alive between pipeline requests.
@@ -94,6 +116,8 @@ impl OmniSwarm {
         Ok(Self {
             inner:  swarm,
             gossip: GossipManager::new(),
+            pending_shard_channels: HashMap::new(),
+            next_channel_id: 0,
         })
     }
 
@@ -132,6 +156,21 @@ impl OmniSwarm {
                         Some(SwarmCommand::Publish { topic, data }) => {
                             if let Err(e) = self.publish(&topic, data) {
                                 warn!(%e, %topic, "gossipsub publish failed");
+                            }
+                        }
+                        Some(SwarmCommand::RequestShard { peer_id, request }) => {
+                            self.inner.behaviour_mut().shard_xfer
+                                .send_request(&peer_id, request);
+                        }
+                        Some(SwarmCommand::SendShardResponse { channel_id, response }) => {
+                            if let Some(channel) = self.pending_shard_channels.remove(&channel_id) {
+                                if let Err(resp) = self.inner.behaviour_mut().shard_xfer
+                                    .send_response(channel, response)
+                                {
+                                    warn!(cid = %resp.cid, "failed to send shard response — channel closed");
+                                }
+                            } else {
+                                warn!(channel_id, "no pending channel for shard response");
                             }
                         }
                         Some(SwarmCommand::Shutdown) | None => {
@@ -194,6 +233,71 @@ impl OmniSwarm {
             // ── Identify ──────────────────────────────────────────────────────
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Identify(e)) => {
                 debug!(?e, "identify event");
+            }
+
+            // ── Shard transfer (request-response) ─────────────────────────────
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
+                request_response::Event::Message { peer, message, .. }
+            )) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        let channel_id = self.next_channel_id;
+                        self.next_channel_id += 1;
+                        self.pending_shard_channels.insert(channel_id, channel);
+                        info!(
+                            %peer,
+                            cid = %request.cid,
+                            channel_id,
+                            "inbound shard request"
+                        );
+                        if let Err(e) = event_tx.try_send(OmniNetEvent::ShardRequested {
+                            peer_id: peer,
+                            request,
+                            channel_id,
+                        }) {
+                            warn!(%e, "event channel full — dropping ShardRequested");
+                        }
+                    }
+                    request_response::Message::Response { response, .. } => {
+                        info!(
+                            %peer,
+                            cid = %response.cid,
+                            offset = response.offset,
+                            bytes = response.data.len(),
+                            "shard chunk received"
+                        );
+                        if let Err(e) = event_tx.try_send(OmniNetEvent::ShardReceived {
+                            peer_id: peer,
+                            response,
+                        }) {
+                            warn!(%e, "event channel full — dropping ShardReceived");
+                        }
+                    }
+                }
+            }
+
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
+                request_response::Event::OutboundFailure { peer, error, .. }
+            )) => {
+                warn!(%peer, %error, "shard request outbound failure");
+                if let Err(e) = event_tx.try_send(OmniNetEvent::ShardRequestFailed {
+                    peer_id: peer,
+                    error: error.to_string(),
+                }) {
+                    warn!(%e, "event channel full — dropping ShardRequestFailed");
+                }
+            }
+
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
+                request_response::Event::InboundFailure { peer, error, .. }
+            )) => {
+                debug!(%peer, %error, "shard request inbound failure");
+            }
+
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
+                request_response::Event::ResponseSent { peer, .. }
+            )) => {
+                debug!(%peer, "shard response sent");
             }
 
             // ── Transport ─────────────────────────────────────────────────────
