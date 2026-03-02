@@ -17,6 +17,7 @@ use omni_types::config::NetConfig;
 use crate::{
     behaviour::{LocalMeshBehaviour, LocalMeshBehaviourEvent},
     codec::{ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL},
+    tensor_codec::{TensorRequest, TensorResponse, TENSOR_XFER_PROTOCOL},
     discovery,
     events::OmniNetEvent,
     gossip::GossipManager,
@@ -36,6 +37,12 @@ pub enum SwarmCommand {
     /// Send a shard response on a stored response channel.
     SendShardResponse { channel_id: u64, response: ShardResponse },
 
+    /// Send a tensor (hidden-state activation) to a remote pipeline stage.
+    RequestTensor { peer_id: PeerId, request: TensorRequest },
+
+    /// Send a tensor acknowledgment on a stored response channel.
+    SendTensorResponse { channel_id: u64, response: TensorResponse },
+
     /// Exit the event loop cleanly.
     Shutdown,
 }
@@ -52,6 +59,13 @@ pub struct OmniSwarm {
     /// Keyed by an internal monotonic ID passed to the caller via
     /// `OmniNetEvent::ShardRequested`.
     pending_shard_channels: HashMap<u64, ResponseChannel<ShardResponse>>,
+
+    /// Stores response channels received from inbound tensor requests.
+    /// Keyed by an internal monotonic ID passed to the caller via
+    /// `OmniNetEvent::TensorReceived`.
+    pending_tensor_channels: HashMap<u64, ResponseChannel<TensorResponse>>,
+
+    /// Monotonic counter shared across shard and tensor channel IDs.
     next_channel_id: u64,
 }
 
@@ -59,7 +73,7 @@ impl OmniSwarm {
     /// Construct and configure the Swarm via the libp2p 0.55 `SwarmBuilder` API.
     ///
     /// Transport:  QUIC (TLS 1.3 baked-in — no separate Noise step required)
-    /// Behaviour:  mDNS + Gossipsub + Identify + request-response (shard xfer)
+    /// Behaviour:  mDNS + Gossipsub + Identify + shard xfer + tensor xfer
     /// Listener:   `0.0.0.0:<config.listen_port>` (0 = OS-assigned)
     pub fn build(config: &NetConfig) -> Result<Self> {
         let gossip_cfg = gossipsub::ConfigBuilder::default()
@@ -96,7 +110,13 @@ impl OmniSwarm {
                         .with_request_timeout(Duration::from_secs(120)),
                 );
 
-                Ok(LocalMeshBehaviour { mdns, gossipsub, identify, shard_xfer })
+                let tensor_xfer = request_response::Behaviour::new(
+                    [(TENSOR_XFER_PROTOCOL.to_string(), ProtocolSupport::Full)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(60)),
+                );
+
+                Ok(LocalMeshBehaviour { mdns, gossipsub, identify, shard_xfer, tensor_xfer })
             })?
             .with_swarm_config(|c| {
                 // Keep idle QUIC connections alive between pipeline requests.
@@ -116,7 +136,8 @@ impl OmniSwarm {
         Ok(Self {
             inner:  swarm,
             gossip: GossipManager::new(),
-            pending_shard_channels: HashMap::new(),
+            pending_shard_channels:  HashMap::new(),
+            pending_tensor_channels: HashMap::new(),
             next_channel_id: 0,
         })
     }
@@ -173,6 +194,24 @@ impl OmniSwarm {
                                 warn!(channel_id, "no pending channel for shard response");
                             }
                         }
+                        Some(SwarmCommand::RequestTensor { peer_id, request }) => {
+                            self.inner.behaviour_mut().tensor_xfer
+                                .send_request(&peer_id, request);
+                        }
+                        Some(SwarmCommand::SendTensorResponse { channel_id, response }) => {
+                            if let Some(channel) = self.pending_tensor_channels.remove(&channel_id) {
+                                if let Err(resp) = self.inner.behaviour_mut().tensor_xfer
+                                    .send_response(channel, response)
+                                {
+                                    warn!(
+                                        session = %resp.session_id,
+                                        "failed to send tensor response — channel closed"
+                                    );
+                                }
+                            } else {
+                                warn!(channel_id, "no pending channel for tensor response");
+                            }
+                        }
                         Some(SwarmCommand::Shutdown) | None => {
                             info!("swarm event loop shutting down");
                             return Ok(());
@@ -191,7 +230,7 @@ impl OmniSwarm {
         event_tx: &mpsc::Sender<OmniNetEvent>,
     ) {
         match event {
-            // ── mDNS ──────────────────────────────────────────────────────────
+            // ── mDNS ──────────────────────────────────────��───────────────────
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Mdns(e)) => {
                 discovery::handle_mdns_event(
                     e,
@@ -235,7 +274,7 @@ impl OmniSwarm {
                 debug!(?e, "identify event");
             }
 
-            // ── Shard transfer (request-response) ─────────────────────────────
+            // ── Shard transfer (Phase 2) ──────────────────────────────────────
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
                 request_response::Event::Message { peer, message, .. }
             )) => {
@@ -298,6 +337,75 @@ impl OmniSwarm {
                 request_response::Event::ResponseSent { peer, .. }
             )) => {
                 debug!(%peer, "shard response sent");
+            }
+
+            // ── Tensor transfer (Phase 4) ─────────────────────────────────────
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::TensorXfer(
+                request_response::Event::Message { peer, message, .. }
+            )) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        let channel_id = self.next_channel_id;
+                        self.next_channel_id += 1;
+                        self.pending_tensor_channels.insert(channel_id, channel);
+                        info!(
+                            %peer,
+                            session = %request.session_id,
+                            micro_batch = request.micro_batch_index,
+                            from_stage = request.from_stage,
+                            to_stage = request.to_stage,
+                            bytes = request.data.len(),
+                            "inbound tensor request"
+                        );
+                        if let Err(e) = event_tx.try_send(OmniNetEvent::TensorReceived {
+                            peer_id: peer,
+                            request,
+                            channel_id,
+                        }) {
+                            warn!(%e, "event channel full — dropping TensorReceived");
+                        }
+                    }
+                    request_response::Message::Response { response, .. } => {
+                        info!(
+                            %peer,
+                            session = %response.session_id,
+                            micro_batch = response.micro_batch_index,
+                            stage = response.stage_index,
+                            accepted = response.accepted,
+                            "tensor response received"
+                        );
+                        if let Err(e) = event_tx.try_send(OmniNetEvent::TensorResponseReceived {
+                            peer_id: peer,
+                            response,
+                        }) {
+                            warn!(%e, "event channel full — dropping TensorResponseReceived");
+                        }
+                    }
+                }
+            }
+
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::TensorXfer(
+                request_response::Event::OutboundFailure { peer, error, .. }
+            )) => {
+                warn!(%peer, %error, "tensor request outbound failure");
+                if let Err(e) = event_tx.try_send(OmniNetEvent::TensorRequestFailed {
+                    peer_id: peer,
+                    error: error.to_string(),
+                }) {
+                    warn!(%e, "event channel full — dropping TensorRequestFailed");
+                }
+            }
+
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::TensorXfer(
+                request_response::Event::InboundFailure { peer, error, .. }
+            )) => {
+                debug!(%peer, %error, "tensor request inbound failure");
+            }
+
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::TensorXfer(
+                request_response::Event::ResponseSent { peer, .. }
+            )) => {
+                debug!(%peer, "tensor response sent");
             }
 
             // ── Transport ─────────────────────────────────────────────────────

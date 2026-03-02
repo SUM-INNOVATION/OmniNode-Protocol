@@ -84,6 +84,74 @@ impl PyOmniNet {
         anyhow_to_pyerr(get_runtime().block_on(net.respond_shard(channel_id, response)))
     }
 
+    // ── Phase 4: Tensor transfer ────────────────────────────────────────
+
+    /// Send a hidden-state activation tensor to a remote pipeline stage.
+    ///
+    /// The acknowledgment arrives later as a `NetEvent` with
+    /// `kind='tensor_response_received'`.
+    fn request_tensor(
+        &self,
+        peer_id: &str,
+        session_id: &str,
+        micro_batch_index: u32,
+        from_stage: u32,
+        to_stage: u32,
+        seq_len: u32,
+        hidden_dim: u32,
+        dtype: u8,
+        data: Vec<u8>,
+    ) -> PyResult<()> {
+        let net = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyOmniError::new_err("OmniNet is shut down"))?;
+        let pid: libp2p::PeerId = peer_id
+            .parse()
+            .map_err(|e| PyOmniError::new_err(format!("invalid PeerId: {e}")))?;
+        let request = omni_net::TensorRequest {
+            session_id: session_id.to_string(),
+            micro_batch_index,
+            from_stage,
+            to_stage,
+            seq_len,
+            hidden_dim,
+            dtype,
+            data,
+        };
+        anyhow_to_pyerr(get_runtime().block_on(net.request_tensor(pid, request)))
+    }
+
+    /// Respond to a tensor request (acknowledge receipt).
+    ///
+    /// `channel_id` is the value from the `NetEvent` with
+    /// `kind='tensor_received'`.
+    #[pyo3(signature = (channel_id, session_id, micro_batch_index, stage_index, accepted, error=None))]
+    fn respond_tensor(
+        &self,
+        channel_id: u64,
+        session_id: &str,
+        micro_batch_index: u32,
+        stage_index: u32,
+        accepted: bool,
+        error: Option<String>,
+    ) -> PyResult<()> {
+        let net = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyOmniError::new_err("OmniNet is shut down"))?;
+        let response = omni_net::TensorResponse {
+            session_id: session_id.to_string(),
+            micro_batch_index,
+            stage_index,
+            accepted,
+            error,
+        };
+        anyhow_to_pyerr(get_runtime().block_on(net.respond_tensor(channel_id, response)))
+    }
+
+    // ── Lifecycle ───────────────────────────────────────────────────────
+
     /// Poll for the next network event.
     ///
     /// Blocks until an event is available or `timeout_secs` elapses.

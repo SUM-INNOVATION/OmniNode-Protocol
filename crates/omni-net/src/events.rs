@@ -1,6 +1,7 @@
 use libp2p::{Multiaddr, PeerId};
 
 use crate::codec::{ShardRequest, ShardResponse};
+use crate::tensor_codec::{TensorRequest, TensorResponse};
 
 /// Clean, domain-level events emitted by the OmniNode networking layer.
 /// Never exposes raw libp2p internals to callers.
@@ -56,6 +57,29 @@ pub enum OmniNetEvent {
 
     /// An outbound shard request failed.
     ShardRequestFailed {
+        peer_id: PeerId,
+        error: String,
+    },
+
+    // ── Phase 4: Tensor transfer ────────────────────────────────────────
+
+    /// A remote pipeline stage sent us a hidden-state activation tensor.
+    /// The handler should call `OmniNet::respond_tensor(channel_id, response)`.
+    TensorReceived {
+        peer_id: PeerId,
+        request: TensorRequest,
+        /// Internal ID mapped to the response channel stored in the swarm.
+        channel_id: u64,
+    },
+
+    /// We received an acknowledgment for a tensor we sent.
+    TensorResponseReceived {
+        peer_id: PeerId,
+        response: TensorResponse,
+    },
+
+    /// An outbound tensor request failed.
+    TensorRequestFailed {
         peer_id: PeerId,
         error: String,
     },

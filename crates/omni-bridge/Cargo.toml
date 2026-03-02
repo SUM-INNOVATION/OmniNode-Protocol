@@ -11,13 +11,14 @@ name = "omni_bridge"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-omni-types = { workspace = true }
-omni-store = { workspace = true }
-omni-net   = { workspace = true }
-pyo3       = { workspace = true }
-tokio      = { workspace = true }
-serde_json = { workspace = true }
-memmap2    = { workspace = true }
-tracing    = { workspace = true }
-anyhow     = { workspace = true }
-libp2p     = { workspace = true }
+omni-types    = { workspace = true }
+omni-store    = { workspace = true }
+omni-net      = { workspace = true }
+omni-pipeline = { workspace = true }
+pyo3          = { workspace = true }
+tokio         = { workspace = true }
+serde_json    = { workspace = true }
+memmap2       = { workspace = true }
+tracing       = { workspace = true }
+anyhow        = { workspace = true }
+libp2p        = { workspace = true }

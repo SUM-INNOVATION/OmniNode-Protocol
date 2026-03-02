@@ -5,6 +5,7 @@ from omninode._omni_bridge import (
     StoreError,
     NetConfig,
     StoreConfig,
+    PipelineConfig,
     LayerRange,
     ShardDescriptor,
     ModelManifest,
@@ -12,6 +13,9 @@ from omninode._omni_bridge import (
     ShardView,
     OmniNet,
     NetEvent,
+    PipelineCapability,
+    PipelineCoordinator,
+    StageExecutor,
 )
 
 __all__ = [
@@ -19,6 +23,7 @@ __all__ = [
     "StoreError",
     "NetConfig",
     "StoreConfig",
+    "PipelineConfig",
     "LayerRange",
     "ShardDescriptor",
     "ModelManifest",
@@ -26,4 +31,7 @@ __all__ = [
     "ShardView",
     "OmniNet",
     "NetEvent",
+    "PipelineCapability",
+    "PipelineCoordinator",
+    "StageExecutor",
 ]

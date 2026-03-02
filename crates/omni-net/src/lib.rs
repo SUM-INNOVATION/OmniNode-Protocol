@@ -8,6 +8,7 @@ pub mod events;
 pub mod gossip;
 pub mod nat;         // deferred — AutoNAT / DCUtR / relay
 pub mod swarm;
+pub mod tensor_codec;
 pub mod transport;   // deferred — TCP/Noise fallback transport
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
@@ -17,6 +18,7 @@ pub use gossip::{
     TOPIC_CAPABILITY, TOPIC_PIPELINE, TOPIC_PROOF, TOPIC_SHARD, TOPIC_TEST,
 };
 pub use codec::{ShardCodec, ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL};
+pub use tensor_codec::{TensorCodec, TensorRequest, TensorResponse, TENSOR_XFER_PROTOCOL};
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
@@ -39,7 +41,7 @@ const CHANNEL_CAPACITY: usize = 256;
 /// Owns two async channels that communicate with a background `tokio` task
 /// running the [`swarm::OmniSwarm`] event loop:
 ///
-/// - `cmd_tx`   — send commands (publish, shutdown, shard ops) **into** the loop
+/// - `cmd_tx`   — send commands (publish, shutdown, shard/tensor ops) **into** the loop
 /// - `event_rx` — receive [`OmniNetEvent`]s **from** the loop
 ///
 /// # Example
@@ -133,6 +135,39 @@ impl OmniNet {
             .send(SwarmCommand::SendShardResponse { channel_id, response })
             .await
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot respond shard"))
+    }
+
+    // ── Phase 4: Tensor transfer ────────────────────────────────────────
+
+    /// Send a hidden-state activation tensor to a remote pipeline stage.
+    ///
+    /// The `request` contains both the metadata (session, micro-batch, stage
+    /// indices, dimensions) and the raw activation bytes.
+    ///
+    /// The acknowledgment arrives later as [`OmniNetEvent::TensorResponseReceived`].
+    pub async fn request_tensor(
+        &self,
+        peer_id: PeerId,
+        request: TensorRequest,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::RequestTensor { peer_id, request })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot send tensor"))
+    }
+
+    /// Send an acknowledgment on a pending tensor response channel.
+    ///
+    /// `channel_id` is the ID received in [`OmniNetEvent::TensorReceived`].
+    pub async fn respond_tensor(
+        &self,
+        channel_id: u64,
+        response: TensorResponse,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::SendTensorResponse { channel_id, response })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot respond tensor"))
     }
 
     // ── Lifecycle ───────────────────────────────────────────────────────

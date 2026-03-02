@@ -2364,6 +2364,7 @@ dependencies = [
  "libp2p",
  "memmap2",
  "omni-net",
+ "omni-pipeline",
  "omni-store",
  "omni-types",
  "pyo3",
@@ -2408,7 +2409,16 @@ dependencies = [
 name = "omni-pipeline"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bincode",
+ "chrono",
+ "omni-net",
  "omni-types",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

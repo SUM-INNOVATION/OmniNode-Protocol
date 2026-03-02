@@ -1,5 +1,5 @@
 [package]
-name             = "omni-pipeline"
+name               = "omni-pipeline"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -7,4 +7,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-omni-types = { workspace = true }
+omni-types  = { workspace = true }
+omni-net    = { workspace = true }
+serde       = { workspace = true }
+bincode     = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+thiserror   = { workspace = true }
+anyhow      = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }

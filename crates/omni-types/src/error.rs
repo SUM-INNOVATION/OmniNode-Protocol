@@ -23,4 +23,12 @@ pub enum OmniError {
 
     #[error("GGUF parse error: {0}")]
     GgufParse(String),
+
+    // ── Phase 4: Pipeline ─────────────────────────────────────────────────
+
+    #[error("pipeline error: {0}")]
+    Pipeline(String),
+
+    #[error("tensor transfer error: {0}")]
+    TensorTransfer(String),
 }

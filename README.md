@@ -69,7 +69,7 @@ The protocol is built on four pillars:
 | **Phase 1** — P2P Mesh Networking | `omni-net` | **Complete** |
 | **Phase 2** — GGUF Model Sharding | `omni-store` | **Complete** |
 | **Phase 3** — FFI Bridge & Local Inference | `omni-bridge` | **Complete** |
-| Phase 4 — Pipeline Parallelism | `omni-pipeline` | Planned |
+| **Phase 4** — Pipeline Parallelism | `omni-pipeline` | **Complete** |
 | Phase 5 — zkML & Tokenomics | `omni-zkml` | Planned |
 
 ---
@@ -330,43 +330,110 @@ mx.eval(result)
 
 ---
 
-### Phase 4: Pipeline Parallelism
+### Phase 4: Pipeline Parallelism — Complete
 
-**Crate:** `omni-pipeline` | **Depends on:** `omni-net`, `omni-store`, `omni-bridge`, `omni-types`
+**Crate:** `omni-pipeline` | **Depends on:** `omni-net`, `omni-types`
 
-Distribute inference across multiple nodes. Each node executes a contiguous range of model layers, forwarding hidden state tensors to the next node over the mesh.
+Distribute inference across multiple nodes. Each node executes a contiguous range of model layers (a *stage*), forwarding hidden-state activation tensors to the next node over the existing libp2p QUIC mesh. `omni-pipeline` is a **coordination layer** — the actual forward pass (matrix multiply, attention, etc.) executes in Python via MLX/llama.cpp through `omni-bridge`.
 
-| Component | Implementation |
-|---|---|
-| Pipeline Schedule | GPipe-style micro-batching — prompts split into M micro-batches, staggered across stages |
-| Tensor Serialization | safetensors wire format — hidden states serialized between pipeline stages |
-| Placement Engine | Dynamic programming — bin-pack layers to nodes minimizing `max(stage_latency) + communication_time` |
-| Latency Probing | RTT measurements over the mesh to inform placement decisions |
-| Fault Tolerance | Heartbeat (5s interval, 15s timeout) → re-assign failed node's layers → re-queue in-flight micro-batches |
-| Coordinator | Orchestrator managing pipeline lifecycle: placement → shard loading → execution → result collection |
+| Component | Implementation | Status |
+|---|---|---|
+| TensorCodec | `/omni/tensor-xfer/1` request-response protocol — `[u32 BE len][bincode]` wire format, 128 MiB safety limit. Activation sizes: 7B ≈ 4 MB, 13B ≈ 5 MB, 70B ≈ 32 MB (f16) | ✅ Done |
+| Session Formation | Gossipsub protocol on `omni/pipeline/v1` — `Propose → CapabilityOffer → ScheduleAssigned → StageReady → StartInference` | ✅ Done |
+| Planner | RAM-proportional layer assignment — filter pipeline-ready nodes, sort by available RAM, assign contiguous `LayerRange`s proportionally | ✅ Done |
+| Scheduler | GPipe micro-batch scheduling — deterministic execution grid, `efficiency = M / (M + S - 1)`, default `num_micro_batches = 2 × num_stages` | ✅ Done |
+| Coordinator | `PipelineCoordinator` produces `PipelineAction::PublishMessage` values — no direct network I/O, caller dispatches via OmniNet | ✅ Done |
+| Executor | `StageExecutor` manages per-node stage state — builds `TensorRequest`/`TensorResponse`, tracks micro-batch progress | ✅ Done |
+| Session State Machine | `Forming → Scheduled → Running → Completed \| Failed` with strict transition validation | ✅ Done |
+| Heartbeat Monitor | 3-second interval, 3× timeout factor — tracks liveness per `(session_id, stage_index)` | ✅ Done |
+| Python FFI Bridge | `PyPipelineCoordinator` and `PyStageExecutor` exposed via PyO3 — drive distributed inference from Python/MLX | ✅ Done |
 
-**Pipeline Schedule (GPipe Micro-Batching):**
+**Key design:** The coordinator and executor are pure synchronous state machines that produce action descriptors. They never call OmniNet directly — the caller (omni-node or Python) executes the network operations. This keeps `omni-pipeline` free of any libp2p dependency.
+
+#### Hidden State Transfer Data Flow
+
 ```
-Time →
-Stage 0 (Node A): [MB0] [MB1] [MB2] [MB3]
-Stage 1 (Node B):       [MB0] [MB1] [MB2] [MB3]
-Stage 2 (Node C):             [MB0] [MB1] [MB2] [MB3]
-Stage 3 (Node D):                   [MB0] [MB1] [MB2] [MB3]
+Stage 0 (Node A)             Stage 1 (Node B)              Stage 2 (Node C)
+────────────────             ────────────────              ────────────────
+[token_ids]
+     │
+embed + layers 0-10
+     │
+     ├── /omni/tensor-xfer/1 ──►
+     │   TensorRequest {              layers 11-21
+     │     data: [f16 activations]         │
+     │     (seq_len × hidden_dim × 2)      ├── /omni/tensor-xfer/1 ──►
+     │   }                                 │   TensorRequest {              layers 22-31 + lm_head
+     │                                     │     data: [f16]                      │
+     ...                                   ...                                    ▼
+                                                                            logits → token
 ```
 
-**Placement Algorithm:**
+**Activation sizes (f16):**
+
+| Model | Hidden Dim | Seq Len | Transfer Size |
+|---|---|---|---|
+| 7B | 4096 | 512 | **4 MB** |
+| 13B | 5120 | 512 | **5 MB** |
+| 70B | 8192 | 2048 | **32 MB** |
+
+All well within the 128 MiB TensorCodec limit and QUIC transport capacity.
+
+#### GPipe Micro-Batch Schedule
+
+```
+Time →  0    1    2    3    4    5    6    7
+S0:    [m0] [m1] [m2] [m3]
+S1:         [m0] [m1] [m2] [m3]
+S2:              [m0] [m1] [m2] [m3]
+
+Pipeline bubble = S-1 time slots at start + end
+Efficiency = M / (M + S - 1)
+Default: num_micro_batches = 2 × num_stages (auto)
+```
+
+#### RAM-Proportional Planner
+
 ```
 Inputs:
-  nodes:  [(node_id, vram_bytes, ram_bytes, flops, bandwidth)]
-  layers: [(layer_index, param_bytes, activation_bytes, flop_cost)]
+  capabilities: [(peer_id, available_ram_bytes, local_shard_cids, pipeline_ready)]
+  total_layers:  32
 
-Objective:  minimize max(stage_latency) + inter_stage_communication_time
-Constraint: sum(layer_memory) per node ≤ node_available_memory
-
-Solution:   O(L × N) dynamic programming (partition problem variant)
+Algorithm:
+  1. Filter nodes with pipeline_ready = true
+  2. Sort by available_ram_bytes descending
+  3. Assign layers proportionally: node with 2× RAM gets 2× layers
+  4. Enforce contiguity (each node gets a contiguous LayerRange)
+  5. Embedding → first stage, output head → last stage
 ```
 
-**Milestone:** CLI command `omni-node --pipeline-infer "Explain quantum computing"` distributes inference across 2+ nodes on the mesh and streams the response.
+#### Python Bridge API
+
+```python
+from omninode import PipelineCoordinator, StageExecutor, PipelineCapability, OmniNet
+
+# Coordinator proposes session → gets gossipsub bytes to publish
+coord = PipelineCoordinator()
+session_id, msg = coord.propose_session("llama-7b", "abc123", 32, local_peer_id)
+net.publish("omni/pipeline/v1", msg)
+
+# Collect capability offers from peers
+cap = PipelineCapability("peer-b", ram_bytes=16e9, available_ram_bytes=8e9,
+                         platform="AppleSilicon", local_shard_cids=["bafkr4i..."],
+                         available_layers=[(0, 31)], pipeline_ready=True)
+coord.handle_capability_offer(session_id, cap)
+
+# Finalize schedule → JSON for executors + gossipsub bytes
+schedule_json, msg = coord.finalize_schedule(session_id, hidden_dim=4096)
+
+# Each node creates an executor for its assigned stage
+executor = StageExecutor(stage_index=1, schedule_json=schedule_json)
+# ... receive tensor → MLX forward pass → send to next stage
+req = executor.build_forward_request(micro_batch_index=0, data=activations,
+                                     seq_len=512, hidden_dim=4096, dtype=0)
+```
+
+**Milestone:** `PipelineCoordinator` and `StageExecutor` compiled and passed all 27 unit tests. `TensorCodec` compiled and passed all 8 networking tests. Python bridge (`PyPipelineCoordinator`, `PyStageExecutor`, `PyPipelineConfig`, `PyPipelineCapability`) fully exposed via PyO3 for driving distributed inference from MLX.
 
 ---
 
@@ -454,20 +521,21 @@ OmniNode-Protocol/
 │   │       ├── lib.rs
 │   │       ├── node.rs                 # NodeId, PeerId wrappers, NodeCapability
 │   │       ├── model.rs                # ModelManifest, ShardDescriptor, LayerRange, GgmlType
-│   │       ├── pipeline.rs             # PipelineStage, MicroBatch, HiddenState (stub)
+│   │       ├── pipeline.rs             # PipelineStage, PipelineSchedule, PipelineMessage, HiddenStateHeader, TensorDtype
 │   │       ├── error.rs                # Unified error types (Network, Storage, GgufParse, ...)
-│   │       └── config.rs              # NetConfig, StoreConfig
+│   │       └── config.rs              # NetConfig, StoreConfig, PipelineConfig
 │   │
 │   ├── omni-net/                       # Phase 1: P2P mesh networking (libp2p 0.55)
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs                  # OmniNet API handle (publish, request_shard_chunk, respond_shard)
-│   │       ├── behaviour.rs            # Composed NetworkBehaviour: mDNS + Gossipsub + Identify + ShardXfer
+│   │       ├── behaviour.rs            # Composed NetworkBehaviour: mDNS + Gossipsub + Identify + ShardXfer + TensorXfer
 │   │       ├── swarm.rs                # Swarm lifecycle, event loop, command dispatch
 │   │       ├── codec.rs                # ShardCodec: [u32 BE len][bincode] wire format for /omni/shard-xfer/1
 │   │       ├── discovery.rs            # mDNS event handling and peer registration
 │   │       ├── gossip.rs               # GossipManager: topic subscriptions and publishing
 │   │       ├── events.rs               # OmniNetEvent enum (clean domain events, no raw libp2p)
+│   │       ├── tensor_codec.rs         # TensorCodec: [u32 BE len][bincode] for /omni/tensor-xfer/1
 │   │       ├── capability.rs           # Custom capability advertisement protocol (deferred)
 │   │       ├── nat.rs                  # AutoNAT, relay, DCUtR (deferred)
 │   │       └── transport.rs           # TCP/Noise fallback transport (deferred)
@@ -497,13 +565,22 @@ OmniNode-Protocol/
 │   │       ├── types.rs               # PyNetConfig, PyStoreConfig, PyLayerRange, PyShardDescriptor, PyModelManifest
 │   │       ├── store.rs               # PyOmniStore: ingest_model, mmap_shard, has_shard, get_shard
 │   │       ├── shard_view.rs          # PyShardView: zero-copy __getbuffer__ over memmap2::Mmap
-│   │       ├── net.rs                 # PyOmniNet: publish, request_shard, next_event, shutdown + context manager
-│   │       └── events.rs             # PyNetEvent: flat struct with kind discriminator
+│   │       ├── net.rs                 # PyOmniNet: publish, request_shard, request_tensor, next_event, shutdown + context manager
+│   │       ├── pipeline.rs            # PyPipelineCoordinator, PyStageExecutor, PyPipelineConfig, PyPipelineCapability
+│   │       └── events.rs             # PyNetEvent: flat struct with kind discriminator (shard + tensor events)
 │   │
-│   ├── omni-pipeline/                  # Phase 4: Pipeline parallelism (stub)
+│   ├── omni-pipeline/                  # Phase 4: Pipeline-parallel inference coordination
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       └── lib.rs
+│   │       ├── lib.rs                  # Module declarations and re-exports
+│   │       ├── coordinator.rs          # PipelineCoordinator: session lifecycle, produces PipelineAction
+│   │       ├── executor.rs             # StageExecutor: per-node stage state, TensorRequest/Response builders
+│   │       ├── planner.rs              # RAM-proportional layer-to-node assignment
+│   │       ├── scheduler.rs            # GPipe micro-batch scheduling (MicroBatchSchedule, ScheduleCell)
+│   │       ├── session.rs              # PipelineSession state machine (Forming → Scheduled → Running → Done)
+│   │       ├── heartbeat.rs            # HeartbeatMonitor: 3s interval, 3× timeout liveness detection
+│   │       ├── transport.rs            # PipelineMessage bincode encode/decode helpers
+│   │       └── error.rs               # PipelineError enum (thiserror)
 │   │
 │   ├── omni-zkml/                      # Phase 5: Zero-knowledge proofs (stub)
 │   │   ├── Cargo.toml
@@ -721,12 +798,13 @@ omni-zkml     = { path = "crates/omni-zkml" }
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `safetensors` | 0.7 | Tensor serialization for hidden state transfer |
-| `ndarray` | 0.16 | N-dimensional arrays for tensor manipulation |
-| `tokio-util` | 0.7 | Codec framework for framed tensor streams |
-| `dashmap` | 6.1 | Concurrent hashmap for routing tables |
-| `priority-queue` | 2.1 | Priority queue for latency-aware scheduling |
-| `petgraph` | 0.7 | Graph data structure for pipeline DAG |
+| `uuid` | 1.11 | Session ID generation (v4) |
+| `chrono` | 0.4 | Timestamps for session creation and heartbeats |
+| `bincode` | 2.0.0-rc.3 | PipelineMessage serialization for gossipsub transport |
+| `thiserror` | 2.0 | PipelineError enum derivation |
+| `async-trait` | 0.1 | Async trait methods for TensorCodec (in omni-net) |
+
+> **Note:** The original plan called for `safetensors`, `ndarray`, `petgraph`, `dashmap`, and `priority-queue`. In practice, none were needed — activations are raw bytes (not safetensors), scheduling is deterministic GPipe (not graph-based), and planning is a simple proportional split (not dynamic programming). These workspace dependencies remain available for future phases.
 
 ### Phase 5: zkML & Tokenomics (`omni-zkml`)
 

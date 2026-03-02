@@ -12,7 +12,8 @@ use omni_net::OmniNetEvent;
 pub struct PyNetEvent {
     /// Event kind: "listening", "peer_discovered", "peer_expired",
     /// "peer_connected", "peer_disconnected", "message_received",
-    /// "shard_requested", "shard_received", "shard_request_failed".
+    /// "shard_requested", "shard_received", "shard_request_failed",
+    /// "tensor_received", "tensor_response_received", "tensor_request_failed".
     #[pyo3(get)]
     pub kind: String,
 
@@ -45,6 +46,35 @@ pub struct PyNetEvent {
 
     #[pyo3(get)]
     pub error: Option<String>,
+
+    // ── Phase 4: Tensor fields ──────────────────────────────────────────
+
+    #[pyo3(get)]
+    pub session_id: Option<String>,
+
+    #[pyo3(get)]
+    pub micro_batch_index: Option<u32>,
+
+    #[pyo3(get)]
+    pub from_stage: Option<u32>,
+
+    #[pyo3(get)]
+    pub to_stage: Option<u32>,
+
+    #[pyo3(get)]
+    pub seq_len: Option<u32>,
+
+    #[pyo3(get)]
+    pub hidden_dim: Option<u32>,
+
+    #[pyo3(get)]
+    pub dtype: Option<u8>,
+
+    #[pyo3(get)]
+    pub stage_index: Option<u32>,
+
+    #[pyo3(get)]
+    pub accepted: Option<bool>,
 }
 
 #[pymethods]
@@ -59,6 +89,15 @@ impl PyNetEvent {
         }
         if let Some(ref c) = self.cid {
             parts.push(format!("cid='{c}'"));
+        }
+        if let Some(ref s) = self.session_id {
+            parts.push(format!("session_id='{s}'"));
+        }
+        if let Some(si) = self.stage_index {
+            parts.push(format!("stage_index={si}"));
+        }
+        if let Some(a) = self.accepted {
+            parts.push(format!("accepted={a}"));
         }
         if let Some(ref e) = self.error {
             parts.push(format!("error='{e}'"));
@@ -82,6 +121,15 @@ impl From<OmniNetEvent> for PyNetEvent {
                 offset: None,
                 total_bytes: None,
                 error: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
             },
             OmniNetEvent::PeerDiscovered { peer_id, addrs } => Self {
                 kind: "peer_discovered".into(),
@@ -95,6 +143,15 @@ impl From<OmniNetEvent> for PyNetEvent {
                 offset: None,
                 total_bytes: None,
                 error: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
             },
             OmniNetEvent::PeerExpired { peer_id } => Self {
                 kind: "peer_expired".into(),
@@ -108,6 +165,15 @@ impl From<OmniNetEvent> for PyNetEvent {
                 offset: None,
                 total_bytes: None,
                 error: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
             },
             OmniNetEvent::PeerConnected { peer_id } => Self {
                 kind: "peer_connected".into(),
@@ -121,6 +187,15 @@ impl From<OmniNetEvent> for PyNetEvent {
                 offset: None,
                 total_bytes: None,
                 error: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
             },
             OmniNetEvent::PeerDisconnected { peer_id } => Self {
                 kind: "peer_disconnected".into(),
@@ -134,6 +209,15 @@ impl From<OmniNetEvent> for PyNetEvent {
                 offset: None,
                 total_bytes: None,
                 error: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
             },
             OmniNetEvent::MessageReceived { from, topic, data } => Self {
                 kind: "message_received".into(),
@@ -147,6 +231,15 @@ impl From<OmniNetEvent> for PyNetEvent {
                 offset: None,
                 total_bytes: None,
                 error: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
             },
             OmniNetEvent::ShardRequested {
                 peer_id,
@@ -164,6 +257,15 @@ impl From<OmniNetEvent> for PyNetEvent {
                 data: None,
                 total_bytes: None,
                 error: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
             },
             OmniNetEvent::ShardReceived { peer_id, response } => Self {
                 kind: "shard_received".into(),
@@ -177,6 +279,15 @@ impl From<OmniNetEvent> for PyNetEvent {
                 addresses: None,
                 topic: None,
                 channel_id: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
             },
             OmniNetEvent::ShardRequestFailed { peer_id, error } => Self {
                 kind: "shard_request_failed".into(),
@@ -190,6 +301,88 @@ impl From<OmniNetEvent> for PyNetEvent {
                 channel_id: None,
                 offset: None,
                 total_bytes: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
+            },
+
+            // ── Phase 4: Tensor events ──────────────────────────────────
+
+            OmniNetEvent::TensorReceived {
+                peer_id,
+                request,
+                channel_id,
+            } => Self {
+                kind: "tensor_received".into(),
+                peer_id: Some(peer_id.to_string()),
+                channel_id: Some(channel_id),
+                session_id: Some(request.session_id),
+                micro_batch_index: Some(request.micro_batch_index),
+                from_stage: Some(request.from_stage),
+                to_stage: Some(request.to_stage),
+                seq_len: Some(request.seq_len),
+                hidden_dim: Some(request.hidden_dim),
+                dtype: Some(request.dtype),
+                data: Some(request.data),
+                address: None,
+                addresses: None,
+                topic: None,
+                cid: None,
+                offset: None,
+                total_bytes: None,
+                error: None,
+                stage_index: None,
+                accepted: None,
+            },
+            OmniNetEvent::TensorResponseReceived { peer_id, response } => Self {
+                kind: "tensor_response_received".into(),
+                peer_id: Some(peer_id.to_string()),
+                session_id: Some(response.session_id),
+                micro_batch_index: Some(response.micro_batch_index),
+                stage_index: Some(response.stage_index),
+                accepted: Some(response.accepted),
+                error: response.error,
+                address: None,
+                addresses: None,
+                topic: None,
+                data: None,
+                cid: None,
+                channel_id: None,
+                offset: None,
+                total_bytes: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+            },
+            OmniNetEvent::TensorRequestFailed { peer_id, error } => Self {
+                kind: "tensor_request_failed".into(),
+                peer_id: Some(peer_id.to_string()),
+                error: Some(error),
+                address: None,
+                addresses: None,
+                topic: None,
+                data: None,
+                cid: None,
+                channel_id: None,
+                offset: None,
+                total_bytes: None,
+                session_id: None,
+                micro_batch_index: None,
+                from_stage: None,
+                to_stage: None,
+                seq_len: None,
+                hidden_dim: None,
+                dtype: None,
+                stage_index: None,
+                accepted: None,
             },
         }
     }

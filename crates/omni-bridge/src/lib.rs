@@ -1,14 +1,15 @@
 //! omni-bridge — PyO3 bindings for the OmniNode Protocol.
 //!
 //! This crate produces a native Python extension module (`omninode._omni_bridge`)
-//! that exposes zero-copy shard access, model ingestion, and P2P networking to
-//! Python code.
+//! that exposes zero-copy shard access, model ingestion, P2P networking, and
+//! pipeline-parallel inference coordination to Python code.
 
 use pyo3::prelude::*;
 
 pub mod errors;
 pub mod events;
 pub mod net;
+pub mod pipeline;
 pub mod runtime;
 pub mod shard_view;
 pub mod store;
@@ -24,6 +25,7 @@ fn _omni_bridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Configuration ────────────────────────────────────────────────────
     m.add_class::<types::PyNetConfig>()?;
     m.add_class::<types::PyStoreConfig>()?;
+    m.add_class::<pipeline::PyPipelineConfig>()?;
 
     // ── Model types ──────────────────────────────────────────────────────
     m.add_class::<types::PyLayerRange>()?;
@@ -37,6 +39,11 @@ fn _omni_bridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Networking ───────────────────────────────────────────────────────
     m.add_class::<net::PyOmniNet>()?;
     m.add_class::<events::PyNetEvent>()?;
+
+    // ── Pipeline ─────────────────────────────────────────────────────────
+    m.add_class::<pipeline::PyPipelineCapability>()?;
+    m.add_class::<pipeline::PyPipelineCoordinator>()?;
+    m.add_class::<pipeline::PyStageExecutor>()?;
 
     Ok(())
 }
