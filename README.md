@@ -112,6 +112,39 @@ RUST_LOG=info cargo run --bin omni-node -- shard tinyllama.gguf
 RUST_LOG=info cargo run --bin omni-node -- fetch bafkr4i...
 ```
 
+### End-to-End Pipeline Inference Demo
+
+`showcase_tui.py` ties all four phases together in a single runnable script.
+Each machine loads only its assigned layer slice from a local GGUF file.
+
+```bash
+# Prerequisites: maturin develop (builds omninode Python extension)
+pip install mlx mlx-lm transformers rich
+
+# Machine A — Sender (embed_tokens + first ½ of layers)
+python showcase_tui.py sender /path/to/model.gguf
+
+# Machine B — Receiver (second ½ of layers + norm + lm_head)
+python showcase_tui.py receiver /path/to/model.gguf
+```
+
+Startup output (example with `tinyllama.gguf`):
+
+```
+[OmniStore] model_name  : TinyLlama
+[OmniStore] model_hash  : a3f8c2...
+[OmniStore] architecture: llama
+[OmniStore] total_layers: 22
+[OmniStore] shards      : 2
+[OmniStore]   shard 0  layers 0-10  cid=bafkr4iabc123…  215 MB  [embedding]
+[OmniStore]   shard 1  layers 11-21  cid=bafkr4ixyz789…  209 MB  [output_head]
+
+[GGUF] arch=llama  hidden=2048  layers=22  heads=32/4  vocab=32000
+[GGUF] Split: Sender layers 0-10 | Receiver layers 11-21
+[GGUF] 198 tensors injected into bare Model()
+[GGUF] RAM pool drop complete.
+```
+
 ---
 
 ## 5-Phase Implementation Roadmap
@@ -434,6 +467,128 @@ req = executor.build_forward_request(micro_batch_index=0, data=activations,
 ```
 
 **Milestone:** `PipelineCoordinator` and `StageExecutor` compiled and passed all 27 unit tests. `TensorCodec` compiled and passed all 8 networking tests. Python bridge (`PyPipelineCoordinator`, `PyStageExecutor`, `PyPipelineConfig`, `PyPipelineCapability`) fully exposed via PyO3 for driving distributed inference from MLX.
+
+---
+
+#### Phase 4b: End-to-End Inference Demo — `showcase_tui.py`
+
+The showcase script is the full-stack integration test: it exercises Phase 2
+(OmniStore CID verification), Phase 3 (PyO3 FFI bridge), and Phase 4 (QUIC
+tensor routing) in a single two-process demo that runs real autoregressive
+inference across two machines over a LAN.
+
+---
+
+##### Native GGUF-to-MLX Bridge
+
+All model weights are loaded directly from the `.gguf` file using Apple's
+low-level `mx.load()` API. There is no dependency on HuggingFace Hub, no
+`config.json`, and no `mlx_lm.load()` call.
+
+```python
+# Low-level GGUF parse — raw tensors + metadata dict in one call
+weights, metadata = mx.load(gguf_path, return_metadata=True)
+
+# Architecture inferred entirely from the file
+arch            = metadata["general.architecture"]          # e.g. "llama"
+hidden_dim      = weights["token_embd.weight"].shape[1]     # e.g. 2048
+vocab_size      = weights["token_embd.weight"].shape[0]     # e.g. 32000
+total_layers    = len([k for k in weights if "attn_q.weight" in k])
+n_sender_layers = total_layers // 2
+
+# ModelArgs populated from GGUF metadata — no config.json required
+args = ModelArgs(
+    hidden_size             = hidden_dim,
+    num_hidden_layers       = total_layers,
+    intermediate_size       = int(metadata[f"{arch}.feed_forward_length"]),
+    num_attention_heads     = int(metadata[f"{arch}.attention.head_count"]),
+    num_key_value_heads     = int(metadata[f"{arch}.attention.head_count_kv"]),
+    vocab_size              = vocab_size,
+    rms_norm_eps            = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"]),
+    max_position_embeddings = int(metadata[f"{arch}.context_length"]),
+    rope_theta              = float(metadata[f"{arch}.rope.freq_base"]),
+    tie_word_embeddings     = "output.weight" not in weights,
+)
+```
+
+**GGUF → MLX tensor name map (Llama family):**
+
+| GGUF key | MLX parameter path |
+|---|---|
+| `token_embd.weight` | `model.embed_tokens.weight` |
+| `output_norm.weight` | `model.norm.weight` |
+| `output.weight` | `lm_head.weight` |
+| `blk.{N}.attn_norm.weight` | `model.layers.{N}.input_layernorm.weight` |
+| `blk.{N}.ffn_norm.weight` | `model.layers.{N}.post_attention_layernorm.weight` |
+| `blk.{N}.attn_q.weight` | `model.layers.{N}.self_attn.q_proj.weight` |
+| `blk.{N}.attn_k.weight` | `model.layers.{N}.self_attn.k_proj.weight` |
+| `blk.{N}.attn_v.weight` | `model.layers.{N}.self_attn.v_proj.weight` |
+| `blk.{N}.attn_output.weight` | `model.layers.{N}.self_attn.o_proj.weight` |
+| `blk.{N}.ffn_gate.weight` | `model.layers.{N}.mlp.gate_proj.weight` |
+| `blk.{N}.ffn_up.weight` | `model.layers.{N}.mlp.up_proj.weight` |
+| `blk.{N}.ffn_down.weight` | `model.layers.{N}.mlp.down_proj.weight` |
+
+---
+
+##### Decentralized RAM Pooling
+
+After slicing out this node's assigned layers, the full model object is
+explicitly destroyed and Apple Silicon's unified memory cache is flushed.
+Each node physically holds only its layer slice in VRAM.
+
+```python
+# Slice out this node's layers
+shard = SenderShard(model, n_sender_layers)   # or ReceiverShard
+
+# Aggressively release the other 50% of weights from unified memory
+del model, weights, mapped_weights
+gc.collect()
+mx.metal.clear_cache()
+```
+
+On a 22-layer model (TinyLlama 1.1B), each node retains ~215 MB of weights
+instead of the full ~430 MB — a 50% RAM reduction per node, directly
+demonstrating the protocol's core value proposition.
+
+---
+
+##### Pure-QUIC Autoregressive Pipeline
+
+All tensor communication is routed over QUIC `request_tensor` streams.
+Gossipsub is intentionally unused for ML operations — it does not support
+the latency or ordering guarantees required for autoregressive inference.
+
+**Wire protocol discriminator (encoded in the `hidden_dim` field):**
+
+| `hidden_dim` value | Payload |
+|---|---|
+| `== model hidden size` | Float16 hidden-state activations `(1, seq_len, hidden_dim)` |
+| `== 1` | 4-byte little-endian token ID (including EOS sentinel) |
+
+**Autoregressive ping-pong loop:**
+
+```
+Sender                                    Receiver
+──────                                    ────────
+embed(prompt_tokens) → layers[0:N]
+        ──── hidden_states (prefill) ──►
+                                          layers[N:] → norm → argmax → token_1
+        ◄─── token_id (hidden_dim=1) ────
+embed(token_1) → layers[0:N]
+        ──── hidden_states (decode) ──►
+                                          layers[N:] → norm → argmax → token_2
+        ◄─── token_id (hidden_dim=1) ────
+... repeat until EOS ...
+```
+
+Both nodes maintain independent KV caches. The residual stream carries no
+positional information, so caches stay synchronized as long as both nodes
+process tokens in the same order — which the ping-pong protocol guarantees.
+
+**Milestone:** Two machines running `showcase_tui.py` — one as Sender, one as
+Receiver — discover each other via mDNS, verify GGUF shard CIDs via OmniStore,
+load only their assigned layer slice from disk, and execute real autoregressive
+LLM inference across the LAN with a Rich TUI displaying live token streaming.
 
 ---
 
