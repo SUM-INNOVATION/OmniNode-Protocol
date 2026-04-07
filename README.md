@@ -171,12 +171,63 @@ Build the communication substrate. Nodes discover each other on the local networ
 
 **Key design:** The swarm runs in a background `tokio` task, communicating with the `OmniNet` API handle via two async MPSC channels (256-slot capacity): commands flow in, events flow out. This keeps the libp2p internals fully encapsulated.
 
-#### Phase 1b — WAN & Capabilities (Deferred)
+#### Phase 1b — Global WAN Transport & Decentralized NAT Traversal
+
+OmniNode's networking layer has graduated from LAN-only mDNS discovery to a fully decentralized WAN transport — with **zero centralized servers**. No AWS instances, no Google STUN, no hosted relays. Every component of the NAT traversal stack is operated by the network's own participants.
+
+##### Zero-Centralization Bootstrap
+
+The Bootstrap Paradox — *"how do you find peers if you don't know any peers?"* — is solved with a **Kademlia DHT** (`/omni/kad/1.0.0`) seeded by community-operated bootstrap nodes. On startup:
+
+1. The node dials bootstrap peers and seeds its Kademlia routing table.
+2. A bootstrap query finds the k-closest peers to our own PeerId, rapidly expanding the routing table beyond the initial seeds.
+3. Every `Identify::Event::Received` feeds the remote peer's **listen addresses** into Kademlia and registers its **observed address** as a local external address candidate.
+
+This creates a **self-healing network graph**: if a bootstrap node goes offline, any 20+ node DHT continues to function. New nodes discover the network through any existing participant, not through a fixed list of servers.
+
+##### Decentralized NAT Traversal
+
+Most consumer devices sit behind NAT. OmniNode traverses firewalls in three stages — all without centralized infrastructure:
+
+| Stage | Protocol | Function |
+|-------|----------|----------|
+| **1. Discovery** | AutoNAT | Probes random DHT peers with "can you dial me back?" requests. 3 confirmations = Public; 3 failures = Private. No Google STUN. |
+| **2. Bridging** | Circuit Relay v2 | Firewalled nodes acquire a `/p2p-circuit` address from a volunteer relay (any open-NAT OmniNode). This is a **temporary bridge**, not a permanent proxy. |
+| **3. Upgrade** | DCUtR | Both endpoints exchange observed addresses through the relay circuit and attempt simultaneous UDP hole-punching. On success, the relay circuit is replaced with a **direct QUIC connection**. |
+
+Nodes with open NATs automatically volunteer as relays by enabling `relay_server: true`. The `active_relay_reservation` state machine prevents repeated reservation spam on flapping NAT status.
+
+##### Mathematical Anti-DDoS Limits
+
+Volunteer relay nodes are protected by three layers of rate limiting that make resource exhaustion **mathematically infeasible**:
+
+| Limit | Value | Purpose |
+|-------|-------|---------|
+| `max_circuit_bytes` | **8 MiB** | Forces DCUtR upgrade before any bulk tensor transfer. A 215 MB TinyLlama shard cannot transit the relay — it *must* go direct. |
+| `circuit_src_per_peer` | 4 / 60 s | Caps circuit opens per peer identity. |
+| `circuit_src_per_ip` | 8 / 60 s | **Sybil-resistant.** A single IP spinning up 100 peer IDs still only gets 8 circuits per minute. This is the critical defense against multi-identity DDoS. |
+| `reservation_rate_per_peer` | 2 / 60 s | Prevents reservation flooding. |
+| `max_circuit_duration` | 120 s | Circuits that fail to upgrade are automatically torn down. |
+
+The 8 MiB cap is the key architectural invariant: relay circuits exist exclusively as a DCUtR bootstrap mechanism. All tensor and shard traffic flows over direct QUIC connections — the relay never sees production data.
+
+##### Systematic Memory Safety
+
+The QUIC async event loop enforces **leak-proof garbage collection** on inbound request channels:
+
+- Every inbound request creates a `PendingInbound<T>` struct pairing the `ResponseChannel` with its `InboundRequestId`.
+- The channel is inserted into the pending HashMap **only if** the internal event queue accepts the notification (`try_send` returns `Ok`).
+- If the queue is saturated, the `ResponseChannel` is **explicitly dropped** — physically releasing the memory and signaling to libp2p that no response is coming.
+- On `InboundFailure` or `ResponseSent`, a reverse-index lookup (`InboundRequestId → channel_id`) cleans up both maps in O(1).
+
+This guarantees that under sustained high-throughput tensor streams (e.g., two nodes running continuous pipeline inference), orphaned channels cannot accumulate — eliminating OOM as a failure mode in the transport layer.
 
 | Component | Implementation | Status |
 |---|---|---|
-| WAN Discovery | Kademlia DHT — internet-scale peer lookup | ⏳ Deferred |
-| NAT Traversal | AutoNAT detection → Circuit Relay → DCUtR hole-punching | ⏳ Deferred |
+| WAN Discovery | Kademlia DHT — internet-scale peer lookup | **Complete** |
+| NAT Traversal | AutoNAT detection → Circuit Relay → DCUtR hole-punching | **Complete** |
+| Anti-DDoS Relay Limits | 8 MiB cap, per-peer + per-IP rate limiting, Sybil-resistant | **Complete** |
+| Leak-Proof Event Loop | `PendingInbound<T>` with conditional insert + reverse-index cleanup | **Complete** |
 | TCP Fallback | TCP + Noise transport for non-QUIC peers | ⏳ Deferred |
 | Capability Ads | Custom request-response protocol — advertise RAM, platform, loaded layers | ⏳ Deferred |
 

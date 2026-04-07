@@ -340,5 +340,19 @@ fn print_event(event: &OmniNetEvent) {
             info!("SHARD_RECV   peer={peer_id}  cid={}  offset={}  bytes={}", response.cid, response.offset, response.data.len()),
         OmniNetEvent::ShardRequestFailed { peer_id, error } =>
             info!("SHARD_FAIL   peer={peer_id}  error={error}"),
+        OmniNetEvent::TensorReceived { peer_id, channel_id, .. } =>
+            info!("TENSOR_RECV  peer={peer_id}  ch={channel_id}"),
+        OmniNetEvent::TensorResponseReceived { peer_id, .. } =>
+            info!("TENSOR_ACK   peer={peer_id}"),
+        OmniNetEvent::TensorRequestFailed { peer_id, error } =>
+            info!("TENSOR_FAIL  peer={peer_id}  error={error}"),
+        OmniNetEvent::NatStatusChanged { is_public, public_addr } =>
+            info!("NAT_STATUS   public={is_public}  addr={public_addr:?}"),
+        OmniNetEvent::RelayReservation { relay_peer_id, relay_addr } =>
+            info!("RELAY_RESV   relay={relay_peer_id}  addr={relay_addr}"),
+        OmniNetEvent::HolePunchSucceeded { peer_id } =>
+            info!("HOLE_PUNCH   peer={peer_id}"),
+        OmniNetEvent::HolePunchFailed { peer_id, error } =>
+            info!("PUNCH_FAIL   peer={peer_id}  error={error}"),
     }
 }

@@ -1621,6 +1621,7 @@ dependencies = [
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",
+ "libp2p-yamux",
  "multiaddr",
  "pin-project",
  "rw-stream-sink",
@@ -2045,6 +2046,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-yamux"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f15df094914eb4af272acf9adaa9e287baa269943f32ea348ba29cfb9bfc60d8"
+dependencies = [
+ "either",
+ "futures",
+ "libp2p-core",
+ "thiserror 2.0.18",
+ "tracing",
+ "yamux 0.12.1",
+ "yamux 0.13.8",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2293,6 +2309,12 @@ dependencies = [
  "cfg-if",
  "libc",
 ]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -4250,6 +4272,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7d8a75eaf6557bb84a65ace8609883db44a29951042ada9b393151532e41fcb"
 dependencies = [
  "xml-rs",
+]
+
+[[package]]
+name = "yamux"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed0164ae619f2dc144909a9f082187ebb5893693d8c0196e8085283ccd4b776"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project",
+ "rand 0.8.5",
+ "static_assertions",
+]
+
+[[package]]
+name = "yamux"
+version = "0.13.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "deab71f2e20691b4728b349c6cee8fc7223880fa67b6b4f92225ec32225447e5"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project",
+ "rand 0.9.2",
+ "static_assertions",
+ "web-time",
 ]
 
 [[package]]

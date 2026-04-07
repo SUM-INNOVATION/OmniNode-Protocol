@@ -6,7 +6,7 @@ pub mod codec;
 pub mod discovery;
 pub mod events;
 pub mod gossip;
-pub mod nat;         // deferred — AutoNAT / DCUtR / relay
+pub mod nat;
 pub mod swarm;
 pub mod tensor_codec;
 pub mod transport;   // deferred — TCP/Noise fallback transport
@@ -19,6 +19,7 @@ pub use gossip::{
 };
 pub use codec::{ShardCodec, ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL};
 pub use tensor_codec::{TensorCodec, TensorRequest, TensorResponse, TENSOR_XFER_PROTOCOL};
+pub use nat::NatStatus;
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 

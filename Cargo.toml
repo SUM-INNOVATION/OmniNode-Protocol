@@ -44,6 +44,7 @@ libp2p = { version = "0.55", features = [
     "macros",
     "tokio",
     "noise",
+    "yamux",
     "quic",
     "tcp",
     "dns",

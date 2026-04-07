@@ -12,7 +12,7 @@ pub enum OmniNetEvent {
     /// The local node is now listening on a new address.
     Listening { addr: Multiaddr },
 
-    /// A new peer was discovered via mDNS on the local network.
+    /// A new peer was discovered via mDNS or Kademlia DHT.
     PeerDiscovered {
         peer_id: PeerId,
         addrs: Vec<Multiaddr>,
@@ -80,6 +80,34 @@ pub enum OmniNetEvent {
 
     /// An outbound tensor request failed.
     TensorRequestFailed {
+        peer_id: PeerId,
+        error: String,
+    },
+
+    // ── WAN: NAT traversal ──────────────────────────────────────────────
+
+    /// AutoNAT determined whether this node is publicly reachable.
+    NatStatusChanged {
+        is_public: bool,
+        /// The confirmed public address, if reachable.
+        public_addr: Option<Multiaddr>,
+    },
+
+    /// A relay reservation was established — this firewalled node is now
+    /// reachable via the relay peer's circuit address.
+    RelayReservation {
+        relay_peer_id: PeerId,
+        relay_addr: Multiaddr,
+    },
+
+    /// DCUtR upgraded a relay circuit to a direct QUIC connection via
+    /// UDP hole-punching.
+    HolePunchSucceeded { peer_id: PeerId },
+
+    /// DCUtR hole-punch failed — the relay circuit remains active but
+    /// at degraded latency. Higher layers may want to warn the user or
+    /// attempt a different relay peer.
+    HolePunchFailed {
         peer_id: PeerId,
         error: String,
     },

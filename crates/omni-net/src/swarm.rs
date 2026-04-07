@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identify, mdns,
-    request_response::{self, ProtocolSupport, ResponseChannel},
+    dcutr, gossipsub, identify, mdns,
+    request_response::{self, InboundRequestId, ProtocolSupport, ResponseChannel},
     swarm::SwarmEvent,
     Multiaddr, PeerId, SwarmBuilder,
 };
@@ -15,12 +15,13 @@ use tracing::{debug, info, warn};
 use omni_types::config::NetConfig;
 
 use crate::{
-    behaviour::{LocalMeshBehaviour, LocalMeshBehaviourEvent},
+    behaviour::{OmniNodeBehaviour, OmniNodeBehaviourEvent},
     codec::{ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL},
     tensor_codec::{TensorRequest, TensorResponse, TENSOR_XFER_PROTOCOL},
     discovery,
     events::OmniNetEvent,
     gossip::GossipManager,
+    nat::{self, NatStatus},
 };
 
 // ── SwarmCommand ──────────────────────────────────────────────────────────────
@@ -47,33 +48,57 @@ pub enum SwarmCommand {
     Shutdown,
 }
 
+// ── PendingInbound ───────────────────────────────────────────────────────────
+
+/// Tracks an inbound request's response channel alongside its libp2p
+/// `InboundRequestId` so we can clean up state on `InboundFailure` or
+/// `ResponseSent` — preventing a memory leak if the caller never responds.
+struct PendingInbound<T> {
+    channel: ResponseChannel<T>,
+    request_id: InboundRequestId,
+}
+
 // ── OmniSwarm ─────────────────────────────────────────────────────────────────
 
 /// Owns the [`libp2p::Swarm`] and the [`GossipManager`].
 /// Constructed by [`OmniSwarm::build`] and consumed by [`OmniSwarm::run`].
 pub struct OmniSwarm {
-    inner:  libp2p::Swarm<LocalMeshBehaviour>,
+    inner:  libp2p::Swarm<OmniNodeBehaviour>,
     gossip: GossipManager,
 
-    /// Stores response channels received from inbound shard requests.
-    /// Keyed by an internal monotonic ID passed to the caller via
-    /// `OmniNetEvent::ShardRequested`.
-    pending_shard_channels: HashMap<u64, ResponseChannel<ShardResponse>>,
+    /// Inbound shard channels keyed by our monotonic channel_id.
+    pending_shard_channels: HashMap<u64, PendingInbound<ShardResponse>>,
+    /// Reverse index: InboundRequestId → channel_id for cleanup on failure/sent.
+    pending_shard_by_req: HashMap<InboundRequestId, u64>,
 
-    /// Stores response channels received from inbound tensor requests.
-    /// Keyed by an internal monotonic ID passed to the caller via
-    /// `OmniNetEvent::TensorReceived`.
-    pending_tensor_channels: HashMap<u64, ResponseChannel<TensorResponse>>,
+    /// Inbound tensor channels keyed by our monotonic channel_id.
+    pending_tensor_channels: HashMap<u64, PendingInbound<TensorResponse>>,
+    /// Reverse index: InboundRequestId → channel_id for cleanup on failure/sent.
+    pending_tensor_by_req: HashMap<InboundRequestId, u64>,
 
     /// Monotonic counter shared across shard and tensor channel IDs.
     next_channel_id: u64,
+
+    // ── WAN state ────────────────────────────────────────────────────────
+
+    /// Peers known to have open NATs — candidates for relay reservations.
+    relay_peers: Vec<PeerId>,
+
+    /// Current NAT status as determined by AutoNAT.
+    nat_status: NatStatus,
+
+    /// The relay peer we currently hold a reservation with, if any.
+    /// Prevents spamming the same relay on repeated StatusChanged::Private.
+    active_relay_reservation: Option<PeerId>,
 }
 
 impl OmniSwarm {
     /// Construct and configure the Swarm via the libp2p 0.55 `SwarmBuilder` API.
     ///
-    /// Transport:  QUIC (TLS 1.3 baked-in — no separate Noise step required)
-    /// Behaviour:  mDNS + Gossipsub + Identify + shard xfer + tensor xfer
+    /// Transport:  QUIC + relay-client (for /p2p-circuit addresses)
+    /// Behaviour:  mDNS + Gossipsub + Identify + Kademlia + AutoNAT +
+    ///             Relay (server) + Relay (client) + DCUtR +
+    ///             shard xfer + tensor xfer
     /// Listener:   `0.0.0.0:<config.listen_port>` (0 = OS-assigned)
     pub fn build(config: &NetConfig) -> Result<Self> {
         let gossip_cfg = gossipsub::ConfigBuilder::default()
@@ -84,13 +109,30 @@ impl OmniSwarm {
             .build()
             .map_err(|msg| anyhow::anyhow!("gossipsub config error: {msg}"))?;
 
+        let relay_server_enabled = config.relay_server;
+
+        // The `.with_relay_client()` call wraps the QUIC transport in a
+        // relay-aware transport that can dial and listen on /p2p-circuit
+        // multiaddrs. It injects a `relay::client::Behaviour` into the
+        // behaviour closure.
+        //
+        // Relay circuits run over TCP-like streams, so they need Noise + Yamux
+        // even though our primary transport is QUIC (which has encryption
+        // and multiplexing baked in).
         let mut swarm = SwarmBuilder::with_new_identity()
             .with_tokio()
             .with_quic()
-            .with_behaviour(|key| {
+            .with_relay_client(
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )?
+            .with_behaviour(|key, relay_client| {
+                let local_peer_id = key.public().to_peer_id();
+
+                // ── Existing protocols ────────────────────────────────
                 let mdns = mdns::tokio::Behaviour::new(
                     mdns::Config::default(),
-                    key.public().to_peer_id(),
+                    local_peer_id,
                 )?;
 
                 let gossipsub = gossipsub::Behaviour::new(
@@ -116,14 +158,32 @@ impl OmniSwarm {
                         .with_request_timeout(Duration::from_secs(60)),
                 );
 
-                Ok(LocalMeshBehaviour { mdns, gossipsub, identify, shard_xfer, tensor_xfer })
+                // ── New WAN protocols ─────────────────────────────────
+                let kademlia = discovery::build_kademlia(local_peer_id);
+                let autonat = nat::build_autonat(local_peer_id);
+                let relay = nat::build_relay_server(local_peer_id, relay_server_enabled);
+                let dcutr = dcutr::Behaviour::new(local_peer_id);
+
+                Ok(OmniNodeBehaviour {
+                    mdns,
+                    gossipsub,
+                    identify,
+                    shard_xfer,
+                    tensor_xfer,
+                    kademlia,
+                    autonat,
+                    relay,
+                    relay_client,
+                    dcutr,
+                })
             })?
-            .with_swarm_config(|c| {
+            .with_swarm_config(|c: libp2p::swarm::Config| {
                 // Keep idle QUIC connections alive between pipeline requests.
                 c.with_idle_connection_timeout(Duration::from_secs(60))
             })
             .build();
 
+        // ── Bind QUIC listener ───────────────────────────────────────────
         let listen_addr: Multiaddr =
             format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.listen_port)
                 .parse()
@@ -133,12 +193,22 @@ impl OmniSwarm {
             .listen_on(listen_addr)
             .context("failed to bind QUIC listener")?;
 
+        // ── Seed DHT from bootstrap peers ────────────────────────────────
+        if !config.bootstrap_peers.is_empty() {
+            discovery::bootstrap_dht(&mut swarm, &config.bootstrap_peers)?;
+        }
+
         Ok(Self {
-            inner:  swarm,
+            inner: swarm,
             gossip: GossipManager::new(),
-            pending_shard_channels:  HashMap::new(),
+            pending_shard_channels: HashMap::new(),
+            pending_shard_by_req: HashMap::new(),
             pending_tensor_channels: HashMap::new(),
+            pending_tensor_by_req: HashMap::new(),
             next_channel_id: 0,
+            relay_peers: Vec::new(),
+            nat_status: NatStatus::Unknown,
+            active_relay_reservation: None,
         })
     }
 
@@ -184,9 +254,10 @@ impl OmniSwarm {
                                 .send_request(&peer_id, request);
                         }
                         Some(SwarmCommand::SendShardResponse { channel_id, response }) => {
-                            if let Some(channel) = self.pending_shard_channels.remove(&channel_id) {
+                            if let Some(pending) = self.pending_shard_channels.remove(&channel_id) {
+                                self.pending_shard_by_req.remove(&pending.request_id);
                                 if let Err(resp) = self.inner.behaviour_mut().shard_xfer
-                                    .send_response(channel, response)
+                                    .send_response(pending.channel, response)
                                 {
                                     warn!(cid = %resp.cid, "failed to send shard response — channel closed");
                                 }
@@ -199,9 +270,10 @@ impl OmniSwarm {
                                 .send_request(&peer_id, request);
                         }
                         Some(SwarmCommand::SendTensorResponse { channel_id, response }) => {
-                            if let Some(channel) = self.pending_tensor_channels.remove(&channel_id) {
+                            if let Some(pending) = self.pending_tensor_channels.remove(&channel_id) {
+                                self.pending_tensor_by_req.remove(&pending.request_id);
                                 if let Err(resp) = self.inner.behaviour_mut().tensor_xfer
-                                    .send_response(channel, response)
+                                    .send_response(pending.channel, response)
                                 {
                                     warn!(
                                         session = %resp.session_id,
@@ -222,16 +294,35 @@ impl OmniSwarm {
         }
     }
 
+    // ── Private: inbound channel cleanup ─────────────────────────────────────
+
+    /// Remove a shard inbound channel by its libp2p request ID.
+    /// Called on InboundFailure and ResponseSent to prevent memory leaks.
+    fn cleanup_shard_inbound(&mut self, request_id: &InboundRequestId) {
+        if let Some(channel_id) = self.pending_shard_by_req.remove(request_id) {
+            self.pending_shard_channels.remove(&channel_id);
+            debug!(%channel_id, %request_id, "cleaned up shard inbound channel");
+        }
+    }
+
+    /// Remove a tensor inbound channel by its libp2p request ID.
+    fn cleanup_tensor_inbound(&mut self, request_id: &InboundRequestId) {
+        if let Some(channel_id) = self.pending_tensor_by_req.remove(request_id) {
+            self.pending_tensor_channels.remove(&channel_id);
+            debug!(%channel_id, %request_id, "cleaned up tensor inbound channel");
+        }
+    }
+
     // ── Private event dispatcher ──────────────────────────────────────────────
 
     fn handle_swarm_event(
         &mut self,
-        event:    SwarmEvent<LocalMeshBehaviourEvent>,
+        event:    SwarmEvent<OmniNodeBehaviourEvent>,
         event_tx: &mpsc::Sender<OmniNetEvent>,
     ) {
         match event {
-            // ── mDNS ──────────────────────────────────────��───────────────────
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Mdns(e)) => {
+            // ── mDNS ──────────────────────────────────────────────────────
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Mdns(e)) => {
                 discovery::handle_mdns_event(
                     e,
                     &mut self.inner.behaviour_mut().gossipsub,
@@ -239,8 +330,8 @@ impl OmniSwarm {
                 );
             }
 
-            // ── Gossipsub: incoming message ────────────────────────────────────
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Gossipsub(
+            // ── Gossipsub: incoming message ────────────────────────────────
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Gossipsub(
                 gossipsub::Event::Message {
                     propagation_source,
                     message,
@@ -265,36 +356,125 @@ impl OmniSwarm {
             }
 
             // Gossipsub mesh formation events (subscribe/unsubscribe) — debug only.
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Gossipsub(e)) => {
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Gossipsub(e)) => {
                 debug!(?e, "gossipsub mesh event");
             }
 
-            // ── Identify ──────────────────────────────────────────────────────
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Identify(e)) => {
+            // ── Identify ──────────────────────────────────────────────────
+            // CRITICAL: feed identified addresses into Kademlia so the DHT
+            // routing table grows beyond just bootstrap peers.
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. }
+            )) => {
+                // Feed every listen address into Kademlia.
+                for addr in &info.listen_addrs {
+                    self.inner
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr.clone());
+                }
+
+                // [Fix #2] Register the observed address as a local external
+                // address candidate so AutoNAT and relay circuits use the
+                // correct public-facing address.
+                self.inner.add_external_address(info.observed_addr.clone());
+
+                // If the peer supports the relay protocol, track it as a
+                // candidate relay for NAT traversal.
+                let supports_relay = info.protocols.iter().any(|p| {
+                    p.as_ref().contains("relay")
+                });
+                if supports_relay && !self.relay_peers.contains(&peer_id) {
+                    self.relay_peers.push(peer_id);
+                    debug!(%peer_id, "identified as relay-capable peer");
+                }
+
+                debug!(
+                    %peer_id,
+                    observed_addr = %info.observed_addr,
+                    protocols = ?info.protocols,
+                    addrs = info.listen_addrs.len(),
+                    "identify received — fed addresses into kademlia"
+                );
+            }
+
+            // Other Identify events (Sent, Pushed, Error).
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Identify(e)) => {
                 debug!(?e, "identify event");
             }
 
-            // ── Shard transfer (Phase 2) ──────────────────────────────────────
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
+            // ── Kademlia DHT ──────────────────────────────────────────────
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Kademlia(e)) => {
+                discovery::handle_kademlia_event(
+                    e,
+                    &mut self.inner.behaviour_mut().gossipsub,
+                    event_tx,
+                );
+            }
+
+            // ── AutoNAT ──────────────────────────────────────────────────
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Autonat(e)) => {
+                // [Fix #4] Pass active_relay_reservation to prevent repeated
+                // reservation requests to the same relay.
+                nat::handle_autonat_event(
+                    e,
+                    &self.relay_peers,
+                    &mut self.inner,
+                    &mut self.nat_status,
+                    &mut self.active_relay_reservation,
+                    event_tx,
+                );
+            }
+
+            // ── Relay server ──────────────────────────────────────────────
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Relay(e)) => {
+                nat::handle_relay_server_event(e);
+            }
+
+            // ── Relay client ─────────────────────────────────────────────
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::RelayClient(e)) => {
+                nat::handle_relay_client_event(e, event_tx);
+            }
+
+            // ── DCUtR (hole-punching) ─────────────────────────────────────
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Dcutr(e)) => {
+                nat::handle_dcutr_event(e, event_tx);
+            }
+
+            // ── Shard transfer (Phase 2) ──────────────────────────────────
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::ShardXfer(
                 request_response::Event::Message { peer, message, .. }
             )) => {
                 match message {
-                    request_response::Message::Request { request, channel, .. } => {
+                    request_response::Message::Request { request_id, request, channel, .. } => {
                         let channel_id = self.next_channel_id;
                         self.next_channel_id += 1;
-                        self.pending_shard_channels.insert(channel_id, channel);
                         info!(
                             %peer,
                             cid = %request.cid,
                             channel_id,
                             "inbound shard request"
                         );
-                        if let Err(e) = event_tx.try_send(OmniNetEvent::ShardRequested {
+                        // [Fix #1] Only store the channel if the event was
+                        // successfully delivered. If the channel is full the
+                        // caller will never see the request, so holding the
+                        // ResponseChannel would leak forever.
+                        match event_tx.try_send(OmniNetEvent::ShardRequested {
                             peer_id: peer,
                             request,
                             channel_id,
                         }) {
-                            warn!(%e, "event channel full — dropping ShardRequested");
+                            Ok(()) => {
+                                self.pending_shard_channels.insert(channel_id, PendingInbound {
+                                    channel,
+                                    request_id,
+                                });
+                                self.pending_shard_by_req.insert(request_id, channel_id);
+                            }
+                            Err(e) => {
+                                warn!(%e, "event channel full — dropping ShardRequested");
+                                drop(channel);
+                            }
                         }
                     }
                     request_response::Message::Response { response, .. } => {
@@ -315,7 +495,7 @@ impl OmniSwarm {
                 }
             }
 
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::ShardXfer(
                 request_response::Event::OutboundFailure { peer, error, .. }
             )) => {
                 warn!(%peer, %error, "shard request outbound failure");
@@ -327,27 +507,30 @@ impl OmniSwarm {
                 }
             }
 
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::InboundFailure { peer, error, .. }
+            // [Fix #1] Clean up leaked channel on inbound failure.
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::ShardXfer(
+                request_response::Event::InboundFailure { peer, request_id, error, .. }
             )) => {
-                debug!(%peer, %error, "shard request inbound failure");
+                self.cleanup_shard_inbound(&request_id);
+                debug!(%peer, %request_id, %error, "shard inbound failure — channel cleaned up");
             }
 
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::ResponseSent { peer, .. }
+            // [Fix #1] Clean up channel after successful response send.
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::ShardXfer(
+                request_response::Event::ResponseSent { peer, request_id, .. }
             )) => {
-                debug!(%peer, "shard response sent");
+                self.cleanup_shard_inbound(&request_id);
+                debug!(%peer, %request_id, "shard response sent — channel cleaned up");
             }
 
-            // ── Tensor transfer (Phase 4) ─────────────────────────────────────
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::TensorXfer(
+            // ── Tensor transfer (Phase 4) ─────────────────────────────────
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::TensorXfer(
                 request_response::Event::Message { peer, message, .. }
             )) => {
                 match message {
-                    request_response::Message::Request { request, channel, .. } => {
+                    request_response::Message::Request { request_id, request, channel, .. } => {
                         let channel_id = self.next_channel_id;
                         self.next_channel_id += 1;
-                        self.pending_tensor_channels.insert(channel_id, channel);
                         info!(
                             %peer,
                             session = %request.session_id,
@@ -357,12 +540,24 @@ impl OmniSwarm {
                             bytes = request.data.len(),
                             "inbound tensor request"
                         );
-                        if let Err(e) = event_tx.try_send(OmniNetEvent::TensorReceived {
+                        // [Fix #1] Only store the channel if the event was
+                        // successfully delivered — same pattern as shard.
+                        match event_tx.try_send(OmniNetEvent::TensorReceived {
                             peer_id: peer,
                             request,
                             channel_id,
                         }) {
-                            warn!(%e, "event channel full — dropping TensorReceived");
+                            Ok(()) => {
+                                self.pending_tensor_channels.insert(channel_id, PendingInbound {
+                                    channel,
+                                    request_id,
+                                });
+                                self.pending_tensor_by_req.insert(request_id, channel_id);
+                            }
+                            Err(e) => {
+                                warn!(%e, "event channel full — dropping TensorReceived");
+                                drop(channel);
+                            }
                         }
                     }
                     request_response::Message::Response { response, .. } => {
@@ -384,7 +579,7 @@ impl OmniSwarm {
                 }
             }
 
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::TensorXfer(
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::TensorXfer(
                 request_response::Event::OutboundFailure { peer, error, .. }
             )) => {
                 warn!(%peer, %error, "tensor request outbound failure");
@@ -396,19 +591,23 @@ impl OmniSwarm {
                 }
             }
 
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::TensorXfer(
-                request_response::Event::InboundFailure { peer, error, .. }
+            // [Fix #1] Clean up leaked channel on inbound failure.
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::TensorXfer(
+                request_response::Event::InboundFailure { peer, request_id, error, .. }
             )) => {
-                debug!(%peer, %error, "tensor request inbound failure");
+                self.cleanup_tensor_inbound(&request_id);
+                debug!(%peer, %request_id, %error, "tensor inbound failure — channel cleaned up");
             }
 
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::TensorXfer(
-                request_response::Event::ResponseSent { peer, .. }
+            // [Fix #1] Clean up channel after successful response send.
+            SwarmEvent::Behaviour(OmniNodeBehaviourEvent::TensorXfer(
+                request_response::Event::ResponseSent { peer, request_id, .. }
             )) => {
-                debug!(%peer, "tensor response sent");
+                self.cleanup_tensor_inbound(&request_id);
+                debug!(%peer, %request_id, "tensor response sent — channel cleaned up");
             }
 
-            // ── Transport ─────────────────────────────────────────────────────
+            // ── Transport ─────────────────────────────────────────────────
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(%address, "listening on address");
                 if let Err(e) = event_tx.try_send(OmniNetEvent::Listening { addr: address }) {

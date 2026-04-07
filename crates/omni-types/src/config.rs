@@ -8,11 +8,24 @@ use std::path::PathBuf;
 pub struct NetConfig {
     /// UDP port for QUIC listener. 0 = OS-assigned.
     pub listen_port: u16,
+
+    /// Kademlia bootstrap peers for WAN discovery.
+    /// Format: `/ip4/<IP>/udp/<PORT>/quic-v1/p2p/<PEER_ID>`
+    /// Empty = LAN-only mode (mDNS discovery only).
+    pub bootstrap_peers: Vec<String>,
+
+    /// Whether this node volunteers as a Circuit Relay v2 server.
+    /// Enable on nodes with open NATs (VPS, port-forwarded home server).
+    pub relay_server: bool,
 }
 
 impl Default for NetConfig {
     fn default() -> Self {
-        Self { listen_port: 0 }
+        Self {
+            listen_port: 0,
+            bootstrap_peers: vec![],
+            relay_server: false,
+        }
     }
 }
 
