@@ -9,19 +9,29 @@
 //! ```text
 //! InferenceCommitment
 //!   └─► commitment_to_chain_digest  ─► InferenceAttestationDigest
-//!         └─► canonical_digest_bytes   = bincode(digest)
+//!         └─► canonical_digest_bytes   = bincode 1.3 serialize(digest)
 //!               └─► signing_input_bytes = DOMAIN_TAG.as_bytes() || canonical_digest_bytes
 //!                     └─► sign_chain_attestation_digest(seed, &digest) -> [u8; 64]
 //! ```
 //!
+//! **Encoder choice.** Chain-wire canonical bytes use **bincode 1.3** via
+//! `bincode::serialize` (imported here as the renamed `bincode1` alias)
+//! to match the chain team's reference implementation exactly. The
+//! difference from bincode 2.0 `config::standard()` that matters here is
+//! the string-length prefix: bincode 1.3 default writes an **8-byte
+//! little-endian `u64`** before the UTF-8 bytes; bincode 2.0 standard
+//! writes a 1-byte varint for short strings. Fixed-size `[u8; N]` arrays
+//! encode identically in both (raw N bytes, no prefix).
+//!
 //! **Compatibility with Stage 4.** Stage 4's [`crate::attestation`] surface
-//! is byte-stable and unchanged. The local Stage-4 [`crate::CommitmentDigest`]
-//! pipeline and the chain-wire pipeline produce **different** bytes for the
-//! same [`omni_types::phase5::InferenceCommitment`] (different schema → different
-//! bincode output → different downstream hashes/signatures). Both pipelines
-//! reuse the same versioned domain string
-//! ([`crate::attestation::DOMAIN_TAG`]) so a future version bump propagates
-//! to both consistently.
+//! is byte-stable and unchanged. Stage 4 continues to use the workspace
+//! bincode 2.0-rc.3 in [`crate::attestation::compute_canonical_bytes`];
+//! chain-wire uses bincode 1.3 via the crate-local `bincode1` alias. The
+//! two encoders intentionally diverge — chain-wire matches the chain
+//! team's reference implementation; Stage 4 matches its existing local
+//! contract. Both pipelines reuse the same versioned domain string
+//! ([`crate::attestation::DOMAIN_TAG`]) so a future version bump
+//! propagates to both consistently.
 //!
 //! **Chain address derivation.** `signer_address_base58` follows the chain's
 //! exact rule:
@@ -154,13 +164,29 @@ pub fn commitment_to_chain_digest(
 
 // ── Canonical bytes and signing input ────────────────────────────────────────
 
-/// `bincode(digest)` under the same `config::standard()` the workspace
-/// uses everywhere else.
+/// Canonical bytes of `digest` for chain signing.
+///
+/// Uses **bincode 1.3** `bincode::serialize` (imported as `bincode1`) to
+/// match the chain team's reference implementation. Layout:
+///
+/// ```text
+/// [u64 LE length of session_id]   // 8 bytes
+/// [session_id UTF-8]              // N bytes
+/// [model_hash]                    // 32 bytes
+/// [manifest_root]                 // 32 bytes
+/// [response_hash]                 // 32 bytes
+/// [proof_root]                    // 32 bytes
+/// ```
+///
+/// Total size: `8 + N + 4*32 = 136 + N` bytes. The fixed-size
+/// `[u8; 32]` fields carry **no per-field length prefix** under
+/// bincode 1.3, identical to bincode 2.0 standard. Only the
+/// string-length prefix differs from bincode 2.0 (8-byte fixed u64 here
+/// vs. 1-byte varint there).
 pub fn canonical_digest_bytes(
     digest: &InferenceAttestationDigest,
 ) -> ChainWireResult<Vec<u8>> {
-    bincode::serde::encode_to_vec(digest, bincode::config::standard())
-        .map_err(|e| ChainWireError::Serialization(e.to_string()))
+    bincode1::serialize(digest).map_err(|e| ChainWireError::Serialization(e.to_string()))
 }
 
 /// `DOMAIN_TAG.as_bytes() || canonical_digest_bytes(digest)` — the exact
@@ -508,7 +534,7 @@ mod tests {
         ));
     }
 
-    // ── Canonical bytes & signing input (5) ──────────────────────────────
+    // ── Canonical bytes & signing input (6) ──────────────────────────────
 
     #[test]
     fn canonical_digest_bytes_is_deterministic() {
@@ -516,6 +542,44 @@ mod tests {
         let a = canonical_digest_bytes(&d).unwrap();
         let b = canonical_digest_bytes(&d).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Pins the exact bincode-1.3 wire layout for `InferenceAttestationDigest`.
+    ///
+    /// A regression to bincode 2.0 standard (which would write a 1-byte
+    /// varint for the 14-byte session_id) fails on the first
+    /// `assert_eq!(len_prefix, 14)` line below. The whole point of this
+    /// test is to catch an accidental encoder swap with a clear named
+    /// failure rather than only the fixture-diff.
+    #[test]
+    fn canonical_digest_bytes_uses_bincode_1_3_fixed_u64_string_length_prefix() {
+        let digest = sample_digest(); // session_id = "session-stage6", len = 14
+        let canonical = canonical_digest_bytes(&digest).unwrap();
+
+        // First 8 bytes: u64 little-endian length prefix == session_id byte length.
+        let len_prefix = u64::from_le_bytes(canonical[..8].try_into().unwrap());
+        assert_eq!(len_prefix, digest.session_id.len() as u64);
+
+        // Next N bytes: raw UTF-8 of session_id.
+        let s = digest.session_id.as_bytes();
+        assert_eq!(&canonical[8..8 + s.len()], s);
+
+        // Then 4 × 32 raw bytes — one per fixed-size field, in declaration
+        // order, with NO per-field length prefix.
+        let mut off = 8 + s.len();
+        for field in [
+            &digest.model_hash,
+            &digest.manifest_root,
+            &digest.response_hash,
+            &digest.proof_root,
+        ] {
+            assert_eq!(&canonical[off..off + 32], field);
+            off += 32;
+        }
+
+        // Total length sanity.
+        assert_eq!(canonical.len(), 8 + s.len() + 4 * 32);
+        assert_eq!(off, canonical.len());
     }
 
     #[test]
