@@ -162,12 +162,43 @@ pub fn check_lifecycle(
     }
 }
 
+// ── Adapter trait ─────────────────────────────────────────────────────────────
+
+/// The minimal `sum-node` surface OmniNode depends on. Implemented for
+/// [`SnipV2Cli`] (the real CLI wrapper) and any test fake.
+///
+/// Stage-2 orchestration in [`crate::snip_v2_artifacts`] takes an
+/// `&impl SnipV2Adapter`, so unit tests can substitute an in-memory fake
+/// without spawning the real binary.
+pub trait SnipV2Adapter {
+    fn ingest_public(&self, path: &Path) -> Result<SnipV2ObjectRef, SnipV2Error>;
+    fn download_public(
+        &self,
+        root: &SnipV2ObjectId,
+        output_path: &Path,
+    ) -> Result<(), SnipV2Error>;
+}
+
 // ── Process wrapper ───────────────────────────────────────────────────────────
 
 /// Thin wrapper around the `sum-node` CLI. Owns a [`SnipV2CliConfig`] and
 /// is the only place in this crate that calls [`std::process::Command`].
 pub struct SnipV2Cli {
     config: SnipV2CliConfig,
+}
+
+impl SnipV2Adapter for SnipV2Cli {
+    fn ingest_public(&self, path: &Path) -> Result<SnipV2ObjectRef, SnipV2Error> {
+        SnipV2Cli::ingest_public(self, path)
+    }
+
+    fn download_public(
+        &self,
+        root: &SnipV2ObjectId,
+        output_path: &Path,
+    ) -> Result<(), SnipV2Error> {
+        SnipV2Cli::download_public(self, root, output_path)
+    }
 }
 
 impl SnipV2Cli {

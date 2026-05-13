@@ -8,6 +8,7 @@ pub mod manifest;
 pub mod mmap;
 pub mod serve;
 pub mod snip_v2;
+pub mod snip_v2_artifacts;
 pub mod store;
 pub mod verify;
 
@@ -16,7 +17,8 @@ pub use content_id::cid_from_data;
 pub use error::StoreError;
 pub use fetch::{FetchManager, FetchOutcome};
 pub use gguf::GgufFile;
-pub use snip_v2::{SnipV2Cli, SnipV2CliConfig, SnipV2Error};
+pub use snip_v2::{SnipV2Adapter, SnipV2Cli, SnipV2CliConfig, SnipV2Error};
+pub use snip_v2_artifacts::{PublishReport, RestoreReport};
 pub use store::ShardStore;
 pub use chunker::ChunkPlan;
 
@@ -25,6 +27,7 @@ use std::path::Path;
 use omni_net::{OmniNet, TOPIC_SHARD};
 use omni_types::config::StoreConfig;
 use omni_types::model::ModelManifest;
+use omni_types::phase5::SnipV2ObjectId;
 use tracing::info;
 
 use crate::error::Result;
@@ -116,5 +119,42 @@ impl OmniStore {
     /// Memory-map a local shard for zero-copy read access.
     pub fn mmap_shard(&self, cid: &str) -> Result<memmap2::Mmap> {
         self.local.mmap(cid)
+    }
+
+    // ── Phase 5 Stage 2: SNIP V2 publish / restore ──────────────────────
+
+    /// Publish `manifest` and its local shard files to SNIP V2 Public via
+    /// `adapter`. See [`snip_v2_artifacts::publish_to_snip`] for semantics
+    /// and resumability behavior.
+    pub fn publish_to_snip<A: SnipV2Adapter>(
+        &self,
+        adapter: &A,
+        manifest: &mut ModelManifest,
+        manifest_path: &Path,
+    ) -> Result<PublishReport> {
+        snip_v2_artifacts::publish_to_snip(adapter, &self.local, manifest, manifest_path)
+    }
+
+    /// Restore every shard in `manifest` whose `<cid>.shard` is missing
+    /// locally, downloading from SNIP V2 via `adapter`. See
+    /// [`snip_v2_artifacts::restore_from_snip`] for verification semantics.
+    pub fn restore_from_snip<A: SnipV2Adapter>(
+        &self,
+        adapter: &A,
+        manifest: &ModelManifest,
+    ) -> Result<RestoreReport> {
+        snip_v2_artifacts::restore_from_snip(adapter, &self.local, manifest)
+    }
+
+    /// Download a SNIP V2-stored manifest by `root` into
+    /// `dest_manifest_path`. See [`snip_v2_artifacts::restore_manifest_from_snip`]
+    /// for the top-level `snip_v2: None` post-condition.
+    pub fn restore_manifest_from_snip<A: SnipV2Adapter>(
+        &self,
+        adapter: &A,
+        root: &SnipV2ObjectId,
+        dest_manifest_path: &Path,
+    ) -> Result<ModelManifest> {
+        snip_v2_artifacts::restore_manifest_from_snip(adapter, root, dest_manifest_path)
     }
 }

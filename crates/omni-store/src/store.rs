@@ -31,6 +31,14 @@ impl ShardStore {
         self.shard_dir.join(format!("{cid}.shard"))
     }
 
+    /// Sibling path used as a download landing zone before integrity
+    /// verification. The Phase 5 Stage 2 restore path writes downloaded
+    /// SNIP V2 bytes here, then renames to [`Self::shard_path`] only after
+    /// BLAKE3 and CID checks pass.
+    pub fn temp_path_for(&self, cid: &str) -> PathBuf {
+        self.shard_dir.join(format!("{cid}.shard.partial"))
+    }
+
     /// Check whether a shard exists locally.
     pub fn has(&self, cid: &str) -> bool {
         self.shard_path(cid).exists()

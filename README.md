@@ -70,8 +70,9 @@ The protocol is built on four pillars:
 | **Phase 2** — GGUF Model Sharding | `omni-store` | **Complete** |
 | **Phase 3** — FFI Bridge & Local Inference | `omni-bridge` | **Complete** |
 | **Phase 4** — Pipeline Parallelism | `omni-pipeline` | **Complete** |
-| **Phase 5 Stage 1** — SNIP V2 Storage Integration | `omni-types`, `omni-store` | **Complete** |
-| Phase 5 Stage 2+ — zkML proofs & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
+| **Phase 5 Stage 1** — SNIP V2 types + CLI adapter | `omni-types`, `omni-store` | **Complete** |
+| **Phase 5 Stage 2** — SNIP-backed model artifacts (publish / restore) | `omni-store` | **Complete** |
+| Phase 5 Stage 3+ — zkML proofs & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
 
@@ -686,7 +687,40 @@ sum-node download <merkle_root_hex> --output <path>
 
 ---
 
-### Phase 5 Stage 2+: zkML & SUM Chain Tokenomics — Planned
+### Phase 5 Stage 2: SNIP-backed Model Artifacts — Complete
+
+**Crate:** `omni-store` | **Depends on:** Stage 1, `sum-node` v0.4.0-rc3+
+
+Stage 2 wires the Stage 1 substrate into actionable storage flows: publishing local shards and their manifest to SNIP V2 Public, and restoring them on a fresh machine into the existing OmniNode shard cache. Both flows operate strictly through SNIP V2's Public surface — V1 is not used, Private V2 is not used, no range reads are issued. OmniNode's existing CIDv1 / BLAKE3 identity remains the only authority for cache key resolution; SNIP V2 roots are a *parallel* identifier used solely to address remote bytes.
+
+| Operation | Function | Notes |
+|---|---|---|
+| Publish shards + manifest | `OmniStore::publish_to_snip` → `snip_v2_artifacts::publish_to_snip` | Resumable per-shard. Skips already-populated `snip_v2` refs. |
+| Restore shards from a manifest | `OmniStore::restore_from_snip` → `snip_v2_artifacts::restore_from_snip` | Skips already-cached shards. Verifies each download against the manifest's BLAKE3 + CID. |
+| Restore a manifest from its SNIP root | `OmniStore::restore_manifest_from_snip` → `snip_v2_artifacts::restore_manifest_from_snip` | Top-level `snip_v2` on the returned manifest is `None` by construction (see below). |
+| Test seam | `trait SnipV2Adapter` in `omni-store::snip_v2`, implemented by `SnipV2Cli` | All 15 Stage-2 unit tests use a content-addressed in-memory fake; no `sum-node` shell-out. |
+
+**Publish flow & resumability.** Each shard's ingest call is followed immediately by `write_manifest`, so the on-disk file always reflects the highest-water-mark of populated refs. A mid-loop failure preserves prior refs on disk; a re-run from the loaded manifest skips them and resumes from the failure point. After all shards succeed, the manifest file itself is ingested into SNIP; its root identifies the canonical "shards-populated, top-level-`None`" bytes.
+
+**On-disk vs SNIP-stored manifest bytes — intentional divergence.** After SNIP returns the manifest root, the on-disk file is rewritten one final time to include a top-level `snip_v2` self-pointer. The SNIP-stored bytes do **not** carry this self-pointer; they remain stable under the canonical root. Restoring a manifest by its SNIP root therefore yields a `ModelManifest` whose top-level `snip_v2` is `None`, while every shard-level `snip_v2` survives intact — callers that want a local self-pointer add one explicitly after restore.
+
+**Atomic restore.** Each shard is downloaded to `<cid>.shard.partial`, mmap-ed, verified against the manifest's BLAKE3 hash and CIDv1 via the existing `verify::verify_blake3` / `verify::verify_cid` primitives, and only then renamed to its final `<cid>.shard` path. Verification failure removes the partial; the cache state is unchanged. Crashes mid-download leave only a partial, which the next run overwrites or cleans.
+
+**New typed errors** (additions to `StoreError`):
+- `ShardFileMissing { cid, path }` — publish-side; the manifest references a CID whose local `<cid>.shard` file is not on disk.
+- `ShardLacksSnipRef { cid }` — restore-side; the manifest's shard has no `snip_v2` ref to follow.
+
+Verification failures continue to surface through the existing `StoreError::IntegrityMismatch`; SNIP CLI failures continue to surface through `StoreError::SnipV2(SnipV2Error)`. No new dependencies were added to any `Cargo.toml`.
+
+**What Stage 2 deliberately does not do:**
+- No SNIP V1, no Private V2, no range reads.
+- No edits to `omni-net`, `omni-pipeline`, `omni-bridge`, `omni-zkml`, or `python/omninode`.
+- No edits to `build_manifest` — SNIP publishing is an explicit, separate call against an already-ingested model.
+- No chain client, no tokenomics, no proof backend — those land in Stage 3+.
+
+---
+
+### Phase 5 Stage 3+: zkML & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
 
@@ -804,8 +838,9 @@ OmniNode-Protocol/
 │   │       ├── announce.rs             # Gossipsub shard announcements (bincode on omni/shard/v1)
 │   │       ├── fetch.rs                # FetchManager: windowed 64MB chunk fetching state machine
 │   │       ├── serve.rs                # Inbound request handler: mmap → slice → respond
-│   │       ├── snip_v2.rs              # Phase 5 Stage 1: sum-node ingest-v2/download CLI adapter + pure parser
-│   │       └── error.rs               # StoreError enum (crate-local; bridges SnipV2Error)
+│   │       ├── snip_v2.rs              # Phase 5 Stage 1: sum-node ingest-v2/download CLI adapter + pure parser + SnipV2Adapter trait
+│   │       ├── snip_v2_artifacts.rs    # Phase 5 Stage 2: publish_to_snip / restore_from_snip / restore_manifest_from_snip
+│   │       └── error.rs               # StoreError enum (crate-local; bridges SnipV2Error, adds ShardFileMissing & ShardLacksSnipRef)
 │   │
 │   ├── omni-bridge/                    # Phase 3: Rust↔Python FFI (PyO3 0.23)
 │   │   ├── Cargo.toml                 # cdylib + rlib, depends on omni-store + omni-net + pyo3

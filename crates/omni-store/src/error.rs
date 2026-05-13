@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 
 /// Crate-local error type for `omni-store` operations.
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +18,12 @@ pub enum StoreError {
 
     #[error("SNIP V2 error: {0}")]
     SnipV2(#[from] crate::snip_v2::SnipV2Error),
+
+    #[error("local shard file missing for cid {cid}: {}", path.display())]
+    ShardFileMissing { cid: String, path: PathBuf },
+
+    #[error("manifest shard {cid} has no SNIP V2 reference; cannot restore")]
+    ShardLacksSnipRef { cid: String },
 
     #[error("{0}")]
     Other(String),
