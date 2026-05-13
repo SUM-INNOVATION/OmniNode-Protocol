@@ -73,7 +73,8 @@ The protocol is built on four pillars:
 | **Phase 5 Stage 1** — SNIP V2 types + CLI adapter | `omni-types`, `omni-store` | **Complete** |
 | **Phase 5 Stage 2** — SNIP-backed model artifacts (publish / restore) | `omni-store` | **Complete** |
 | **Phase 5 Stage 3** — Proof artifact flow (publish + commitment) | `omni-zkml` | **Complete** |
-| Phase 5 Stage 4+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
+| **Phase 5 Stage 4** — Local verifier attestation envelope (canonical bytes + digest + Signer trait) | `omni-zkml` | **Complete** |
+| Phase 5 Stage 5+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
 
@@ -767,7 +768,63 @@ A missing file always surfaces as the typed `ResponseFileNotFound { path }` or `
 
 ---
 
-### Phase 5 Stage 4+: zkML Proof Generation & SUM Chain Tokenomics — Planned
+### Phase 5 Stage 4: Local Verifier Attestation Envelope — Complete
+
+**Crate:** `omni-zkml` | **Depends on:** Stage 3, `omni-types::phase5::{InferenceCommitment, InferenceAttestation}`
+
+Stage 4 turns an `InferenceCommitment` (Stage 3 output) into a signed `InferenceAttestation` through a deterministic, domain-separated pipeline. **No real cryptography, no chain submission, no verifier wiring.** The point of this stage is the canonical-bytes contract and the `Signer` trait seam — the same seam a future Ed25519-backed signer (libp2p identity ↔ chain address) and an eventual real chain submitter will plug into.
+
+```
+InferenceCommitment
+  └─► compute_canonical_bytes (bincode 2.0 of CommitmentPayload { domain, commitment })
+        └─► CommitmentDigest (BLAKE3 of canonical bytes — 32 bytes)
+              └─► Signer::sign(digest) → verifier_signature
+                    └─► InferenceAttestation { commitment, verifier_address, verifier_signature }
+```
+
+| Concern | Where | Notes |
+|---|---|---|
+| Domain tag | `omni_zkml::DOMAIN_TAG = "omninode.inference_attestation.v1"` | Encoded as the **first** field of `CommitmentPayload`; bumping the trailing `vN` is the contract for any breaking change to the envelope |
+| Canonical envelope | `omni_zkml::CommitmentPayload { domain, commitment }` | bincode 2.0 + `config::standard()`, same configuration `omni-store::announce` / `omni-net::codec` already use |
+| Digest | `omni_zkml::CommitmentDigest([u8; 32])` | BLAKE3 over the canonical bytes; `as_bytes`, `to_hex` (lowercase, no `0x`) |
+| Signer abstraction | `omni_zkml::Signer { verifier_address() -> String, sign(&CommitmentDigest) -> Result<String, SignerError> }` | Both strings opaque; chain encoding (hex vs base58 vs bech32, sig scheme) deliberately pending |
+| Builder | `omni_zkml::build_attestation(commitment, signer) -> AttestationResult<InferenceAttestation>` | Consumes the commitment by value (moves it into the attestation) |
+| Local error type | `omni_zkml::{AttestationError, SignerError, AttestationResult<T>}` | `SignerError: Clone` so test fixtures can store and re-use canned outcomes; `AttestationError` is intentionally not Clone |
+
+**Determinism guarantees** (each pinned by a named test):
+- `canonical_bytes_are_deterministic` — same commitment → byte-equal canonical output across calls.
+- `digest_changes_when_domain_tag_changes` — via the `pub(crate) compute_canonical_bytes_with_domain` test seam: same commitment, different domain string → different digest. Pins the version-bump contract.
+- `digest_changes_when_session_id_changes` / `..._model_hash_changes` / `..._manifest_snip_root_changes` / `..._response_hash_changes` / `..._proof_snip_root_changes` — every commitment field flows into the digest.
+- `digest_matches_independent_blake3_of_canonical_bytes` — `compute_digest(&c)` equals `blake3::hash(compute_canonical_bytes(&c))` byte-for-byte.
+
+**Builder semantics:**
+- Pre-validation rejects empty `session_id`, `model_hash`, `response_hash` *before* invoking the signer (asserted by spying on the fake signer's recorded digest).
+- The signer receives the 32-byte `CommitmentDigest`, **not** the raw canonical bytes — pinned by `build_attestation_passes_digest_not_raw_bytes_to_signer`.
+- Empty `verifier_address` and empty `verifier_signature` returned by the signer are rejected as typed errors.
+- Signer failures propagate as `AttestationError::Signer(SignerError::Failed(msg))` with the diagnostic message preserved verbatim (`build_attestation_propagates_signer_failure_with_message`).
+
+**Result-alias hygiene:** `omni-zkml` now exposes two non-colliding aliases:
+- `omni_zkml::Result<T>` — Stage 3, `= std::result::Result<T, ProofArtifactError>`.
+- `omni_zkml::AttestationResult<T>` — Stage 4, `= std::result::Result<T, AttestationError>`.
+
+Callers import whichever they need; `attestation.rs` itself uses `AttestationResult` exclusively and never brings the Stage-3 `Result` alias into scope.
+
+**Dependencies added** (both workspace-declared; no new versions, no root `Cargo.toml` edit):
+- `bincode = { workspace = true }` — for the deterministic canonical envelope.
+- `serde = { workspace = true }` — strict consequence of `CommitmentPayload` deriving `Serialize`/`Deserialize`.
+
+**What Stage 4 deliberately does not do:**
+- No real signature scheme — no Ed25519, no secp256k1, no actual key handling.
+- No `Verifier` companion trait, no `verify_attestation` function. Stage 4 is producer-side only.
+- No chain client, no RPC, no transaction encoding.
+- No SUM Chain address/signature encoding decisions — strings remain opaque.
+- No libp2p-identity ↔ chain-address binding implementation (the 32-byte seed convention is documented for Stage 5+).
+- No edits to `omni-store`, `omni-types`, `omni-net`, `omni-pipeline`, `omni-bridge`, or `python/omninode`.
+- No SNIP V1, no Private V2, no range reads, no tokenomics.
+
+---
+
+### Phase 5 Stage 5+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
 
@@ -915,12 +972,13 @@ OmniNode-Protocol/
 │   │       ├── transport.rs            # PipelineMessage bincode encode/decode helpers
 │   │       └── error.rs               # PipelineError enum (thiserror)
 │   │
-│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + (later) zk proofs
-│   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + thiserror + tracing
+│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope (later: zk proofs)
+│   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + bincode + serde + thiserror + tracing
 │   │   └── src/
 │   │       ├── lib.rs                 # module declarations and root re-exports
 │   │       ├── artifact.rs            # Stage 3: ProofArtifact, ResponseArtifact, publish_proof_artifacts, build_commitment
-│   │       └── error.rs               # ProofArtifactError enum (bridges SnipV2Error and io::Error via #[from])
+│   │       ├── attestation.rs         # Stage 4: DOMAIN_TAG, CommitmentPayload, CommitmentDigest, Signer trait, build_attestation
+│   │       └── error.rs               # ProofArtifactError + Stage-4 SignerError + AttestationError (with AttestationResult<T>)
 │   │
 │   └── omni-node/                      # Binary: CLI entry point
 │       ├── Cargo.toml

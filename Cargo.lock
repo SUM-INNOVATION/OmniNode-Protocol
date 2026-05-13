@@ -2479,9 +2479,11 @@ dependencies = [
 name = "omni-zkml"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "blake3",
  "omni-store",
  "omni-types",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
