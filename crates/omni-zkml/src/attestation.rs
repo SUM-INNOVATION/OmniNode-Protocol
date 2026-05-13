@@ -18,7 +18,7 @@
 //! `pub(crate) compute_canonical_bytes_with_domain` seam exists so tests
 //! can prove this directly.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use omni_types::phase5::{InferenceAttestation, InferenceCommitment};
 
@@ -69,6 +69,53 @@ impl CommitmentDigest {
             let _ = write!(&mut s, "{:02x}", b);
         }
         s
+    }
+
+    /// Parse a 64-char lowercase hex string into a digest. Strict on
+    /// length, lowercase, and digit shape. Used by the custom serde
+    /// implementation and reused by Stage-5 `AttestationRecord`
+    /// deserialization.
+    pub fn from_hex(s: &str) -> std::result::Result<Self, String> {
+        if s.len() != 64 {
+            return Err(format!(
+                "CommitmentDigest hex must be 64 chars, got {}",
+                s.len()
+            ));
+        }
+        let bytes = s.as_bytes();
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            let hi = decode_lower_nibble(bytes[i * 2])?;
+            let lo = decode_lower_nibble(bytes[i * 2 + 1])?;
+            out[i] = (hi << 4) | lo;
+        }
+        Ok(Self(out))
+    }
+}
+
+fn decode_lower_nibble(b: u8) -> std::result::Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Err(format!("uppercase hex not allowed: '{}'", b as char)),
+        other => Err(format!("invalid hex digit: '{}'", other as char)),
+    }
+}
+
+// Serialize / deserialize as the lowercase-hex string. Added in Stage 5 so
+// that `AttestationRecord` (which embeds `CommitmentDigest`) can round-trip
+// through JSON. Pure additive: the byte representation of a `CommitmentDigest`
+// value is unchanged.
+impl Serialize for CommitmentDigest {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for CommitmentDigest {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        CommitmentDigest::from_hex(&s).map_err(serde::de::Error::custom)
     }
 }
 

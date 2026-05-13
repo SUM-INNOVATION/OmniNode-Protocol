@@ -74,7 +74,8 @@ The protocol is built on four pillars:
 | **Phase 5 Stage 2** — SNIP-backed model artifacts (publish / restore) | `omni-store` | **Complete** |
 | **Phase 5 Stage 3** — Proof artifact flow (publish + commitment) | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 4** — Local verifier attestation envelope (canonical bytes + digest + Signer trait) | `omni-zkml` | **Complete** |
-| Phase 5 Stage 5+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
+| **Phase 5 Stage 5** — Chain client abstraction + offline attestation registry | `omni-zkml` | **Complete** |
+| Phase 5 Stage 6+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
 
@@ -824,7 +825,66 @@ Callers import whichever they need; `attestation.rs` itself uses `AttestationRes
 
 ---
 
-### Phase 5 Stage 5+: zkML Proof Generation & SUM Chain Tokenomics — Planned
+### Phase 5 Stage 5: Chain Client Abstraction & Offline Attestation Registry — Complete
+
+**Crate:** `omni-zkml` | **Depends on:** Stage 4, `omni-types::phase5::InferenceAttestation`
+
+Stage 5 ships the chain-shaped pieces OmniNode can own without depending on the unfinished SUM Chain spec: a synchronous `ChainClient` trait, a deterministic `AttestationId` keyed on `(session_id, verifier_address)`, a six-state `LocalAttestationStatus` state machine, and an on-disk JSON-per-record `AttestationRegistry` with atomic writes. Two workflow free functions (`submit_attestation_workflow`, `query_attestation_workflow`) compose the trait with the registry so a future real chain adapter slots in unchanged. **No real RPC, no on-chain calls, no tx encoding, no tokenomics.**
+
+```
+InferenceAttestation
+  └─► compute_attestation_id  (BLAKE3 of bincode { domain, session_id, verifier_address })
+        └─► AttestationRegistry::insert  → AttestationRecord { Pending }
+              └─► submit_attestation_workflow ─► ChainClient::submit_attestation
+                                                  └─► mark_submitted(receipt) → Submitted
+                                                        └─► query_attestation_workflow ─► ChainClient::query_attestation_status
+                                                              ├─► Included      → mark_included
+                                                              ├─► Finalized     → mark_finalized  (terminal)
+                                                              ├─► Failed{reason}→ mark_failed      (terminal)
+                                                              └─► Dropped{...}  → mark_dropped    (retryable)
+```
+
+| Concern | Where | Notes |
+|---|---|---|
+| Deterministic record key | `omni_zkml::compute_attestation_id` | Domain `"omninode.attestation_record.v1"` + `session_id` + `verifier_address`. Signature / commitment body deliberately excluded — matches the chain proposal's de-duplication rule. |
+| Record identifier | `omni_zkml::AttestationId([u8; 32])` | Custom serde-as-lowercase-hex; filename is `<hex_id>.json` |
+| Chain trait (sync) | `omni_zkml::ChainClient { submit_attestation, query_attestation_status }` | No real RPC; opaque `String` ids and signature encodings; no `Pending` on the chain-returned status (chain only knows submitted-or-later) |
+| Chain-returned status | `omni_zkml::AttestationStatus { Submitted, Included, Finalized, Failed { reason }, Dropped { reason: Option<String> } }` | Matches the chain proposal's five-state lifecycle |
+| Local status | `omni_zkml::LocalAttestationStatus { Pending, Submitted, Included, Finalized, Failed { reason }, Dropped { reason: Option<String> } }` | `Pending` is local-only; `Dropped` is retryable; `Finalized` and `Failed` are terminal this stage |
+| Storage | `omni_zkml::AttestationRegistry::open(root)` | One JSON file per record at `<root>/<hex_id>.json`; atomic `.tmp` + rename; `list()` sorted by id hex ascending |
+| Workflow seams | `submit_attestation_workflow`, `query_attestation_workflow` | Free functions generic over `ChainClient`; RPC failures propagate as `RegistryError::ChainClient(_)` and leave records unchanged |
+| Local errors | `omni_zkml::{ChainClientError, RegistryError, RegistryResult<T>}` | Three error domains, three result aliases (`Result` Stage 3, `AttestationResult` Stage 4, `RegistryResult` Stage 5) coexist explicitly |
+
+**Insert idempotency & conflict.** `insert(attestation)` computes the key from `(session_id, verifier_address)`:
+- If no record exists → write a new `Pending` record.
+- If a record exists and stores a byte-equal attestation → return it unchanged (no file rewrite, `updated_at` not bumped).
+- If a record exists but stores a byte-different attestation → return `RegistryError::ConflictingAttestation { id }`, with the on-disk record preserved intact.
+
+**RPC failures are not terminal.** Pinned by two named tests:
+- `submit_workflow_returns_chain_error_and_leaves_record_pending` — fake client returns `Err(ChainClientError::Other("rpc gone"))`; workflow returns `Err(RegistryError::ChainClient(...))`; loaded record is still `Pending`.
+- `query_workflow_returns_chain_error_and_leaves_record_unchanged` — same shape for the query path; record status unchanged after the failed RPC.
+
+Only an explicit chain status of `Failed { reason }` (from `Submitted` or `Included`) or `Dropped { reason }` (from `Submitted`) transitions a record into those local states. The retry hinge is `mark_submitted` accepting both `Pending` *and* `Dropped` as source states — `submit_workflow_resubmits_dropped_records` exercises the end-to-end Pending → Submitted → Dropped → Submitted path with a new receipt replacing the old one.
+
+**Atomic writes.** Every persisted change goes through `serde_json::to_vec_pretty` → write to `<hex_id>.json.tmp` → `fs::rename` to `<hex_id>.json`. Crashes mid-write leave at most a `.tmp` file behind; the `.json` is either present-and-complete or absent. Stray `.tmp` files are silently ignored by `list()`.
+
+**`CommitmentDigest` JSON serde** was added to `attestation.rs` this stage (additive to Stage 4): `Serialize` / `Deserialize` impls that read/write the lowercase 64-char hex string. Required because `AttestationRecord` embeds the digest and persists to JSON. The Stage-1 `SnipV2ObjectId` hex-string serde pattern is reused.
+
+**Dependencies added** (both workspace-declared; no new versions, no root `Cargo.toml` edit): `serde_json` (JSON persistence) and `chrono` (RFC3339 timestamps for `created_at` / `updated_at`).
+
+**What Stage 5 deliberately does not do:**
+- No real chain RPC, no `reqwest`/`hyper`/`alloy` clients.
+- No tx encoding, no final receipt schema beyond two opaque strings.
+- No staking, slashing, or reward formulas.
+- No proof generation, no verifier wiring.
+- No real cryptographic signer — Stage 4's `Signer` trait surface is unchanged.
+- No `Included → Dropped` transition (chain reorgs of already-Included records would surface as `RegistryError::InvalidStatusTransition`; a future stage can extend the rules if reorg handling becomes first-class).
+- No SNIP V1, no Private V2, no range reads.
+- No edits to `omni-types`, `omni-store`, `omni-net`, `omni-pipeline`, `omni-bridge`, or `python/omninode`.
+
+---
+
+### Phase 5 Stage 6+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
 
@@ -972,13 +1032,15 @@ OmniNode-Protocol/
 │   │       ├── transport.rs            # PipelineMessage bincode encode/decode helpers
 │   │       └── error.rs               # PipelineError enum (thiserror)
 │   │
-│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope (later: zk proofs)
-│   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + bincode + serde + thiserror + tracing
+│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope + chain abstraction & registry (later: zk proofs)
+│   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + bincode + serde + serde_json + chrono + thiserror + tracing
 │   │   └── src/
 │   │       ├── lib.rs                 # module declarations and root re-exports
 │   │       ├── artifact.rs            # Stage 3: ProofArtifact, ResponseArtifact, publish_proof_artifacts, build_commitment
-│   │       ├── attestation.rs         # Stage 4: DOMAIN_TAG, CommitmentPayload, CommitmentDigest, Signer trait, build_attestation
-│   │       └── error.rs               # ProofArtifactError + Stage-4 SignerError + AttestationError (with AttestationResult<T>)
+│   │       ├── attestation.rs         # Stage 4: DOMAIN_TAG, CommitmentPayload, CommitmentDigest (+ Stage-5 serde), Signer trait, build_attestation
+│   │       ├── chain.rs               # Stage 5: ChainClient trait, SubmissionReceipt, AttestationStatus
+│   │       ├── registry.rs            # Stage 5: AttestationId, AttestationRecord, LocalAttestationStatus, AttestationRegistry, submit/query workflows
+│   │       └── error.rs               # ProofArtifactError + SignerError + AttestationError + ChainClientError + RegistryError (with Result / AttestationResult / RegistryResult)
 │   │
 │   └── omni-node/                      # Binary: CLI entry point
 │       ├── Cargo.toml

@@ -1,25 +1,37 @@
 //! `omni-zkml` — Phase 5 zkML and proof attestation crate.
 //!
-//! Stage 3 laid down the **proof artifact substrate**: types that describe
-//! local response/proof byte files, a publish flow that ingests them into
-//! SNIP V2 Public via the existing `omni-store::SnipV2Adapter`, and a
-//! builder that assembles an [`omni_types::phase5::InferenceCommitment`].
+//! Stage 3 laid down the **proof artifact substrate** (publish opaque
+//! response/proof byte files to SNIP V2 Public and build an
+//! [`omni_types::phase5::InferenceCommitment`]).
 //!
-//! Stage 4 adds the **local verifier attestation envelope**: canonical
-//! domain-separated bytes for an `InferenceCommitment`, a 32-byte BLAKE3
-//! [`attestation::CommitmentDigest`], a [`attestation::Signer`] trait
-//! abstraction, and a builder that produces the existing
-//! [`omni_types::phase5::InferenceAttestation`].
+//! Stage 4 added the **local verifier attestation envelope** (canonical
+//! domain-separated bytes, BLAKE3 digest, [`attestation::Signer`] trait
+//! seam, [`attestation::build_attestation`] producing an
+//! [`omni_types::phase5::InferenceAttestation`]).
 //!
-//! No real proof generation, no verifier, no chain client, and no real
-//! cryptographic signing scheme is present in this crate yet — proof
-//! bytes are opaque blobs supplied by the caller, and the `Signer` trait
-//! is satisfied by a local fake in unit tests. The actual zk machinery
-//! and chain integration are the subject of Stage 5+.
+//! Stage 5 adds the **chain client abstraction** and the **offline
+//! attestation registry**:
+//! - [`chain::ChainClient`] — synchronous trait future chain adapters
+//!   implement. No real RPC, no tx encoding this stage.
+//! - [`registry::AttestationRegistry`] — filesystem-backed JSON-per-record
+//!   store, keyed by `(session_id, verifier_address)` to match the chain
+//!   proposal's de-duplication rule. Atomic `.tmp` + rename writes;
+//!   deterministic `list()` order.
+//! - [`registry::submit_attestation_workflow`] /
+//!   [`registry::query_attestation_workflow`] — composite operations that
+//!   drive the chain client + registry together. RPC failures propagate
+//!   as [`error::RegistryError::ChainClient`] and **leave records
+//!   unchanged**; only an explicit chain `Failed { reason }` or
+//!   `Dropped { reason }` transitions a record into those states.
+//!
+//! No real cryptographic signing scheme, no real chain implementation,
+//! no proof verifier is wired in this crate yet. Those are Stage 6+.
 
 pub mod artifact;
 pub mod attestation;
+pub mod chain;
 pub mod error;
+pub mod registry;
 
 pub use artifact::{
     build_commitment, publish_proof_artifacts, ProofArtifact, ProofPublishReport, ResponseArtifact,
@@ -28,6 +40,13 @@ pub use attestation::{
     build_attestation, compute_canonical_bytes, compute_digest, CommitmentDigest,
     CommitmentPayload, Signer, DOMAIN_TAG,
 };
+pub use chain::{AttestationStatus, ChainClient, SubmissionReceipt};
 pub use error::{
-    AttestationError, AttestationResult, ProofArtifactError, Result, SignerError,
+    AttestationError, AttestationResult, ChainClientError, ProofArtifactError, RegistryError,
+    RegistryResult, Result, SignerError,
+};
+pub use registry::{
+    compute_attestation_id, query_attestation_workflow, submit_attestation_workflow,
+    AttestationId, AttestationRecord, AttestationRegistry, LocalAttestationStatus,
+    ATTESTATION_ID_DOMAIN,
 };

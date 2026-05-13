@@ -88,3 +88,61 @@ pub enum AttestationError {
 /// `attestation.rs` never route attestation errors through the Stage-3
 /// error domain.
 pub type AttestationResult<T> = std::result::Result<T, AttestationError>;
+
+// ── Stage 5: chain client + offline attestation registry ──────────────────────
+
+/// Failure reported by a [`crate::chain::ChainClient`] implementation.
+///
+/// `Clone` is derived so test fixtures (and a future real chain adapter's
+/// own error machinery) can store a canned outcome and reuse it. The
+/// single-variant `Other(String)` shape preserves the implementation's
+/// diagnostic message verbatim; a future real chain adapter may upgrade
+/// to structured variants.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ChainClientError {
+    #[error("chain client failure: {0}")]
+    Other(String),
+}
+
+/// Failure produced by the [`crate::registry::AttestationRegistry`] and
+/// its workflow free functions.
+///
+/// Intentionally **not** `Clone` (`io::Error` is not `Clone`).
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("registry serialization failure: {0}")]
+    Serialization(String),
+
+    #[error("registry I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("attestation record not found: {0}")]
+    RecordNotFound(crate::registry::AttestationId),
+
+    /// Returned by `insert` when an existing record under the same
+    /// `(session_id, verifier_address)` carries a byte-different
+    /// `InferenceAttestation`. The existing record on disk is **not**
+    /// overwritten; the caller can `load(&id)` to inspect the stored
+    /// value.
+    #[error(
+        "conflicting attestation under existing id {id}: session_id and \
+         verifier_address match but the stored attestation differs from \
+         the one being inserted"
+    )]
+    ConflictingAttestation { id: crate::registry::AttestationId },
+
+    #[error("invalid status transition for {id}: cannot go from {from:?} to {to}")]
+    InvalidStatusTransition {
+        id: crate::registry::AttestationId,
+        from: crate::registry::LocalAttestationStatus,
+        to: &'static str,
+    },
+
+    #[error("chain client failure: {0}")]
+    ChainClient(#[from] ChainClientError),
+}
+
+/// Stage 5 result alias. Distinct from [`Result`] (Stage 3) and
+/// [`AttestationResult`] (Stage 4) so each domain's errors stay typed at
+/// every call site.
+pub type RegistryResult<T> = std::result::Result<T, RegistryError>;
