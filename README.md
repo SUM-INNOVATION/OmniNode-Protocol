@@ -75,7 +75,8 @@ The protocol is built on four pillars:
 | **Phase 5 Stage 3** — Proof artifact flow (publish + commitment) | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 4** — Local verifier attestation envelope (canonical bytes + digest + Signer trait) | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 5** — Chain client abstraction + offline attestation registry | `omni-zkml` | **Complete** |
-| Phase 5 Stage 6+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
+| **Phase 5 Stage 6** — Chain wire fixture & signing-spec deliverables (Ed25519 + bs58 checksum address) | `omni-zkml` | **Complete** |
+| Phase 5 Stage 7+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
 
@@ -884,7 +885,81 @@ Only an explicit chain status of `Failed { reason }` (from `Submitted` or `Inclu
 
 ---
 
-### Phase 5 Stage 6+: zkML Proof Generation & SUM Chain Tokenomics — Planned
+### Phase 5 Stage 6: Chain Wire Fixture & Signing-Spec Deliverables — Complete
+
+**Crate:** `omni-zkml` | **Depends on:** Stage 4 (for `DOMAIN_TAG`), `libp2p-identity` Ed25519, `bs58`
+
+Stage 6 produces the **frozen signing spec** and **three deterministic test vectors** the chain team needs to build their `InferenceAttestation` adapter. It implements the v1 chain payload shape locally and exercises the full pipeline end-to-end. **No live RPC, no outer transaction encoding, no tokenomics.**
+
+```
+InferenceCommitment
+  └─► commitment_to_chain_digest   ─► InferenceAttestationDigest
+        └─► canonical_digest_bytes      = bincode(digest)
+              └─► signing_input_bytes   = DOMAIN_TAG.as_bytes() || canonical_digest_bytes
+                    └─► sign_chain_attestation_digest(seed, &digest) ─► [u8; 64]
+```
+
+| Concern | Where | Notes |
+|---|---|---|
+| Chain v1 wire structs | `omni_zkml::{InferenceAttestationDigest, InferenceAttestationTxData}` | Field order is bincode order; declaration order **frozen** for v1. `[u8; 32]` × 4 in the digest; `[u8; 64]` signature field on tx-data via a local `serde_signature_64` helper (no `serde-big-array` dep added). |
+| Strict conversion | `commitment_to_chain_digest(&InferenceCommitment)` | Bare 64-char lowercase hex on both string hashes; 256-byte byte-length cap on `session_id`; SNIP roots as `[u8; 32]`. |
+| Canonical bytes | `canonical_digest_bytes(&digest)` | `bincode::serde::encode_to_vec` with `config::standard()` — same configuration the workspace already uses. |
+| Signing input | `signing_input_bytes(&digest)` | Exactly `DOMAIN_TAG.as_bytes() ‖ canonical_digest_bytes(&digest)` — the literal bytes of Stage 4's `"omninode.inference_attestation.v1"` constant. |
+| Ed25519 signing | `sign_chain_attestation_digest(&seed, &digest) -> [u8; 64]` | Via `libp2p-identity::ed25519` (already a workspace dep). Returns the raw 64-byte signature. Verified deterministically using `RFC 8032` Ed25519: same seed + same digest → bit-identical signature. |
+| Chain address | `derive_chain_address_base58(&pubkey)` / `signer_chain_address_base58(&seed)` | Implements the chain's exact rule: `BLAKE3(pubkey)[12..32] ‖ BLAKE3(BLAKE3(addr))[0..4]` → 24-byte payload → `bs58::encode(...)`. **No libp2p PeerId** in the chain-wire surface. |
+| Local error type | `omni_zkml::{ChainWireError, ChainWireResult<T>}` | Four typed variants: `InvalidHex { field, reason }`, `SessionIdTooLong { got, max }`, `Signing`, `Serialization`. Fourth distinct result alias in `omni-zkml`. |
+
+**Compatibility with Stage 4.** Stage 4's [`attestation.rs`](crates/omni-zkml/src/attestation.rs) is **byte-stable and unchanged**. `CommitmentDigest`, `compute_canonical_bytes`, `compute_digest`, `Signer`, and `build_attestation` all behave exactly as before. The Stage-4 local-digest pipeline (`CommitmentPayload { domain, commitment }` → bincode → BLAKE3) and the Stage-6 chain pipeline (`DOMAIN_TAG ‖ bincode(InferenceAttestationDigest)` → Ed25519) produce **different** byte sequences for the same `InferenceCommitment` by design. Both share the same versioned `DOMAIN_TAG` so a future version bump propagates to both consistently.
+
+**Deliverable for the chain team.** [crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json](crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json) — three vectors with ASCII-only `session_id` strings (`"omninode-stage6-vec-1"`, `"omninode-stage6-vec-2"`, `"omninode-stage6-vec-3-abcdef-0123456789"`) and 32-byte fields rendered as one byte repeated 32 times (e.g. `"00…00"`, `"11…11"`, etc.). Each vector carries:
+
+```json
+{
+  "session_id":             "...",
+  "model_hash":             "<64 lowercase hex chars = 32 bytes>",
+  "manifest_root":          "<64 lowercase hex chars = 32 bytes>",
+  "response_hash":          "<64 lowercase hex chars = 32 bytes>",
+  "proof_root":             "<64 lowercase hex chars = 32 bytes>",
+  "verifier_ed25519_seed":  "<64 lowercase hex chars = 32 bytes>",
+  "canonical_digest_bytes": "<lowercase hex, variable>",
+  "signing_input_bytes":    "<lowercase hex, variable>",
+  "signature_bytes":        "<128 lowercase hex chars = 64 bytes>",
+  "signer_address_base58":  "<chain checksum-base58>",
+  "signer_pubkey_hex":      "<64 lowercase hex chars = 32 bytes>"
+}
+```
+
+The integration test at [crates/omni-zkml/tests/chain_attestation_vectors.rs](crates/omni-zkml/tests/chain_attestation_vectors.rs) re-derives all three vectors via the actual implementation path and asserts byte-equality against the committed JSON on every `cargo test` run. `OMNINODE_REGEN_VECTORS=1 cargo test -p omni-zkml --test chain_attestation_vectors` overwrites the fixture when intentionally bumping the spec.
+
+**Spot-checks confirming the wire format:**
+- Vector 1's `signer_pubkey_hex` is `3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29` — exactly the RFC 8032 Ed25519 test-vector-1 public key for seed `0x00…00`. Confirms `libp2p-identity::ed25519` treats the seed as the standard Ed25519 secret seed.
+- `canonical_digest_bytes` begins with `15` (= 21) for vector 1 and `27` (= 39) for vector 3 — the bincode varint length prefixes for the respective `session_id` strings.
+- `signing_input_bytes` begins with `6f6d6e…7631` = ASCII `"omninode.inference_attestation.v1"`, the literal bytes of `DOMAIN_TAG`.
+
+**Chain-address invariants — pinned by `derive_chain_address_uses_last_20_bytes_of_blake3_and_correct_checksum`:**
+- Decoded base58 payload is exactly 24 bytes.
+- Split is 20 (address) + 4 (checksum).
+- Checksum equals `BLAKE3(BLAKE3(address_bytes))[..4]`.
+- Address equals `BLAKE3(pubkey)[12..32]` (last 20 bytes, **positive assertion**).
+- Address does **not** equal `BLAKE3(pubkey)[0..20]` (first 20 bytes, **explicit negative assertion**).
+
+**Dependencies added** (one new workspace crate; both omni-zkml entries reference workspace-declared crates):
+- Root `Cargo.toml` `[workspace.dependencies]` — added `bs58 = "0.5"`. The chain's address encoding requires Bitcoin-base58 over a manually-checksummed 24-byte payload; no existing workspace dep provides that alphabet.
+- `crates/omni-zkml/Cargo.toml` — added `bs58 = { workspace = true }` and `libp2p-identity = { workspace = true }` (no speculative `features = [...]`).
+
+**What Stage 6 deliberately does not do:**
+- No live chain RPC, no `sum_sendRawTransaction`, no JSON-RPC client.
+- No outer `SignedTransaction` encoding — `InferenceAttestationTxData` exists for type completeness only.
+- No nonce, fee, gas, or mempool handling.
+- No chain activation gate, no reward / slash / dispute logic, no tokenomics.
+- No real `Signer` impl — `sign_chain_attestation_digest` is a standalone free function, not a Stage-4 `Signer` impl.
+- No libp2p `PeerId` derivation in the chain-wire surface (identity-binding is a future-stage concern).
+- No edits to Stage 4 `attestation.rs`, Stage 5 `registry.rs` / `chain.rs`, or anywhere outside `omni-zkml` (other than the one-line `bs58` workspace declaration).
+- No SNIP V1, no Private V2, no range reads, no edits to `omni-net` / `omni-pipeline` / `omni-bridge` / `python/omninode`.
+
+---
+
+### Phase 5 Stage 7+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
 
@@ -1032,15 +1107,20 @@ OmniNode-Protocol/
 │   │       ├── transport.rs            # PipelineMessage bincode encode/decode helpers
 │   │       └── error.rs               # PipelineError enum (thiserror)
 │   │
-│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope + chain abstraction & registry (later: zk proofs)
-│   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + bincode + serde + serde_json + chrono + thiserror + tracing
-│   │   └── src/
-│   │       ├── lib.rs                 # module declarations and root re-exports
-│   │       ├── artifact.rs            # Stage 3: ProofArtifact, ResponseArtifact, publish_proof_artifacts, build_commitment
-│   │       ├── attestation.rs         # Stage 4: DOMAIN_TAG, CommitmentPayload, CommitmentDigest (+ Stage-5 serde), Signer trait, build_attestation
-│   │       ├── chain.rs               # Stage 5: ChainClient trait, SubmissionReceipt, AttestationStatus
-│   │       ├── registry.rs            # Stage 5: AttestationId, AttestationRecord, LocalAttestationStatus, AttestationRegistry, submit/query workflows
-│   │       └── error.rs               # ProofArtifactError + SignerError + AttestationError + ChainClientError + RegistryError (with Result / AttestationResult / RegistryResult)
+│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope + chain abstraction & registry + chain wire (later: zk proofs)
+│   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + bincode + bs58 + libp2p-identity + serde + serde_json + chrono + thiserror + tracing
+│   │   ├── src/
+│   │   │   ├── lib.rs                 # module declarations and root re-exports
+│   │   │   ├── artifact.rs            # Stage 3: ProofArtifact, ResponseArtifact, publish_proof_artifacts, build_commitment
+│   │   │   ├── attestation.rs         # Stage 4: DOMAIN_TAG, CommitmentPayload, CommitmentDigest (+ Stage-5 serde), Signer trait, build_attestation
+│   │   │   ├── chain.rs               # Stage 5: ChainClient trait, SubmissionReceipt, AttestationStatus
+│   │   │   ├── registry.rs            # Stage 5: AttestationId, AttestationRecord, LocalAttestationStatus, AttestationRegistry, submit/query workflows
+│   │   │   ├── chain_wire.rs          # Stage 6: InferenceAttestationDigest, InferenceAttestationTxData, canonical/signing bytes, Ed25519 signing, chain-address bs58, ChainAttestationVector
+│   │   │   └── error.rs               # ProofArtifactError + SignerError + AttestationError + ChainClientError + RegistryError + ChainWireError (with Result / AttestationResult / RegistryResult / ChainWireResult)
+│   │   └── tests/
+│   │       ├── chain_attestation_vectors.rs        # Stage 6 integration test (verify-by-default, regen via OMNINODE_REGEN_VECTORS=1)
+│   │       └── fixtures/
+│   │           └── chain_attestation_vectors.json  # Stage 6 frozen deliverable: 3 chain attestation test vectors
 │   │
 │   └── omni-node/                      # Binary: CLI entry point
 │       ├── Cargo.toml

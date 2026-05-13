@@ -2481,7 +2481,9 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "bs58",
  "chrono",
+ "libp2p-identity",
  "omni-store",
  "omni-types",
  "serde",

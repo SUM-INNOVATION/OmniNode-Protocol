@@ -30,6 +30,7 @@
 pub mod artifact;
 pub mod attestation;
 pub mod chain;
+pub mod chain_wire;
 pub mod error;
 pub mod registry;
 
@@ -41,9 +42,15 @@ pub use attestation::{
     CommitmentPayload, Signer, DOMAIN_TAG,
 };
 pub use chain::{AttestationStatus, ChainClient, SubmissionReceipt};
+pub use chain_wire::{
+    canonical_digest_bytes, commitment_to_chain_digest, compute_chain_attestation_vector,
+    derive_chain_address_base58, sign_chain_attestation_digest, signer_chain_address_base58,
+    signer_pubkey_bytes, signer_pubkey_hex, signing_input_bytes, ChainAttestationVector,
+    InferenceAttestationDigest, InferenceAttestationTxData, MAX_SESSION_ID_BYTES,
+};
 pub use error::{
-    AttestationError, AttestationResult, ChainClientError, ProofArtifactError, RegistryError,
-    RegistryResult, Result, SignerError,
+    AttestationError, AttestationResult, ChainClientError, ChainWireError, ChainWireResult,
+    ProofArtifactError, RegistryError, RegistryResult, Result, SignerError,
 };
 pub use registry::{
     compute_attestation_id, query_attestation_workflow, submit_attestation_workflow,

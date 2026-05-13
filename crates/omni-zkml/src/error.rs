@@ -146,3 +146,30 @@ pub enum RegistryError {
 /// [`AttestationResult`] (Stage 4) so each domain's errors stay typed at
 /// every call site.
 pub type RegistryResult<T> = std::result::Result<T, RegistryError>;
+
+// ── Stage 6: chain wire fixture & signing-spec deliverables ────────────────────
+
+/// Failure produced by [`crate::chain_wire`] — the chain-wire conversion,
+/// canonical-bytes, signing, and address-derivation surface.
+///
+/// Intentionally **not** `Clone` (no consumer needs to clone a chain-wire
+/// error; Stage 4's `SignerError` was `Clone` only because the fake fixture
+/// stored a canned outcome).
+#[derive(Debug, thiserror::Error)]
+pub enum ChainWireError {
+    #[error("invalid hex for field {field}: {reason}")]
+    InvalidHex { field: &'static str, reason: String },
+
+    #[error("session_id is {got} bytes; max allowed is {max}")]
+    SessionIdTooLong { got: usize, max: usize },
+
+    #[error("Ed25519 signing failure: {0}")]
+    Signing(String),
+
+    #[error("chain-wire serialization failure: {0}")]
+    Serialization(String),
+}
+
+/// Stage 6 result alias. Distinct from the Stage 3/4/5 aliases so the
+/// chain-wire surface stays in its own typed lane.
+pub type ChainWireResult<T> = std::result::Result<T, ChainWireError>;
