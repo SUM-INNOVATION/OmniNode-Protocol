@@ -7,6 +7,7 @@ pub mod gguf;
 pub mod manifest;
 pub mod mmap;
 pub mod serve;
+pub mod snip_v2;
 pub mod store;
 pub mod verify;
 
@@ -15,6 +16,7 @@ pub use content_id::cid_from_data;
 pub use error::StoreError;
 pub use fetch::{FetchManager, FetchOutcome};
 pub use gguf::GgufFile;
+pub use snip_v2::{SnipV2Cli, SnipV2CliConfig, SnipV2Error};
 pub use store::ShardStore;
 pub use chunker::ChunkPlan;
 

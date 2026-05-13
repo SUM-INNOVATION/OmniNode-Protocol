@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::phase5::SnipV2ObjectRef;
+
 // ── Layer Range ───────────────────────────────────────────────────────────────
 
 /// Inclusive range of transformer block indices assigned to a shard.
@@ -44,6 +46,15 @@ pub struct ShardDescriptor {
     pub size_bytes: u64,
     /// BLAKE3 hash of the shard data (hex-encoded, 64 chars).
     pub blake3_hash: String,
+
+    /// Optional SNIP V2 reference for the same shard byte stream.
+    ///
+    /// Phase 5 addition. This is **not** a CID and **not** the raw BLAKE3
+    /// hash of the file; it is the BLAKE3 Merkle root produced by SNIP's
+    /// chunking. CID and SNIP V2 root may coexist; neither replaces the
+    /// other. Absent in manifests written before Phase 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snip_v2: Option<SnipV2ObjectRef>,
 }
 
 // ── Model Manifest ────────────────────────────────────────────────────────────
@@ -69,6 +80,12 @@ pub struct ModelManifest {
     pub gguf_version: u32,
     /// Ordered list of shard descriptors.
     pub shards: Vec<ShardDescriptor>,
+
+    /// Optional SNIP V2 reference for the manifest artifact itself.
+    ///
+    /// Phase 5 addition. Absent in manifests written before Phase 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snip_v2: Option<SnipV2ObjectRef>,
 }
 
 // ── GGML Quantization Types ───────────────────────────────────────────────────
@@ -200,6 +217,7 @@ mod tests {
             includes_output_head: false,
             size_bytes: 512_000_000,
             blake3_hash: "a".repeat(64),
+            snip_v2: None,
         };
         let json = serde_json::to_string(&sd).unwrap();
         let round: ShardDescriptor = serde_json::from_str(&json).unwrap();
@@ -217,10 +235,134 @@ mod tests {
             total_size_bytes: 4_000_000_000,
             gguf_version: 3,
             shards: vec![],
+            snip_v2: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         let round: ModelManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(m.model_name, round.model_name);
         assert_eq!(m.total_layers, round.total_layers);
+    }
+
+    // ── Phase 5 backward-compatibility (JSON) ────────────────────────────
+
+    /// A manifest serialized before Phase 5 has no `snip_v2` keys at any
+    /// level. It must still deserialize into the new struct with both
+    /// optional fields resolved to `None`.
+    #[test]
+    fn manifest_deserializes_without_snip_field() {
+        let legacy = r#"{
+            "model_name": "tinyllama",
+            "model_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "architecture": "llama",
+            "total_layers": 22,
+            "quantization": "F16",
+            "total_size_bytes": 2200000000,
+            "gguf_version": 3,
+            "shards": [{
+                "shard_index": 0,
+                "cid": "bafkrlegacy",
+                "layer_range": { "start": 0, "end": 10 },
+                "includes_embedding": true,
+                "includes_output_head": false,
+                "size_bytes": 215000000,
+                "blake3_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }]
+        }"#;
+        let m: ModelManifest = serde_json::from_str(legacy).unwrap();
+        assert!(m.snip_v2.is_none());
+        assert_eq!(m.shards.len(), 1);
+        assert!(m.shards[0].snip_v2.is_none());
+        assert_eq!(m.model_name, "tinyllama");
+        assert_eq!(m.shards[0].cid, "bafkrlegacy");
+    }
+
+    #[test]
+    fn shard_descriptor_deserializes_without_snip_field() {
+        let legacy = r#"{
+            "shard_index": 0,
+            "cid": "bafkrlegacy",
+            "layer_range": { "start": 0, "end": 3 },
+            "includes_embedding": true,
+            "includes_output_head": false,
+            "size_bytes": 1000,
+            "blake3_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }"#;
+        let sd: ShardDescriptor = serde_json::from_str(legacy).unwrap();
+        assert!(sd.snip_v2.is_none());
+        assert_eq!(sd.cid, "bafkrlegacy");
+    }
+
+    #[test]
+    fn manifest_round_trip_with_snip_field() {
+        use crate::phase5::{SnipV2Lifecycle, SnipV2ObjectId, SnipV2ObjectRef};
+
+        let hex =
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let id = SnipV2ObjectId::from_hex(hex).unwrap();
+
+        let m = ModelManifest {
+            model_name: "test".into(),
+            model_hash: "a".repeat(64),
+            architecture: "llama".into(),
+            total_layers: 4,
+            quantization: "F16".into(),
+            total_size_bytes: 1000,
+            gguf_version: 3,
+            shards: vec![ShardDescriptor {
+                shard_index: 0,
+                cid: "bafkrnew".into(),
+                layer_range: LayerRange { start: 0, end: 3 },
+                includes_embedding: true,
+                includes_output_head: true,
+                size_bytes: 1000,
+                blake3_hash: "b".repeat(64),
+                snip_v2: Some(SnipV2ObjectRef {
+                    merkle_root: id,
+                    lifecycle: SnipV2Lifecycle::Active,
+                    plaintext_size_bytes: Some(1000),
+                }),
+            }],
+            snip_v2: Some(SnipV2ObjectRef {
+                merkle_root: id,
+                lifecycle: SnipV2Lifecycle::Active,
+                plaintext_size_bytes: None,
+            }),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let round: ModelManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(m.snip_v2, round.snip_v2);
+        assert_eq!(m.shards[0].snip_v2, round.shards[0].snip_v2);
+    }
+
+    /// When `snip_v2` is `None` on every struct, the serialized JSON must
+    /// not mention it — so observers of the legacy JSON shape see no new
+    /// keys.
+    #[test]
+    fn manifest_round_trip_without_snip_field_omits_key() {
+        let m = ModelManifest {
+            model_name: "test".into(),
+            model_hash: "a".repeat(64),
+            architecture: "llama".into(),
+            total_layers: 4,
+            quantization: "F16".into(),
+            total_size_bytes: 1000,
+            gguf_version: 3,
+            shards: vec![ShardDescriptor {
+                shard_index: 0,
+                cid: "bafkrnone".into(),
+                layer_range: LayerRange { start: 0, end: 3 },
+                includes_embedding: false,
+                includes_output_head: false,
+                size_bytes: 1000,
+                blake3_hash: "b".repeat(64),
+                snip_v2: None,
+            }],
+            snip_v2: None,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("snip_v2"),
+            "JSON for an all-None manifest must not contain `snip_v2`: {json}"
+        );
     }
 }

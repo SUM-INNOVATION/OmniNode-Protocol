@@ -15,6 +15,9 @@ pub enum StoreError {
     #[error("shard not found: {0}")]
     NotFound(String),
 
+    #[error("SNIP V2 error: {0}")]
+    SnipV2(#[from] crate::snip_v2::SnipV2Error),
+
     #[error("{0}")]
     Other(String),
 }

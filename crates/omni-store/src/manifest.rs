@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use omni_types::model::{LayerRange, ModelManifest, ShardDescriptor};
+use omni_types::model::{ModelManifest, ShardDescriptor};
 
 use crate::chunker::{self, ChunkPlan};
 use crate::content_id;
@@ -56,6 +56,9 @@ pub fn build_manifest(
             includes_output_head: plan.includes_output_head,
             size_bytes: shard_bytes.len() as u64,
             blake3_hash,
+            // Phase 5: SNIP V2 reference is populated in a later stage; not
+            // produced by `build_manifest` itself.
+            snip_v2: None,
         });
     }
 
@@ -68,6 +71,8 @@ pub fn build_manifest(
         total_size_bytes: file_len,
         gguf_version: gguf.header.version,
         shards,
+        // Phase 5: filled in by a later SNIP V2 publishing step, not here.
+        snip_v2: None,
     })
 }
 
@@ -100,6 +105,7 @@ pub fn manifest_to_json(manifest: &ModelManifest) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omni_types::model::LayerRange;
 
     fn sample_manifest() -> ModelManifest {
         ModelManifest {
@@ -118,7 +124,9 @@ mod tests {
                 includes_output_head: false,
                 size_bytes: 500_000_000,
                 blake3_hash: "b".repeat(64),
+                snip_v2: None,
             }],
+            snip_v2: None,
         }
     }
 
@@ -151,7 +159,6 @@ mod tests {
     #[test]
     fn build_manifest_from_synthetic_gguf() {
         use crate::chunker::plan_chunks;
-        use crate::gguf::{GgufHeader, MetadataKv, MetadataValue, TensorInfo};
 
         // Helper to make GGUF string
         fn ws(buf: &mut Vec<u8>, s: &str) {
@@ -214,5 +221,131 @@ mod tests {
         // Sizes are non-zero
         assert!(manifest.shards[0].size_bytes > 0);
         assert!(manifest.shards[1].size_bytes > 0);
+    }
+
+    // ── Phase 5 backward-compatibility (CBOR) ────────────────────────────
+
+    /// A CBOR manifest written by pre-Phase-5 code (no `snip_v2` keys
+    /// anywhere) must round-trip cleanly through `read_manifest`, with
+    /// both optional `snip_v2` fields resolved to `None`.
+    #[test]
+    fn cbor_old_manifest_decodes_into_new_struct() {
+        use serde::Serialize;
+
+        // Mirror of the pre-Phase-5 struct shape. Used only here, to
+        // produce bytes representative of an old on-disk manifest.
+        #[derive(Serialize)]
+        struct LegacyShard {
+            shard_index: u32,
+            cid: String,
+            layer_range: LayerRange,
+            includes_embedding: bool,
+            includes_output_head: bool,
+            size_bytes: u64,
+            blake3_hash: String,
+        }
+        #[derive(Serialize)]
+        struct LegacyManifest {
+            model_name: String,
+            model_hash: String,
+            architecture: String,
+            total_layers: u32,
+            quantization: String,
+            total_size_bytes: u64,
+            gguf_version: u32,
+            shards: Vec<LegacyShard>,
+        }
+
+        let legacy = LegacyManifest {
+            model_name: "tinyllama".into(),
+            model_hash: "a".repeat(64),
+            architecture: "llama".into(),
+            total_layers: 22,
+            quantization: "F16".into(),
+            total_size_bytes: 2_200_000_000,
+            gguf_version: 3,
+            shards: vec![LegacyShard {
+                shard_index: 0,
+                cid: "bafkrlegacy".into(),
+                layer_range: LayerRange { start: 0, end: 10 },
+                includes_embedding: true,
+                includes_output_head: false,
+                size_bytes: 215_000_000,
+                blake3_hash: "b".repeat(64),
+            }],
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_manifest.cbor");
+        let mut buf: Vec<u8> = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut buf).unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let loaded = read_manifest(&path).unwrap();
+        assert!(loaded.snip_v2.is_none());
+        assert_eq!(loaded.shards.len(), 1);
+        assert!(loaded.shards[0].snip_v2.is_none());
+        assert_eq!(loaded.model_name, "tinyllama");
+        assert_eq!(loaded.architecture, "llama");
+        assert_eq!(loaded.total_layers, 22);
+        assert_eq!(loaded.shards[0].cid, "bafkrlegacy");
+        assert_eq!(loaded.shards[0].size_bytes, 215_000_000);
+    }
+
+    /// A manifest produced today with `Some(SnipV2ObjectRef)` populated on
+    /// both struct and shard must survive a CBOR round trip via the
+    /// existing `write_manifest`/`read_manifest` path.
+    #[test]
+    fn cbor_round_trip_new_manifest_with_snip_field() {
+        use omni_types::phase5::{SnipV2Lifecycle, SnipV2ObjectId, SnipV2ObjectRef};
+
+        let hex =
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let id = SnipV2ObjectId::from_hex(hex).unwrap();
+
+        let manifest = ModelManifest {
+            model_name: "test-model".into(),
+            model_hash: "a".repeat(64),
+            architecture: "llama".into(),
+            total_layers: 4,
+            quantization: "F16".into(),
+            total_size_bytes: 1_000,
+            gguf_version: 3,
+            shards: vec![ShardDescriptor {
+                shard_index: 0,
+                cid: "bafknew".into(),
+                layer_range: LayerRange { start: 0, end: 3 },
+                includes_embedding: true,
+                includes_output_head: true,
+                size_bytes: 1_000,
+                blake3_hash: "b".repeat(64),
+                snip_v2: Some(SnipV2ObjectRef {
+                    merkle_root: id,
+                    lifecycle: SnipV2Lifecycle::Active,
+                    plaintext_size_bytes: Some(1_000),
+                }),
+            }],
+            snip_v2: Some(SnipV2ObjectRef {
+                merkle_root: id,
+                lifecycle: SnipV2Lifecycle::Active,
+                plaintext_size_bytes: None,
+            }),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest_with_snip.cbor");
+        write_manifest(&manifest, &path).unwrap();
+        let loaded = read_manifest(&path).unwrap();
+
+        assert!(loaded.snip_v2.is_some());
+        let top = loaded.snip_v2.as_ref().unwrap();
+        assert_eq!(top.merkle_root, id);
+        assert_eq!(top.lifecycle, SnipV2Lifecycle::Active);
+        assert_eq!(top.plaintext_size_bytes, None);
+
+        let shard_ref = loaded.shards[0].snip_v2.as_ref().unwrap();
+        assert_eq!(shard_ref.merkle_root, id);
+        assert_eq!(shard_ref.lifecycle, SnipV2Lifecycle::Active);
+        assert_eq!(shard_ref.plaintext_size_bytes, Some(1_000));
     }
 }

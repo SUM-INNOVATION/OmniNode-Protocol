@@ -70,7 +70,8 @@ The protocol is built on four pillars:
 | **Phase 2** — GGUF Model Sharding | `omni-store` | **Complete** |
 | **Phase 3** — FFI Bridge & Local Inference | `omni-bridge` | **Complete** |
 | **Phase 4** — Pipeline Parallelism | `omni-pipeline` | **Complete** |
-| Phase 5 — zkML & Tokenomics | `omni-zkml` | Planned |
+| **Phase 5 Stage 1** — SNIP V2 Storage Integration | `omni-types`, `omni-store` | **Complete** |
+| Phase 5 Stage 2+ — zkML proofs & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
 
@@ -643,7 +644,49 @@ LLM inference across the LAN with a Rich TUI displaying live token streaming.
 
 ---
 
-### Phase 5: zkML & SUM Chain Tokenomics
+### Phase 5 Stage 1: SNIP V2 Storage Integration — Complete
+
+**Crates:** `omni-types` (data), `omni-store` (CLI adapter) | **Depends on:** `sum-node` v0.4.0-rc3+
+
+Stage 1 of Phase 5 introduces a **storage substrate** for the future zkML / tokenomics work without touching any of the existing CIDv1 / BLAKE3 shard identity that Phases 2–4 depend on. SNIP V2 references are strictly **additive**: optional fields on the existing `ModelManifest` / `ShardDescriptor`, with `#[serde(default, skip_serializing_if = "Option::is_none")]` so every pre-Phase-5 JSON or CBOR manifest still deserializes unchanged.
+
+| Concern | Where | Notes |
+|---|---|---|
+| 32-byte BLAKE3 Merkle root | `omni_types::phase5::SnipV2ObjectId` | `0x`-prefixed lowercase hex (66 chars); custom serde as string; distinct from CIDv1 |
+| Lifecycle | `omni_types::phase5::SnipV2Lifecycle` | `Active` / `Pending` / `Abandoned`; serde for persistence, separate `FromStr` for stdout |
+| Object reference | `omni_types::phase5::SnipV2ObjectRef` | `{ merkle_root, lifecycle, plaintext_size_bytes? }` |
+| Inference data containers | `omni_types::phase5::{InferenceCommitment, InferenceAttestation}` | Carry session ID + model hash + manifest/proof Merkle roots + verifier address & signature (encoding deliberately opaque until SUM Chain spec is locked) |
+| Optional manifest fields | `ShardDescriptor::snip_v2`, `ModelManifest::snip_v2` | Both `Option<SnipV2ObjectRef>`; CIDv1 / BLAKE3 fields are untouched |
+| CLI adapter | `omni_store::snip_v2::{SnipV2Cli, SnipV2CliConfig, SnipV2Error}` | Wraps the documented `sum-node` CLI surface |
+
+**Documented `sum-node` commands wrapped:**
+
+```bash
+# Ingest a local file into SNIP V2 Public storage
+sum-node ingest-v2 <path> --visibility public
+# stdout:
+#   merkle_root: 0x<64 hex>
+#   lifecycle:   <Active|Pending|Abandoned>
+
+# Download a whole SNIP V2 object to a local path (no range reads in V2 today)
+sum-node download <merkle_root_hex> --output <path>
+```
+
+**Module layout:** the parser is a pure function (`parse_ingest_stdout`) with no I/O, separated from process invocation (`SnipV2Cli::ingest_public` / `download_public`). All 14 parser/config tests run without ever spawning `sum-node`, alongside 2 CBOR backward-compatibility tests in `omni-store::manifest` that decode a legacy mirror manifest into the new struct shape.
+
+**Typed errors (`SnipV2Error`, bridged into `StoreError::SnipV2`):** `CommandSpawn`, `NonZeroExit { code, stderr }`, `InputNotFound { path }`, `MissingMerkleRootLine`, `MissingLifecycleLine`, `InvalidMerkleRoot(SnipV2ParseError)`, `UnknownLifecycle(String)`, `UnsupportedLifecycle(SnipV2Lifecycle)`, `ParseFailure { reason }`, `DownloadFailed { code, stderr }`.
+
+**What Stage 1 deliberately does not do:**
+- No SNIP V1 — V1 is obsolete and unsupported.
+- No Private V2 — encryption keys, access lists, and `download_private` are out of scope.
+- No range reads — SNIP V2 does not expose them today; OmniNode's libp2p 64 MiB sliding window (Phase 2) is unchanged.
+- No `omni-store::build_manifest` change — `snip_v2` defaults to `None` and is populated by a later stage.
+- No PyO3 bridge surface, no `omni-pipeline` scheduler changes, no `omni-net` codec changes.
+- No chain client, no tokenomics, no proof backend — `omni-zkml` remains a stub for Stage 2+.
+
+---
+
+### Phase 5 Stage 2+: zkML & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
 
@@ -726,8 +769,9 @@ OmniNode-Protocol/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── node.rs                 # NodeId, PeerId wrappers, NodeCapability
-│   │       ├── model.rs                # ModelManifest, ShardDescriptor, LayerRange, GgmlType
+│   │       ├── model.rs                # ModelManifest, ShardDescriptor (+ optional snip_v2), LayerRange, GgmlType
 │   │       ├── pipeline.rs             # PipelineStage, PipelineSchedule, PipelineMessage, HiddenStateHeader, TensorDtype
+│   │       ├── phase5.rs               # SnipV2ObjectId, SnipV2Lifecycle, SnipV2ObjectRef, InferenceCommitment, InferenceAttestation
 │   │       ├── error.rs                # Unified error types (Network, Storage, GgufParse, ...)
 │   │       └── config.rs              # NetConfig, StoreConfig, PipelineConfig
 │   │
@@ -760,7 +804,8 @@ OmniNode-Protocol/
 │   │       ├── announce.rs             # Gossipsub shard announcements (bincode on omni/shard/v1)
 │   │       ├── fetch.rs                # FetchManager: windowed 64MB chunk fetching state machine
 │   │       ├── serve.rs                # Inbound request handler: mmap → slice → respond
-│   │       └── error.rs               # StoreError enum (crate-local)
+│   │       ├── snip_v2.rs              # Phase 5 Stage 1: sum-node ingest-v2/download CLI adapter + pure parser
+│   │       └── error.rs               # StoreError enum (crate-local; bridges SnipV2Error)
 │   │
 │   ├── omni-bridge/                    # Phase 3: Rust↔Python FFI (PyO3 0.23)
 │   │   ├── Cargo.toml                 # cdylib + rlib, depends on omni-store + omni-net + pyo3
