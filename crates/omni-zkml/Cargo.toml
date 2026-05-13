@@ -8,3 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 omni-types = { workspace = true }
+omni-store = { workspace = true }
+blake3     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

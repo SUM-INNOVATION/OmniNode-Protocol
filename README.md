@@ -72,7 +72,8 @@ The protocol is built on four pillars:
 | **Phase 4** — Pipeline Parallelism | `omni-pipeline` | **Complete** |
 | **Phase 5 Stage 1** — SNIP V2 types + CLI adapter | `omni-types`, `omni-store` | **Complete** |
 | **Phase 5 Stage 2** — SNIP-backed model artifacts (publish / restore) | `omni-store` | **Complete** |
-| Phase 5 Stage 3+ — zkML proofs & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
+| **Phase 5 Stage 3** — Proof artifact flow (publish + commitment) | `omni-zkml` | **Complete** |
+| Phase 5 Stage 4+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
 
@@ -720,7 +721,53 @@ Verification failures continue to surface through the existing `StoreError::Inte
 
 ---
 
-### Phase 5 Stage 3+: zkML & SUM Chain Tokenomics — Planned
+### Phase 5 Stage 3: Proof Artifact Flow — Complete
+
+**Crate:** `omni-zkml` | **Depends on:** Stage 1, Stage 2, `omni-store::SnipV2Adapter`
+
+Stage 3 lays down the byte-shovel substrate that future zkML stages will sit on top of: the `omni-zkml` crate is no longer a stub. It accepts opaque proof and response byte files from a caller, publishes them to SNIP V2 Public through the existing [`omni-store::SnipV2Adapter`](crates/omni-store/src/snip_v2.rs), computes the response BLAKE3 hash, and assembles an `InferenceCommitment` ready for a future stage to sign and submit. **No real proof generation, no verifier, no signing, no chain client** is wired in this stage — proof bytes are opaque and the actual zk machinery is the subject of Stage 4+.
+
+| Concern | Where | Notes |
+|---|---|---|
+| Proof byte file | `omni_zkml::ProofArtifact { local_path, snip_v2 }` | `snip_v2 == None` means "not yet published"; ingest skips when already populated |
+| Response byte file + hash | `omni_zkml::ResponseArtifact { local_path, snip_v2, blake3_hash }` | `blake3_hash` is bare lowercase 64-char hex matching `ModelManifest::model_hash` convention |
+| Publish flow | `omni_zkml::publish_proof_artifacts(&adapter, &mut response, &mut proof)` | Idempotent; per-case file-existence rules (see below) |
+| Commitment builder | `omni_zkml::build_commitment(session_id, &manifest, &response, &proof)` | Strict pre-conditions; returns `omni_types::phase5::InferenceCommitment` |
+| Local error type | `omni_zkml::ProofArtifactError` | Eight typed variants; SNIP and IO errors bridged via `#[from]` |
+
+**Idempotent file-existence rules.** The publish flow only touches the local filesystem for what it actually needs:
+
+| `response.snip_v2` | `response.blake3_hash` | Response file required? |
+|---|---|---|
+| `Some` | `Some` | No — response side fully skipped |
+| `Some` | `None` | Yes — hash must be computed from the bytes (own preflight) |
+| `None` | `Some` | Yes — needed for ingest |
+| `None` | `None` | Yes — needed for both |
+
+| `proof.snip_v2` | Proof file required? |
+|---|---|
+| `Some` | No — proof side fully skipped |
+| `None` | Yes — needed for ingest |
+
+A missing file always surfaces as the typed `ResponseFileNotFound { path }` or `ProofFileNotFound { path }`, never as a generic `Io` error. The hash-computation step on the response side has its **own** `is_file()` preflight, so a pre-supplied `snip_v2` with a missing local file still produces `ResponseFileNotFound` rather than leaking an I/O failure from `std::fs::read`.
+
+**Strict commitment construction.** `build_commitment` enforces four pre-conditions, each mapped to a typed error: non-empty `session_id` (`EmptySessionId`), `manifest.snip_v2.is_some()` (`ManifestLacksSnipRoot`), `response.blake3_hash.is_some()` (`ResponseLacksHash`), and `proof.snip_v2.is_some()` (`ProofLacksSnipRoot`). Note that `response.snip_v2` is **not** required — `InferenceCommitment` carries only the response hash, not a response SNIP root.
+
+**Restored-manifest annotation flow.** `OmniStore::restore_manifest_from_snip` returns a manifest with `snip_v2: None` at the top level (Stage 2's intentional contract — the canonical SNIP bytes never embed a self-pointer). To build a commitment from a restored manifest, callers explicitly annotate it with the root they restored from before calling `build_commitment`. This is exercised by [test `restored_manifest_requires_annotation_before_commitment`](crates/omni-zkml/src/artifact.rs).
+
+**Dependencies added** (all workspace-declared; no new versions): `omni-store`, `blake3`, `thiserror`, `tracing` to `omni-zkml/Cargo.toml`; `tempfile` as a dev-dep. The root `Cargo.toml` is unchanged.
+
+**What Stage 3 deliberately does not do:**
+- No actual zk proof generation — no `ezkl`, no `risc0`, no witness construction.
+- No proof verifier wiring; no circuit checks; no STARK/SNARK validation.
+- No signing — `InferenceAttestation` is not produced this stage.
+- No chain client, no on-chain submission, no tokenomics.
+- No edits to `omni-store`, `omni-types`, `omni-net`, `omni-pipeline`, `omni-bridge`, or `python/omninode`.
+- No SNIP V1, no Private V2, no range reads.
+
+---
+
+### Phase 5 Stage 4+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
 
@@ -868,10 +915,12 @@ OmniNode-Protocol/
 │   │       ├── transport.rs            # PipelineMessage bincode encode/decode helpers
 │   │       └── error.rs               # PipelineError enum (thiserror)
 │   │
-│   ├── omni-zkml/                      # Phase 5: Zero-knowledge proofs (stub)
-│   │   ├── Cargo.toml
+│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + (later) zk proofs
+│   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + thiserror + tracing
 │   │   └── src/
-│   │       └── lib.rs
+│   │       ├── lib.rs                 # module declarations and root re-exports
+│   │       ├── artifact.rs            # Stage 3: ProofArtifact, ResponseArtifact, publish_proof_artifacts, build_commitment
+│   │       └── error.rs               # ProofArtifactError enum (bridges SnipV2Error and io::Error via #[from])
 │   │
 │   └── omni-node/                      # Binary: CLI entry point
 │       ├── Cargo.toml
