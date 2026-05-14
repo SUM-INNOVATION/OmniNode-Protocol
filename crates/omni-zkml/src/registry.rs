@@ -13,9 +13,15 @@
 //! `submit_attestation_workflow` and `query_attestation_workflow`.
 //!
 //! Chain-client RPC failures propagate as `RegistryError::ChainClient(_)`
-//! and **leave the local record's status unchanged**. Only an explicit
-//! chain status of `Failed { reason }` or `Dropped { reason }` transitions
-//! the local record into those states.
+//! and **leave the local record's status unchanged**. Among chain-returned
+//! statuses, only `Failed { reason }` transitions the local record into a
+//! terminal local state. SUM Chain v1's `Unknown` (unrecognized tx hash —
+//! could be mempool eviction, never-seen tx, or chain lag) is
+//! observation-only: the record is left unchanged and a `tracing::warn!`
+//! fires. The local `Dropped` state is a **client-side synthetic**
+//! variant; it is never set from a chain-returned status. Stage 5.2's
+//! local staleness/timeout detection will be the only writer that
+//! transitions `Submitted → Dropped`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -153,8 +159,13 @@ pub enum LocalAttestationStatus {
     Finalized,
     /// Chain reported execution failure. **Terminal for this stage.**
     Failed { reason: String },
-    /// Chain dropped the submission. **Retryable** via `mark_submitted`
-    /// (which transitions `Dropped → Submitted`).
+    /// **Client-side synthetic state.** SUM Chain v1 does **not** report a
+    /// `Dropped` status — chain v1 surfaces unrecognized tx hashes as
+    /// [`crate::chain::AttestationStatus::Unknown`]. OmniNode marks a
+    /// record `Dropped` only via local staleness/timeout detection
+    /// (Stage 5.2, not part of Stage 5.1), never as a direct
+    /// translation of a chain-returned status. **Retryable** via
+    /// `mark_submitted` (which transitions `Dropped → Submitted`).
     Dropped { reason: Option<String> },
 }
 
@@ -390,6 +401,12 @@ impl AttestationRegistry {
     }
 
     /// `Submitted → Dropped`. Retryable via `mark_submitted`.
+    ///
+    /// Invoked by local staleness/timeout detection (Stage 5.2); never as
+    /// a direct translation of a chain-returned status. SUM Chain v1
+    /// surfaces unrecognized tx hashes as
+    /// [`crate::chain::AttestationStatus::Unknown`], which the query
+    /// workflow leaves observation-only.
     pub fn mark_dropped(
         &self,
         id: &AttestationId,
@@ -452,17 +469,34 @@ pub fn submit_attestation_workflow<C: ChainClient>(
 /// Query the chain client for the latest status of a record and update
 /// the registry accordingly.
 ///
+/// External signature stays keyed by [`AttestationId`] (the local record
+/// key). Internally the workflow extracts the stored
+/// [`SubmissionReceipt::tx_id`](crate::chain::SubmissionReceipt::tx_id)
+/// from the record and passes it to
+/// [`ChainClient::query_attestation_status`], which is keyed by `tx_id`
+/// to match SUM Chain v1's `sum_getInferenceAttestationStatus(tx_hash)`.
+///
 /// - Only `Submitted` and `Included` records are queried; others are
 ///   returned unchanged with no chain call.
+/// - **Receipt is required.** If a `Submitted` or `Included` record has
+///   `receipt: None` (only reachable via hand-edited / corrupted JSON
+///   since `mark_submitted` always sets the receipt),
+///   [`RegistryError::SubmittedRecordMissingReceipt`] is returned and
+///   the chain is **not** called. This makes registry-directory
+///   corruption visible rather than silently masked as a no-op.
 /// - Chain-client RPC failures propagate as
 ///   `Err(RegistryError::ChainClient(_))`; the record is **not** modified.
 /// - Chain status `Submitted` produces no local transition. `Included`
 ///   transitions `Submitted → Included` (no-op if already `Included`).
-///   `Finalized`, `Failed`, `Dropped` apply the corresponding `mark_*`
-///   method. If the chain reports `Dropped` for a record that is locally
-///   `Included`, the underlying `mark_dropped` returns
-///   `InvalidStatusTransition` because Stage 5's transition rules do not
-///   cover `Included → Dropped`; the caller observes the typed error.
+///   `Finalized` / `Failed` apply the corresponding `mark_*` method.
+/// - **`Unknown` is observation-only.** SUM Chain v1 returns `Unknown`
+///   for unrecognized tx hashes (could mean mempool eviction, never-seen
+///   tx, or chain lag). The workflow leaves the record unchanged and
+///   emits `tracing::warn!`. It does **not** mark the record `Failed`
+///   (that would be terminal and wrong) and does **not** auto-transition
+///   to local `Dropped` (that's a policy decision belonging to staleness
+///   detection in Stage 5.2). Callers that need timeout-based retry must
+///   implement it on top — Stage 5.2 will land that surface.
 pub fn query_attestation_workflow<C: ChainClient>(
     registry: &AttestationRegistry,
     client: &C,
@@ -476,8 +510,14 @@ pub fn query_attestation_workflow<C: ChainClient>(
         _ => return Ok(record),
     }
 
+    let tx_id = record
+        .receipt
+        .as_ref()
+        .map(|r| r.tx_id.as_str())
+        .ok_or(RegistryError::SubmittedRecordMissingReceipt { id: *id })?;
+
     let status = client
-        .query_attestation_status(id)
+        .query_attestation_status(tx_id)
         .map_err(RegistryError::ChainClient)?;
     match status {
         AttestationStatus::Submitted => Ok(record),
@@ -490,7 +530,15 @@ pub fn query_attestation_workflow<C: ChainClient>(
         }
         AttestationStatus::Finalized => registry.mark_finalized(id),
         AttestationStatus::Failed { reason } => registry.mark_failed(id, reason),
-        AttestationStatus::Dropped { reason } => registry.mark_dropped(id, reason),
+        AttestationStatus::Unknown => {
+            tracing::warn!(
+                id = %id,
+                tx_id = %tx_id,
+                "chain reports Unknown for a locally-known record; leaving \
+                 unchanged (staleness detection is Stage 5.2)"
+            );
+            Ok(record)
+        }
     }
 }
 
@@ -509,12 +557,16 @@ mod tests {
 
     // ── Fake chain client ────────────────────────────────────────────────
 
+    /// Stage 5.1: query path is keyed by `tx_id: String` (matching the
+    /// chain RPC), not by `AttestationId`. The registry workflow
+    /// extracts the tx_id from the local record's stored receipt and
+    /// passes it to `query_attestation_status`.
     struct FakeChainClient {
         submit_outcome: RefCell<std::result::Result<SubmissionReceipt, ChainClientError>>,
-        query_outcomes: RefCell<HashMap<AttestationId, AttestationStatus>>,
+        query_outcomes: RefCell<HashMap<String, AttestationStatus>>,
         default_query: RefCell<std::result::Result<AttestationStatus, ChainClientError>>,
         submit_calls: RefCell<Vec<InferenceAttestation>>,
-        query_calls: RefCell<Vec<AttestationId>>,
+        query_calls: RefCell<Vec<String>>,
     }
 
     impl FakeChainClient {
@@ -541,8 +593,8 @@ mod tests {
             }
         }
 
-        fn set_query_for(&self, id: AttestationId, status: AttestationStatus) {
-            self.query_outcomes.borrow_mut().insert(id, status);
+        fn set_query_for(&self, tx_id: String, status: AttestationStatus) {
+            self.query_outcomes.borrow_mut().insert(tx_id, status);
         }
 
         fn set_default_query_err(&self, msg: &str) {
@@ -572,10 +624,10 @@ mod tests {
 
         fn query_attestation_status(
             &self,
-            id: &AttestationId,
+            tx_id: &str,
         ) -> std::result::Result<AttestationStatus, ChainClientError> {
-            self.query_calls.borrow_mut().push(*id);
-            if let Some(s) = self.query_outcomes.borrow().get(id).cloned() {
+            self.query_calls.borrow_mut().push(tx_id.to_string());
+            if let Some(s) = self.query_outcomes.borrow().get(tx_id).cloned() {
                 return Ok(s);
             }
             self.default_query.borrow().clone()
@@ -1006,58 +1058,53 @@ mod tests {
         assert_eq!(client.submit_call_count(), 1);
     }
 
-    // ── Query workflow (5) ───────────────────────────────────────────────
+    // ── Query workflow (8) — Stage 5.1: keyed by receipt.tx_id ──────────
 
     fn setup_submitted(reg: &AttestationRegistry) -> AttestationRecord {
         let r = fresh_pending(reg);
         reg.mark_submitted(&r.id, dummy_receipt("tx-x")).unwrap()
     }
 
+    /// Helper: pull the tx_id out of a record that was just `mark_submitted`.
+    /// Panics if the record has no receipt (the helper is only used in the
+    /// happy-path tests).
+    fn receipt_tx_id(r: &AttestationRecord) -> String {
+        r.receipt.as_ref().expect("setup record must have a receipt").tx_id.clone()
+    }
+
     #[test]
     fn query_workflow_marks_included_on_chain_included() {
         let (_dir, reg) = open_temp_registry();
         let r = setup_submitted(&reg);
+        let tx_id = receipt_tx_id(&r);
         let client = FakeChainClient::ok_submit("unused");
-        client.set_query_for(r.id, AttestationStatus::Included);
+        client.set_query_for(tx_id.clone(), AttestationStatus::Included);
         let updated = query_attestation_workflow(&reg, &client, &r.id).unwrap();
         assert_eq!(updated.status, LocalAttestationStatus::Included);
+        // Stage 5.1: chain is queried by tx_id, not by AttestationId.
+        assert_eq!(client.query_calls.borrow().as_slice(), &[tx_id]);
     }
 
     #[test]
     fn query_workflow_marks_finalized_on_chain_finalized() {
         let (_dir, reg) = open_temp_registry();
         let r = setup_submitted(&reg);
+        let tx_id = receipt_tx_id(&r);
         let client = FakeChainClient::ok_submit("unused");
-        client.set_query_for(r.id, AttestationStatus::Finalized);
+        client.set_query_for(tx_id.clone(), AttestationStatus::Finalized);
         let updated = query_attestation_workflow(&reg, &client, &r.id).unwrap();
         assert_eq!(updated.status, LocalAttestationStatus::Finalized);
-    }
-
-    #[test]
-    fn query_workflow_marks_dropped_on_chain_dropped() {
-        let (_dir, reg) = open_temp_registry();
-        let r = setup_submitted(&reg);
-        let client = FakeChainClient::ok_submit("unused");
-        client.set_query_for(
-            r.id,
-            AttestationStatus::Dropped {
-                reason: Some("evicted".into()),
-            },
-        );
-        let updated = query_attestation_workflow(&reg, &client, &r.id).unwrap();
-        assert!(
-            matches!(updated.status, LocalAttestationStatus::Dropped { ref reason } if reason.as_deref() == Some("evicted"))
-        );
-        assert_eq!(updated.error_message.as_deref(), Some("evicted"));
+        assert_eq!(client.query_calls.borrow().as_slice(), &[tx_id]);
     }
 
     #[test]
     fn query_workflow_marks_failed_on_chain_failed_with_reason() {
         let (_dir, reg) = open_temp_registry();
         let r = setup_submitted(&reg);
+        let tx_id = receipt_tx_id(&r);
         let client = FakeChainClient::ok_submit("unused");
         client.set_query_for(
-            r.id,
+            tx_id.clone(),
             AttestationStatus::Failed {
                 reason: "execution reverted".into(),
             },
@@ -1065,15 +1112,19 @@ mod tests {
         let updated = query_attestation_workflow(&reg, &client, &r.id).unwrap();
         assert!(matches!(updated.status, LocalAttestationStatus::Failed { ref reason } if reason == "execution reverted"));
         assert_eq!(updated.error_message.as_deref(), Some("execution reverted"));
+        assert_eq!(client.query_calls.borrow().as_slice(), &[tx_id]);
     }
 
-    /// Pins the corrected behaviour: a chain-client error during query
-    /// does NOT alter the local record. Caller observes a typed
-    /// `ChainClient` error.
+    /// Pins the Stage 5 behaviour: a chain-client error during query does
+    /// NOT alter the local record. Caller observes a typed `ChainClient`
+    /// error. Stage 5.1 also pins that the workflow reached the chain call
+    /// after extracting tx_id (so the failure is on the chain side, not in
+    /// the receipt-lookup defense).
     #[test]
     fn query_workflow_returns_chain_error_and_leaves_record_unchanged() {
         let (_dir, reg) = open_temp_registry();
         let r = setup_submitted(&reg);
+        let tx_id = receipt_tx_id(&r);
         let client = FakeChainClient::ok_submit("unused");
         client.set_default_query_err("rpc gone");
         let err = query_attestation_workflow(&reg, &client, &r.id).unwrap_err();
@@ -1085,6 +1136,107 @@ mod tests {
         }
         let reloaded = reg.load(&r.id).unwrap();
         assert_eq!(reloaded.status, LocalAttestationStatus::Submitted);
+        // The chain WAS reached — proves the receipt was extracted before
+        // the RPC failure surfaced.
+        assert_eq!(client.query_calls.borrow().as_slice(), &[tx_id]);
+    }
+
+    // ── Stage 5.1 additions: Unknown + tx_id-keying + missing-receipt ────
+
+    /// Chain returns `Unknown` for a `Submitted` record. Stage 5.1
+    /// contract: leave the record unchanged. Do not mark `Failed`. Do not
+    /// auto-mark `Dropped` (staleness detection is Stage 5.2). Also pins
+    /// that the chain was queried by the receipt's tx_id.
+    #[test]
+    fn query_workflow_leaves_submitted_record_unchanged_on_chain_unknown() {
+        let (_dir, reg) = open_temp_registry();
+        let r = setup_submitted(&reg);
+        let tx_id = receipt_tx_id(&r);
+        let client = FakeChainClient::ok_submit("unused");
+        client.set_query_for(tx_id.clone(), AttestationStatus::Unknown);
+
+        let returned = query_attestation_workflow(&reg, &client, &r.id).unwrap();
+        assert_eq!(returned.status, LocalAttestationStatus::Submitted);
+        assert!(returned.error_message.is_none());
+
+        let reloaded = reg.load(&r.id).unwrap();
+        assert_eq!(reloaded.status, LocalAttestationStatus::Submitted);
+        assert_eq!(reloaded.receipt.as_ref().unwrap().tx_id, tx_id);
+        assert_eq!(client.query_calls.borrow().as_slice(), &[tx_id]);
+    }
+
+    /// Same contract from the `Included` source state — Stage 5.1 covers
+    /// the rare chain reorg case (chain forgot a previously-Included tx)
+    /// by leaving the record alone and surfacing via tracing.
+    #[test]
+    fn query_workflow_leaves_included_record_unchanged_on_chain_unknown() {
+        let (_dir, reg) = open_temp_registry();
+        let r = setup_submitted(&reg);
+        let tx_id = receipt_tx_id(&r);
+        reg.mark_included(&r.id).unwrap();
+        let client = FakeChainClient::ok_submit("unused");
+        client.set_query_for(tx_id.clone(), AttestationStatus::Unknown);
+
+        let returned = query_attestation_workflow(&reg, &client, &r.id).unwrap();
+        assert_eq!(returned.status, LocalAttestationStatus::Included);
+
+        let reloaded = reg.load(&r.id).unwrap();
+        assert_eq!(reloaded.status, LocalAttestationStatus::Included);
+        assert_eq!(client.query_calls.borrow().as_slice(), &[tx_id]);
+    }
+
+    /// Pins the Stage 5.1 contract: the chain is queried by the
+    /// receipt's tx_id, not by `AttestationId` or any encoding of it.
+    /// Failing this test indicates the workflow regressed to keying the
+    /// chain by registry-local identifiers.
+    #[test]
+    fn query_workflow_queries_by_receipt_tx_id() {
+        let (_dir, reg) = open_temp_registry();
+        let r = fresh_pending(&reg);
+        reg.mark_submitted(&r.id, dummy_receipt("tx-x")).unwrap();
+
+        let client = FakeChainClient::ok_submit("unused");
+        client.set_query_for("tx-x".to_string(), AttestationStatus::Finalized);
+
+        let updated = query_attestation_workflow(&reg, &client, &r.id).unwrap();
+        assert_eq!(updated.status, LocalAttestationStatus::Finalized);
+        assert_eq!(client.query_calls.borrow().as_slice(), &["tx-x".to_string()]);
+        // Negative cross-check: the hex of AttestationId is NOT what was
+        // sent to the chain.
+        assert_ne!(client.query_calls.borrow()[0], r.id.to_hex());
+    }
+
+    /// Defensive integrity test: a queryable record (`Submitted` or
+    /// `Included`) with `receipt: None` is corrupt — `mark_submitted`
+    /// always sets the receipt, so this state can only arise from
+    /// hand-edited / corrupted JSON in the registry directory. The
+    /// workflow surfaces a typed
+    /// `RegistryError::SubmittedRecordMissingReceipt` rather than silently
+    /// returning the record unchanged. The chain is NEVER reached.
+    #[test]
+    fn query_workflow_errors_when_submitted_record_has_no_receipt() {
+        let (_dir, reg) = open_temp_registry();
+        let r = fresh_pending(&reg);
+        reg.mark_submitted(&r.id, dummy_receipt("tx-orig")).unwrap();
+
+        // Hand-corrupt the on-disk record: status stays `Submitted` but
+        // receipt is cleared. Bypass the public API (which always sets
+        // the receipt) by re-serializing a mutated copy directly.
+        let mut record = reg.load(&r.id).unwrap();
+        record.receipt = None;
+        let bytes = serde_json::to_vec_pretty(&record).unwrap();
+        std::fs::write(reg.path_for(&r.id), bytes).unwrap();
+
+        let client = FakeChainClient::ok_submit("unused");
+        let err = query_attestation_workflow(&reg, &client, &r.id).unwrap_err();
+        match err {
+            RegistryError::SubmittedRecordMissingReceipt { id } => {
+                assert_eq!(id, r.id);
+            }
+            other => panic!("expected SubmittedRecordMissingReceipt, got {other:?}"),
+        }
+        // Defense fires BEFORE the chain is reached.
+        assert!(client.query_calls.borrow().is_empty());
     }
 
     // ── Atomic writes (1) ────────────────────────────────────────────────

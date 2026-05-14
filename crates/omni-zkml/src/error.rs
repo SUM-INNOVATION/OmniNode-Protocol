@@ -138,6 +138,15 @@ pub enum RegistryError {
         to: &'static str,
     },
 
+    /// Stage 5.1 integrity defense: a record in a queryable local status
+    /// (`Submitted` or `Included`) had `receipt: None`. `mark_submitted`
+    /// always sets the receipt, so this state can only arise from
+    /// hand-edited or corrupted JSON in the registry directory. Returned
+    /// by [`crate::registry::query_attestation_workflow`] instead of
+    /// silently no-op'ing, so the corruption is visible to the caller.
+    #[error("queryable record {id} is missing its submission receipt")]
+    SubmittedRecordMissingReceipt { id: crate::registry::AttestationId },
+
     #[error("chain client failure: {0}")]
     ChainClient(#[from] ChainClientError),
 }

@@ -838,20 +838,24 @@ InferenceAttestation
         └─► AttestationRegistry::insert  → AttestationRecord { Pending }
               └─► submit_attestation_workflow ─► ChainClient::submit_attestation
                                                   └─► mark_submitted(receipt) → Submitted
-                                                        └─► query_attestation_workflow ─► ChainClient::query_attestation_status
+                                                        └─► query_attestation_workflow ─► ChainClient::query_attestation_status(tx_id)
+                                                              ├─► Submitted     → no transition
                                                               ├─► Included      → mark_included
-                                                              ├─► Finalized     → mark_finalized  (terminal)
-                                                              ├─► Failed{reason}→ mark_failed      (terminal)
-                                                              └─► Dropped{...}  → mark_dropped    (retryable)
+                                                              ├─► Finalized     → mark_finalized   (terminal)
+                                                              ├─► Failed{reason}→ mark_failed       (terminal)
+                                                              └─► Unknown       → leave unchanged + tracing::warn!
+
+(client-side, Stage 5.2 — separate from query_attestation_workflow:)
+   staleness_policy + current_block ─► mark_stale_if_overdue ─► Submitted → Dropped (retryable)
 ```
 
 | Concern | Where | Notes |
 |---|---|---|
 | Deterministic record key | `omni_zkml::compute_attestation_id` | Domain `"omninode.attestation_record.v1"` + `session_id` + `verifier_address`. Signature / commitment body deliberately excluded — matches the chain proposal's de-duplication rule. |
 | Record identifier | `omni_zkml::AttestationId([u8; 32])` | Custom serde-as-lowercase-hex; filename is `<hex_id>.json` |
-| Chain trait (sync) | `omni_zkml::ChainClient { submit_attestation, query_attestation_status }` | No real RPC; opaque `String` ids and signature encodings; no `Pending` on the chain-returned status (chain only knows submitted-or-later) |
-| Chain-returned status | `omni_zkml::AttestationStatus { Submitted, Included, Finalized, Failed { reason }, Dropped { reason: Option<String> } }` | Matches the chain proposal's five-state lifecycle |
-| Local status | `omni_zkml::LocalAttestationStatus { Pending, Submitted, Included, Finalized, Failed { reason }, Dropped { reason: Option<String> } }` | `Pending` is local-only; `Dropped` is retryable; `Finalized` and `Failed` are terminal this stage |
+| Chain trait (sync) | `omni_zkml::ChainClient { submit_attestation, query_attestation_status(tx_id: &str) }` | No real RPC; opaque `String` ids and signature encodings; no `Pending` on the chain-returned status (chain only knows submitted-or-later). Query is keyed by `tx_id` (Stage 5.1) to match SUM Chain v1's `sum_getInferenceAttestationStatus(tx_hash)`. |
+| Chain-returned status | `omni_zkml::AttestationStatus { Submitted, Included, Finalized, Failed { reason }, Unknown }` | Stage 5.1: matches SUM Chain v1's five-state lifecycle. `Unknown` replaces the earlier provisional `Dropped` — chain v1 surfaces unrecognized tx hashes (eviction, never-seen, or lag) via `Unknown`. |
+| Local status | `omni_zkml::LocalAttestationStatus { Pending, Submitted, Included, Finalized, Failed { reason }, Dropped { reason: Option<String> } }` | `Pending` and `Dropped` are local-only. `Dropped` is a **client-side synthetic** state (chain never reports it); OmniNode sets it via staleness/timeout detection (Stage 5.2). The `Dropped → Submitted` retry hinge is unchanged. `Finalized` and `Failed` are terminal this stage. |
 | Storage | `omni_zkml::AttestationRegistry::open(root)` | One JSON file per record at `<root>/<hex_id>.json`; atomic `.tmp` + rename; `list()` sorted by id hex ascending |
 | Workflow seams | `submit_attestation_workflow`, `query_attestation_workflow` | Free functions generic over `ChainClient`; RPC failures propagate as `RegistryError::ChainClient(_)` and leave records unchanged |
 | Local errors | `omni_zkml::{ChainClientError, RegistryError, RegistryResult<T>}` | Three error domains, three result aliases (`Result` Stage 3, `AttestationResult` Stage 4, `RegistryResult` Stage 5) coexist explicitly |
@@ -865,7 +869,14 @@ InferenceAttestation
 - `submit_workflow_returns_chain_error_and_leaves_record_pending` — fake client returns `Err(ChainClientError::Other("rpc gone"))`; workflow returns `Err(RegistryError::ChainClient(...))`; loaded record is still `Pending`.
 - `query_workflow_returns_chain_error_and_leaves_record_unchanged` — same shape for the query path; record status unchanged after the failed RPC.
 
-Only an explicit chain status of `Failed { reason }` (from `Submitted` or `Included`) or `Dropped { reason }` (from `Submitted`) transitions a record into those local states. The retry hinge is `mark_submitted` accepting both `Pending` *and* `Dropped` as source states — `submit_workflow_resubmits_dropped_records` exercises the end-to-end Pending → Submitted → Dropped → Submitted path with a new receipt replacing the old one.
+Only an explicit chain status of `Failed { reason }` (from `Submitted` or `Included`) transitions a record into a terminal local state. The retry hinge is `mark_submitted` accepting both `Pending` *and* `Dropped` as source states — `submit_workflow_resubmits_dropped_records` exercises the end-to-end Pending → Submitted → Dropped → Submitted path with a new receipt replacing the old one (`Dropped` is set via local staleness detection, not via the chain).
+
+**Stage 5.1 — SUM Chain v1 alignment.** Stage 5.1 (in this section) realigned three pieces with the final chain spec:
+- `ChainClient::query_attestation_status` is keyed by `tx_id: &str`, matching `sum_getInferenceAttestationStatus(tx_hash)`. The workflow externally takes an `AttestationId` (registry key) and internally reads `record.receipt.tx_id` before calling the chain.
+- Chain-returned `AttestationStatus::Dropped` replaced with `Unknown` (no payload). The query workflow treats `Unknown` as observation-only: the record is left unchanged and `tracing::warn!` fires. `Unknown` is **never** translated to local `Failed` (terminal and wrong) or auto-translated to local `Dropped` (a staleness-policy decision belonging to Stage 5.2).
+- New defensive error `RegistryError::SubmittedRecordMissingReceipt { id }` is returned when a queryable local record (`Submitted` or `Included`) has `receipt: None` — only reachable via hand-edited / corrupted JSON, since `mark_submitted` always sets the receipt. The chain is **not** called in that path.
+
+**Stage 5.2 — staleness/timeout detection (planned, not in this stage).** Caller-supplied `submitted_threshold_blocks` (derived from live `chain_getChainParams`, no hardcoded `finality_depth`), an optional `submitted_at_block` field on `AttestationRecord`, and a `mark_stale_if_overdue` composite that transitions `Submitted → Dropped` when the threshold is exceeded.
 
 **Atomic writes.** Every persisted change goes through `serde_json::to_vec_pretty` → write to `<hex_id>.json.tmp` → `fs::rename` to `<hex_id>.json`. Crashes mid-write leave at most a `.tmp` file behind; the `.json` is either present-and-complete or absent. Stray `.tmp` files are silently ignored by `list()`.
 
@@ -879,7 +890,6 @@ Only an explicit chain status of `Failed { reason }` (from `Submitted` or `Inclu
 - No staking, slashing, or reward formulas.
 - No proof generation, no verifier wiring.
 - No real cryptographic signer — Stage 4's `Signer` trait surface is unchanged.
-- No `Included → Dropped` transition (chain reorgs of already-Included records would surface as `RegistryError::InvalidStatusTransition`; a future stage can extend the rules if reorg handling becomes first-class).
 - No SNIP V1, no Private V2, no range reads.
 - No edits to `omni-types`, `omni-store`, `omni-net`, `omni-pipeline`, `omni-bridge`, or `python/omninode`.
 
