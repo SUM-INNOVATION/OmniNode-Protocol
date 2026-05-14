@@ -76,7 +76,9 @@ The protocol is built on four pillars:
 | **Phase 5 Stage 4** — Local verifier attestation envelope (canonical bytes + digest + Signer trait) | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 5** — Chain client abstraction + offline attestation registry | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 6** — Chain wire fixture & signing-spec deliverables (Ed25519 + bs58 checksum address) | `omni-zkml` | **Complete** |
-| Phase 5 Stage 7+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
+| **Phase 5 Stage 7a** — SUM Chain adapter (read/query against JSON-RPC; typed stub for submit) | `omni-sumchain` | **Complete** |
+| Phase 5 Stage 7b — SUM Chain submit path (outer `SignedTransaction` construction) | `omni-sumchain` | Planned — gated on chain primitive vendoring strategy |
+| Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
 
@@ -969,7 +971,73 @@ The integration test at [crates/omni-zkml/tests/chain_attestation_vectors.rs](cr
 
 ---
 
-### Phase 5 Stage 7+: zkML Proof Generation & SUM Chain Tokenomics — Planned
+### Phase 5 Stage 7a: SUM Chain Adapter — Complete
+
+**Crate:** `omni-sumchain` (new) | **Depends on:** `omni-zkml` (Stage 5/6 surface), `ureq` (sync HTTP)
+
+Stage 7a ships the SUM Chain `ChainClient` adapter as a read/query implementation. Real RPC calls go through `ureq` against the local-mirror endpoint; default `cargo test` is fully hermetic via a `FakeJsonRpcTransport`. **The submit path is a typed stub** — `submit_attestation` returns a documented `ChainClientError::Other(_)` until Stage 7b lands the outer `SignedTransaction` construction. The chain-confirmed construction sequence is already documented in [crates/omni-sumchain/src/tx.rs](crates/omni-sumchain/src/tx.rs) so Stage 7b's diff localises to that one file.
+
+| Concern | Where | Notes |
+|---|---|---|
+| Adapter trait impl | `omni_sumchain::SumChainClient` | Generic over `T: JsonRpcTransport`; default `T = UreqTransport`. Implements `omni_zkml::ChainClient` (Stage 5). |
+| Transport seam | `omni_sumchain::JsonRpcTransport` trait; `UreqTransport` (production) and `FakeJsonRpcTransport` (clonable `Arc<Mutex<_>>` test fixture) | Default tests never spawn HTTP. |
+| Read RPCs implemented | `query_attestation_status(tx_id: &str)` (trait method), plus inherent `query_attestation_status_full`, `get_attestation`, `list_attestations`, `get_chain_params`, `get_block_height(BlockFinality)`, `get_nonce`, `omninode_is_active` | All six chain RPCs (status, attestation read, attestation list, chain params, block height, nonce) reachable. |
+| Read DTOs | `omni_sumchain::{InferenceAttestationStatusInfo, InferenceAttestationInfo, BlockHeightInfo, BlockFinality, ChainParamsInfo}` | Owned by this crate; hex fields are `0x`-prefixed (as chain emits). `ChainParamsInfo` carries `finality_depth`, `min_fee`, `chain_id`, and an `#[serde(default)] omninode_enabled_from_height: Option<u64>` for forward-compat with the pending chain follow-up patch. |
+| Status mapping | `omni_sumchain::map_status_info` | Strict matching against the five chain-confirmed lowercase variants: `"submitted" \| "included" \| "finalized" \| "failed" \| "unknown"`. Anything else is rejected (no silent fallback to `Unknown`). |
+| Submit path | `SumChainClient::submit_attestation` → typed `ChainClientError::Other("unimplemented in Stage 7a…")` | Delegated to `tx::build_and_submit_signed_transaction` so Stage 7b's body change is localised to one function. The Stage 5.1 workflow handles the error gracefully — record stays at `Pending`. |
+| `omninode_is_active` | Single body works pre-patch and post-patch | Pre-patch (`omninode_enabled_from_height` missing → parses as `None`): returns `Ok(false)`. Post-patch with `Some(h)` and `head >= h`: returns `Ok(true)`. No code change needed when the chain ships the follow-up patch. |
+
+**Stage 5.1 contract preserved (Stage 7a integration):** chain `Unknown` → local record unchanged + `tracing::warn!`. Chain-RPC failures → `RegistryError::ChainClient(_)` with the record at its prior state. Tx-id keying flows from `SubmissionReceipt::tx_id` (Stage 5.1) through `query_attestation_workflow` into `ChainClient::query_attestation_status(&str)`.
+
+**Operational setup for live tests** (documented in [crates/omni-sumchain/README.md](crates/omni-sumchain/README.md)):
+1. Operator generates an Ed25519 seed locally (never committed).
+2. Derives verifier address via Stage 6 `omni_zkml::signer_chain_address_base58`.
+3. Funds the address by editing the chain's `extra-alloc.json` before first `docker-compose up`.
+4. Live read tests: `OMNINODE_SUMCHAIN_RPC_URL=http://localhost:8545 cargo test -p omni-sumchain -- --ignored`.
+5. Live tests **auto-skip** when the env var is unset, so CI invocations exit 0.
+
+Documented local-mirror defaults: `http://localhost:8545`, `chain_id: 31337`, `min_fee: 1`. Final confirmation waits for the rebuilt local-mirror branch announcement.
+
+**Dependencies added** (one new workspace crate):
+- Root `Cargo.toml` `[workspace.dependencies]` — added `ureq = "2.10"` (sync HTTP). Used by `omni-sumchain` only. The `omni-sumchain` package additionally takes `omni-types`, `omni-zkml`, `serde`, `serde_json`, `thiserror`, `tracing` from the workspace (all pre-existing); `tempfile` as a `[dev-dependencies]` entry for the integration tests.
+
+**Tests** (default-on, hermetic):
+- `unit_status_mapping.rs` — 10 tests pinning every chain status variant + every negative case (uppercase rejected, unknown variant rejected, `failed` without `reason` errors, chain never returns `Dropped`).
+- `unit_dto.rs` — 12 tests pinning DTO deserialisation for every read RPC, including the pre-patch and post-patch shapes of `ChainParamsInfo`.
+- `unit_rpc_envelope.rs` — 16 tests asserting JSON-RPC method names and `params` arrays for every read helper, the `submit_attestation` typed stub, `omninode_is_active`'s three branches, and two Stage 5.1 integration tests (`Unknown` leaves the record unchanged; RPC errors propagate as `RegistryError::ChainClient(_)` without modifying state).
+- `stage6_wire_parity.rs` — 1 cross-crate smoke that consumes the committed Stage 6 chain-team deliverable fixture from `omni-zkml/tests/fixtures/` and asserts byte-equal output.
+- `live_local_mirror.rs` — 4 `#[ignore]`'d tests gated by `OMNINODE_SUMCHAIN_RPC_URL`; auto-skip when unset.
+
+**What Stage 7a deliberately does not do:**
+- No real submit RPC call (`submit_attestation` is a typed stub).
+- No outer `SignedTransaction` construction (Stage 7b).
+- No mainnet endpoint, no mainnet `chain_id`.
+- No edits to `omni-zkml`, `omni-types`, `omni-store`, `omni-net`, `omni-pipeline`, `omni-bridge`, or `python/omninode`.
+- No edits to `omni-zkml/Cargo.toml`.
+- No staleness/timeout detection (Stage 5.2).
+- No real cryptographic signing — Stage 4's `Signer` trait is unchanged.
+
+---
+
+### Phase 5 Stage 7b: SUM Chain Submit Path — Planned
+
+**Crate:** `omni-sumchain` (extends Stage 7a) | **Blocker:** chain primitive vendoring strategy (publishable crate vs. local mirror + parity fixture)
+
+The construction sequence is already documented in [crates/omni-sumchain/src/tx.rs](crates/omni-sumchain/src/tx.rs):
+
+1. Stage 6 inner pipeline → `InferenceAttestationDigest` + 64-byte `verifier_signature`.
+2. Wrap as `InferenceAttestationTxData`.
+3. Build `TransactionV2 { chain_id, from, fee, nonce, payload }` with `chain_id`/`min_fee` from `get_chain_params`, nonce from `get_nonce(&address)`, and `from = Address::from_public_key(verifier_pubkey)`.
+4. Outer canonical = raw bincode 1.3 of `TransactionV2` (no domain tag; replay protection is via `chain_id`).
+5. Outer hash = BLAKE3 of the canonical bytes. Outer signature = Ed25519 over the 32-byte hash (note: differs from Stage 6's inner pattern which signs raw `DOMAIN_TAG || bytes`).
+6. `SignedTransaction::new_v2(tx, outer_sig, verifier_pubkey)` → `.to_hex()` → **bare hex** → `sum_sendRawTransaction(hex)`.
+7. Response `tx_hash` is `0x`-prefixed and propagates to `SubmissionReceipt::tx_id` as-is.
+
+Stage 7b will replace `tx::build_and_submit_signed_transaction`'s body. The trait method `SumChainClient::submit_attestation` already delegates to it, so the diff localises.
+
+---
+
+### Phase 5 Stage 8+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
 
@@ -1131,6 +1199,23 @@ OmniNode-Protocol/
 │   │       ├── chain_attestation_vectors.rs        # Stage 6 integration test (verify-by-default, regen via OMNINODE_REGEN_VECTORS=1)
 │   │       └── fixtures/
 │   │           └── chain_attestation_vectors.json  # Stage 6 frozen deliverable: 3 chain attestation test vectors
+│   │
+│   ├── omni-sumchain/                  # Phase 5 Stage 7a: SUM Chain adapter (read/query; submit stub)
+│   │   ├── Cargo.toml                 # depends on omni-zkml + omni-types + ureq + serde + serde_json + thiserror + tracing
+│   │   ├── README.md                  # operational setup (extra-alloc.json funding, env vars, live-test guide)
+│   │   ├── src/
+│   │   │   ├── lib.rs                 # module decls + re-exports
+│   │   │   ├── client.rs              # SumChainClient<T: JsonRpcTransport>, ChainClient impl, inherent read helpers
+│   │   │   ├── dto.rs                 # InferenceAttestationStatusInfo, InferenceAttestationInfo, BlockHeightInfo, BlockFinality, ChainParamsInfo
+│   │   │   ├── rpc.rs                 # JsonRpcTransport trait, UreqTransport (sync HTTP), FakeJsonRpcTransport (Arc<Mutex<_>> test fixture)
+│   │   │   ├── status.rs              # map_status_info: chain status JSON -> omni_zkml::AttestationStatus (strict variant matching)
+│   │   │   └── tx.rs                  # Stage 7a typed-stub + Stage 7b 9-step construction-sequence rustdoc
+│   │   └── tests/
+│   │       ├── unit_status_mapping.rs # 10 hermetic status-mapping tests
+│   │       ├── unit_dto.rs            # 12 hermetic DTO parse tests (pre-patch + post-patch ChainParamsInfo, etc.)
+│   │       ├── unit_rpc_envelope.rs   # 16 hermetic RPC envelope + Stage 5.1 integration tests
+│   │       ├── stage6_wire_parity.rs  # 1 cross-crate smoke against the Stage 6 chain-team fixture
+│   │       └── live_local_mirror.rs   # 4 #[ignore]'d live tests, env-gated by OMNINODE_SUMCHAIN_RPC_URL
 │   │
 │   └── omni-node/                      # Binary: CLI entry point
 │       ├── Cargo.toml

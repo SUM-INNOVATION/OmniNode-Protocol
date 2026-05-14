@@ -7,6 +7,7 @@ members = [
     "crates/omni-bridge",
     "crates/omni-pipeline",
     "crates/omni-zkml",
+    "crates/omni-sumchain",
     "crates/omni-node",
 ]
 
@@ -73,6 +74,11 @@ multihash  = "0.19"
 tempfile   = "3.14"
 bs58       = "0.5"
 
+# ─── Phase 5 Stage 7a: SUM Chain adapter ─────────────────────────────────────
+# Sync HTTP client for JSON-RPC against the local SUM Chain mirror.
+# Used by `omni-sumchain` only.
+ureq       = "2.10"
+
 # ─── Phase 3: FFI ────────────────────────────────────────────────────────────
 
 pyo3 = { version = "0.23", features = ["extension-module"] }
@@ -112,3 +118,4 @@ omni-store    = { path = "crates/omni-store" }
 omni-bridge   = { path = "crates/omni-bridge" }
 omni-pipeline = { path = "crates/omni-pipeline" }
 omni-zkml     = { path = "crates/omni-zkml" }
+omni-sumchain = { path = "crates/omni-sumchain" }
