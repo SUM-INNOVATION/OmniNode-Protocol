@@ -79,6 +79,15 @@ bs58       = "0.5"
 # Used by `omni-sumchain` only.
 ureq       = "2.10"
 
+# ─── Phase 5 Stage 7b: SUM Chain vendored primitives ─────────────────────────
+# Pinned to chain rev `d83e45a4` (chain-team-confirmed for the v2 outer-tx
+# spec). Used by `omni-sumchain` only. The chain repo
+# (SUM-INNOVATION/sum-chain) is private; developers and CI need a GitHub
+# credential (PAT or SSH key) with read access. See
+# `crates/omni-sumchain/README.md` for setup notes.
+sumchain-primitives = { git = "https://github.com/SUM-INNOVATION/sum-chain", rev = "d83e45a4", package = "sumchain-primitives" }
+sumchain-crypto     = { git = "https://github.com/SUM-INNOVATION/sum-chain", rev = "d83e45a4", package = "sumchain-crypto" }
+
 # ─── Phase 3: FFI ────────────────────────────────────────────────────────────
 
 pyo3 = { version = "0.23", features = ["extension-module"] }

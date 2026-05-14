@@ -132,3 +132,128 @@ fn live_omninode_is_active_after_chain_patch() {
          landed on this mirror"
     );
 }
+
+// ── Stage 7b — live submit roundtrip ────────────────────────────────────────
+
+/// Submit a synthesized `InferenceAttestation` against the local
+/// mirror and poll `query_attestation_status` until the lifecycle
+/// progresses to `Included` or `Finalized`. Requires:
+///
+/// - `OMNINODE_SUMCHAIN_RPC_URL` — local-mirror endpoint.
+/// - `OMNINODE_VERIFIER_SEED_HEX` — 64 hex chars (32-byte Ed25519 seed)
+///   for a verifier whose derived address has been pre-funded via the
+///   chain's `extra-alloc.json` before `docker-compose up`.
+///
+/// Skipped (with a clear message) if either env var is unset, so
+/// `cargo test -- --ignored` without the env vars exits 0.
+#[test]
+#[ignore]
+fn live_submit_roundtrip() {
+    use std::time::{Duration, Instant};
+
+    use omni_sumchain::BlockFinality;
+    use omni_types::phase5::{
+        InferenceAttestation, InferenceCommitment, SnipV2ObjectId,
+    };
+    use omni_zkml::{AttestationStatus, ChainClient};
+
+    let Some(url) = live_url_or_skip("live_submit_roundtrip") else { return };
+    let seed_hex = match std::env::var("OMNINODE_VERIFIER_SEED_HEX") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            eprintln!(
+                "[skip] live_submit_roundtrip: OMNINODE_VERIFIER_SEED_HEX unset; \
+                 Stage 7b live submit needs a funded verifier seed"
+            );
+            return;
+        }
+    };
+
+    // Parse the seed: 64 hex chars → [u8; 32].
+    assert_eq!(
+        seed_hex.len(),
+        64,
+        "OMNINODE_VERIFIER_SEED_HEX must be exactly 64 hex chars (32 bytes)"
+    );
+    let mut seed = [0u8; 32];
+    for i in 0..32 {
+        let pair = &seed_hex[i * 2..i * 2 + 2];
+        seed[i] = u8::from_str_radix(pair, 16)
+            .expect("OMNINODE_VERIFIER_SEED_HEX must be valid lowercase hex");
+    }
+
+    let client = SumChainClient::new(url, seed);
+
+    // Guardrail: refuse to run against anything other than the local
+    // mirror's documented chain_id.
+    let params = client.get_chain_params().expect("chain_getChainParams must succeed");
+    assert_eq!(
+        params.chain_id, 31337,
+        "expected local-mirror chain_id 31337; got {}. Refusing to submit \
+         against a non-local-mirror endpoint",
+        params.chain_id
+    );
+
+    // Both activation gates must be live.
+    assert!(
+        client.omninode_is_active().expect("omninode_is_active"),
+        "omninode_is_active is false; chain follow-up patch may not have landed"
+    );
+    assert!(
+        client.v2_is_active().expect("v2_is_active"),
+        "v2_is_active is false; V2 envelope not yet activated"
+    );
+
+    // Synthesise a unique attestation per run so reruns don't collide
+    // with a prior on-chain entry under the same (session_id, verifier)
+    // de-dup key.
+    let address = omni_zkml::signer_chain_address_base58(&seed).unwrap();
+    let head = client
+        .get_block_height(BlockFinality::Latest)
+        .expect("chain_getBlockHeight")
+        .height;
+    let session_id = format!("omninode-stage7b-live-{}-{}", address, head);
+
+    let attestation = InferenceAttestation {
+        commitment: InferenceCommitment {
+            session_id,
+            model_hash: "a".repeat(64),
+            manifest_snip_root: SnipV2ObjectId::from_bytes([0x11u8; 32]),
+            response_hash: "b".repeat(64),
+            proof_snip_root: SnipV2ObjectId::from_bytes([0x22u8; 32]),
+        },
+        verifier_address: address.clone(),
+        verifier_signature: "live-stage7b-roundtrip".into(),
+    };
+
+    let receipt = client
+        .submit_attestation(&attestation)
+        .expect("live submit_attestation must succeed against a funded verifier");
+    eprintln!("[live] submitted; tx_hash = {}", receipt.tx_id);
+
+    // Poll status until Included / Finalized, with a generous timeout.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_status = None;
+    while Instant::now() < deadline {
+        let status = client
+            .query_attestation_status(&receipt.tx_id)
+            .expect("query_attestation_status must succeed");
+        match &status {
+            AttestationStatus::Included | AttestationStatus::Finalized => {
+                eprintln!("[live] tx reached {:?}", status);
+                return;
+            }
+            AttestationStatus::Failed { reason } => {
+                panic!("live submit progressed to Failed: {reason}");
+            }
+            other => {
+                last_status = Some(other.clone());
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+    panic!(
+        "live submit did not reach Included/Finalized within 30s; last seen \
+         status: {last_status:?}"
+    );
+}

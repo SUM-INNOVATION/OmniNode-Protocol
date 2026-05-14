@@ -1,10 +1,10 @@
-//! Phase 5 Stage 7a — `SumChainClient`, the SUM Chain adapter.
+//! Phase 5 Stage 7a + 7b — `SumChainClient`, the SUM Chain adapter.
 //!
 //! Implements the [`ChainClient`] trait from `omni-zkml` for SUM
-//! Chain's JSON-RPC surface. Stage 7a is **read/query only** — the
-//! `submit_attestation` trait method is a typed stub; Stage 7b will
-//! replace its body once chain confirms the outer-tx primitive
-//! dependency strategy.
+//! Chain's JSON-RPC surface. Both the read/query surface (Stage 7a)
+//! and the real `submit_attestation` flow (Stage 7b) are live; the
+//! submit path delegates to [`crate::tx::build_and_submit_signed_transaction`]
+//! against vendored chain primitives at rev `d83e45a4`.
 //!
 //! `SumChainClient` is generic over a [`JsonRpcTransport`] so default
 //! `cargo test` runs fully hermetically against
@@ -31,10 +31,12 @@ use crate::tx::build_and_submit_signed_transaction;
 /// [`JsonRpcTransport`] so tests can substitute
 /// [`crate::FakeJsonRpcTransport`] without touching the network.
 ///
-/// **Stage 7a is read/query only.** `submit_attestation` returns a
-/// typed `ChainClientError::Other(_)` describing exactly why; do not
-/// wire `SumChainClient` into a production submit workflow until
-/// Stage 7b lands.
+/// Implements both the Stage 7a read surface and the Stage 7b real
+/// submit flow. `submit_attestation` enforces four pre-flight gates
+/// (OmniNode activation, V2 activation, verifier-address consistency)
+/// before any state-mutating RPC, delegates the construction to
+/// [`crate::tx::build_and_submit_signed_transaction`], and posts the
+/// resulting `SignedTransaction` via `sum_sendRawTransaction`.
 pub struct SumChainClient<T: JsonRpcTransport = UreqTransport> {
     seed: [u8; 32],
     transport: T,
@@ -42,10 +44,12 @@ pub struct SumChainClient<T: JsonRpcTransport = UreqTransport> {
 
 impl SumChainClient<UreqTransport> {
     /// Build a production client with the default [`UreqTransport`]
-    /// against `rpc_url`. The `seed` is an Ed25519 seed used for
-    /// inner-digest signing (Stage 6) and, in Stage 7b, for outer-tx
-    /// signing. Stage 7a does not invoke either signing path — the
-    /// seed is held for forward-compat.
+    /// against `rpc_url`. The `seed` is the Ed25519 seed used for
+    /// Stage 6 inner-digest signing and Stage 7b outer-tx signing; it
+    /// must derive (via `omni_zkml::signer_chain_address_base58`) to
+    /// the same chain address embedded in the attestations submitted
+    /// through this client, or the verifier-address gate refuses to
+    /// submit.
     pub fn new(rpc_url: String, seed: [u8; 32]) -> Self {
         Self::with_transport(seed, UreqTransport::new(rpc_url))
     }
@@ -64,9 +68,10 @@ impl<T: JsonRpcTransport> SumChainClient<T> {
         &self.transport
     }
 
-    /// Borrow the configured Ed25519 seed (32 bytes). Not used by
-    /// Stage 7a but exposed for symmetry with Stage 7b's eventual
-    /// outer-signing path.
+    /// Borrow the configured Ed25519 seed (32 bytes). Used by Stage 7b
+    /// for both the Stage 6 inner-digest signing call
+    /// (`sign_chain_attestation_digest`) and the outer
+    /// `TransactionV2::signing_hash()` Ed25519 sign.
     pub fn seed(&self) -> &[u8; 32] {
         &self.seed
     }
@@ -163,9 +168,10 @@ impl<T: JsonRpcTransport> SumChainClient<T> {
     }
 
     /// `sum_getNonce(address)` — returns the next nonce the address
-    /// should use when submitting a transaction. Stage 7b will call
-    /// this from `build_signed_transaction`. Stage 7a exposes it for
-    /// operators / live tests to verify their funded account.
+    /// should use when submitting a transaction. Stage 7b's submit
+    /// flow calls this once, after all four pre-flight gates pass.
+    /// Exposed as an inherent helper so operators / live tests can
+    /// inspect the nonce of a funded account independently.
     pub fn get_nonce(
         &self,
         address: &str,
@@ -195,13 +201,51 @@ impl<T: JsonRpcTransport> SumChainClient<T> {
         &self,
     ) -> std::result::Result<bool, ChainClientError> {
         let params = self.get_chain_params()?;
-        match params.omninode_enabled_from_height {
+        self.activation_satisfied(params.omninode_enabled_from_height)
+    }
+
+    /// `Ok(true)` only when the chain has activated the V2 transaction
+    /// envelope AND has progressed past `v2_enabled_from_height`.
+    ///
+    /// Stage 7b addition. Symmetric to [`Self::omninode_is_active`].
+    /// `submit_attestation` requires **both** active before transmitting
+    /// — V2 activation gates the outer-tx format itself, OmniNode
+    /// activation gates the `TxPayload::InferenceAttestation` variant.
+    pub fn v2_is_active(
+        &self,
+    ) -> std::result::Result<bool, ChainClientError> {
+        let params = self.get_chain_params()?;
+        self.activation_satisfied(params.v2_enabled_from_height)
+    }
+
+    /// Stage 7b helper: given an `Option<u64>` activation height from
+    /// `chain_getChainParams`, return `Ok(true)` iff it is `Some(h)` and
+    /// the chain's latest head is `>= h`. `None` (field absent / pre-
+    /// patch) maps to `Ok(false)`; no `chain_getBlockHeight` call is
+    /// made in that case.
+    pub(crate) fn activation_satisfied(
+        &self,
+        activation: Option<u64>,
+    ) -> std::result::Result<bool, ChainClientError> {
+        match activation {
             None => Ok(false),
-            Some(activation) => {
+            Some(h) => {
                 let head = self.get_block_height(BlockFinality::Latest)?.height;
-                Ok(head >= activation)
+                Ok(head >= h)
             }
         }
+    }
+
+    /// Derive the chain address from `self.seed` using Stage 6's helper.
+    /// Stage 7b uses this both for the `sender == verifier` consistency
+    /// check inside `submit_attestation` and for the `sum_getNonce`
+    /// lookup parameter.
+    pub fn derived_verifier_address(
+        &self,
+    ) -> std::result::Result<String, ChainClientError> {
+        omni_zkml::signer_chain_address_base58(&self.seed).map_err(|e| {
+            ChainClientError::Other(format!("seed → address derivation failed: {e}"))
+        })
     }
 }
 
@@ -222,24 +266,24 @@ impl<T: JsonRpcTransport> ChainClient for SumChainClient<T> {
         map_status_info(info)
     }
 
-    /// Stage 7a — **typed stub.**
+    /// Stage 7b — real implementation.
     ///
-    /// Returns a `ChainClientError::Other(_)` with a clear message.
-    /// Stage 7b will replace this body with the 9-step outer
-    /// `SignedTransaction` construction once the chain primitive
-    /// vendoring strategy is confirmed.
+    /// Delegates the full submit flow to
+    /// [`crate::tx::build_and_submit_signed_transaction`], which
+    /// performs the four pre-flight gates (omninode-active,
+    /// v2-active, verifier-address consistency), runs the Stage 6
+    /// inner pipeline, converts to the vendored chain primitives,
+    /// outer-signs via `sumchain-crypto`, and posts to
+    /// `sum_sendRawTransaction`.
     ///
-    /// The Stage 5.1 workflow already handles this gracefully: the
-    /// error surfaces as `RegistryError::ChainClient(_)` and leaves
-    /// the local record at `Pending`.
+    /// Stage 5.1 contract preserved: any error returned here surfaces
+    /// through `submit_attestation_workflow` as
+    /// `RegistryError::ChainClient(_)` and leaves the local record at
+    /// its pre-submit state.
     fn submit_attestation(
         &self,
         attestation: &InferenceAttestation,
     ) -> std::result::Result<SubmissionReceipt, ChainClientError> {
-        // Delegated so Stage 7b's diff localises to `tx.rs`. The
-        // function currently returns the documented "unimplemented"
-        // typed error; see the module rustdoc on `tx` for the
-        // construction sequence that will replace it.
-        build_and_submit_signed_transaction(&self.seed, attestation)
+        build_and_submit_signed_transaction(self, attestation)
     }
 }

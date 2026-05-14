@@ -1,0 +1,323 @@
+//! Stage 7b — `submit_attestation` construction tests.
+//!
+//! Hermetic tests pinning the gate ordering, RPC call shapes, and
+//! Stage 5.1 contract preservation. All tests use
+//! [`FakeJsonRpcTransport`]; no live HTTP.
+//!
+//! The invariants under test:
+//!
+//! 1. `chain_getChainParams` is called at most once per submit (cached
+//!    across both activation gates).
+//! 2. `chain_getBlockHeight` is called at most once per submit (cached
+//!    across both activation gates).
+//! 3. `sum_getNonce` and `sum_sendRawTransaction` are reached **only**
+//!    when both activation gates pass AND the verifier-address gate
+//!    passes.
+//! 4. Submission hex passed to `sum_sendRawTransaction` is bare (no
+//!    `0x` prefix); the chain's response (a `0x`-prefixed tx hash) is
+//!    propagated unchanged into `SubmissionReceipt::tx_id`.
+//! 5. Stage 5.1 contracts hold: chain-RPC failures during submit
+//!    propagate as `RegistryError::ChainClient(_)` from the workflow
+//!    and leave records at their pre-submit state.
+
+use omni_sumchain::{FakeJsonRpcTransport, SumChainClient};
+use omni_types::phase5::{InferenceAttestation, InferenceCommitment, SnipV2ObjectId};
+use omni_zkml::{ChainClient, ChainClientError};
+
+// ── Fixtures ─────────────────────────────────────────────────────────────────
+
+const SEED: [u8; 32] = [42u8; 32];
+
+fn seed_address() -> String {
+    omni_zkml::signer_chain_address_base58(&SEED).unwrap()
+}
+
+fn attestation_for(verifier_address: &str) -> InferenceAttestation {
+    InferenceAttestation {
+        commitment: InferenceCommitment {
+            session_id: "sess-stage7b".into(),
+            model_hash: "0".repeat(64),
+            manifest_snip_root: SnipV2ObjectId::from_bytes([0x11u8; 32]),
+            response_hash: "1".repeat(64),
+            proof_snip_root: SnipV2ObjectId::from_bytes([0x22u8; 32]),
+        },
+        verifier_address: verifier_address.into(),
+        verifier_signature: "ignored-by-stage-7b".into(),
+    }
+}
+
+fn happy_fake() -> FakeJsonRpcTransport {
+    let fake = FakeJsonRpcTransport::new();
+    fake.set_response(
+        "chain_getChainParams",
+        Ok(serde_json::json!({
+            "finality_depth": 10,
+            "min_fee": 1,
+            "chain_id": 31337,
+            "omninode_enabled_from_height": 0,
+            "v2_enabled_from_height": 0,
+        })),
+    );
+    fake.set_response(
+        "chain_getBlockHeight",
+        Ok(serde_json::json!({"height": 5, "finality": "latest"})),
+    );
+    fake.set_response("sum_getNonce", Ok(serde_json::json!(0)));
+    fake.set_response(
+        "sum_sendRawTransaction",
+        Ok(serde_json::json!("0xdeadbeefcafebabe")),
+    );
+    fake
+}
+
+fn methods_called(fake: &FakeJsonRpcTransport) -> Vec<String> {
+    fake.calls().into_iter().map(|(m, _)| m).collect()
+}
+
+fn assert_no_state_mutating_rpcs(fake: &FakeJsonRpcTransport) {
+    let methods = methods_called(fake);
+    assert!(
+        !methods.contains(&"sum_getNonce".to_string()),
+        "expected no sum_getNonce call, got methods: {methods:?}"
+    );
+    assert!(
+        !methods.contains(&"sum_sendRawTransaction".to_string()),
+        "expected no sum_sendRawTransaction call, got methods: {methods:?}"
+    );
+}
+
+// ── Gate 1: OmniNode activation ─────────────────────────────────────────────
+
+#[test]
+fn submit_attestation_rejects_when_omninode_not_activated() {
+    let fake = happy_fake();
+    fake.set_response(
+        "chain_getChainParams",
+        Ok(serde_json::json!({
+            "finality_depth": 10,
+            "min_fee": 1,
+            "chain_id": 31337,
+            // omninode_enabled_from_height missing/null
+            "v2_enabled_from_height": 0,
+        })),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    let err = client.submit_attestation(&attestation_for(&seed_address())).unwrap_err();
+    let ChainClientError::Other(msg) = err;
+    assert!(msg.contains("OmniNode subprotocol not activated"), "got: {msg}");
+    assert_no_state_mutating_rpcs(&fake);
+}
+
+// ── Gate 2: V2 envelope activation ──────────────────────────────────────────
+
+#[test]
+fn submit_attestation_rejects_when_v2_not_activated() {
+    let fake = happy_fake();
+    fake.set_response(
+        "chain_getChainParams",
+        Ok(serde_json::json!({
+            "finality_depth": 10,
+            "min_fee": 1,
+            "chain_id": 31337,
+            "omninode_enabled_from_height": 0,
+            // v2_enabled_from_height missing/null
+        })),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    let err = client.submit_attestation(&attestation_for(&seed_address())).unwrap_err();
+    let ChainClientError::Other(msg) = err;
+    assert!(msg.contains("V2 transaction envelope not activated"), "got: {msg}");
+    assert_no_state_mutating_rpcs(&fake);
+}
+
+// ── Gate 1 height check ─────────────────────────────────────────────────────
+
+#[test]
+fn submit_attestation_rejects_when_head_below_activation() {
+    let fake = happy_fake();
+    fake.set_response(
+        "chain_getChainParams",
+        Ok(serde_json::json!({
+            "finality_depth": 10,
+            "min_fee": 1,
+            "chain_id": 31337,
+            "omninode_enabled_from_height": 100,
+            "v2_enabled_from_height": 0,
+        })),
+    );
+    fake.set_response(
+        "chain_getBlockHeight",
+        Ok(serde_json::json!({"height": 50, "finality": "latest"})),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    let err = client.submit_attestation(&attestation_for(&seed_address())).unwrap_err();
+    let ChainClientError::Other(msg) = err;
+    assert!(msg.contains("OmniNode subprotocol not activated"), "got: {msg}");
+    assert_no_state_mutating_rpcs(&fake);
+}
+
+// ── Gate 3: verifier address consistency ────────────────────────────────────
+
+#[test]
+fn submit_attestation_rejects_on_verifier_address_mismatch() {
+    let fake = happy_fake();
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    // Attestation built for a verifier address that does NOT match the
+    // address derived from SEED → mismatch → typed error.
+    let bogus = "SomeOtherChainAddressNotMatchingSeed".to_string();
+    let err = client.submit_attestation(&attestation_for(&bogus)).unwrap_err();
+    let ChainClientError::Other(msg) = err;
+    assert!(msg.contains("verifier address mismatch"), "got: {msg}");
+    // Gates 1+2 ran (RPCs called), but nonce/submit did NOT.
+    let methods = methods_called(&fake);
+    assert!(methods.contains(&"chain_getChainParams".to_string()));
+    assert_no_state_mutating_rpcs(&fake);
+}
+
+// ── Cached params + height ───────────────────────────────────────────────────
+
+#[test]
+fn submit_attestation_calls_chain_get_chain_params_exactly_once() {
+    let fake = happy_fake();
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    client.submit_attestation(&attestation_for(&seed_address())).unwrap();
+    let count = methods_called(&fake)
+        .iter()
+        .filter(|m| *m == "chain_getChainParams")
+        .count();
+    assert_eq!(
+        count, 1,
+        "chain_getChainParams must be cached across both activation gates"
+    );
+}
+
+#[test]
+fn submit_attestation_calls_chain_get_block_height_at_most_once() {
+    let fake = happy_fake();
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    client.submit_attestation(&attestation_for(&seed_address())).unwrap();
+    let count = methods_called(&fake)
+        .iter()
+        .filter(|m| *m == "chain_getBlockHeight")
+        .count();
+    assert!(
+        count <= 1,
+        "chain_getBlockHeight called {count} times; activation gates should \
+         share at most one call"
+    );
+}
+
+// ── Nonce + send shapes ──────────────────────────────────────────────────────
+
+#[test]
+fn submit_attestation_calls_sum_get_nonce_for_derived_address() {
+    let fake = happy_fake();
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    client.submit_attestation(&attestation_for(&seed_address())).unwrap();
+    let nonce_call = fake
+        .calls()
+        .into_iter()
+        .find(|(m, _)| m == "sum_getNonce")
+        .expect("sum_getNonce must be called on the happy path");
+    assert_eq!(
+        nonce_call.1,
+        serde_json::json!([seed_address()]),
+        "sum_getNonce param must be the derived (== claimed) verifier address"
+    );
+}
+
+#[test]
+fn submit_attestation_passes_bare_hex_to_send_raw_transaction() {
+    let fake = happy_fake();
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    client.submit_attestation(&attestation_for(&seed_address())).unwrap();
+    let send_call = fake
+        .calls()
+        .into_iter()
+        .find(|(m, _)| m == "sum_sendRawTransaction")
+        .expect("sum_sendRawTransaction must be called on the happy path");
+    let params = send_call.1;
+    let hex = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .expect("sum_sendRawTransaction params[0] must be a string");
+    assert!(
+        !hex.starts_with("0x") && !hex.starts_with("0X"),
+        "sum_sendRawTransaction input must be BARE hex; got prefix: {:?}",
+        &hex[..hex.len().min(4)]
+    );
+    assert!(
+        hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "submission must be lowercase hex digits"
+    );
+}
+
+// ── Receipt propagation ──────────────────────────────────────────────────────
+
+#[test]
+fn submit_attestation_propagates_send_raw_transaction_tx_hash() {
+    let fake = happy_fake();
+    fake.set_response(
+        "sum_sendRawTransaction",
+        Ok(serde_json::json!("0xabad1deafeed")),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    let receipt = client.submit_attestation(&attestation_for(&seed_address())).unwrap();
+    // The 0x-prefixed chain response is propagated verbatim.
+    assert_eq!(receipt.tx_id, "0xabad1deafeed");
+}
+
+// ── Error path: chain RPC failure during submit ──────────────────────────────
+
+#[test]
+fn submit_attestation_handles_send_raw_transaction_error_response() {
+    let fake = happy_fake();
+    fake.set_response(
+        "sum_sendRawTransaction",
+        Err(ChainClientError::Other("mempool full".into())),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    let err = client.submit_attestation(&attestation_for(&seed_address())).unwrap_err();
+    let ChainClientError::Other(msg) = err;
+    assert!(msg.contains("mempool full"), "expected upstream error in {msg:?}");
+}
+
+// ── Min-fee usage (Stage 7b plan §5 point 11) ────────────────────────────────
+
+#[test]
+fn submit_attestation_uses_min_fee_unconditionally() {
+    // The chain returns min_fee = 7. After submit, decode the bare hex
+    // from sum_sendRawTransaction back into a SignedTransaction and
+    // assert tx.fee == 7. This pins the chain-team contract that fee is
+    // sourced from params.min_fee with no override path in Stage 7b.
+    use sumchain_primitives::{SignedTransaction, TxInner};
+
+    let fake = happy_fake();
+    fake.set_response(
+        "chain_getChainParams",
+        Ok(serde_json::json!({
+            "finality_depth": 10,
+            "min_fee": 7,
+            "chain_id": 31337,
+            "omninode_enabled_from_height": 0,
+            "v2_enabled_from_height": 0,
+        })),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    client.submit_attestation(&attestation_for(&seed_address())).unwrap();
+
+    let send_call = fake
+        .calls()
+        .into_iter()
+        .find(|(m, _)| m == "sum_sendRawTransaction")
+        .expect("sum_sendRawTransaction must be called");
+    let hex = send_call.1.as_array().unwrap()[0].as_str().unwrap().to_string();
+    let signed = SignedTransaction::from_hex(&hex).expect("hex must decode");
+    match signed.inner {
+        TxInner::V2(tx) => {
+            assert_eq!(tx.fee, 7, "tx.fee must equal params.min_fee (widened u64 → u128)");
+        }
+        TxInner::Legacy(_) => panic!("expected V2 inner, got Legacy"),
+    }
+}

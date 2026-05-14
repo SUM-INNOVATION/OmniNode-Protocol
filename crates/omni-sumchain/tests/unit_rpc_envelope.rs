@@ -259,28 +259,64 @@ fn omninode_is_active_returns_false_when_head_below_activation() {
     assert!(!client.omninode_is_active().unwrap());
 }
 
-// ── submit_attestation stub ─────────────────────────────────────────────────
+// ── submit_attestation (Stage 7b — real implementation) ────────────────────
 
+/// Smoke: a fully-configured happy-path submit returns
+/// `Ok(SubmissionReceipt)` and the fake transport saw a
+/// `sum_sendRawTransaction` call. Detailed gate / RPC-shape pinning
+/// lives in `tests/unit_submit_construction.rs`.
 #[test]
-fn submit_attestation_returns_typed_unimplemented_error() {
+fn submit_attestation_happy_path_returns_receipt() {
     use omni_types::phase5::{InferenceAttestation, InferenceCommitment, SnipV2ObjectId};
 
-    let (_fake, client) = client_with_fake();
+    // Derive the verifier address from a known seed so the
+    // attestation's `verifier_address` matches (consistency gate).
+    let seed = [42u8; 32];
+    let verifier_address = omni_zkml::signer_chain_address_base58(&seed).unwrap();
+
+    let fake = omni_sumchain::FakeJsonRpcTransport::new();
+    fake.set_response(
+        "chain_getChainParams",
+        Ok(serde_json::json!({
+            "finality_depth": 10,
+            "min_fee": 1,
+            "chain_id": 31337,
+            "omninode_enabled_from_height": 0,
+            "v2_enabled_from_height": 0,
+        })),
+    );
+    fake.set_response(
+        "chain_getBlockHeight",
+        Ok(serde_json::json!({"height": 5, "finality": "latest"})),
+    );
+    fake.set_response("sum_getNonce", Ok(serde_json::json!(0)));
+    fake.set_response(
+        "sum_sendRawTransaction",
+        Ok(serde_json::json!("0xdeadbeefcafebabe")),
+    );
+    let client = omni_sumchain::SumChainClient::with_transport(seed, fake.clone());
+
     let attestation = InferenceAttestation {
         commitment: InferenceCommitment {
-            session_id: "sess".into(),
-            model_hash: "a".repeat(64),
-            manifest_snip_root: SnipV2ObjectId::from_bytes([0u8; 32]),
-            response_hash: "b".repeat(64),
-            proof_snip_root: SnipV2ObjectId::from_bytes([0u8; 32]),
+            session_id: "sess-happy".into(),
+            model_hash: "0".repeat(64),
+            manifest_snip_root: SnipV2ObjectId::from_bytes([0x11u8; 32]),
+            response_hash: "1".repeat(64),
+            proof_snip_root: SnipV2ObjectId::from_bytes([0x22u8; 32]),
         },
-        verifier_address: "addr".into(),
-        verifier_signature: "sig".into(),
+        verifier_address,
+        verifier_signature: "ignored-by-stage-7b".into(),
     };
-    let err = client.submit_attestation(&attestation).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("unimplemented"), "expected 'unimplemented' in {msg:?}");
-    assert!(msg.contains("Stage 7b"), "expected 'Stage 7b' in {msg:?}");
+
+    let receipt = client.submit_attestation(&attestation).unwrap();
+    assert_eq!(receipt.tx_id, "0xdeadbeefcafebabe");
+
+    let methods: Vec<String> = fake
+        .calls()
+        .iter()
+        .map(|(m, _)| m.clone())
+        .collect();
+    assert!(methods.contains(&"sum_sendRawTransaction".to_string()));
 }
 
 // ── Stage 5.1 integration: Unknown is non-terminal ──────────────────────────

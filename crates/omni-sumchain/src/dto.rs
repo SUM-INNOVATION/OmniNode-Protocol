@@ -100,15 +100,35 @@ impl BlockFinality {
 /// Response shape for `chain_getChainParams`.
 ///
 /// `finality_depth`, `min_fee`, and `chain_id` are required (chain has
-/// confirmed they are present at this RPC today). `omninode_enabled_from_height`
-/// is a planned follow-up patch — the `#[serde(default)]` keeps the
-/// parser working both before (`None`) and after (`Some(_)`) that
-/// patch lands.
+/// confirmed they are present at this RPC today).
+/// `omninode_enabled_from_height` is the chain follow-up patch's
+/// activation flag for the OmniNode subprotocol;
+/// `v2_enabled_from_height` (Stage 7b) is the symmetric activation flag
+/// for the chain's V2 transaction envelope itself. Both are
+/// `#[serde(default)]` to keep the parser forward-compat with mirrors
+/// that don't yet expose them.
+///
+/// Chain rev `d83e45a4`'s local mirror config emits both at value `0`,
+/// meaning activation from genesis.
+///
+/// Note on `min_fee` width: the chain's on-tx fee field is `Balance`
+/// (= `u128`); this DTO exposes it as `u64` because the JSON-RPC
+/// emission fits in 64 bits for any practical local-mirror fee. Stage 7b
+/// widens to `u128` via `as` cast at the `TransactionV2` construction
+/// site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainParamsInfo {
     pub finality_depth: u64,
     pub min_fee: u64,
     pub chain_id: u64,
+
     #[serde(default)]
     pub omninode_enabled_from_height: Option<u64>,
+
+    /// Stage 7b addition. Chain rev `d83e45a4` exposes this alongside
+    /// `omninode_enabled_from_height`. `submit_attestation` requires
+    /// **both** activation flags to be `Some(h)` with `head >= h` before
+    /// transmitting.
+    #[serde(default)]
+    pub v2_enabled_from_height: Option<u64>,
 }

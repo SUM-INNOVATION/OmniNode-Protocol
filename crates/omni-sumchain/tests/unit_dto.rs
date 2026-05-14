@@ -101,6 +101,42 @@ fn chain_params_info_local_mirror_defaults() {
     assert_eq!(parsed.min_fee, 1);
 }
 
+// ── Stage 7b additions: v2_enabled_from_height ──────────────────────
+
+/// Pin the Stage 7b-confirmed shape from the local mirror at chain rev
+/// `d83e45a4`: both activation fields present and set to `0`
+/// (activation-from-genesis).
+#[test]
+fn chain_params_info_parses_with_both_activation_fields() {
+    let json = r#"{
+        "finality_depth": 12,
+        "min_fee": 1,
+        "chain_id": 31337,
+        "omninode_enabled_from_height": 0,
+        "v2_enabled_from_height": 0
+    }"#;
+    let parsed: ChainParamsInfo = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.omninode_enabled_from_height, Some(0));
+    assert_eq!(parsed.v2_enabled_from_height, Some(0));
+}
+
+/// Asymmetric activation case (real branch): OmniNode subprotocol is
+/// active but the V2 envelope itself is gated. Stage 7b's
+/// `submit_attestation` must reject submission in this state.
+#[test]
+fn chain_params_info_parses_asymmetric_activation() {
+    let json = r#"{
+        "finality_depth": 12,
+        "min_fee": 1,
+        "chain_id": 31337,
+        "omninode_enabled_from_height": 0,
+        "v2_enabled_from_height": null
+    }"#;
+    let parsed: ChainParamsInfo = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.omninode_enabled_from_height, Some(0));
+    assert_eq!(parsed.v2_enabled_from_height, None);
+}
+
 // ── InferenceAttestationInfo ────────────────────────────────────────────────
 
 #[test]
