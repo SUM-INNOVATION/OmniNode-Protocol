@@ -1035,7 +1035,7 @@ Stage 7b ships the real `submit_attestation` implementation. The Stage 5 `ChainC
 | Fee | `params.min_fee as u128` | Unconditional; no override path in the trait. `Balance` is `u128` on the chain; the `u64` DTO field is widened at construction time. |
 | `ChainParamsInfo` gains | `#[serde(default)] v2_enabled_from_height: Option<u64>` | Symmetric to `omninode_enabled_from_height`; parser forward-compat with pre-patch mirrors that don't emit it. |
 | Submission encoding | `signed_tx.to_hex()` returns **bare hex** (no `0x` prefix); chain accepts either | Pinned by `submit_attestation_passes_bare_hex_to_send_raw_transaction`. |
-| Response propagation | Chain's `0x`-prefixed `tx_hash` flows verbatim into `SubmissionReceipt::tx_id` | Stage 5.1's registry sees the chain-canonical tx-id and can later query against it via `query_attestation_status`. |
+| Response propagation | Chain emits `{ "tx_hash": "0x..." }` (canonical) and the `0x`-prefixed `tx_hash` field flows verbatim into `SubmissionReceipt::tx_id` | Bare-string responses are also accepted as a backwards-compat fallback. Object form was confirmed via the Stage 7b live submit roundtrip against `sum-chain @ b586ff3f`. Stage 5.1's registry sees the chain-canonical tx-id and can later query against it via `query_attestation_status`. |
 
 **Stage 5.1 contract preserved.** A submit failure (gate, RPC, or signing) propagates from `submit_attestation_workflow` as `RegistryError::ChainClient(_)` and leaves the local record at `Pending` (or `Dropped` for retry). The workflow never terminalises a record on a single submit failure.
 
@@ -1242,7 +1242,7 @@ OmniNode-Protocol/
 │   │       ├── unit_status_mapping.rs        # 10 hermetic status-mapping tests
 │   │       ├── unit_dto.rs                   # 14 hermetic DTO parse tests (pre-patch + post-patch ChainParamsInfo including v2_enabled_from_height)
 │   │       ├── unit_rpc_envelope.rs          # 16 hermetic RPC envelope + Stage 5.1 integration tests (includes Stage 7b happy-path receipt)
-│   │       ├── unit_submit_construction.rs   # 11 hermetic Stage 7b construction tests (gate ordering, RPC caching, bare-hex shape, min-fee round-trip, error propagation)
+│   │       ├── unit_submit_construction.rs   # 15 hermetic Stage 7b construction tests (gate ordering, RPC caching, bare-hex shape, min-fee round-trip, {tx_hash} object + bare-string + 3 negative parse paths)
 │   │       ├── parity_vendored_primitives.rs # 3 byte-equivalence tests: Stage 6 local digest/tx-data + bs58 address derivation == vendored chain types under bincode 1.3
 │   │       ├── stage6_wire_parity.rs         # 1 cross-crate smoke against the Stage 6 chain-team fixture
 │   │       └── live_local_mirror.rs          # 5 #[ignore]'d live tests, env-gated by OMNINODE_SUMCHAIN_RPC_URL (+ OMNINODE_VERIFIER_SEED_HEX for Stage 7b submit roundtrip)

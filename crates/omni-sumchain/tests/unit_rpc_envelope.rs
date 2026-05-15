@@ -292,7 +292,8 @@ fn submit_attestation_happy_path_returns_receipt() {
     fake.set_response("sum_getNonce", Ok(serde_json::json!(0)));
     fake.set_response(
         "sum_sendRawTransaction",
-        Ok(serde_json::json!("0xdeadbeefcafebabe")),
+        // Canonical chain response shape (sum-chain @ b586ff3f).
+        Ok(serde_json::json!({ "tx_hash": "0xdeadbeefcafebabe" })),
     );
     let client = omni_sumchain::SumChainClient::with_transport(seed, fake.clone());
 

@@ -47,8 +47,11 @@
 //!     `SignedTransaction::new_v2(tx, sig_bytes, pubkey_bytes)`.
 //! 11. Submit: `signed_tx.to_hex()` produces **bare hex** (no `0x`
 //!     prefix); `sum_sendRawTransaction([hex])` accepts bare hex; the
-//!     response is a `0x`-prefixed tx hash and is propagated unchanged
-//!     into `SubmissionReceipt::tx_id`.
+//!     chain's canonical response is the object
+//!     `{ "tx_hash": "0x..." }` (confirmed against `sum-chain @
+//!     b586ff3f`). [`parse_send_raw_transaction_result`] also accepts
+//!     a bare string for backwards compatibility. The `0x`-prefixed
+//!     `tx_hash` is propagated unchanged into `SubmissionReceipt::tx_id`.
 
 use omni_types::phase5::InferenceAttestation;
 use omni_zkml::{ChainClientError, SubmissionReceipt};
@@ -185,17 +188,17 @@ pub(crate) fn build_and_submit_signed_transaction<T: JsonRpcTransport>(
 
     // ── Step 11: submit ──────────────────────────────────────────────
     // `to_hex()` returns BARE hex (no `0x` prefix); the chain accepts
-    // both. Chain response is a `0x`-prefixed tx hash, propagated
-    // unchanged into `SubmissionReceipt::tx_id`.
+    // both. The chain's canonical response shape is the object
+    // `{ "tx_hash": "0x..." }` (confirmed against
+    // `sum-chain @ b586ff3f` on the local mirror). A bare string is
+    // also accepted as a backwards-compat fallback for older mirrors
+    // and pre-Stage-7b hermetic fixtures. The `0x`-prefixed `tx_hash`
+    // is propagated unchanged into `SubmissionReceipt::tx_id`.
     let hex = signed.to_hex();
     let result = client
         .transport()
         .call("sum_sendRawTransaction", serde_json::json!([hex]))?;
-    let tx_hash = result.as_str().ok_or_else(|| {
-        ChainClientError::Other(format!(
-            "sum_sendRawTransaction returned non-string result: {result}"
-        ))
-    })?;
+    let tx_hash = parse_send_raw_transaction_result(&result)?;
 
     tracing::info!(
         tx_hash = %tx_hash,
@@ -205,7 +208,37 @@ pub(crate) fn build_and_submit_signed_transaction<T: JsonRpcTransport>(
     );
 
     Ok(SubmissionReceipt {
-        tx_id: tx_hash.to_string(),
+        tx_id: tx_hash,
         note: None,
     })
+}
+
+/// Parse the `sum_sendRawTransaction` JSON-RPC result into a tx-hash
+/// string. The chain's canonical response is
+/// `{ "tx_hash": "0x..." }`; a bare string is accepted for
+/// backwards compatibility with older mirrors / hermetic fixtures.
+/// Any other shape (including object missing the field, or with a
+/// non-string `tx_hash`) returns a typed `ChainClientError::Other`.
+fn parse_send_raw_transaction_result(
+    result: &serde_json::Value,
+) -> std::result::Result<String, ChainClientError> {
+    if let Some(s) = result.as_str() {
+        return Ok(s.to_string());
+    }
+    if let Some(obj) = result.as_object() {
+        let field = obj.get("tx_hash").ok_or_else(|| {
+            ChainClientError::Other(format!(
+                "sum_sendRawTransaction object response missing 'tx_hash' field: {result}"
+            ))
+        })?;
+        return field.as_str().map(str::to_string).ok_or_else(|| {
+            ChainClientError::Other(format!(
+                "sum_sendRawTransaction 'tx_hash' field is not a string: {result}"
+            ))
+        });
+    }
+    Err(ChainClientError::Other(format!(
+        "sum_sendRawTransaction returned unexpected result shape \
+         (expected `{{\"tx_hash\": \"0x…\"}}` or bare string): {result}"
+    )))
 }

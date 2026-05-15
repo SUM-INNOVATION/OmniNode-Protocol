@@ -65,7 +65,10 @@ fn happy_fake() -> FakeJsonRpcTransport {
     fake.set_response("sum_getNonce", Ok(serde_json::json!(0)));
     fake.set_response(
         "sum_sendRawTransaction",
-        Ok(serde_json::json!("0xdeadbeefcafebabe")),
+        // Canonical chain response shape (confirmed against the
+        // sum-chain @ b586ff3f local mirror): an object carrying the
+        // 0x-prefixed tx hash under the `tx_hash` field.
+        Ok(serde_json::json!({ "tx_hash": "0xdeadbeefcafebabe" })),
     );
     fake
 }
@@ -257,15 +260,88 @@ fn submit_attestation_passes_bare_hex_to_send_raw_transaction() {
 
 #[test]
 fn submit_attestation_propagates_send_raw_transaction_tx_hash() {
+    // Canonical chain response shape — `{ "tx_hash": "0x..." }`,
+    // confirmed against `sum-chain @ b586ff3f`. The 0x-prefixed
+    // `tx_hash` field flows verbatim into `SubmissionReceipt::tx_id`.
     let fake = happy_fake();
     fake.set_response(
         "sum_sendRawTransaction",
-        Ok(serde_json::json!("0xabad1deafeed")),
+        Ok(serde_json::json!({ "tx_hash": "0xabad1deafeed" })),
     );
     let client = SumChainClient::with_transport(SEED, fake.clone());
     let receipt = client.submit_attestation(&attestation_for(&seed_address())).unwrap();
-    // The 0x-prefixed chain response is propagated verbatim.
     assert_eq!(receipt.tx_id, "0xabad1deafeed");
+}
+
+/// Backwards-compatibility: older mirrors (and pre-Stage-7b hermetic
+/// fixtures) returned the tx hash as a bare string. The parser
+/// continues to accept that shape so a chain regression isn't a hard
+/// break on the client side.
+#[test]
+fn submit_attestation_accepts_bare_string_send_raw_transaction_response() {
+    let fake = happy_fake();
+    fake.set_response(
+        "sum_sendRawTransaction",
+        Ok(serde_json::json!("0xbarestringfallback")),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    let receipt = client.submit_attestation(&attestation_for(&seed_address())).unwrap();
+    assert_eq!(receipt.tx_id, "0xbarestringfallback");
+}
+
+/// Negative: an object response without the `tx_hash` field surfaces
+/// a typed `ChainClientError::Other` rather than silently producing a
+/// bogus receipt.
+#[test]
+fn submit_attestation_rejects_object_response_missing_tx_hash() {
+    let fake = happy_fake();
+    fake.set_response(
+        "sum_sendRawTransaction",
+        Ok(serde_json::json!({ "status": "ok" })),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    let err = client.submit_attestation(&attestation_for(&seed_address())).unwrap_err();
+    let ChainClientError::Other(msg) = err;
+    assert!(
+        msg.contains("missing 'tx_hash'"),
+        "expected missing-field error; got: {msg}"
+    );
+}
+
+/// Negative: an object response where `tx_hash` is not a string
+/// surfaces a typed `ChainClientError::Other`.
+#[test]
+fn submit_attestation_rejects_object_response_non_string_tx_hash() {
+    let fake = happy_fake();
+    fake.set_response(
+        "sum_sendRawTransaction",
+        Ok(serde_json::json!({ "tx_hash": 12345 })),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    let err = client.submit_attestation(&attestation_for(&seed_address())).unwrap_err();
+    let ChainClientError::Other(msg) = err;
+    assert!(
+        msg.contains("not a string"),
+        "expected non-string error; got: {msg}"
+    );
+}
+
+/// Negative: a non-string, non-object response (e.g. a number)
+/// surfaces a typed `ChainClientError::Other`.
+#[test]
+fn submit_attestation_rejects_unexpected_send_raw_transaction_shape() {
+    let fake = happy_fake();
+    fake.set_response(
+        "sum_sendRawTransaction",
+        Ok(serde_json::json!(42)),
+    );
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    let err = client.submit_attestation(&attestation_for(&seed_address())).unwrap_err();
+    let ChainClientError::Other(msg) = err;
+    assert!(
+        msg.contains("unexpected result shape"),
+        "expected unexpected-shape error; got: {msg}"
+    );
 }
 
 // ── Error path: chain RPC failure during submit ──────────────────────────────

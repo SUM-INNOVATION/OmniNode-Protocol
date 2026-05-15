@@ -169,8 +169,12 @@ The full chain-confirmed construction sequence is implemented in
     &PrivateKey)`; `SignedTransaction::new_v2(tx, sig_bytes,
     pubkey_bytes)`.
 11. **Submission** — `signed.to_hex()` produces **bare hex** (no `0x`
-    prefix); `sum_sendRawTransaction([hex])` accepts bare. Response
-    `tx_hash` is `0x`-prefixed and propagates verbatim into
+    prefix); `sum_sendRawTransaction([hex])` accepts bare. The chain's
+    canonical response shape is the object
+    `{ "tx_hash": "0x..." }` (confirmed against the
+    `snip-local-mirror-omninode @ b586ff3f` mirror); a bare string is
+    also accepted as a backwards-compat fallback. The `0x`-prefixed
+    `tx_hash` field propagates verbatim into
     `SubmissionReceipt::tx_id`.
 
 The runtime invariant is: `sum_getNonce` and `sum_sendRawTransaction`
