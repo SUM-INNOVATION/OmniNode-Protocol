@@ -878,7 +878,7 @@ Only an explicit chain status of `Failed { reason }` (from `Submitted` or `Inclu
 - Chain-returned `AttestationStatus::Dropped` replaced with `Unknown` (no payload). The query workflow treats `Unknown` as observation-only: the record is left unchanged and `tracing::warn!` fires. `Unknown` is **never** translated to local `Failed` (terminal and wrong) or auto-translated to local `Dropped` (a staleness-policy decision belonging to Stage 5.2).
 - New defensive error `RegistryError::SubmittedRecordMissingReceipt { id }` is returned when a queryable local record (`Submitted` or `Included`) has `receipt: None` — only reachable via hand-edited / corrupted JSON, since `mark_submitted` always sets the receipt. The chain is **not** called in that path.
 
-**Stage 5.2 — staleness/timeout detection (planned, not in this stage).** Caller-supplied `submitted_threshold_blocks` (derived from live `chain_getChainParams`, no hardcoded `finality_depth`), an optional `submitted_at_block` field on `AttestationRecord`, and a `mark_stale_if_overdue` composite that transitions `Submitted → Dropped` when the threshold is exceeded.
+**Stage 5.2 — staleness/timeout detection (Complete; see dedicated section below).** Optional `submitted_at_block: Option<u64>` on `AttestationRecord`, a `mark_submitted_with_block` registry method, and the `omni_zkml::staleness` module with `StalenessPolicy` + `is_record_stale` (pure) + `mark_stale_if_overdue` (workflow). Caller-supplied threshold; library hardcodes nothing.
 
 **Atomic writes.** Every persisted change goes through `serde_json::to_vec_pretty` → write to `<hex_id>.json.tmp` → `fs::rename` to `<hex_id>.json`. Crashes mid-write leave at most a `.tmp` file behind; the `.json` is either present-and-complete or absent. Stray `.tmp` files are silently ignored by `list()`.
 
@@ -894,6 +894,100 @@ Only an explicit chain status of `Failed { reason }` (from `Submitted` or `Inclu
 - No real cryptographic signer — Stage 4's `Signer` trait surface is unchanged.
 - No SNIP V1, no Private V2, no range reads.
 - No edits to `omni-types`, `omni-store`, `omni-net`, `omni-pipeline`, `omni-bridge`, or `python/omninode`.
+
+---
+
+### Phase 5 Stage 5.2: Client-Local Staleness / Retry Policy — Complete
+
+**Crate:** `omni-zkml` (extends Stage 5 / 5.1) | **Depends on:** `tracing`, `chrono` (already in the workspace)
+
+Stage 5.2 ships the **client-side staleness surface** that decides when a locally `Submitted` record has gone stale enough to mark `Dropped`. SUM Chain v1 does not return a chain-side `Dropped`; this module is the *only* writer that transitions `Submitted → Dropped`, and the resulting `Dropped` is a synthetic OmniNode decision. The retry hinge `Dropped → Submitted` is unchanged and continues to work via `mark_submitted` (legacy) or the new `mark_submitted_with_block`.
+
+| Concern | Where | Notes |
+|---|---|---|
+| Policy type | `omni_zkml::StalenessPolicy` | Single knob `submitted_threshold_blocks: u64`. `StalenessPolicy::new(0)` returns `StalenessPolicyError::ZeroThreshold` — zero means "stale on the first new block past submit", almost always a config bug. Library hardcodes no formula like `finality_depth * N`; deriving the threshold from `chain_getChainParams` is the caller's responsibility. |
+| Pure detection | `omni_zkml::is_record_stale(&record, current_block, &policy) -> bool` | True iff `status == Submitted` AND `submitted_at_block == Some(b)` AND `current_block.saturating_sub(b) > policy.submitted_threshold_blocks()`. Strict `>` (boundary `elapsed == threshold` is not stale). Pure: returns `false` (conservative) on height regression and on legacy records missing `submitted_at_block`; no logging. |
+| Workflow helper | `omni_zkml::mark_stale_if_overdue(&registry, &id, current_block, &policy) -> RegistryResult<AttestationRecord>` | Reads the record; if `Submitted` and stale, calls `mark_dropped(Some("stale: submitted_at_block=N, current_block=M, threshold_blocks=T"))`. Non-`Submitted` source states are silent no-ops (mirrors `query_attestation_workflow` precedent for irrelevant inputs). Height regression and `submitted_at_block == None` paths each emit a typed `tracing::warn!` with the record id and both heights in scope. |
+| Record extension | `AttestationRecord.submitted_at_block: Option<u64>` | New field. `#[serde(default, skip_serializing_if = "Option::is_none")]` — old Stage 5 / 5.1 / 7 records on disk deserialise cleanly to `None`. Pinned by `legacy_json_without_submitted_at_block_loads_with_none`. |
+| Registry method | `AttestationRegistry::mark_submitted_with_block(id, receipt, current_block)` | Sibling of `mark_submitted`; both go through a private `mark_submitted_inner(.., Option<u64>)`. Legacy `mark_submitted` keeps its signature and **clears** any prior `submitted_at_block` on retry (no stale height can persist across submissions). Pinned by `mark_submitted_clears_prior_submitted_at_block_on_retry`. |
+| Receipt + height preservation on Drop | `mark_stale_if_overdue` path | Preserves `receipt` and `submitted_at_block` on the dropped record so the next retry (`mark_submitted_with_block`) has the prior submission's traceability available. Pinned by `mark_stale_if_overdue_preserves_receipt_and_submitted_at_block_on_drop`. |
+| Block height source | Caller-driven; no `ChainClient` trait change | The trait is unchanged at Stage 5.2 (`submit_attestation` + `query_attestation_status`). Production callers fetch the chain head via their adapter's own helper (for SUM Chain: `SumChainClient::get_block_height(BlockFinality::Latest)`) and pass `current_block: u64` into Stage 5.2's surface. `Latest` is the natural finality token for staleness; `Finalized` lags inclusion and would over-aggressively declare records stale. |
+
+**State transitions — unchanged.** Stage 5.2 only adds a new caller path into the existing `mark_dropped`, which already rejects every non-`Submitted` source. `Pending`, `Included`, `Finalized`, `Failed`, and `Dropped` records remain immune from the staleness writer (silent no-op at the workflow layer).
+
+**Stale predicate, in code:**
+
+```rust
+let elapsed = current_block.saturating_sub(submitted_at_block);
+elapsed > policy.submitted_threshold_blocks()
+```
+
+`saturating_sub` is the height-regression safety. If a momentary chain re-org or a misconfigured caller passes a `current_block` below the stored `submitted_at_block`, the predicate evaluates to `false` (not stale) and a workflow-level `tracing::warn!` surfaces the regression for operator inspection. No typed error: callers iterating over many records shouldn't bail on one funny height.
+
+**Wiring example (operator loop, sketch):**
+
+The existing `submit_attestation_workflow` calls the legacy
+`mark_submitted` and therefore does **not** stamp `submitted_at_block`.
+Stage 5.2 callers that want staleness coverage bypass the workflow on
+the submit side and stitch insert + client submit + the block-aware
+mark together themselves:
+
+```rust
+use omni_sumchain::{BlockFinality, SumChainClient};
+use omni_zkml::{
+    mark_stale_if_overdue, AttestationRegistry, ChainClient,
+    LocalAttestationStatus, StalenessPolicy,
+};
+
+let policy = StalenessPolicy::new(params.finality_depth * 4)?; // caller's choice
+
+// Submit, stamping the chain head as `submitted_at_block`.
+let record = registry.insert(attestation.clone())?;
+if matches!(
+    record.status,
+    LocalAttestationStatus::Pending | LocalAttestationStatus::Dropped { .. },
+) {
+    let head = client.get_block_height(BlockFinality::Latest)?.height;
+    let receipt = client.submit_attestation(&attestation)?;
+    registry.mark_submitted_with_block(&record.id, receipt, head)?;
+}
+
+// Periodically: sweep Submitted records for staleness.
+let head_now = client.get_block_height(BlockFinality::Latest)?.height;
+for r in registry.list()? {
+    let _ = mark_stale_if_overdue(&registry, &r.id, head_now, &policy)?;
+}
+// Records transitioned to Dropped can be retried by repeating the
+// submit block above (insert is idempotent; `mark_submitted_with_block`
+// accepts `Dropped` as a source state and stamps the fresh height).
+```
+
+A convenience `submit_attestation_workflow_with_block` that folds the
+insert + submit + block-aware mark into a single helper (so the
+existing `submit_attestation_workflow` doesn't have to lose its
+signature) is **deliberately deferred** to a later stage — it would be
+sugar over the same surface, and operators wanting staleness today have
+the short stitched call site above.
+
+**Tests** (default-on, hermetic):
+
+- `staleness::tests` — 26 tests covering:
+    * Policy construction (`policy_new_rejects_zero_threshold`, `policy_new_accepts_one_and_above`).
+    * Pure `is_record_stale`: 5 negative-status branches (Pending / Included / Finalized / Failed / Dropped), 2 missing-or-zero-elapsed branches, the `>` boundary, true-when-strictly-past, height regression, and the minimum-threshold-one two-block-gap rule.
+    * `mark_stale_if_overdue`: drops the stale Submitted, embeds the block-context triple in the reason, preserves `receipt` + `submitted_at_block`, leaves not-stale records alone, walks through the legacy-record + height-regression `tracing::warn!` branches, and silently no-ops on every non-Submitted source state.
+    * End-to-end retry hinge — drop via staleness, retry via `mark_submitted_with_block` with a fresh height, sweep again at a fresh height that's within the new threshold.
+- `registry::tests` — +5 persistence tests: `mark_submitted_does_not_set_submitted_at_block`, `mark_submitted_with_block_persists_submitted_at_block`, `mark_submitted_with_block_from_dropped_retry_records_new_height`, `mark_submitted_clears_prior_submitted_at_block_on_retry`, `legacy_json_without_submitted_at_block_loads_with_none`.
+- Total: `cargo test -p omni-zkml` now reports 120 lib tests passing (up from 89 at the end of Stage 5.1 / Stage 6).
+
+**What Stage 5.2 deliberately does not do:**
+- No live polling loop, scheduler, retry backoff, or automatic resubmission. Stage 5.2 ships the *surface*; operators wire the cadence.
+- No `ChainClient` trait extension — the trait stays at `submit_attestation` + `query_attestation_status`. `SumChainClient::get_block_height` already exists as an inherent method.
+- No mainnet config, no hardcoded `chain_id`, no hardcoded finality depth, no hardcoded block-time assumptions.
+- No chain-side `Dropped` state introduced anywhere.
+- No edits to Stage 6 chain-wire code or fixtures.
+- No edits to Stage 7b transaction construction / signing / submit path; `omni-sumchain` is untouched.
+- No reward / slash / dispute logic, no async client changes.
+- No edits to `omni-types` / `omni-store` / `omni-net` / `omni-pipeline` / `omni-bridge` / `python/omninode`.
 
 ---
 
@@ -1212,15 +1306,16 @@ OmniNode-Protocol/
 │   │       ├── transport.rs            # PipelineMessage bincode encode/decode helpers
 │   │       └── error.rs               # PipelineError enum (thiserror)
 │   │
-│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope + chain abstraction & registry + chain wire (later: zk proofs)
+│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope + chain abstraction & registry + chain wire + staleness (later: zk proofs)
 │   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + bincode + bs58 + libp2p-identity + serde + serde_json + chrono + thiserror + tracing
 │   │   ├── src/
 │   │   │   ├── lib.rs                 # module declarations and root re-exports
 │   │   │   ├── artifact.rs            # Stage 3: ProofArtifact, ResponseArtifact, publish_proof_artifacts, build_commitment
 │   │   │   ├── attestation.rs         # Stage 4: DOMAIN_TAG, CommitmentPayload, CommitmentDigest (+ Stage-5 serde), Signer trait, build_attestation
 │   │   │   ├── chain.rs               # Stage 5: ChainClient trait, SubmissionReceipt, AttestationStatus
-│   │   │   ├── registry.rs            # Stage 5: AttestationId, AttestationRecord, LocalAttestationStatus, AttestationRegistry, submit/query workflows
+│   │   │   ├── registry.rs            # Stage 5/5.1/5.2: AttestationId, AttestationRecord (incl. submitted_at_block), LocalAttestationStatus, AttestationRegistry (incl. mark_submitted_with_block), submit/query workflows
 │   │   │   ├── chain_wire.rs          # Stage 6: InferenceAttestationDigest, InferenceAttestationTxData, canonical/signing bytes, Ed25519 signing, chain-address bs58, ChainAttestationVector
+│   │   │   ├── staleness.rs           # Stage 5.2: StalenessPolicy, StalenessPolicyError, is_record_stale (pure), mark_stale_if_overdue (workflow)
 │   │   │   └── error.rs               # ProofArtifactError + SignerError + AttestationError + ChainClientError + RegistryError + ChainWireError (with Result / AttestationResult / RegistryResult / ChainWireResult)
 │   │   └── tests/
 │   │       ├── chain_attestation_vectors.rs        # Stage 6 integration test (verify-by-default, regen via OMNINODE_REGEN_VECTORS=1)

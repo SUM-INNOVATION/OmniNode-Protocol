@@ -21,11 +21,16 @@
 //!   [`registry::query_attestation_workflow`] — composite operations that
 //!   drive the chain client + registry together. RPC failures propagate
 //!   as [`error::RegistryError::ChainClient`] and **leave records
-//!   unchanged**; only an explicit chain `Failed { reason }` or
-//!   `Dropped { reason }` transitions a record into those states.
+//!   unchanged**; only an explicit chain `Failed { reason }`
+//!   transitions a record into a terminal local state.
 //!
-//! No real cryptographic signing scheme, no real chain implementation,
-//! no proof verifier is wired in this crate yet. Those are Stage 6+.
+//! Stage 5.2 layers **client-local staleness / retry policy** on top
+//! via [`staleness`]. SUM Chain v1 has no chain-side `Dropped`; this
+//! module is the only writer that transitions `Submitted → Dropped`,
+//! based on a caller-constructed [`staleness::StalenessPolicy`] and a
+//! `current_block` height the caller fetches from the chain.
+//! Stage 7a/7b ship the real SUM Chain `ChainClient` adapter
+//! (`omni-sumchain`).
 
 pub mod artifact;
 pub mod attestation;
@@ -33,6 +38,7 @@ pub mod chain;
 pub mod chain_wire;
 pub mod error;
 pub mod registry;
+pub mod staleness;
 
 pub use artifact::{
     build_commitment, publish_proof_artifacts, ProofArtifact, ProofPublishReport, ResponseArtifact,
@@ -56,4 +62,7 @@ pub use registry::{
     compute_attestation_id, query_attestation_workflow, submit_attestation_workflow,
     AttestationId, AttestationRecord, AttestationRegistry, LocalAttestationStatus,
     ATTESTATION_ID_DOMAIN,
+};
+pub use staleness::{
+    is_record_stale, mark_stale_if_overdue, StalenessPolicy, StalenessPolicyError,
 };

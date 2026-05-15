@@ -19,9 +19,16 @@
 //! could be mempool eviction, never-seen tx, or chain lag) is
 //! observation-only: the record is left unchanged and a `tracing::warn!`
 //! fires. The local `Dropped` state is a **client-side synthetic**
-//! variant; it is never set from a chain-returned status. Stage 5.2's
-//! local staleness/timeout detection will be the only writer that
-//! transitions `Submitted → Dropped`.
+//! variant; it is never set from a chain-returned status.
+//!
+//! Stage 5.2 layers optional client-local staleness/retry policy on top
+//! via [`crate::staleness`]. Records optionally carry
+//! `submitted_at_block: Option<u64>` (set via [`AttestationRegistry::mark_submitted_with_block`]);
+//! [`crate::staleness::mark_stale_if_overdue`] is the single writer that
+//! transitions `Submitted → Dropped` based on a caller-constructed
+//! [`crate::staleness::StalenessPolicy`]. The retry hinge
+//! `Dropped → Submitted` is unchanged and continues to work via
+//! `mark_submitted` (legacy) or `mark_submitted_with_block`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -185,6 +192,15 @@ pub struct AttestationRecord {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+
+    /// Stage 5.2: chain-head block height at submit time, recorded only
+    /// when [`AttestationRegistry::mark_submitted_with_block`] is used.
+    /// `None` for records last marked via the legacy
+    /// [`AttestationRegistry::mark_submitted`] and for any record on disk
+    /// from before Stage 5.2. Consumed by
+    /// [`crate::staleness::is_record_stale`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at_block: Option<u64>,
 }
 
 // ── AttestationRegistry ──────────────────────────────────────────────────────
@@ -270,6 +286,7 @@ impl AttestationRegistry {
             status: LocalAttestationStatus::Pending,
             receipt: None,
             error_message: None,
+            submitted_at_block: None,
         };
         self.write_atomic(&record)?;
         tracing::info!(id = %record.id, "inserted attestation record");
@@ -326,17 +343,55 @@ impl AttestationRegistry {
     }
 
     /// `Pending → Submitted` or `Dropped → Submitted` (retry). Sets the
-    /// receipt; clears any prior `error_message`.
+    /// receipt; clears any prior `error_message`; **clears**
+    /// `submitted_at_block` (legacy path has no block-height context).
+    /// Stage 5.2 callers wanting staleness coverage should use
+    /// [`Self::mark_submitted_with_block`] instead.
     pub fn mark_submitted(
         &self,
         id: &AttestationId,
         receipt: SubmissionReceipt,
+    ) -> RegistryResult<AttestationRecord> {
+        self.mark_submitted_inner(id, receipt, None)
+    }
+
+    /// Stage 5.2 — `Pending → Submitted` or `Dropped → Submitted` (retry)
+    /// recording the chain-head block height at submit time.
+    ///
+    /// Identical to [`Self::mark_submitted`] except `submitted_at_block`
+    /// is set to `Some(current_block)`. Use this when the caller has
+    /// just read the chain head (e.g. `chain_getBlockHeight(latest)`)
+    /// so staleness detection has a reference point to compare
+    /// against. `Latest` is the natural finality token for staleness;
+    /// `Finalized` lags inclusion and would declare records stale more
+    /// aggressively than intended.
+    ///
+    /// If a record was previously submitted via the legacy
+    /// [`Self::mark_submitted`] and then dropped, retrying via this
+    /// method correctly stamps the new block height; conversely, a
+    /// retry via legacy [`Self::mark_submitted`] clears any prior
+    /// height (no stale value can persist across retries).
+    pub fn mark_submitted_with_block(
+        &self,
+        id: &AttestationId,
+        receipt: SubmissionReceipt,
+        current_block: u64,
+    ) -> RegistryResult<AttestationRecord> {
+        self.mark_submitted_inner(id, receipt, Some(current_block))
+    }
+
+    fn mark_submitted_inner(
+        &self,
+        id: &AttestationId,
+        receipt: SubmissionReceipt,
+        submitted_at_block: Option<u64>,
     ) -> RegistryResult<AttestationRecord> {
         self.update_record(id, |r| match &r.status {
             LocalAttestationStatus::Pending | LocalAttestationStatus::Dropped { .. } => {
                 r.status = LocalAttestationStatus::Submitted;
                 r.receipt = Some(receipt);
                 r.error_message = None;
+                r.submitted_at_block = submitted_at_block;
                 Ok(())
             }
             _ => Err(RegistryError::InvalidStatusTransition {
@@ -400,13 +455,17 @@ impl AttestationRegistry {
         })
     }
 
-    /// `Submitted → Dropped`. Retryable via `mark_submitted`.
+    /// `Submitted → Dropped`. Retryable via `mark_submitted` or
+    /// [`Self::mark_submitted_with_block`].
     ///
-    /// Invoked by local staleness/timeout detection (Stage 5.2); never as
-    /// a direct translation of a chain-returned status. SUM Chain v1
+    /// Invoked by local staleness/timeout detection
+    /// ([`crate::staleness::mark_stale_if_overdue`], Stage 5.2); never
+    /// as a direct translation of a chain-returned status. SUM Chain v1
     /// surfaces unrecognized tx hashes as
     /// [`crate::chain::AttestationStatus::Unknown`], which the query
-    /// workflow leaves observation-only.
+    /// workflow leaves observation-only. Preserves `receipt` and
+    /// `submitted_at_block` so the dropped record retains traceability
+    /// for a future resubmit.
     pub fn mark_dropped(
         &self,
         id: &AttestationId,
@@ -417,7 +476,13 @@ impl AttestationRegistry {
                 r.error_message = Some(
                     reason
                         .clone()
-                        .unwrap_or_else(|| "dropped by chain".to_string()),
+                        // SUM Chain v1 never returns a Dropped status;
+                        // every transition into Dropped is a local
+                        // OmniNode decision. The fallback message
+                        // reflects that — callers passing
+                        // `reason = None` are explicitly marking the
+                        // record dropped without a more specific cause.
+                        .unwrap_or_else(|| "dropped by local policy".to_string()),
                 );
                 r.status = LocalAttestationStatus::Dropped { reason };
                 Ok(())
@@ -495,8 +560,10 @@ pub fn submit_attestation_workflow<C: ChainClient>(
 ///   emits `tracing::warn!`. It does **not** mark the record `Failed`
 ///   (that would be terminal and wrong) and does **not** auto-transition
 ///   to local `Dropped` (that's a policy decision belonging to staleness
-///   detection in Stage 5.2). Callers that need timeout-based retry must
-///   implement it on top — Stage 5.2 will land that surface.
+///   detection in [`crate::staleness::mark_stale_if_overdue`]). Callers
+///   that want timeout-based retry construct a
+///   [`crate::staleness::StalenessPolicy`] and drive
+///   `mark_stale_if_overdue` at their own cadence.
 pub fn query_attestation_workflow<C: ChainClient>(
     registry: &AttestationRegistry,
     client: &C,
@@ -1259,5 +1326,105 @@ mod tests {
         }
         assert_eq!(json_count, 1);
         assert_eq!(tmp_count, 0);
+    }
+
+    // ── Stage 5.2 — submitted_at_block persistence (5) ───────────────────
+
+    /// Legacy path: `mark_submitted` (no block) must leave
+    /// `submitted_at_block = None`. Pins backwards-compat for callers
+    /// that don't have a block height handy.
+    #[test]
+    fn mark_submitted_does_not_set_submitted_at_block() {
+        let (_dir, reg) = open_temp_registry();
+        let r = fresh_pending(&reg);
+        let updated = reg.mark_submitted(&r.id, dummy_receipt("tx-1")).unwrap();
+        assert_eq!(updated.submitted_at_block, None);
+        let reloaded = reg.load(&r.id).unwrap();
+        assert_eq!(reloaded.submitted_at_block, None);
+    }
+
+    /// Stage 5.2 path: `mark_submitted_with_block` persists the height
+    /// across a `load` round-trip.
+    #[test]
+    fn mark_submitted_with_block_persists_submitted_at_block() {
+        let (_dir, reg) = open_temp_registry();
+        let r = fresh_pending(&reg);
+        let updated = reg
+            .mark_submitted_with_block(&r.id, dummy_receipt("tx-1"), 42)
+            .unwrap();
+        assert_eq!(updated.status, LocalAttestationStatus::Submitted);
+        assert_eq!(updated.submitted_at_block, Some(42));
+        let reloaded = reg.load(&r.id).unwrap();
+        assert_eq!(reloaded.submitted_at_block, Some(42));
+    }
+
+    /// Retry from Dropped via `mark_submitted_with_block` stamps the
+    /// new height and clears `error_message`. Pins the retry hinge.
+    #[test]
+    fn mark_submitted_with_block_from_dropped_retry_records_new_height() {
+        let (_dir, reg) = open_temp_registry();
+        let r = fresh_pending(&reg);
+        reg.mark_submitted_with_block(&r.id, dummy_receipt("tx-old"), 10)
+            .unwrap();
+        reg.mark_dropped(&r.id, Some("stale".into())).unwrap();
+
+        let retried = reg
+            .mark_submitted_with_block(&r.id, dummy_receipt("tx-new"), 100)
+            .unwrap();
+        assert_eq!(retried.status, LocalAttestationStatus::Submitted);
+        assert_eq!(retried.receipt.as_ref().unwrap().tx_id, "tx-new");
+        assert_eq!(retried.submitted_at_block, Some(100));
+        assert!(retried.error_message.is_none());
+    }
+
+    /// Mixed path: a record previously stamped via
+    /// `mark_submitted_with_block`, then dropped, then retried via the
+    /// **legacy** `mark_submitted` must have its `submitted_at_block`
+    /// cleared. Pins the no-stale-height-can-persist invariant
+    /// documented on `mark_submitted`.
+    #[test]
+    fn mark_submitted_clears_prior_submitted_at_block_on_retry() {
+        let (_dir, reg) = open_temp_registry();
+        let r = fresh_pending(&reg);
+        reg.mark_submitted_with_block(&r.id, dummy_receipt("tx-old"), 10)
+            .unwrap();
+        reg.mark_dropped(&r.id, Some("stale".into())).unwrap();
+
+        // Legacy retry: no block context.
+        let retried = reg.mark_submitted(&r.id, dummy_receipt("tx-new")).unwrap();
+        assert_eq!(retried.submitted_at_block, None);
+        let reloaded = reg.load(&r.id).unwrap();
+        assert_eq!(reloaded.submitted_at_block, None);
+    }
+
+    /// Forward-compat: a JSON record that pre-dates Stage 5.2 (no
+    /// `submitted_at_block` key in the JSON at all) must deserialise
+    /// to `Some(_)` on the field becoming `None`, and the rest of the
+    /// record must round-trip unchanged. We synthesise the pre-Stage-5.2
+    /// shape by writing a fresh record, parsing it, removing the
+    /// `submitted_at_block` key from the JSON, re-writing, then loading.
+    #[test]
+    fn legacy_json_without_submitted_at_block_loads_with_none() {
+        let (_dir, reg) = open_temp_registry();
+        let r = fresh_pending(&reg);
+        // Stamp the field so it's present on disk.
+        reg.mark_submitted_with_block(&r.id, dummy_receipt("tx-x"), 77)
+            .unwrap();
+
+        // Mutate on-disk JSON to drop the field, simulating a record
+        // written by Stage 5 / 5.1 / 7 before Stage 5.2 existed.
+        let path = reg.path_for(&r.id);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        let removed = obj.remove("submitted_at_block");
+        assert!(removed.is_some(), "field must have been present pre-mutation");
+        let mutated = serde_json::to_vec_pretty(&value).unwrap();
+        std::fs::write(&path, mutated).unwrap();
+
+        let reloaded = reg.load(&r.id).unwrap();
+        assert_eq!(reloaded.submitted_at_block, None);
+        assert_eq!(reloaded.status, LocalAttestationStatus::Submitted);
+        assert_eq!(reloaded.receipt.as_ref().unwrap().tx_id, "tx-x");
     }
 }
