@@ -419,3 +419,35 @@ fn workflow_with_sum_chain_client_returns_chain_client_error_on_rpc_failure() {
     let reloaded = reg.load(&id).unwrap();
     assert_eq!(reloaded.status, LocalAttestationStatus::Submitted);
 }
+
+// ── OrchestrationClient (Stage 5.3) ──────────────────────────────────────────
+
+/// Pins that `SumChainClient`'s `OrchestrationClient::get_latest_block_height`
+/// implementation delegates to `chain_getBlockHeight("latest")` and
+/// returns the `.height` field unchanged. Wires the omni-zkml
+/// Stage 5.3 surface through to the SUM Chain RPC layer.
+#[test]
+fn sum_chain_client_get_latest_block_height_calls_chain_get_block_height_latest() {
+    use omni_zkml::OrchestrationClient;
+
+    let (fake, client) = client_with_fake();
+    fake.set_response(
+        "chain_getBlockHeight",
+        Ok(serde_json::json!({"height": 88, "finality": "latest"})),
+    );
+
+    let height = client.get_latest_block_height().expect("height fetch must succeed");
+    assert_eq!(height, 88, "height field must propagate verbatim");
+
+    let calls = fake.calls();
+    let (method, params) = calls
+        .iter()
+        .find(|(m, _)| m == "chain_getBlockHeight")
+        .expect("chain_getBlockHeight must be called");
+    assert_eq!(method, "chain_getBlockHeight");
+    assert_eq!(
+        params,
+        &serde_json::json!(["latest"]),
+        "OrchestrationClient must request the `latest` finality token, not `finalized`"
+    );
+}

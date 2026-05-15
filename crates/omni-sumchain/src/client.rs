@@ -14,7 +14,7 @@
 
 use omni_types::phase5::InferenceAttestation;
 use omni_zkml::{
-    AttestationStatus, ChainClient, ChainClientError, SubmissionReceipt,
+    AttestationStatus, ChainClient, ChainClientError, OrchestrationClient, SubmissionReceipt,
 };
 
 use crate::dto::{
@@ -285,5 +285,19 @@ impl<T: JsonRpcTransport> ChainClient for SumChainClient<T> {
         attestation: &InferenceAttestation,
     ) -> std::result::Result<SubmissionReceipt, ChainClientError> {
         build_and_submit_signed_transaction(self, attestation)
+    }
+}
+
+// ── OrchestrationClient trait impl (Stage 5.3) ───────────────────────────────
+
+impl<T: JsonRpcTransport> OrchestrationClient for SumChainClient<T> {
+    /// Stage 5.3 surface for `omni-zkml::orchestration`. Delegates to
+    /// the existing inherent helper `get_block_height(BlockFinality::Latest)`
+    /// and returns the `.height` field. `Latest` (not `Finalized`) is
+    /// the natural finality token for staleness and block-aware
+    /// submit — `Finalized` lags inclusion and would over-aggressively
+    /// declare records stale.
+    fn get_latest_block_height(&self) -> std::result::Result<u64, ChainClientError> {
+        self.get_block_height(BlockFinality::Latest).map(|h| h.height)
     }
 }

@@ -924,13 +924,17 @@ elapsed > policy.submitted_threshold_blocks()
 
 `saturating_sub` is the height-regression safety. If a momentary chain re-org or a misconfigured caller passes a `current_block` below the stored `submitted_at_block`, the predicate evaluates to `false` (not stale) and a workflow-level `tracing::warn!` surfaces the regression for operator inspection. No typed error: callers iterating over many records shouldn't bail on one funny height.
 
-**Wiring example (operator loop, sketch):**
-
-The existing `submit_attestation_workflow` calls the legacy
-`mark_submitted` and therefore does **not** stamp `submitted_at_block`.
-Stage 5.2 callers that want staleness coverage bypass the workflow on
-the submit side and stitch insert + client submit + the block-aware
-mark together themselves:
+**Wiring example (operator loop, sketch).** Stage 5.3 lands the
+preferred entry points (`submit_attestation_workflow_with_block`,
+`poll_attestations_workflow`, `sweep_stale_attestations_workflow`,
+`retry_dropped_attestations_workflow`) — see the dedicated section
+below. The lower-level Stage 5.2 stitch is preserved here for
+reference and for callers that want finer-grained control: the
+existing `submit_attestation_workflow` calls the legacy
+`mark_submitted` and therefore does **not** stamp
+`submitted_at_block`, so Stage 5.2 callers that want staleness
+coverage either use the Stage 5.3 helper or hand-stitch insert +
+client submit + the block-aware mark themselves:
 
 ```rust
 use omni_sumchain::{BlockFinality, SumChainClient};
@@ -962,12 +966,13 @@ for r in registry.list()? {
 // accepts `Dropped` as a source state and stamps the fresh height).
 ```
 
-A convenience `submit_attestation_workflow_with_block` that folds the
-insert + submit + block-aware mark into a single helper (so the
-existing `submit_attestation_workflow` doesn't have to lose its
-signature) is **deliberately deferred** to a later stage — it would be
-sugar over the same surface, and operators wanting staleness today have
-the short stitched call site above.
+**Stage 5.3 now ships `submit_attestation_workflow_with_block`** and
+three companion sweep helpers — see the dedicated Stage 5.3 section
+below for the recommended operator entry points. New code should
+prefer those; the lower-level stitched sequence above remains useful
+for custom orchestration that needs to do something between the
+height fetch and the submit, or wants to interleave submits with other
+chain calls.
 
 **Tests** (default-on, hermetic):
 
@@ -1158,6 +1163,83 @@ Live tests self-skip cleanly when either env var is unset.
 
 ---
 
+### Phase 5 Stage 5.3: End-to-End Attestation Orchestration — Complete
+
+**Crate:** `omni-zkml` (new `orchestration` module) + `omni-sumchain` (additive `OrchestrationClient` impl on `SumChainClient`) | **Depends on:** Stage 5 / 5.1 / 5.2 / 6 / 7b — no new external dependencies
+
+Stage 5.3 stitches every prior Phase 5 surface into one operator-facing module. Submit, poll, sweep-for-staleness, and retry now compose through four free functions over a sibling trait `OrchestrationClient: ChainClient` that adds exactly **one** method — `get_latest_block_height` — so the chain protocol surface (`submit_attestation` + `query_attestation_status`) is unchanged. `SumChainClient` opts into Stage 5.3 via an additive trait impl that wraps the existing inherent `get_block_height(BlockFinality::Latest)` helper.
+
+| Helper | Source-state filter | Per-record RPC budget | Aggregate RPC budget | Where |
+|---|---|---|---|---|
+| `submit_attestation_workflow_with_block(reg, client, attestation)` | `Pending`, `Dropped` (insert is idempotent) | 1× height + 1× submit | (single record) | [crates/omni-zkml/src/orchestration.rs](crates/omni-zkml/src/orchestration.rs) |
+| `poll_attestations_workflow(reg, client)` | `Submitted`, `Included` | 1× query | 1× per queryable record | same |
+| `sweep_stale_attestations_workflow(reg, client, policy)` | `Submitted` | 0 (pure registry write on stale) | 1× height up-front, shared | same |
+| `retry_dropped_attestations_workflow(reg, client)` | `Dropped` | 1× height + 1× submit | 1× height + 1× submit **per** dropped record | same |
+
+**Invariants preserved (pinned by hermetic tests):**
+
+- **Stage 5 idempotency.** `submit_attestation_workflow_with_block` calls `insert(attestation.clone())` first. An existing `Submitted` / `Included` / `Finalized` / `Failed` record returns unchanged with **zero** chain calls. A byte-different attestation under the same `(session_id, verifier_address)` key surfaces as `RegistryError::ConflictingAttestation` without reaching the chain. Pinned by `submit_with_block_is_noop_for_already_submitted_record`.
+- **Height before submit.** The block-aware submit fetches `get_latest_block_height` **before** `submit_attestation`, so the `submitted_at_block` stamp reflects the chain head as seen by the chain at submit time, not after a multi-second submit RPC. Pinned by `submit_with_block_fetches_height_before_submit`.
+- **Stage 5.1 `Unknown` is observation-only.** `poll_attestations_workflow` delegates to `query_attestation_workflow` per record; chain-returned `Unknown` leaves records unchanged and the sweep continues. Pinned by `poll_preserves_unknown_as_observation_only`.
+- **Stage 5.1 RPC-failure containment in sweeps.** Per-record chain failures land as `Err` entries in the returned vec; the rest of the sweep continues; the failing record is **not** mutated. Pinned by `poll_per_record_failure_does_not_abort_sweep` and `retry_per_record_failure_does_not_abort_sweep`.
+- **Stage 5.2 single-`Dropped`-writer rule.** Only `sweep_stale_attestations_workflow` writes `Submitted → Dropped`, and only via `mark_stale_if_overdue` (which itself only fires when the caller-constructed `StalenessPolicy` says so). Non-`Submitted` records are skipped (omitted from the sweep result vec).
+- **Stage 5.2 height-source story.** The sibling trait exposes **only** `Latest` finality; `Finalized` lags inclusion and would over-aggressively declare records stale. Pinned by `sum_chain_client_get_latest_block_height_calls_chain_get_block_height_latest`.
+
+**Sweep error model.** All three sweeps return `Vec<(AttestationId, RegistryResult<AttestationRecord>)>`. Records skipped by the source-state filter are **omitted** entirely (Q3 from the plan: operators wanting the full registry call `registry.list()`). The staleness sweep's up-front `get_latest_block_height` is fail-fast — without a reference height there's nothing to compare against, so the whole sweep returns `Err(RegistryError::ChainClient(_))` and no records are touched. Pinned by `staleness_sweep_height_failure_aborts_without_touching_records`.
+
+**Wiring example (operator loop, replaces the lower-level Stage 5.2 sketch):**
+
+```rust
+use omni_sumchain::SumChainClient;
+use omni_zkml::{
+    poll_attestations_workflow, retry_dropped_attestations_workflow,
+    submit_attestation_workflow_with_block, sweep_stale_attestations_workflow,
+    AttestationRegistry, StalenessPolicy,
+};
+
+let policy = StalenessPolicy::new(params.finality_depth * 4)?; // caller's choice
+let registry = AttestationRegistry::open("./attestations".into())?;
+let client = SumChainClient::new(rpc_url, seed);
+
+// 1. Submit new attestations (idempotent; stamps `submitted_at_block`).
+let _ = submit_attestation_workflow_with_block(&registry, &client, attestation)?;
+
+// 2. Periodically: reconcile chain-side state into the registry.
+let polled = poll_attestations_workflow(&registry, &client)?;
+for (id, result) in polled {
+    if let Err(e) = result {
+        tracing::warn!(id = %id, error = ?e, "poll failed; will retry next tick");
+    }
+}
+
+// 3. Mark records that have aged out as locally Dropped.
+let _ = sweep_stale_attestations_workflow(&registry, &client, &policy)?;
+
+// 4. Resubmit anything in Dropped (fresh height stamp per retry).
+let _ = retry_dropped_attestations_workflow(&registry, &client)?;
+```
+
+The four helpers compose freely — there is no required order, no retry cap, no backoff, and no scheduler. Operators pick the cadence.
+
+**Tests** (default-on, hermetic):
+
+- `omni_zkml::orchestration::tests` — 22 tests, all using a single in-module `FakeOrchestrationClient` that implements both `ChainClient` and `OrchestrationClient` with configurable per-call outcomes and a `Call` log for ordering / count assertions. Covers: 6 submit-with-block tests, 5 poll tests, 5 staleness-sweep tests, 5 retry tests, and 1 end-to-end lifecycle test (submit → poll → simulated chain forget → poll(Unknown) → staleness drop → retry → poll(Finalized)).
+- `omni_sumchain::tests::unit_rpc_envelope` — +1 test confirming `SumChainClient::get_latest_block_height` posts `chain_getBlockHeight(["latest"])` and propagates the `height` field. Total in that file: 17 (was 16).
+- Aggregate: `cargo test -p omni-zkml` reports **142 lib tests** (up from 120) + 1 fixture integration + 1 doc-test. `cargo test -p omni-zkml -p omni-sumchain` is fully green; the five `#[ignore]`'d `omni-sumchain` live tests continue to self-skip cleanly.
+
+**What Stage 5.3 deliberately does not do:**
+- No live polling loop, scheduler, retry backoff, or max-attempts cap. Operators wire the cadence.
+- No `ChainClient` trait change. `OrchestrationClient` is a sibling that extends it via supertrait; existing Stage 5/5.1 fakes continue to compile untouched.
+- No async. Everything stays sync.
+- No new dependencies.
+- No mainnet config. No hardcoded chain id, finality depth, or block time.
+- No tokenomics / reward / slash / dispute logic — Stage 5.3 is glue, not policy.
+- No edits to Stage 6 chain-wire or Stage 7b submit construction.
+- No live-test additions; operator-level tests are hermetic against `FakeOrchestrationClient`.
+- No edits to `omni-types` / `omni-store` / `omni-net` / `omni-pipeline` / `omni-bridge` / `python/omninode`.
+
+---
+
 ### Phase 5 Stage 8+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
@@ -1306,7 +1388,7 @@ OmniNode-Protocol/
 │   │       ├── transport.rs            # PipelineMessage bincode encode/decode helpers
 │   │       └── error.rs               # PipelineError enum (thiserror)
 │   │
-│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope + chain abstraction & registry + chain wire + staleness (later: zk proofs)
+│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope + chain abstraction & registry + chain wire + staleness + orchestration (later: zk proofs)
 │   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + bincode + bs58 + libp2p-identity + serde + serde_json + chrono + thiserror + tracing
 │   │   ├── src/
 │   │   │   ├── lib.rs                 # module declarations and root re-exports
@@ -1316,6 +1398,7 @@ OmniNode-Protocol/
 │   │   │   ├── registry.rs            # Stage 5/5.1/5.2: AttestationId, AttestationRecord (incl. submitted_at_block), LocalAttestationStatus, AttestationRegistry (incl. mark_submitted_with_block), submit/query workflows
 │   │   │   ├── chain_wire.rs          # Stage 6: InferenceAttestationDigest, InferenceAttestationTxData, canonical/signing bytes, Ed25519 signing, chain-address bs58, ChainAttestationVector
 │   │   │   ├── staleness.rs           # Stage 5.2: StalenessPolicy, StalenessPolicyError, is_record_stale (pure), mark_stale_if_overdue (workflow)
+│   │   │   ├── orchestration.rs       # Stage 5.3: OrchestrationClient trait + submit_attestation_workflow_with_block + poll_attestations_workflow + sweep_stale_attestations_workflow + retry_dropped_attestations_workflow
 │   │   │   └── error.rs               # ProofArtifactError + SignerError + AttestationError + ChainClientError + RegistryError + ChainWireError (with Result / AttestationResult / RegistryResult / ChainWireResult)
 │   │   └── tests/
 │   │       ├── chain_attestation_vectors.rs        # Stage 6 integration test (verify-by-default, regen via OMNINODE_REGEN_VECTORS=1)
@@ -1327,7 +1410,7 @@ OmniNode-Protocol/
 │   │   ├── README.md                  # operational setup (extra-alloc.json funding, env vars, live-test guide, Stage 7b submission flow)
 │   │   ├── src/
 │   │   │   ├── lib.rs                 # module decls + re-exports
-│   │   │   ├── client.rs              # SumChainClient<T: JsonRpcTransport>, ChainClient impl, inherent read helpers, v2_is_active, derived_verifier_address
+│   │   │   ├── client.rs              # SumChainClient<T: JsonRpcTransport>, ChainClient + OrchestrationClient impls, inherent read helpers, v2_is_active, derived_verifier_address
 │   │   │   ├── dto.rs                 # InferenceAttestationStatusInfo, InferenceAttestationInfo, BlockHeightInfo, BlockFinality, ChainParamsInfo (omninode_enabled_from_height + v2_enabled_from_height)
 │   │   │   ├── rpc.rs                 # JsonRpcTransport trait, UreqTransport (sync HTTP), FakeJsonRpcTransport (Arc<Mutex<_>> test fixture)
 │   │   │   ├── status.rs              # map_status_info: chain status JSON -> omni_zkml::AttestationStatus (strict variant matching)
