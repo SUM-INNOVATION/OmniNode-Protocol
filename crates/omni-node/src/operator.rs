@@ -145,6 +145,15 @@ pub(crate) enum OperatorError {
     #[error("RPC URL unset: pass --rpc-url or set OMNINODE_SUMCHAIN_RPC_URL")]
     RpcUrlMissing,
 
+    #[error("--expect-chain-id is required when --rpc-url is given")]
+    ExpectChainIdRequiredWithRpc,
+
+    #[error("chain has no attestation for (session_id={session_id}, verifier_address={verifier_address})")]
+    AttestationNotFound {
+        session_id: String,
+        verifier_address: String,
+    },
+
     #[error("internal invariant violated: {0}")]
     Internal(String),
 
@@ -310,6 +319,10 @@ enum OperatorCmd {
     Smoke(SmokeArgs),
     /// Periodic poll → stale-sweep → (retry) lifecycle loop.
     Loop(LoopArgs),
+    /// Read-only: validate seed ↔ attestation-json (+ optional chain snapshot).
+    Preflight(PreflightArgs),
+    /// Read-only: query the chain's attestation by (session_id, verifier_address).
+    Query(QueryArgs),
 }
 
 #[derive(Args)]
@@ -343,6 +356,30 @@ struct SmokeArgs {
     allow_mainnet_submit: bool,
     #[arg(long, default_value_t = 60)]
     confirm_timeout_secs: u64,
+}
+
+#[derive(Args)]
+struct PreflightArgs {
+    #[arg(long)]
+    attestation_json: PathBuf,
+    /// Optional: when given, also fetch a one-shot chain snapshot.
+    #[arg(long)]
+    rpc_url: Option<String>,
+    /// Required iff --rpc-url is given.
+    #[arg(long)]
+    expect_chain_id: Option<u64>,
+}
+
+#[derive(Args)]
+struct QueryArgs {
+    #[arg(long)]
+    rpc_url: Option<String>,
+    #[arg(long)]
+    expect_chain_id: u64,
+    #[arg(long)]
+    session_id: String,
+    #[arg(long)]
+    verifier_address: String,
 }
 
 #[derive(Args)]
@@ -420,6 +457,36 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
                     allow_mainnet_submit: a.allow_mainnet_submit,
                     max_ticks: a.max_ticks,
                     seed_source: SeedSource::Env,
+                },
+            )
+            .await?;
+        }
+        OperatorCmd::Preflight(a) => {
+            let cfg = PreflightConfig {
+                attestation_json: a.attestation_json,
+                expect_chain_id: a.expect_chain_id,
+                seed_source: SeedSource::Env,
+            };
+            match a.rpc_url {
+                Some(url) => {
+                    if a.expect_chain_id.is_none() {
+                        return Err(OperatorError::ExpectChainIdRequiredWithRpc.into());
+                    }
+                    run_preflight(Some(ureq_factory(url)), cfg).await?;
+                }
+                None => {
+                    run_preflight::<UreqTransport>(None, cfg).await?;
+                }
+            }
+        }
+        OperatorCmd::Query(a) => {
+            let url = resolve_rpc_url(a.rpc_url.clone())?;
+            run_query(
+                ureq_factory(url),
+                QueryConfig {
+                    expect_chain_id: a.expect_chain_id,
+                    session_id: a.session_id,
+                    verifier_address: a.verifier_address,
                 },
             )
             .await?;
@@ -808,6 +875,152 @@ fn log_tick_summary(s: &TickSummary) {
             }
         }
     }
+}
+
+// ── preflight (Stage 8b) ──────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct PreflightConfig {
+    attestation_json: PathBuf,
+    /// Required iff a client factory is supplied (i.e. `--rpc-url` set).
+    expect_chain_id: Option<u64>,
+    seed_source: SeedSource,
+}
+
+/// Read-only readiness check. Validates that the verifier seed derives
+/// to the attestation JSON's `verifier_address`, prints the de-dup
+/// `AttestationId`, and — only when a client factory is supplied —
+/// fetches a one-shot chain snapshot (chain-id guardrail + params +
+/// head + activation status, **report-only**: valid before *and*
+/// after activation). Never submits, never writes the registry, never
+/// requires activation or `--allow-submit`.
+async fn run_preflight<T>(
+    make_client: Option<ClientFactory<T>>,
+    cfg: PreflightConfig,
+) -> Result<(), OperatorError>
+where
+    T: JsonRpcTransport + Send + Sync + 'static,
+{
+    if make_client.is_some() && cfg.expect_chain_id.is_none() {
+        return Err(OperatorError::ExpectChainIdRequiredWithRpc);
+    }
+
+    run_blocking(move || -> Result<(), OperatorError> {
+        // Seed ↔ attestation validation (the whole point of preflight;
+        // resolving the seed here is intended, not deferred).
+        let seed = cfg.seed_source.resolve()?;
+        let derived = signer_chain_address_base58(&seed)
+            .map_err(|e| OperatorError::SeedMalformed(e.to_string()))?;
+
+        let bytes = std::fs::read(&cfg.attestation_json).map_err(|source| {
+            OperatorError::AttestationJsonRead {
+                path: cfg.attestation_json.display().to_string(),
+                source,
+            }
+        })?;
+        let att: InferenceAttestation = serde_json::from_slice(&bytes)
+            .map_err(|e| OperatorError::AttestationJsonParse(e.to_string()))?;
+        if att.verifier_address != derived {
+            return Err(OperatorError::VerifierAddressMismatch {
+                claimed: att.verifier_address.clone(),
+                derived,
+            });
+        }
+        let id = omni_zkml::compute_attestation_id(&att)?;
+        info!(
+            verifier_address = %derived,
+            attestation_id = %id,
+            session_id = %att.commitment.session_id,
+            "preflight: seed ↔ attestation OK (verifier_address matches; \
+             this is the (session_id, verifier_address) de-dup key)"
+        );
+
+        match make_client {
+            None => {
+                info!(
+                    "preflight: offline mode (no --rpc-url) — chain \
+                     snapshot skipped; run again with --rpc-url \
+                     --expect-chain-id to also verify chain params"
+                );
+            }
+            Some(mc) => {
+                let expect = cfg
+                    .expect_chain_id
+                    .ok_or(OperatorError::ExpectChainIdRequiredWithRpc)?;
+                let client = mc(DUMMY_SEED);
+                let params = client.get_chain_params()?;
+                check_chain_id(expect, params.chain_id)?;
+                let head = client.get_block_height(BlockFinality::Latest)?.height;
+                let omninode = client.omninode_is_active()?;
+                let v2 = client.v2_is_active()?;
+                info!(
+                    chain_id = params.chain_id,
+                    finality_depth = params.finality_depth,
+                    min_fee = params.min_fee,
+                    v2_enabled_from_height = ?params.v2_enabled_from_height,
+                    omninode_enabled_from_height = ?params.omninode_enabled_from_height,
+                    head = head,
+                    "preflight: chain params"
+                );
+                info!(
+                    v2_blocks_remaining = ?blocks_remaining(head, params.v2_enabled_from_height),
+                    omninode_blocks_remaining = ?blocks_remaining(head, params.omninode_enabled_from_height),
+                    v2_active = v2,
+                    omninode_active = omninode,
+                    activated = omninode && v2,
+                    "preflight: chain snapshot (report-only — valid \
+                     before and after activation)"
+                );
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+// ── query (Stage 8b) ──────────────────────────────────────────────────────────
+
+struct QueryConfig {
+    expect_chain_id: u64,
+    session_id: String,
+    verifier_address: String,
+}
+
+/// Read-only: `sum_getInferenceAttestation(session_id, verifier_address)`
+/// behind the chain-id guardrail. Logs the chain's stored attestation
+/// when present; returns a typed `AttestationNotFound` (non-zero exit,
+/// scriptable) when the chain has no record under the pair. Never
+/// submits.
+async fn run_query<T>(
+    make_client: ClientFactory<T>,
+    cfg: QueryConfig,
+) -> Result<(), OperatorError>
+where
+    T: JsonRpcTransport + Send + Sync + 'static,
+{
+    run_blocking(move || -> Result<(), OperatorError> {
+        let client = make_client(DUMMY_SEED);
+        let params = client.get_chain_params()?;
+        check_chain_id(cfg.expect_chain_id, params.chain_id)?;
+        match client.get_attestation(&cfg.session_id, &cfg.verifier_address)? {
+            Some(info) => {
+                info!(
+                    session_id = %info.session_id,
+                    verifier_address = %info.verifier_address,
+                    tx_hash = %info.tx_hash,
+                    included_at_height = info.included_at_height,
+                    finalized = info.finalized,
+                    "query: chain attestation found"
+                );
+                Ok(())
+            }
+            None => Err(OperatorError::AttestationNotFound {
+                session_id: cfg.session_id,
+                verifier_address: cfg.verifier_address,
+            }),
+        }
+    })
+    .await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1372,5 +1585,214 @@ mod tests {
         };
         let err = loop_core(factory(fake), cfg).await.unwrap_err();
         assert!(matches!(err, OperatorError::Policy(_)), "got {err:?}");
+    }
+
+    // ── preflight (Stage 8b) ─────────────────────────────────────────
+
+    fn write_attestation(dir: &std::path::Path, verifier_address: &str) -> PathBuf {
+        let path = dir.join("att.json");
+        let att = synth_attestation(verifier_address, 1);
+        std::fs::write(&path, serde_json::to_vec(&att).unwrap()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn preflight_offline_ok_with_matching_seed_and_no_chain_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_attestation(dir.path(), &seed_address());
+        let cfg = PreflightConfig {
+            attestation_json: path,
+            expect_chain_id: None,
+            seed_source: SeedSource::Explicit(SEED),
+        };
+        // No client factory → purely offline; cannot reach the chain.
+        run_preflight::<FakeJsonRpcTransport>(None, cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preflight_offline_verifier_mismatch_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_attestation(dir.path(), "NotTheSeedAddress");
+        let cfg = PreflightConfig {
+            attestation_json: path,
+            expect_chain_id: None,
+            seed_source: SeedSource::Explicit(SEED),
+        };
+        let err = run_preflight::<FakeJsonRpcTransport>(None, cfg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OperatorError::VerifierAddressMismatch { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn preflight_offline_malformed_json_errors_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("att.json");
+        std::fs::write(&path, b"{ not attestation }").unwrap();
+        let cfg = PreflightConfig {
+            attestation_json: path,
+            expect_chain_id: None,
+            seed_source: SeedSource::Explicit(SEED),
+        };
+        let err = run_preflight::<FakeJsonRpcTransport>(None, cfg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OperatorError::AttestationJsonParse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn preflight_offline_missing_seed_is_surfaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_attestation(dir.path(), &seed_address());
+        let cfg = PreflightConfig {
+            attestation_json: path,
+            expect_chain_id: None,
+            seed_source: SeedSource::AbsentForTest,
+        };
+        let err = run_preflight::<FakeJsonRpcTransport>(None, cfg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OperatorError::SeedMissing), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn preflight_rpc_requires_expect_chain_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_attestation(dir.path(), &seed_address());
+        let fake = activated_fake(1);
+        let cfg = PreflightConfig {
+            attestation_json: path,
+            expect_chain_id: None, // but a factory IS supplied
+            seed_source: SeedSource::Explicit(SEED),
+        };
+        let err = run_preflight(Some(factory(fake.clone())), cfg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OperatorError::ExpectChainIdRequiredWithRpc), "got {err:?}");
+        assert_eq!(submit_calls(&fake), 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_rpc_chain_id_mismatch_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_attestation(dir.path(), &seed_address());
+        let fake = activated_fake(1);
+        let cfg = PreflightConfig {
+            attestation_json: path,
+            expect_chain_id: Some(31337),
+            seed_source: SeedSource::Explicit(SEED),
+        };
+        let err = run_preflight(Some(factory(fake.clone())), cfg)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::ChainIdMismatch { expected: 31337, actual: 1 }),
+            "got {err:?}"
+        );
+        assert_eq!(submit_calls(&fake), 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_rpc_happy_reports_snapshot_and_never_submits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_attestation(dir.path(), &seed_address());
+        let fake = activated_fake(1);
+        let cfg = PreflightConfig {
+            attestation_json: path,
+            expect_chain_id: Some(1),
+            seed_source: SeedSource::Explicit(SEED),
+        };
+        run_preflight(Some(factory(fake.clone())), cfg).await.unwrap();
+        let methods: Vec<String> = fake.calls().into_iter().map(|(m, _)| m).collect();
+        assert!(methods.iter().any(|m| m == "chain_getChainParams"));
+        assert!(methods.iter().any(|m| m == "chain_getBlockHeight"));
+        assert_eq!(submit_calls(&fake), 0, "preflight must never submit");
+    }
+
+    /// Report-only even when already activated (Q2): preflight succeeds
+    /// against an activated chain rather than erroring.
+    #[tokio::test]
+    async fn preflight_rpc_reports_only_when_already_activated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_attestation(dir.path(), &seed_address());
+        let fake = activated_fake(1); // omninode/v2 enabled from height 0 → active
+        let cfg = PreflightConfig {
+            attestation_json: path,
+            expect_chain_id: Some(1),
+            seed_source: SeedSource::Explicit(SEED),
+        };
+        run_preflight(Some(factory(fake.clone())), cfg).await.unwrap();
+        assert_eq!(submit_calls(&fake), 0);
+    }
+
+    // ── query (Stage 8b) ─────────────────────────────────────────────
+
+    fn attestation_info_json(session_id: &str, verifier_address: &str) -> serde_json::Value {
+        json!({
+            "session_id": session_id,
+            "verifier_address": verifier_address,
+            "model_hash": format!("0x{}", "a".repeat(64)),
+            "manifest_root": format!("0x{}", "1".repeat(64)),
+            "response_hash": format!("0x{}", "b".repeat(64)),
+            "proof_root": format!("0x{}", "2".repeat(64)),
+            "verifier_signature": format!("0x{}", "c".repeat(128)),
+            "included_at_height": 6_000_010,
+            "tx_hash": "0xfeed",
+            "finalized": true
+        })
+    }
+
+    #[tokio::test]
+    async fn query_returns_found_attestation_and_never_submits() {
+        let fake = activated_fake(1);
+        fake.set_response(
+            "sum_getInferenceAttestation",
+            Ok(attestation_info_json("sess-q", "addr-q")),
+        );
+        let cfg = QueryConfig {
+            expect_chain_id: 1,
+            session_id: "sess-q".into(),
+            verifier_address: "addr-q".into(),
+        };
+        run_query(factory(fake.clone()), cfg).await.unwrap();
+        let methods: Vec<String> = fake.calls().into_iter().map(|(m, _)| m).collect();
+        assert!(methods.iter().any(|m| m == "sum_getInferenceAttestation"));
+        assert_eq!(submit_calls(&fake), 0);
+    }
+
+    #[tokio::test]
+    async fn query_not_found_returns_typed_error() {
+        let fake = activated_fake(1);
+        fake.set_response("sum_getInferenceAttestation", Ok(json!(null)));
+        let cfg = QueryConfig {
+            expect_chain_id: 1,
+            session_id: "missing".into(),
+            verifier_address: "addr-x".into(),
+        };
+        let err = run_query(factory(fake.clone()), cfg).await.unwrap_err();
+        assert!(matches!(err, OperatorError::AttestationNotFound { .. }), "got {err:?}");
+        assert_eq!(submit_calls(&fake), 0);
+    }
+
+    #[tokio::test]
+    async fn query_chain_id_mismatch_is_refused_before_get_attestation() {
+        let fake = activated_fake(1);
+        fake.set_response(
+            "sum_getInferenceAttestation",
+            Ok(attestation_info_json("s", "a")),
+        );
+        let cfg = QueryConfig {
+            expect_chain_id: 31337,
+            session_id: "s".into(),
+            verifier_address: "a".into(),
+        };
+        let err = run_query(factory(fake.clone()), cfg).await.unwrap_err();
+        assert!(matches!(err, OperatorError::ChainIdMismatch { .. }), "got {err:?}");
+        let methods: Vec<String> = fake.calls().into_iter().map(|(m, _)| m).collect();
+        assert!(
+            !methods.iter().any(|m| m == "sum_getInferenceAttestation"),
+            "chain-id guardrail must fire before the attestation read"
+        );
+        assert_eq!(submit_calls(&fake), 0);
     }
 }

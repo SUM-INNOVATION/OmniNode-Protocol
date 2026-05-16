@@ -81,6 +81,7 @@ The protocol is built on four pillars:
 | **Phase 5 Stage 7a** — SUM Chain adapter (read/query against JSON-RPC; typed stub for submit) | `omni-sumchain` | **Complete** |
 | **Phase 5 Stage 7b** — SUM Chain submit path (outer `SignedTransaction` via vendored chain primitives) | `omni-sumchain` | **Complete** |
 | **Phase 5 Stage 8a** — Operator surface: activation watch / smoke / lifecycle loop (safe-by-default CLI) | `omni-node` | **Complete** |
+| **Phase 5 Stage 8b** — Mainnet activation smoke hardening: read-only `preflight` + `query` + checklist runbook | `omni-node` | **Complete** |
 | Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
@@ -1286,6 +1287,46 @@ The gate ordering is asserted by hermetic tests that pass an **absent or malform
 
 ---
 
+### Phase 5 Stage 8b: Mainnet Activation Smoke + Operator Hardening — Complete
+
+**Crate:** `omni-node` (two read-only subcommands added to the `operator` surface) | **Depends on:** Stage 8a — no new external crates, zero edits outside `crates/omni-node/`
+
+Stage 8b de-risks the mainnet activation smoke. The concrete gap Stage 8a exposed: `smoke`'s verifier-address / JSON-parse checks sit at gate 5, **after** the gate-2 activation precheck — so pre-activation there was no way to confirm "the verifier seed derives to the JSON's `verifier_address`" until *after* mainnet activates, the worst possible time to discover a mismatch. Stage 8b adds a read-only preflight that validates the pairing decoupled from activation, plus a read-only chain query for post-activation verification, plus a checklist-driven runbook.
+
+| Command | What it does | Chain writes |
+|---|---|---|
+| `operator preflight --attestation-json <P> [--rpc-url <U>] [--expect-chain-id <N>]` | Resolves the verifier seed, parses the attestation JSON, asserts `signer_chain_address_base58(seed) == attestation.verifier_address`, prints the `(session_id, verifier_address)` `AttestationId`. With `--rpc-url` (then `--expect-chain-id` required): one-shot chain snapshot — chain-id guardrail, params, head, blocks-remaining, activation status, **report-only** (succeeds whether or not the chain is already activated, Q2). Offline mode (no `--rpc-url`) skips the chain snapshot entirely. | **None** (read-only; never submits, never writes the registry, never requires activation or `--allow-submit`). |
+| `operator query --rpc-url <U> --expect-chain-id <N> --session-id <S> --verifier-address <A>` | `sum_getInferenceAttestation(session_id, verifier_address)` behind the chain-id guardrail. Logs the chain's stored attestation when present; returns typed `AttestationNotFound` (non-zero, scriptable) when absent. | **None** (read-only). |
+
+**Decisions:** Q1 yes (both `preflight` + `query` shipped); Q2 report-only when already activated (no error); Q3 documented timeout guidance, default `--confirm-timeout-secs` unchanged; Q4 no funding check in code — preflight prints the derived address, the operator verifies balance externally (no balance RPC in the adapter; adding one would be a forbidden Stage-7-area change).
+
+**Mainnet activation runbook.** Pre-activation (head < 6,000,000):
+
+1. `export OMNINODE_SUMCHAIN_RPC_URL=<mainnet RPC>` and `OMNINODE_VERIFIER_SEED_HEX=<64 hex>`.
+2. `omni-node operator preflight --attestation-json ./first-attestation.json --rpc-url $OMNINODE_SUMCHAIN_RPC_URL --expect-chain-id 1` — one shot confirms seed↔JSON verifier match, the de-dup `AttestationId`, `chain_id=1` / `finality_depth=6` / `min_fee=1000` / `v2_enabled_from_height=5200000` / `omninode_enabled_from_height=6000000`, current head (must read `< 6,000,000`), and blocks-remaining. Funding: preflight logs the derived address; verify its balance via your chain explorer (out of band).
+3. `omni-node operator watch-activation --expect-chain-id 1` — leave running; exits 0 when both gates live.
+
+At/after activation (head ≥ 6,000,000):
+
+4. `omni-node operator smoke --expect-chain-id 1 --registry-path <P> --attestation-json ./first-attestation.json --allow-submit --allow-mainnet-submit --confirm-timeout-secs <generous>`. **Timeout guidance:** set it well above `finality_depth × your expected block time`; no block time is hardcoded anywhere, so choose deliberately (e.g. if you expect ~12 s blocks, finality_depth 6 ≈ ~72 s — set ≥ 180 s for margin). Record the **tx hash**.
+5. Confirm chain status reaches **`Finalized`** — Stage 8a returns success only on `Finalized`; `Included` is logged as progress.
+6. `omni-node operator query --expect-chain-id 1 --session-id <S> --verifier-address <A>` — confirm the chain's stored attestation matches; record `included_at_height`, `tx_hash`, `finalized`.
+
+**Duplicate / idempotency checks (split — they prove different things):**
+
+1. **Local idempotency.** Re-run the *exact same* `smoke` command with the *same* `--registry-path`. Expected: the local record is already `Finalized`, so `submit_attestation_workflow_with_block`'s `insert` short-circuits — **no new chain submission**, the finalized record is reused, smoke re-polls to `Finalized`. This proves the local registry prevents accidental double-submit; it does **not** exercise chain-side duplicate rejection.
+2. **Chain duplicate rejection.** Only if intentionally exercising chain rejection: from a fresh/empty registry (or a controlled one-off path that bypasses local idempotency), resubmit the same `(session_id, verifier_address)`. Expected: the chain rejects the duplicate or reports `Failed` with the documented duplicate behavior. **Stage 8b does not ship a bypass-local-idempotency duplicate-submit tool** — this remains a manual/external check or a later explicit diagnostic command.
+
+**Operational sequencing.** Start the lifecycle loop **monitor-only first** (`operator loop … ` with no `--allow-submit`) to confirm poll/sweep behave; only after the smoke is clean add `--allow-submit --allow-mainnet-submit` to enable the retry sweep.
+
+**Results template to record:** `tx_hash`, `included_at_height`, finalized height + `finalized` status, `AttestationId`, local-idempotency rerun outcome.
+
+**Tests** (default-on, hermetic; **31** total in `omni_node::operator::tests`, +11 over Stage 8a): preflight — offline OK with matching seed (zero chain calls), verifier mismatch refused, malformed JSON, missing seed surfaced, `--rpc-url` requires `--expect-chain-id`, chain-id mismatch refused, happy path reports the snapshot and never submits, report-only when already activated; query — found attestation logged (never submits), not-found returns typed `AttestationNotFound`, chain-id guardrail fires before the attestation read. Every preflight/query path asserts `submit_calls == 0`.
+
+**What Stage 8b deliberately does not do:** no Stage 6/7b changes (no live bug surfaced); no protocol changes; no synthetic mainnet attestation; no bypass-local-idempotency duplicate-submit tool; no daemonization/systemd; no balance RPC / new `omni-sumchain` methods; no `--confirm-timeout-secs` default change; no edits outside `crates/omni-node/`.
+
+---
+
 ### Phase 5 Stage 8+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
@@ -1475,7 +1516,7 @@ OmniNode-Protocol/
 │       ├── Cargo.toml                 # + omni-zkml + omni-sumchain + thiserror (dev: tempfile)
 │       └── src/
 │           ├── main.rs                # listen | shard <path> | fetch <cid> | send <msg> | operator <…>
-│           └── operator.rs            # Stage 8a: operator watch-activation | smoke | loop (safe-by-default, hermetic-tested)
+│           └── operator.rs            # Stage 8a/8b: operator watch-activation | smoke | loop | preflight | query (safe-by-default, hermetic-tested)
 │
 ├── pyproject.toml                     # maturin build config for omninode Python package
 ├── python/                            # Python ML package (Phase 3)

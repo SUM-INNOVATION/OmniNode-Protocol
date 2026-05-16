@@ -337,7 +337,6 @@ fn print_event(event: &OmniNetEvent) {
         OmniNetEvent::PeerDisconnected { peer_id } =>
             info!("DISCONNECTED {peer_id}"),
         OmniNetEvent::MessageReceived { from, topic, data } => {
-            let text = String::from_utf8_lossy(data);
             info!("MESSAGE      topic={topic}  from={from}  len={}", data.len());
         }
         OmniNetEvent::ShardRequested { peer_id, request, channel_id } =>
