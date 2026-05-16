@@ -1,5 +1,7 @@
 # OmniNode Protocol
 
+[![license: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT) [![rust edition 2024](https://img.shields.io/badge/rust-2024-orange)](Cargo.toml) [![toolchain 1.85](https://img.shields.io/badge/toolchain-1.85-orange)](rust-toolchain.toml) [![SNIP V2 gated](https://img.shields.io/badge/SNIP-V2_gated-brightgreen)](#phase-5-stage-1-snip-v2-storage-integration--complete) [![SUM Chain InferenceAttestation v1 (dormant)](https://img.shields.io/badge/SUM_Chain-InferenceAttestation_v1_%28dormant%29-blueviolet)](#phase-5-stage-6-chain-wire-fixture--signing-spec-deliverables--complete)
+
 **A Trustless, Peer-to-Peer AI Inference Network — Public Utility Infrastructure for AGI**
 
 > Any device with a chip can become a node. Pool low-power devices into an omnipotent network.
@@ -78,6 +80,7 @@ The protocol is built on four pillars:
 | **Phase 5 Stage 6** — Chain wire fixture & signing-spec deliverables (Ed25519 + bs58 checksum address) | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 7a** — SUM Chain adapter (read/query against JSON-RPC; typed stub for submit) | `omni-sumchain` | **Complete** |
 | **Phase 5 Stage 7b** — SUM Chain submit path (outer `SignedTransaction` via vendored chain primitives) | `omni-sumchain` | **Complete** |
+| **Phase 5 Stage 8a** — Operator surface: activation watch / smoke / lifecycle loop (safe-by-default CLI) | `omni-node` | **Complete** |
 | Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
@@ -1240,6 +1243,49 @@ The four helpers compose freely — there is no required order, no retry cap, no
 
 ---
 
+### Phase 5 Stage 8a: Operator / Activation Monitoring Loop — Complete
+
+**Crate:** `omni-node` (new `operator` module + nested subcommand) | **Depends on:** Stage 5.3 orchestration helpers + Stage 7a/7b `omni-sumchain` adapter — no new external crates, **zero edits outside `crates/omni-node/`**
+
+Stage 8a turns the Stage 5.3 library helpers into a usable operator command surface on the `omni-node` binary. Three nested subcommands under `omni-node operator`, **safe by default**, no chain-protocol changes.
+
+```
+omni-node operator watch-activation --rpc-url <U> --expect-chain-id <N> [--poll-interval-secs 30] [--max-ticks <N>]
+omni-node operator smoke            --rpc-url <U> --expect-chain-id <N> --registry-path <P>
+                                    [--attestation-json <PATH>] [--synthetic]
+                                    --allow-submit [--allow-mainnet-submit] [--confirm-timeout-secs 60]
+omni-node operator loop             --rpc-url <U> --expect-chain-id <N> --registry-path <P>
+                                    --staleness-threshold-blocks <N> [--poll-interval-secs 30]
+                                    [--allow-submit] [--allow-mainnet-submit] [--max-ticks <N>]
+```
+
+| Command | What it does | Chain writes |
+|---|---|---|
+| `watch-activation` | Polls `chain_getChainParams` + `chain_getBlockHeight(Latest)`; logs params + blocks-remaining to each gate; exits `0` once `omninode_is_active() && v2_is_active()`, errors `ActivationNotReached` if `--max-ticks` exhausts first. | None (read-only). |
+| `smoke` | Submits exactly one attestation, polls it to **`Finalized`** (`Included` is logged as progress, never treated as success) or errors `SmokeConfirmTimeout` at `--confirm-timeout-secs`. | One submit (gated). |
+| `loop` | Per tick: `poll_attestations_workflow` → `sweep_stale_attestations_workflow` → (only if submit permitted **and** chain activated) `retry_dropped_attestations_workflow`. `tokio::select!` Ctrl-C graceful shutdown; `--max-ticks` bounds CI runs. | Retry submits only (gated); monitor-only without `--allow-submit`. |
+
+**Mainnet smoke safety boundary (the load-bearing rule).** `operator smoke` resolves its attestation source through a pure, seed-free gate evaluated **before** the verifier seed is ever read:
+
+- `chain_id == 1` (mainnet) **requires** `--attestation-json <path>` (deserialized to `InferenceAttestation`, submitted verbatim). There is **no** synthetic-mainnet path and no danger-flag to create one in Stage 8a.
+- `--synthetic` is rejected outright on `chain_id == 1`.
+- Synthetic generation is non-mainnet only and requires explicit `--synthetic` (no silent synthesis even on dev chains).
+- `--attestation-json` + `--synthetic` together is a typed conflict error.
+
+The gate ordering is asserted by hermetic tests that pass an **absent or malformed** seed and confirm the mainnet refusal still fires (`smoke_mainnet_without_attestation_json_is_refused_before_seed`, `smoke_mainnet_rejects_synthetic_before_malformed_seed`) — a missing/garbage `OMNINODE_VERIFIER_SEED_HEX` can never mask the real mainnet-misuse error.
+
+**Runtime safety gates (defense-in-depth; smoke order):** chain-id guardrail → attestation-source/no-synthetic-mainnet (seed-free) → activation precheck (`omninode_is_active && v2_is_active`) → submit opt-in (`--allow-submit`) + mainnet double-gate (`--allow-mainnet-submit` when `chain_id == 1`) → seed resolution + verifier-address consistency → Stage 7b adapter-layer activation/verifier gates (unchanged backstop). The operator never even constructs a tx before activation; the Stage 7b adapter independently refuses too.
+
+**Config / env.** `OMNINODE_SUMCHAIN_RPC_URL` (or `--rpc-url`); `OMNINODE_VERIFIER_SEED_HEX` (64 hex, only read by submit paths, only *after* the mainnet gate); `--expect-chain-id` required on every operator chain command (fail-loud if pointed at the wrong endpoint); `--staleness-threshold-blocks` passed verbatim to `StalenessPolicy::new` (rejects 0). Blocking SUM Chain RPC runs in `tokio::task::spawn_blocking` with an `Arc`'d client factory so no borrow escapes.
+
+**Live / mainnet runbook.** (1) export `OMNINODE_SUMCHAIN_RPC_URL`; (2) `operator watch-activation --expect-chain-id 1` — logs blocks-remaining to V2 (5,200,000) then OmniNode (6,000,000), exits 0 when both live; (3) sanity-check logged params against expected mainnet values (chain_id 1, finality_depth 6, min_fee 1000); (4) export `OMNINODE_VERIFIER_SEED_HEX` for a funded verifier; (5) `operator smoke --expect-chain-id 1 --registry-path <P> --attestation-json ./first.json --allow-submit --allow-mainnet-submit` — submits a **real** operator-provided attestation, polls to `Finalized`; (6) `operator loop --expect-chain-id 1 --registry-path <P> --staleness-threshold-blocks <finality_depth*K> --allow-submit --allow-mainnet-submit`. Pre-activation only step 2 runs; steps 5–6 self-refuse until head ≥ 6,000,000.
+
+**Tests** (default-on, hermetic; 20 in `omni_node::operator::tests`): pure gate matrices (`check_chain_id`, `submission_permitted`, `blocks_remaining`, `resolve_smoke_source`); `watch-activation` active/not-reached/chain-id-mismatch-before-height; the two gate-7-before-seed guarantees; non-mainnet synthetic requires explicit flag; attestation-json verifier mismatch + malformed file refused with zero submit calls; mainnet with valid attestation-json proceeds to finalized; mainnet without `--allow-mainnet-submit` refused; **smoke treats `Included` as progress not success — times out if the chain stays `Included`, succeeds only once `Finalized` (sequenced included→finalized via the shared fake)**; `loop` monitor-only never submits, submit-mode retries a seeded `Dropped` record exactly once, mainnet-without-flag fails at startup, zero staleness threshold rejected. Runners are exercised against `SumChainClient<FakeJsonRpcTransport>` — no live chain.
+
+**What Stage 8a deliberately does not do:** no daemonization/systemd; no metrics backend (tracing-only); no scheduler beyond fixed-interval sleep; no `--allow-synthetic-mainnet-smoke` escape hatch; no `ChainClient`/`OrchestrationClient` trait changes; no async rewrite of `SumChainClient`; no keystore/multi-account; no proof/tokenomics; no edits to Stage 6 chain-wire/fixture, Stage 7b tx construction, or any crate outside `omni-node`.
+
+---
+
 ### Phase 5 Stage 8+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
@@ -1426,9 +1472,10 @@ OmniNode-Protocol/
 │   │       └── live_local_mirror.rs          # 5 #[ignore]'d live tests, env-gated by OMNINODE_SUMCHAIN_RPC_URL (+ OMNINODE_VERIFIER_SEED_HEX for Stage 7b submit roundtrip)
 │   │
 │   └── omni-node/                      # Binary: CLI entry point
-│       ├── Cargo.toml
+│       ├── Cargo.toml                 # + omni-zkml + omni-sumchain + thiserror (dev: tempfile)
 │       └── src/
-│           └── main.rs                # listen | shard <path> | fetch <cid> | send <msg>
+│           ├── main.rs                # listen | shard <path> | fetch <cid> | send <msg> | operator <…>
+│           └── operator.rs            # Stage 8a: operator watch-activation | smoke | loop (safe-by-default, hermetic-tested)
 │
 ├── pyproject.toml                     # maturin build config for omninode Python package
 ├── python/                            # Python ML package (Phase 3)

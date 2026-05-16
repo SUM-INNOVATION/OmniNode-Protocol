@@ -26,6 +26,8 @@ use omni_net::{OmniNet, OmniNetEvent, TOPIC_SHARD, TOPIC_TEST};
 use omni_store::{OmniStore, FetchOutcome, decode_announcement};
 use omni_types::config::{NetConfig, StoreConfig};
 
+mod operator;
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -61,6 +63,9 @@ enum Command {
         /// UTF-8 message to broadcast on `omni/test/v1`.
         message: String,
     },
+
+    /// SUM Chain operator surface: activation watch, smoke, lifecycle loop.
+    Operator(operator::OperatorArgs),
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -81,6 +86,7 @@ async fn main() -> Result<()> {
         Command::Shard { path }   => run_shard(path).await,
         Command::Fetch { cid }    => run_fetch(cid).await,
         Command::Send { message } => run_send(message).await,
+        Command::Operator(args)   => operator::dispatch(args).await,
     }
 }
 
