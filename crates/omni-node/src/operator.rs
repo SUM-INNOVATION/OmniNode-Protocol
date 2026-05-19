@@ -154,6 +154,15 @@ pub(crate) enum OperatorError {
         verifier_address: String,
     },
 
+    #[error("smoke interrupted (Ctrl-C) before finality was confirmed")]
+    SmokeInterrupted,
+
+    #[error("--tx-hash is mutually exclusive with --session-id/--verifier-address")]
+    ConflictingQueryMode,
+
+    #[error("query needs either --tx-hash, or both --session-id and --verifier-address")]
+    QueryModeRequired,
+
     #[error("internal invariant violated: {0}")]
     Internal(String),
 
@@ -179,22 +188,32 @@ pub(crate) enum OperatorError {
 #[derive(Clone)]
 pub(crate) enum SeedSource {
     Env,
+    // The variants below are test-injection seams only. They are
+    // `#[cfg(test)]`-gated (not `#[allow(dead_code)]`-suppressed) so the
+    // production build genuinely contains only `Env` — no dead code,
+    // no lint suppression.
+    #[cfg(test)]
     Explicit([u8; 32]),
+    #[cfg(test)]
     AbsentForTest,
+    #[cfg(test)]
     MalformedForTest(String),
 }
 
 impl SeedSource {
     fn resolve(&self) -> Result<[u8; 32], OperatorError> {
         match self {
-            SeedSource::Explicit(s) => Ok(*s),
-            SeedSource::AbsentForTest => Err(OperatorError::SeedMissing),
-            SeedSource::MalformedForTest(h) => parse_seed_hex(h),
             SeedSource::Env => {
                 let v = std::env::var("OMNINODE_VERIFIER_SEED_HEX")
                     .map_err(|_| OperatorError::SeedMissing)?;
                 parse_seed_hex(&v)
             }
+            #[cfg(test)]
+            SeedSource::Explicit(s) => Ok(*s),
+            #[cfg(test)]
+            SeedSource::AbsentForTest => Err(OperatorError::SeedMissing),
+            #[cfg(test)]
+            SeedSource::MalformedForTest(h) => parse_seed_hex(h),
         }
     }
 }
@@ -321,8 +340,10 @@ enum OperatorCmd {
     Loop(LoopArgs),
     /// Read-only: validate seed ↔ attestation-json (+ optional chain snapshot).
     Preflight(PreflightArgs),
-    /// Read-only: query the chain's attestation by (session_id, verifier_address).
+    /// Read-only: query the chain by (session_id, verifier_address) OR --tx-hash.
     Query(QueryArgs),
+    /// Read-only: print the chain address derived from OMNINODE_VERIFIER_SEED_HEX.
+    DeriveAddress,
 }
 
 #[derive(Args)]
@@ -376,10 +397,15 @@ struct QueryArgs {
     rpc_url: Option<String>,
     #[arg(long)]
     expect_chain_id: u64,
+    /// Status-by-tx lookup. Mutually exclusive with the
+    /// session-id/verifier-address pair (validated manually so the
+    /// error wording matches the rest of `operator`).
     #[arg(long)]
-    session_id: String,
+    tx_hash: Option<String>,
     #[arg(long)]
-    verifier_address: String,
+    session_id: Option<String>,
+    #[arg(long)]
+    verifier_address: Option<String>,
 }
 
 #[derive(Args)]
@@ -429,7 +455,7 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
         }
         OperatorCmd::Smoke(a) => {
             let url = resolve_rpc_url(a.rpc_url.clone())?;
-            smoke_core(
+            let outcome = smoke_core(
                 ureq_factory(url),
                 SmokeConfig {
                     expect_chain_id: a.expect_chain_id,
@@ -443,6 +469,7 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
                 },
             )
             .await?;
+            print_smoke_summary(&outcome);
         }
         OperatorCmd::Loop(a) => {
             let url = resolve_rpc_url(a.rpc_url.clone())?;
@@ -481,15 +508,27 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
         }
         OperatorCmd::Query(a) => {
             let url = resolve_rpc_url(a.rpc_url.clone())?;
+            let mode = resolve_query_mode(
+                a.tx_hash,
+                a.session_id,
+                a.verifier_address,
+            )?;
             run_query(
                 ureq_factory(url),
                 QueryConfig {
                     expect_chain_id: a.expect_chain_id,
-                    session_id: a.session_id,
-                    verifier_address: a.verifier_address,
+                    mode,
                 },
             )
             .await?;
+        }
+        OperatorCmd::DeriveAddress => {
+            let addr = derive_address_core(SeedSource::Env).await?;
+            // Bare stdout line so it is scriptable
+            // (`ADDR=$(omni-node operator derive-address)`); the info!
+            // line carries human context on stderr.
+            info!(verifier_address = %addr, "derive-address");
+            println!("{addr}");
         }
     }
     Ok(())
@@ -613,10 +652,33 @@ struct WatchSnapshot {
 
 // ── smoke ─────────────────────────────────────────────────────────────────────
 
+/// Structured result of a successful `smoke` run. Returned by
+/// [`smoke_core`] (testable) and rendered by [`print_smoke_summary`]
+/// for the operator. Only constructed once the tx reaches `Finalized`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SmokeOutcome {
+    pub attestation_id: String,
+    pub session_id: String,
+    pub verifier_address: String,
+    pub tx_hash: String,
+    pub submitted_at_block: Option<u64>,
+    pub included_at_height: Option<u64>,
+    pub finalized: bool,
+}
+
+/// Phase-A result handed from the submit blocking unit to the poll loop.
+struct SmokePending {
+    tx_id: String,
+    attestation_id: String,
+    session_id: String,
+    verifier_address: String,
+    submitted_at_block: Option<u64>,
+}
+
 async fn smoke_core<T>(
     make_client: ClientFactory<T>,
     cfg: SmokeConfig,
-) -> Result<(), OperatorError>
+) -> Result<SmokeOutcome, OperatorError>
 where
     T: JsonRpcTransport + Send + Sync + 'static,
 {
@@ -625,7 +687,7 @@ where
     // after gate 7 (resolve_smoke_source) has passed.
     let mc = make_client.clone();
     let cfg_a = cfg.clone();
-    let tx_id = run_blocking(move || -> Result<String, OperatorError> {
+    let pending = run_blocking(move || -> Result<SmokePending, OperatorError> {
         let probe = mc(DUMMY_SEED);
 
         let params = probe.get_chain_params()?;
@@ -683,7 +745,7 @@ where
         let client = mc(seed);
         let record =
             submit_attestation_workflow_with_block(&registry, &client, attestation)?;
-        record
+        let tx_id = record
             .receipt
             .as_ref()
             .map(|r| r.tx_id.clone())
@@ -691,13 +753,22 @@ where
                 OperatorError::Internal(
                     "submitted record has no receipt (registry invariant)".into(),
                 )
-            })
+            })?;
+        Ok(SmokePending {
+            tx_id,
+            attestation_id: record.id.to_hex(),
+            session_id: record.attestation.commitment.session_id.clone(),
+            verifier_address: record.attestation.verifier_address.clone(),
+            submitted_at_block: record.submitted_at_block,
+        })
     })
     .await?;
 
-    info!(%tx_id, "smoke: submitted; polling for confirmation");
+    info!(tx_id = %pending.tx_id, "smoke: submitted; polling for confirmation");
 
-    // Phase B — poll the tx to a terminal-ish status, Ctrl-C-friendly.
+    // Phase B — poll the tx until Finalized. Included is progress only;
+    // returning success at Included would be a false-positive mainnet
+    // activation smoke.
     let deadline = Instant::now() + Duration::from_secs(cfg.confirm_timeout_secs);
     let mut last = "submitted".to_string();
     loop {
@@ -705,7 +776,7 @@ where
             return Err(OperatorError::SmokeConfirmTimeout { last });
         }
         let mc2 = make_client.clone();
-        let txq = tx_id.clone();
+        let txq = pending.tx_id.clone();
         let status = run_blocking(move || -> Result<omni_zkml::AttestationStatus, OperatorError> {
             let c = mc2(DUMMY_SEED);
             Ok(c.query_attestation_status(&txq)?)
@@ -714,13 +785,30 @@ where
 
         use omni_zkml::AttestationStatus::*;
         match status {
-            // Finalized is the ONLY success. Included is progress, not
-            // a green: returning Ok at Included would declare success
-            // before finality and produce a false-positive mainnet
-            // activation smoke.
             Finalized => {
+                // One extra read-only lookup to populate
+                // included_at_height for the operator summary (Stage 8c
+                // Q3). Submit semantics are unchanged — success is
+                // still gated solely on Finalized above.
+                let mc3 = make_client.clone();
+                let txq = pending.tx_id.clone();
+                let included_at_height = run_blocking(
+                    move || -> Result<Option<u64>, OperatorError> {
+                        let c = mc3(DUMMY_SEED);
+                        Ok(c.query_attestation_status_full(&txq)?.included_at_height)
+                    },
+                )
+                .await?;
                 info!("smoke: finalized — confirmed");
-                return Ok(());
+                return Ok(SmokeOutcome {
+                    attestation_id: pending.attestation_id,
+                    session_id: pending.session_id,
+                    verifier_address: pending.verifier_address,
+                    tx_hash: pending.tx_id,
+                    submitted_at_block: pending.submitted_at_block,
+                    included_at_height,
+                    finalized: true,
+                });
             }
             Failed { reason } => return Err(OperatorError::SmokeFailed { reason }),
             progressing => {
@@ -732,13 +820,28 @@ where
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                     _ = tokio::signal::ctrl_c() => {
-                        info!("ctrl-c — stopping smoke poll");
-                        return Ok(());
+                        info!("ctrl-c — stopping smoke poll before finality");
+                        return Err(OperatorError::SmokeInterrupted);
                     }
                 }
             }
         }
     }
+}
+
+/// Render a successful [`SmokeOutcome`] as one consolidated operator
+/// summary block (Stage 8c Q2).
+fn print_smoke_summary(o: &SmokeOutcome) {
+    info!(
+        attestation_id = %o.attestation_id,
+        session_id = %o.session_id,
+        verifier_address = %o.verifier_address,
+        tx_hash = %o.tx_hash,
+        submitted_at_block = ?o.submitted_at_block,
+        included_at_height = ?o.included_at_height,
+        finalized = o.finalized,
+        "SMOKE SUMMARY — attestation finalized on chain"
+    );
 }
 
 // ── loop ──────────────────────────────────────────────────────────────────────
@@ -978,19 +1081,53 @@ where
     .await
 }
 
-// ── query (Stage 8b) ──────────────────────────────────────────────────────────
+// ── query (Stage 8b + 8c) ─────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq, Eq)]
+enum QueryMode {
+    /// Stage 8c: status-by-tx (`sum_getInferenceAttestationStatus`).
+    TxHash(String),
+    /// Stage 8b: presence-by-key (`sum_getInferenceAttestation`).
+    Pair {
+        session_id: String,
+        verifier_address: String,
+    },
+}
 
 struct QueryConfig {
     expect_chain_id: u64,
-    session_id: String,
-    verifier_address: String,
+    mode: QueryMode,
 }
 
-/// Read-only: `sum_getInferenceAttestation(session_id, verifier_address)`
-/// behind the chain-id guardrail. Logs the chain's stored attestation
-/// when present; returns a typed `AttestationNotFound` (non-zero exit,
-/// scriptable) when the chain has no record under the pair. Never
-/// submits.
+/// Manual mode selection (Stage 8c Q4) — typed errors so the wording
+/// matches the rest of `operator`. Exactly one of: `--tx-hash`, or
+/// **both** `--session-id` and `--verifier-address`.
+fn resolve_query_mode(
+    tx_hash: Option<String>,
+    session_id: Option<String>,
+    verifier_address: Option<String>,
+) -> Result<QueryMode, OperatorError> {
+    let pair_present = session_id.is_some() || verifier_address.is_some();
+    match (tx_hash, pair_present) {
+        (Some(_), true) => Err(OperatorError::ConflictingQueryMode),
+        (Some(h), false) => Ok(QueryMode::TxHash(h)),
+        (None, true) => match (session_id, verifier_address) {
+            (Some(session_id), Some(verifier_address)) => Ok(QueryMode::Pair {
+                session_id,
+                verifier_address,
+            }),
+            // Exactly one of the pair supplied → incomplete.
+            _ => Err(OperatorError::QueryModeRequired),
+        },
+        (None, false) => Err(OperatorError::QueryModeRequired),
+    }
+}
+
+/// Read-only, behind the chain-id guardrail. `Pair` mode is a
+/// presence assertion: returns typed `AttestationNotFound` (scriptable
+/// non-zero) when absent. `TxHash` mode is a status report: logs the
+/// chain status (incl. `included_at_height`) and always returns Ok —
+/// `unknown` is a legitimate observation, not an error. Never submits.
 async fn run_query<T>(
     make_client: ClientFactory<T>,
     cfg: QueryConfig,
@@ -1002,23 +1139,53 @@ where
         let client = make_client(DUMMY_SEED);
         let params = client.get_chain_params()?;
         check_chain_id(cfg.expect_chain_id, params.chain_id)?;
-        match client.get_attestation(&cfg.session_id, &cfg.verifier_address)? {
-            Some(info) => {
+        match cfg.mode {
+            QueryMode::Pair {
+                session_id,
+                verifier_address,
+            } => match client.get_attestation(&session_id, &verifier_address)? {
+                Some(info) => {
+                    info!(
+                        session_id = %info.session_id,
+                        verifier_address = %info.verifier_address,
+                        tx_hash = %info.tx_hash,
+                        included_at_height = info.included_at_height,
+                        finalized = info.finalized,
+                        "query: chain attestation found"
+                    );
+                    Ok(())
+                }
+                None => Err(OperatorError::AttestationNotFound {
+                    session_id,
+                    verifier_address,
+                }),
+            },
+            QueryMode::TxHash(tx) => {
+                let s = client.query_attestation_status_full(&tx)?;
                 info!(
-                    session_id = %info.session_id,
-                    verifier_address = %info.verifier_address,
-                    tx_hash = %info.tx_hash,
-                    included_at_height = info.included_at_height,
-                    finalized = info.finalized,
-                    "query: chain attestation found"
+                    tx_hash = %tx,
+                    status = %s.status,
+                    included_at_height = ?s.included_at_height,
+                    reason = ?s.reason,
+                    "query: chain tx status"
                 );
                 Ok(())
             }
-            None => Err(OperatorError::AttestationNotFound {
-                session_id: cfg.session_id,
-                verifier_address: cfg.verifier_address,
-            }),
         }
+    })
+    .await
+}
+
+// ── derive-address (Stage 8c) ─────────────────────────────────────────────────
+
+/// Read-only: resolve the verifier seed and return its chain address.
+/// No chain access, no attestation file, no submit. Returns the
+/// address so the dispatch layer (and tests) can render/assert it.
+async fn derive_address_core(seed_source: SeedSource) -> Result<String, OperatorError> {
+    run_blocking(move || -> Result<String, OperatorError> {
+        let seed = seed_source.resolve()?;
+        signer_chain_address_base58(&seed)
+            .map_err(|e| OperatorError::SeedMalformed(e.to_string()))
     })
     .await
 }
@@ -1743,7 +1910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_returns_found_attestation_and_never_submits() {
+    async fn query_pair_returns_found_attestation_and_never_submits() {
         let fake = activated_fake(1);
         fake.set_response(
             "sum_getInferenceAttestation",
@@ -1751,8 +1918,10 @@ mod tests {
         );
         let cfg = QueryConfig {
             expect_chain_id: 1,
-            session_id: "sess-q".into(),
-            verifier_address: "addr-q".into(),
+            mode: QueryMode::Pair {
+                session_id: "sess-q".into(),
+                verifier_address: "addr-q".into(),
+            },
         };
         run_query(factory(fake.clone()), cfg).await.unwrap();
         let methods: Vec<String> = fake.calls().into_iter().map(|(m, _)| m).collect();
@@ -1761,13 +1930,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_not_found_returns_typed_error() {
+    async fn query_pair_not_found_returns_typed_error() {
         let fake = activated_fake(1);
         fake.set_response("sum_getInferenceAttestation", Ok(json!(null)));
         let cfg = QueryConfig {
             expect_chain_id: 1,
-            session_id: "missing".into(),
-            verifier_address: "addr-x".into(),
+            mode: QueryMode::Pair {
+                session_id: "missing".into(),
+                verifier_address: "addr-x".into(),
+            },
         };
         let err = run_query(factory(fake.clone()), cfg).await.unwrap_err();
         assert!(matches!(err, OperatorError::AttestationNotFound { .. }), "got {err:?}");
@@ -1775,7 +1946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_chain_id_mismatch_is_refused_before_get_attestation() {
+    async fn query_chain_id_mismatch_is_refused_before_read() {
         let fake = activated_fake(1);
         fake.set_response(
             "sum_getInferenceAttestation",
@@ -1783,8 +1954,10 @@ mod tests {
         );
         let cfg = QueryConfig {
             expect_chain_id: 31337,
-            session_id: "s".into(),
-            verifier_address: "a".into(),
+            mode: QueryMode::Pair {
+                session_id: "s".into(),
+                verifier_address: "a".into(),
+            },
         };
         let err = run_query(factory(fake.clone()), cfg).await.unwrap_err();
         assert!(matches!(err, OperatorError::ChainIdMismatch { .. }), "got {err:?}");
@@ -1794,5 +1967,120 @@ mod tests {
             "chain-id guardrail must fire before the attestation read"
         );
         assert_eq!(submit_calls(&fake), 0);
+    }
+
+    // ── Stage 8c: query --tx-hash mode ───────────────────────────────
+
+    #[test]
+    fn resolve_query_mode_matrix() {
+        // tx-hash alone → TxHash
+        assert_eq!(
+            resolve_query_mode(Some("0xabc".into()), None, None).unwrap(),
+            QueryMode::TxHash("0xabc".into())
+        );
+        // full pair → Pair
+        assert_eq!(
+            resolve_query_mode(None, Some("s".into()), Some("a".into())).unwrap(),
+            QueryMode::Pair { session_id: "s".into(), verifier_address: "a".into() }
+        );
+        // tx-hash + any pair field → conflict
+        assert!(matches!(
+            resolve_query_mode(Some("0xabc".into()), Some("s".into()), None),
+            Err(OperatorError::ConflictingQueryMode)
+        ));
+        // incomplete pair → required
+        assert!(matches!(
+            resolve_query_mode(None, Some("s".into()), None),
+            Err(OperatorError::QueryModeRequired)
+        ));
+        assert!(matches!(
+            resolve_query_mode(None, None, Some("a".into())),
+            Err(OperatorError::QueryModeRequired)
+        ));
+        // nothing → required
+        assert!(matches!(
+            resolve_query_mode(None, None, None),
+            Err(OperatorError::QueryModeRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn query_tx_hash_reports_status_and_never_submits() {
+        let fake = activated_fake(1);
+        fake.set_response(
+            "sum_getInferenceAttestationStatus",
+            Ok(json!({"status": "finalized", "included_at_height": 6_049_201, "reason": null})),
+        );
+        let cfg = QueryConfig {
+            expect_chain_id: 1,
+            mode: QueryMode::TxHash("0x3a9cbf".into()),
+        };
+        // tx-hash mode always returns Ok (status report, not a presence
+        // assertion) — even `unknown` is a legitimate observation.
+        run_query(factory(fake.clone()), cfg).await.unwrap();
+        let methods: Vec<String> = fake.calls().into_iter().map(|(m, _)| m).collect();
+        assert!(methods.iter().any(|m| m == "sum_getInferenceAttestationStatus"));
+        assert!(!methods.iter().any(|m| m == "sum_getInferenceAttestation"));
+        assert_eq!(submit_calls(&fake), 0);
+    }
+
+    #[tokio::test]
+    async fn query_tx_hash_unknown_status_is_ok_not_error() {
+        let fake = activated_fake(1);
+        fake.set_response(
+            "sum_getInferenceAttestationStatus",
+            Ok(json!({"status": "unknown", "included_at_height": null, "reason": null})),
+        );
+        let cfg = QueryConfig {
+            expect_chain_id: 1,
+            mode: QueryMode::TxHash("0xdeadbeef".into()),
+        };
+        run_query(factory(fake.clone()), cfg).await.unwrap();
+        assert_eq!(submit_calls(&fake), 0);
+    }
+
+    // ── Stage 8c: derive-address ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn derive_address_returns_seed_derived_address() {
+        let addr = derive_address_core(SeedSource::Explicit(SEED)).await.unwrap();
+        assert_eq!(addr, seed_address());
+    }
+
+    #[tokio::test]
+    async fn derive_address_missing_seed_is_surfaced() {
+        let err = derive_address_core(SeedSource::AbsentForTest).await.unwrap_err();
+        assert!(matches!(err, OperatorError::SeedMissing), "got {err:?}");
+    }
+
+    // ── Stage 8c: smoke returns a populated SmokeOutcome ─────────────
+
+    #[tokio::test]
+    async fn smoke_outcome_carries_tx_hash_and_finalization_fields() {
+        let fake = activated_fake(1);
+        add_submit_responses(&fake); // status RPC seeded "finalized" w/ included_at_height 101
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("att.json");
+        let att = synth_attestation(&seed_address(), 100);
+        std::fs::write(&path, serde_json::to_vec(&att).unwrap()).unwrap();
+
+        let cfg = SmokeConfig {
+            expect_chain_id: 1,
+            registry_path: dir.path().join("registry"),
+            attestation_json: Some(path),
+            synthetic: false,
+            allow_submit: true,
+            allow_mainnet_submit: true,
+            confirm_timeout_secs: 5,
+            seed_source: SeedSource::Explicit(SEED),
+        };
+        let outcome = smoke_core(factory(fake.clone()), cfg).await.unwrap();
+        assert!(outcome.finalized);
+        assert_eq!(outcome.tx_hash, "0xsmoke");
+        assert_eq!(outcome.verifier_address, seed_address());
+        assert_eq!(outcome.session_id, att.commitment.session_id);
+        assert_eq!(outcome.included_at_height, Some(101)); // from the extra finalization read
+        assert!(!outcome.attestation_id.is_empty());
+        assert_eq!(submit_calls(&fake), 1);
     }
 }

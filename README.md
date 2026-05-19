@@ -82,6 +82,7 @@ The protocol is built on four pillars:
 | **Phase 5 Stage 7b** — SUM Chain submit path (outer `SignedTransaction` via vendored chain primitives) | `omni-sumchain` | **Complete** |
 | **Phase 5 Stage 8a** — Operator surface: activation watch / smoke / lifecycle loop (safe-by-default CLI) | `omni-node` | **Complete** |
 | **Phase 5 Stage 8b** — Mainnet activation smoke hardening: read-only `preflight` + `query` + checklist runbook | `omni-node` | **Complete** |
+| **Phase 5 Stage 8c** — Post-mainnet-smoke hardening: warning-clean build, `smoke` summary, `query --tx-hash`, `derive-address` | `omni-node` | **Complete** |
 | Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
@@ -1308,7 +1309,7 @@ Stage 8b de-risks the mainnet activation smoke. The concrete gap Stage 8a expose
 
 At/after activation (head ≥ 6,000,000):
 
-4. `omni-node operator smoke --expect-chain-id 1 --registry-path <P> --attestation-json ./first-attestation.json --allow-submit --allow-mainnet-submit --confirm-timeout-secs <generous>`. **Timeout guidance:** set it well above `finality_depth × your expected block time`; no block time is hardcoded anywhere, so choose deliberately (e.g. if you expect ~12 s blocks, finality_depth 6 ≈ ~72 s — set ≥ 180 s for margin). Record the **tx hash**.
+4. `omni-node operator smoke --expect-chain-id 1 --registry-path <P> --attestation-json ./first-attestation.json --allow-submit --allow-mainnet-submit [--confirm-timeout-secs N]`. **Timeout guidance (empirically corrected, Stage 8c):** the first mainnet smoke (2026-05-19, see [docs/mainnet-smoke-audit.md](docs/mainnet-smoke-audit.md)) finalized in ~**11 s** / ~1 block past submit, so the default `--confirm-timeout-secs 60` is comfortably sufficient on SUM Chain mainnet — no need to inflate it. No block time is hardcoded; raise it only if your endpoint or network conditions warrant. Record the **tx hash**.
 5. Confirm chain status reaches **`Finalized`** — Stage 8a returns success only on `Finalized`; `Included` is logged as progress.
 6. `omni-node operator query --expect-chain-id 1 --session-id <S> --verifier-address <A>` — confirm the chain's stored attestation matches; record `included_at_height`, `tx_hash`, `finalized`.
 
@@ -1321,9 +1322,33 @@ At/after activation (head ≥ 6,000,000):
 
 **Results template to record:** `tx_hash`, `included_at_height`, finalized height + `finalized` status, `AttestationId`, local-idempotency rerun outcome.
 
+> **Mainnet smoke: PASS (2026-05-19, SUM Chain `chain_id=1`).** First real OmniNode attestation finalized on mainnet — see the operational run record in [docs/mainnet-smoke-audit.md](docs/mainnet-smoke-audit.md). README stays the feature doc; the audit note holds the exact tx hash / heights / finality timing.
+
 **Tests** (default-on, hermetic; **31** total in `omni_node::operator::tests`, +11 over Stage 8a): preflight — offline OK with matching seed (zero chain calls), verifier mismatch refused, malformed JSON, missing seed surfaced, `--rpc-url` requires `--expect-chain-id`, chain-id mismatch refused, happy path reports the snapshot and never submits, report-only when already activated; query — found attestation logged (never submits), not-found returns typed `AttestationNotFound`, chain-id guardrail fires before the attestation read. Every preflight/query path asserts `submit_calls == 0`.
 
 **What Stage 8b deliberately does not do:** no Stage 6/7b changes (no live bug surfaced); no protocol changes; no synthetic mainnet attestation; no bypass-local-idempotency duplicate-submit tool; no daemonization/systemd; no balance RPC / new `omni-sumchain` methods; no `--confirm-timeout-secs` default change; no edits outside `crates/omni-node/`.
+
+---
+
+### Phase 5 Stage 8c: Operator Hardening After First Mainnet Smoke — Complete
+
+**Crate:** `omni-node` | **Depends on:** Stage 8b + the 2026-05-19 mainnet smoke ([docs/mainnet-smoke-audit.md](docs/mainnet-smoke-audit.md)) | zero edits outside `crates/omni-node/`, no new deps
+
+Folds the first real mainnet finalization back into the operator surface: a genuinely warning-clean production build, empirically-corrected runbook timing, and three read-only ergonomics wins.
+
+| Change | Detail |
+|---|---|
+| Warning-clean build (no suppression) | `SeedSource`'s three test-injection variants (`Explicit`/`AbsentForTest`/`MalformedForTest`) and their `resolve()` match arms are `#[cfg(test)]`-gated, **not** `#[allow(dead_code)]`-suppressed. The production binary contains only `SeedSource::Env`; `cargo build -p omni-node` is genuinely warning-clean (verified). |
+| `operator smoke` summary block | `smoke_core` now returns a testable `SmokeOutcome { attestation_id, session_id, verifier_address, tx_hash, submitted_at_block, included_at_height, finalized }`; the CLI renders it as one consolidated `SMOKE SUMMARY` line. `included_at_height` is populated by **one extra read-only** `query_attestation_status_full` call at finalization — submit semantics unchanged (success still gated solely on `Finalized`; `Included` remains progress). Ctrl-C during the poll now returns typed `SmokeInterrupted` rather than a false-success (a partial smoke must never look green). |
+| `operator query --tx-hash` | New status-by-tx mode (`sum_getInferenceAttestationStatus`) alongside the Stage 8b `(session_id, verifier_address)` presence mode. Manual mutual-exclusion validation (Q4) with typed `ConflictingQueryMode` / `QueryModeRequired` errors so wording matches the rest of `operator`. Pair mode still returns `AttestationNotFound` when absent; tx-hash mode reports status (incl. `unknown`) and returns Ok — it's an observation, not a presence assertion. Read-only. |
+| `operator derive-address` | New read-only subcommand: resolves `OMNINODE_VERIFIER_SEED_HEX` and prints the chain address (bare stdout for scripting + an `info!` context line). No chain access, no attestation file — removes the friction of needing a preflight/attestation just to learn your verifier address. Never echoes the seed. |
+| Runbook timing corrected | Stage 8b runbook step 4 timeout guidance replaced with the empirical figure (mainnet finality ~11 s / ~1 block; default `--confirm-timeout-secs 60` is sufficient). |
+
+**Tests** (default-on, hermetic; **37** total in `omni_node::operator::tests`, +6 over Stage 8b): `resolve_query_mode` matrix (tx-hash vs full pair vs conflict vs incomplete vs none); `query --tx-hash` reports status & never submits; tx-hash `unknown` is Ok not error; `derive_address` returns the seed-derived address / surfaces missing seed; `smoke_core` returns a populated `SmokeOutcome` (tx_hash, finalized, `included_at_height` from the extra read, session/verifier). Warning-clean is verified by `cargo build -p omni-node` (not a unit test). Stage 8a/8b tests carried forward (query tests renamed to the `query_pair_*` mode).
+
+**Audit note immutability:** [docs/mainnet-smoke-audit.md](docs/mainnet-smoke-audit.md) records the 2026-05-19 run as a frozen historical record; Stage 8c added only a short "follow-up hardening" pointer at its foot — the smoke facts themselves are unedited.
+
+**What Stage 8c deliberately does not do:** no Stage 6 chain-wire / Stage 7b tx-construction changes (no concrete bug surfaced); no synthetic mainnet support; no daemonization/systemd (first mainnet smoke just passed — observability/UX hardening is the correct increment before a supervised long-running process); no new chain RPCs / `omni-sumchain` changes; no `--confirm-timeout-secs` default change (docs corrected instead); no edits outside `crates/omni-node/`.
 
 ---
 
@@ -1516,7 +1541,7 @@ OmniNode-Protocol/
 │       ├── Cargo.toml                 # + omni-zkml + omni-sumchain + thiserror (dev: tempfile)
 │       └── src/
 │           ├── main.rs                # listen | shard <path> | fetch <cid> | send <msg> | operator <…>
-│           └── operator.rs            # Stage 8a/8b: operator watch-activation | smoke | loop | preflight | query (safe-by-default, hermetic-tested)
+│           └── operator.rs            # Stage 8a/8b/8c: operator watch-activation | smoke | loop | preflight | query [--tx-hash] | derive-address (safe-by-default, hermetic-tested, warning-clean)
 │
 ├── pyproject.toml                     # maturin build config for omninode Python package
 ├── python/                            # Python ML package (Phase 3)
