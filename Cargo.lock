@@ -3395,7 +3395,8 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sumchain-crypto"
 version = "0.1.0"
-source = "git+https://github.com/SUM-INNOVATION/sum-chain?rev=d83e45a4#d83e45a4d4e20282f8b2e483882d33dee3199c36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd7e31df6223f670e2eeaf534f9493e89d6d5c5b6f3939c2f6bdc976071aa90d"
 dependencies = [
  "blake3",
  "bs58",
@@ -3416,7 +3417,8 @@ dependencies = [
 [[package]]
 name = "sumchain-primitives"
 version = "0.1.0"
-source = "git+https://github.com/SUM-INNOVATION/sum-chain?rev=d83e45a4#d83e45a4d4e20282f8b2e483882d33dee3199c36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6baa1202dd3b874e97b3157bf1a435b1949c04e326f39077dae5dc7542e4214b"
 dependencies = [
  "bincode 1.3.3",
  "blake3",

@@ -270,13 +270,16 @@ impl<T: JsonRpcTransport> ChainClient for SumChainClient<T> {
     /// Stage 7b — real implementation, gated behind the `submit`
     /// feature (Stage 9a). With `submit`, delegates to
     /// [`crate::tx::build_and_submit_signed_transaction`] (four
-    /// pre-flight gates → Stage 6 inner pipeline → vendored chain
-    /// types → outer-sign via `sumchain-crypto` →
-    /// `sum_sendRawTransaction`). Without `submit`, returns a typed
-    /// `ChainClientError::Other` so the `ChainClient` trait stays
-    /// satisfied for the read-only operator surface (`query`,
-    /// `poll_attestations_workflow`, etc.) while default builds need
-    /// no access to the private `SUM-INNOVATION/sum-chain` repo.
+    /// pre-flight gates → Stage 6 inner pipeline → public chain
+    /// types from `sumchain-primitives` → outer-sign via
+    /// `sumchain-crypto` → `sum_sendRawTransaction`). Without
+    /// `submit`, returns a typed `ChainClientError::Other` so the
+    /// `ChainClient` trait stays satisfied for the read-only
+    /// operator surface (`query`, `poll_attestations_workflow`,
+    /// etc.) while default builds resolve without compiling or
+    /// linking the chain crates at all (Stage 9c: the chain crates
+    /// are public on crates.io; gating is now purely about compile
+    /// graph size, not credential access).
     ///
     /// Stage 5.1 contract preserved either way: any error returned
     /// here surfaces through `submit_attestation_workflow` as

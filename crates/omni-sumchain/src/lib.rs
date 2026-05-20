@@ -52,10 +52,10 @@
 
 pub mod client;
 pub mod dto;
-// Stage 9a: outer_sign + tx depend on the vendored chain primitives
-// (`sumchain-primitives` / `sumchain-crypto`) from the private
-// `SUM-INNOVATION/sum-chain` repo. Gated behind `submit` so default
-// builds need no private repo access.
+// Stage 9a + 9c: outer_sign + tx depend on the public chain
+// primitives (`sumchain-primitives` / `sumchain-crypto` v0.1.0,
+// crates.io, MIT OR Apache-2.0). Gated behind `submit` so default
+// builds resolve without ever touching the chain crates.
 #[cfg(feature = "submit")]
 pub(crate) mod outer_sign;
 pub mod rpc;

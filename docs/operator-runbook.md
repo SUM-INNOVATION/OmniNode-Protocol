@@ -11,24 +11,23 @@ record see [`mainnet-smoke-audit.md`](./mainnet-smoke-audit.md).
 
 ---
 
-## 1. Build matrix (Stage 9a / 9b interim → Stage 9c final)
+## 1. Build matrix (Stage 9a + 9c)
 
 OmniNode separates **read-only** operator commands from **submit**
 commands at the cargo-feature level. A default build's binary
 contains only the read-only subcommands; submit subcommands appear
-only with `--features submit`.
+only with `--features submit`. Both builds resolve entirely from
+public sources (crates.io); **no GitHub credential is required for
+either build** as of Stage 9c.
 
-| Invocation | Compiled subcommands | Resolution-time GitHub access to `SUM-INNOVATION/sum-chain` (Stage 9c pending) |
+| Invocation | Compiled subcommands | `sumchain-primitives` / `sumchain-crypto` source |
 |---|---|---|
-| `cargo build -p omni-node` (default) | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) | **Required today.** Cargo clones the private repo at workspace-resolution time even though the submit feature is off (see § 1d). |
-| `cargo build -p omni-node --features submit` | All of the above plus `smoke` and `loop --allow-submit [--allow-mainnet-submit]` | Required (same as above). |
+| `cargo build -p omni-node` (default) | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) | absent from compile graph (Stage 9a feature gate keeps them out) |
+| `cargo build -p omni-node --features submit` | All of the above plus `smoke` and `loop --allow-submit [--allow-mainnet-submit]` | crates.io `v0.1.0` (dual-licensed MIT OR Apache-2.0, byte-equivalent to chain rev `d83e45a4` for the InferenceAttestation surface) |
 
-If you only need monitor-only / read-only operation, the **compiled
-binary** will still be free of the submit code path — but until
-Stage 9c lands, getting that binary built from source on a fresh
-machine still requires credentials. Operators without credentials
-should wait for the Stage 9c publish, or use a prebuilt binary if
-one is distributed before then.
+Read-only operator binaries stay small and submit code is an
+explicit operator choice; both halves are enforced as HARD GATES by
+the Stage 9c CI workflow on every push / PR.
 
 ### 1a. Choosing the right build — `--help` discoverability
 
@@ -58,71 +57,66 @@ read-only build (e.g. `omni-node operator smoke …`), `clap` reports
 discoverability cue rather than a runtime stub. To upgrade, rebuild
 with `--features submit`.
 
-### 1b. CI workflow status (Stage 9b interim)
+### 1b. CI workflow (Stage 9c restored gates)
 
 The CI workflow at [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
-runs on push to `main` and on PRs targeting `main`. **What's live
-today** (after the corrective revert):
+runs on push to `main` and on PRs targeting `main`. All jobs are
+unconditional — no secrets, no skip branches, runs on external-fork
+PRs too:
 
-| Job | What it does |
-|---|---|
-| `decoupling-status-notice` | Always-green job that emits a `::notice::` on every run explaining that the Stage 9a/9b decoupling gates are paused until Stage 9c (public sumchain crates) lands. Visible on every PR / push status page. |
-| `stage6-fixture-check` | Asserts that `crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json` and `crates/omni-zkml/src/chain_wire.rs` are byte-identical vs the PR base / push parent. No Cargo involvement; works on any runner regardless of credentials. |
-
-**What was removed from the live workflow (Stage 9c-pending):**
-
-- `default-build-test`, `default-tree-check` — both cargo-touching
-  jobs failed on their first CI run because Cargo clones the
-  private SUM Chain repo at workspace-resolution time even when the
-  submit feature is off (see § 1d). Adding credentials to default
-  jobs would only hide the underlying decoupling bug from fresh /
-  external operators.
-- `check-submit-auth`, `submit-build-test`, `submit-skip-notice` —
-  the secret-gated submit matrix. Removed alongside the default
-  jobs while we wait for Stage 9c; the design is preserved in the
-  Stage 9b commit (`fa1cacf`) in git history and the matrix will be
-  reintroduced fresh against the public crates.io source.
+| Job | Hard gate? | What it asserts |
+|---|---|---|
+| `default-build-test` | — | `cargo build -p omni-node` succeeds and `cargo test` passes for the workspace minus the PyO3 `omni-bridge` crate. |
+| `default-tree-check` | **yes** | `cargo tree -p omni-node` (default features) does NOT contain `sumchain-(crypto\|primitives)`. The Stage 9a feature gating must keep them out of the default compile graph. |
+| `submit-build-test` | — | `cargo build / test -p omni-sumchain -p omni-node --features submit` passes. Live `#[ignore]`'d tests are not run in CI. |
+| `submit-tree-check` | **yes** | `cargo tree -p omni-node --features submit` DOES contain the public chain crates. Catches the submit feature silently going inert. |
+| `stage6-fixture-check` | **yes** | `crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json` and `crates/omni-zkml/src/chain_wire.rs` are byte-identical vs the PR base / push parent. |
 
 Live `omni-sumchain` tests (`#[ignore]`'d, env-var-gated against
 `OMNINODE_SUMCHAIN_RPC_URL` / `OMNINODE_VERIFIER_SEED_HEX`) are **not**
 run in CI under any configuration — they stay operator-driven against
 a local mirror / mainnet.
 
-### 1d. Why decoupling needs Stage 9c (the Cargo-resolution issue)
+### 1d. How Stage 9c fixed the fresh-runner source-build issue (historical)
 
 Stage 9a moved the submit code path behind a cargo `submit` feature.
-That means a default build's **compiled binary** contains no submit
+That made a default build's **compiled binary** contain no submit
 code — `operator smoke` and the loop's `--allow-submit` flags are
-genuinely absent from `--help`. That part is real and correct.
+genuinely absent from `--help` on a default build. That part has
+always been real.
 
-What Stage 9a **did not** change is how Cargo evaluates a workspace
-manifest. `optional = true` on a git dependency only controls
+What Stage 9a did **not** change is how Cargo evaluates a workspace
+manifest. `optional = true` on a **git** dependency only controls
 whether the dep is compiled / linked. Cargo still **clones** the
 git source at workspace resolution time to read its own
 `Cargo.toml` and validate the lockfile, regardless of whether any
-feature pulls it in. So:
+feature pulls it in. Stage 9b's CI workflow on its first run on
+`main` exposed this — `cargo build -p omni-node` failed at resolve
+on a fresh runner with no credentials:
 
-```bash
-# On a fresh machine, no GitHub creds for SUM-INNOVATION/sum-chain:
-$ cargo build -p omni-node
-# Fails with:
-#   error: failed to get `sumchain-crypto` as a dependency …
-#   Caused by: unable to update https://github.com/SUM-INNOVATION/sum-chain?rev=d83e45a4
-#   Caused by: failed to authenticate when downloading repository
+```text
+error: failed to get `sumchain-crypto` as a dependency of package `omni-sumchain v0.1.0`
+Caused by: unable to update https://github.com/SUM-INNOVATION/sum-chain?rev=d83e45a4
+Caused by: failed to authenticate when downloading repository
 ```
 
-The actual fix is **Stage 9c**: the chain team publishes
-`sumchain-primitives` and `sumchain-crypto` to crates.io (Track A,
-confirmed in writing). Once those crates are public, the workspace
-dep swaps from a git source to `version = "0.1"`, Cargo never needs
-to clone anything private, and fresh default builds become
-credential-free — at which point Stage 9b's cargo-side gates return
-to the workflow and turn green on the same runner that's red today.
+**Stage 9c** retired the private git dependency. The chain team
+published `sumchain-primitives` v0.1.0 and `sumchain-crypto` v0.1.0
+to crates.io under MIT OR Apache-2.0 (Track A, confirmed in writing
+2026-05-19). The workspace dep swap from git to `"0.1.0"` eliminates
+the git source entirely; Cargo now resolves both crates through the
+public crates.io index, no clone of any private repo is attempted on
+any code path, and `cargo build -p omni-node` works on a fresh
+runner without credentials. Stage 9b's cargo-side gates are restored
+in Stage 9c and now run unconditionally — the green run is the
+proof.
 
-Treat the source-build-needs-credentials state as **temporary** and
-**Stage 9c-tracked**. The audit note for the 2026-05-19 mainnet
-smoke ([`mainnet-smoke-audit.md`](./mainnet-smoke-audit.md)) is a
-frozen historical record and is unaffected by this correction.
+The audit note for the 2026-05-19 mainnet smoke
+([`mainnet-smoke-audit.md`](./mainnet-smoke-audit.md)) is a frozen
+historical record and is unaffected by the source-of-deps change
+(the on-chain bytes for that tx were produced by chain code that
+also ran at rev `d83e45a4`; crates.io v0.1.0 is byte-equivalent for
+the InferenceAttestation surface).
 
 ### 1c. Distribution artifact convention (future)
 
@@ -440,11 +434,12 @@ Adapt paths, the user, environment file, and the RPC URL to your
 deployment. Build the binary appropriately for the desired mode:
 
 ```bash
-# Monitor-only (default, no SUM-chain credentials needed):
+# Monitor-only (default; resolves from crates.io only):
 cargo build --release -p omni-node
 sudo install -m 0755 target/release/omni-node /usr/local/bin/omni-node
 
-# Retry-enabled (requires GitHub access to SUM-INNOVATION/sum-chain):
+# Retry-enabled (also crates.io only; Stage 9c — no GitHub access
+# required; the chain primitives ship from public crates.io v0.1.0):
 cargo build --release -p omni-node --features submit
 sudo install -m 0755 target/release/omni-node /usr/local/bin/omni-node
 ```
