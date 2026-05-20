@@ -23,6 +23,24 @@ The protocol is built on four pillars:
 
 ---
 
+## Choosing your build (operator quick-reference)
+
+OmniNode separates the **read-only operator surface** (default build, no
+private deps) from the **submit-capable surface** (`--features submit`,
+which pulls vendored `sumchain-primitives` / `sumchain-crypto` from
+the chain team's private repo). Most operators want the default build.
+
+| You want to … | Build | Subcommands you get |
+|---|---|---|
+| Watch activation, query the chain, inspect your local registry, derive an address, run the lifecycle loop **monitor-only** | `cargo build -p omni-node` | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) |
+| Submit attestations, run the lifecycle loop with retry | `cargo build -p omni-node --features submit` | all of the above **plus** `smoke` and `loop --allow-submit [--allow-mainnet-submit]` |
+
+Default builds need no GitHub access to `SUM-INNOVATION/sum-chain`.
+Stage 9b's CI workflow enforces this on every push / PR — see the
+full operator guidance in [`docs/operator-runbook.md`](docs/operator-runbook.md).
+
+---
+
 ## Architecture Overview
 
 ```
@@ -84,6 +102,7 @@ The protocol is built on four pillars:
 | **Phase 5 Stage 8b** — Mainnet activation smoke hardening: read-only `preflight` + `query` + checklist runbook | `omni-node` | **Complete** |
 | **Phase 5 Stage 8c** — Post-mainnet-smoke hardening: warning-clean build, `smoke` summary, `query --tx-hash`, `derive-address` | `omni-node` | **Complete** |
 | **Phase 5 Stage 9a** — Production runbook + build decoupling (`submit` feature; default builds need no private repo); `operator registry list/show` | `omni-node`, `omni-sumchain` | **Complete** |
+| **Phase 5 Stage 9b** — CI matrix + operator distribution docs: HARD GATE on default-tree decoupling, Stage 6 byte-stability gate, secret-gated submit jobs | `.github/workflows`, docs | **Complete** |
 | Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
@@ -1400,6 +1419,43 @@ No mutating registry-repair tools ship in Stage 9a — registry inspection stays
 
 ---
 
+### Phase 5 Stage 9b: CI Matrix + Operator Distribution Docs — Complete
+
+**Crate:** none (workflow + docs only) | **Depends on:** Stage 9a | zero source changes; zero protocol changes; Stage 6 fixture + Stage 7b tx construction byte-stable (also a HARD CI gate now)
+
+Converts Stage 9a's manual `cargo tree` and feature-matrix verification into an enforced GitHub Actions workflow at [`.github/workflows/ci.yml`](.github/workflows/ci.yml), and codifies the read-only vs submit-capable build choice as a top-of-README pointer. No source-code changes — Stage 9b is purely operational hardening.
+
+| CI job | Triggers | Secret required | Outcome on miss |
+|---|---|---|---|
+| `default-build-test` | push to `main`, PR → `main` | none | hard fail on build/test regression |
+| `default-tree-check` | same | none | **HARD GATE** — fails the workflow if `cargo tree -p omni-node` ever pulls `sumchain-crypto` / `sumchain-primitives` (i.e. Stage 9a decoupling regresses) |
+| `stage6-fixture-check` | same | none | **HARD GATE** — fails if `crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json` or `crates/omni-zkml/src/chain_wire.rs` diff is non-empty vs the PR base / push parent |
+| `check-submit-auth` | same | reads `SUM_CHAIN_DEPLOY_KEY` / `SUM_CHAIN_PAT` presence | always green; emits `auth=deploy_key | pat | none` |
+| `submit-build-test` | same, **iff** `check-submit-auth != 'none'` | `SUM_CHAIN_DEPLOY_KEY` preferred, `SUM_CHAIN_PAT` fallback | runs `cargo build / test -p omni-sumchain -p omni-node --features submit`; asserts the submit tree DOES contain the vendored chain crates; live `#[ignore]`'d tests are never run in CI |
+| `submit-skip-notice` | same, **iff** `check-submit-auth == 'none'` | — | emits a `::notice::` explaining the skip (external-fork PRs, repos without the secret) so reviewers see a **clear yellow skip**, not a red failure |
+
+**Secret gating shape (Q1):** prefer `SUM_CHAIN_DEPLOY_KEY` (read-only deploy key on the chain team's repo — least privilege) via `webfactory/ssh-agent`; fall back to `SUM_CHAIN_PAT` rewritten as an `https://x-access-token:<PAT>@github.com/.insteadOf` git config. The probe job never echoes the secret value, only its presence as a string output (`deploy_key | pat | none`).
+
+**Triggers (Q2):** push to `main` + PR targeting `main` only. No cron job in 9b. No live-mirror / mainnet jobs (the `omni-sumchain` `#[ignore]`'d live tests stay operator-driven).
+
+**Release artifacts (Q3):** none in 9b. The runbook names the future convention (`omni-node-readonly-<version>-<target>` / `omni-node-submit-<version>-<target>`) so a later stage has a target; no release pipeline / signing / publishing is added.
+
+**PR-vs-direct policy going forward (Q4):** with CI in place, **any stage touching** `crates/omni-sumchain/src/tx.rs`, `crates/omni-zkml/src/chain_wire.rs`, the Stage 6 fixture, vendored SUM Chain deps / `--features submit`, or protocol/signing behavior **routes through a PR** so CI runs before merge. Small docs/operator non-protocol fixes can still go direct to `main`.
+
+**Distribution discoverability (Q5):** a short "Choosing your build" pointer table lives at the top of this README (linking to the runbook); the full table + `--help` discoverability notes (e.g., `operator smoke` is **absent** from `--help` without the feature; clap reports "unrecognized subcommand 'smoke'" rather than a runtime stub) live in [`docs/operator-runbook.md`](docs/operator-runbook.md) § 1.
+
+**Local dry-run of the gates against the Stage 9a commit:**
+
+```text
+cargo tree -p omni-node | grep -E 'sumchain-(crypto|primitives)'                 → empty (PASS)
+git diff HEAD~1..HEAD -- <stage-6 fixture> <chain_wire.rs>                       → empty (PASS)
+cargo tree -p omni-node --features submit | grep -E 'sumchain-(crypto|primitives)' → vendored crates present (PASS, informational)
+```
+
+**What Stage 9b deliberately does not do:** no source changes (no bug surfaced); no release pipeline / signing / publishing automation (deferred); no `cargo clippy` / `cargo deny` / SBOM / supply-chain scanning jobs (scope creep, deferred); no cron / drift-detection jobs (Q2 deferred); no daemonization / systemd code; no edits to `docs/mainnet-smoke-audit.md` (immutability); no chain protocol changes; no `omni-sumchain` API changes; no `omni-zkml` changes; no publishing of `sumchain-primitives` / `sumchain-crypto` ourselves.
+
+---
+
 ### Phase 5 Stage 8+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
@@ -1601,9 +1657,13 @@ OmniNode-Protocol/
 │
 ├── proto/                              # Protobuf schema definitions
 │
+├── .github/
+│   └── workflows/
+│       └── ci.yml                      # Stage 9b: CI matrix (default build/test + HARD GATES on default tree decoupling + Stage 6 byte-stability; secret-gated --features submit jobs with clear-skip for forks)
+│
 ├── docs/                              # Architecture documentation
 │   ├── mainnet-smoke-audit.md         # Stage 8b: frozen historical record of the 2026-05-19 first mainnet finalization
-│   └── operator-runbook.md            # Stage 9a: canonical operator runbook (build matrix, daily commands, recovery, RUST_LOG, systemd sample)
+│   └── operator-runbook.md            # Stage 9a + 9b: canonical operator runbook (build matrix, daily commands, recovery, RUST_LOG, systemd sample, --help discoverability)
 │
 ├── scripts/                           # Development scripts
 │

@@ -11,7 +11,7 @@ record see [`mainnet-smoke-audit.md`](./mainnet-smoke-audit.md).
 
 ---
 
-## 1. Build matrix (Stage 9a)
+## 1. Build matrix (Stage 9a / 9b)
 
 OmniNode separates **read-only** operator commands from **submit**
 commands at the build level. The chain submit path pulls vendored
@@ -24,20 +24,87 @@ to that repo.
 | `cargo build -p omni-node` (default) | **No** | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) |
 | `cargo build -p omni-node --features submit` | Yes (one-time `cargo fetch`; needs GitHub auth to `SUM-INNOVATION/sum-chain`) | All of the above plus `smoke` and `loop --allow-submit [--allow-mainnet-submit]` |
 
-Verify locally:
+Verify locally — these exact checks are also **HARD GATES** in
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml), so any
+push or PR that regresses the decoupling fails CI before merge:
 
 ```bash
 # No private deps in the default build's resolved tree.
 cargo tree -p omni-node | grep -E 'sumchain-(crypto|primitives)'
-# (expected: no rows)
+# (expected: no rows  →  CI hard-fails if this finds rows)
 
 cargo tree -p omni-node --features submit | grep -E 'sumchain-(crypto|primitives)'
-# (expected: sumchain-crypto + sumchain-primitives appear)
+# (expected: sumchain-crypto + sumchain-primitives appear  →  CI hard-fails if they don't)
 ```
 
 If you only need monitor-only / read-only operation, default builds
 are friction-free and your account does not need access to
 `SUM-INNOVATION/sum-chain`.
+
+### 1a. Choosing the right build — `--help` discoverability
+
+The CLI is the source of truth for which mode a built binary is in:
+
+```text
+# Read-only binary  (default build):
+$ omni-node operator --help
+  watch-activation       Poll until OmniNode + V2 activation, then exit 0.
+  loop                   Periodic poll → stale-sweep → (retry) lifecycle loop.
+  preflight              Read-only: validate seed ↔ attestation-json …
+  query                  Read-only: query the chain by (session_id, …) OR --tx-hash.
+  derive-address         Read-only: print the chain address derived from …
+  registry               Read-only: list / show records in a local …
+# (no `smoke` subcommand; `loop --help` shows no --allow-submit / --allow-mainnet-submit)
+
+# Submit-capable binary  (cargo … --features submit):
+$ omni-node operator --help
+  …all of the above, plus:
+  smoke                  Submit one attestation and poll it to Finalized (Included = progress).
+# (`loop --help` additionally shows --allow-submit / --allow-mainnet-submit)
+```
+
+If an operator accidentally invokes a submit command against a
+read-only build (e.g. `omni-node operator smoke …`), `clap` reports
+**`error: unrecognized subcommand 'smoke'`** — a clear, scriptable
+discoverability cue rather than a runtime stub. To upgrade, rebuild
+with `--features submit`.
+
+### 1b. CI enforces this on every push / PR (Stage 9b)
+
+The CI workflow at [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+runs on push to `main` and on pull requests targeting `main`:
+
+| Job | What it gates |
+|---|---|
+| `default-build-test` | `cargo build -p omni-node` + workspace `cargo test` minus the PyO3 `omni-bridge` crate (default features only — no SUM Chain repo access). |
+| `default-tree-check` | **HARD GATE.** Asserts `cargo tree -p omni-node` contains no `sumchain-(crypto\|primitives)` rows. Any regression of the Stage 9a decoupling fails CI. |
+| `stage6-fixture-check` | **HARD GATE.** Asserts `crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json` and `crates/omni-zkml/src/chain_wire.rs` are byte-identical vs the PR base (or push parent). |
+| `check-submit-auth` | Probes for `SUM_CHAIN_DEPLOY_KEY` (preferred) or `SUM_CHAIN_PAT` (fallback). Emits `auth=deploy_key \| pat \| none` for downstream jobs. |
+| `submit-build-test` | Runs **iff** `check-submit-auth != 'none'`. `cargo build / test -p omni-sumchain -p omni-node --features submit`; also asserts the submit tree DOES contain the vendored chain crates. Live `#[ignore]`'d tests are never run in CI. |
+| `submit-skip-notice` | Runs **iff** `check-submit-auth == 'none'`. Emits a `::notice::` explaining the skip (external-fork PRs, repos without the secret) — a clear yellow skip, not a red failure. |
+
+To run the submit suite in CI, repo admins install one of:
+- `SUM_CHAIN_DEPLOY_KEY` — a read-only deploy key on `SUM-INNOVATION/sum-chain` (preferred, least privilege; wired via `webfactory/ssh-agent`).
+- `SUM_CHAIN_PAT` — a personal access token with read access to that repo (fallback; rewritten as `url."https://x-access-token:<PAT>@github.com/".insteadOf "https://github.com/"`).
+
+Live `omni-sumchain` tests (`#[ignore]`'d, env-var-gated against
+`OMNINODE_SUMCHAIN_RPC_URL` / `OMNINODE_VERIFIER_SEED_HEX`) are **not**
+run in CI under any configuration — they stay operator-driven against
+a local mirror / mainnet.
+
+### 1c. Distribution artifact convention (future)
+
+When release automation lands in a later stage, the documented asset
+naming will distinguish the two builds at download time without
+renaming the in-Cargo `[[bin]]`:
+
+```text
+omni-node-readonly-<version>-<target>.tar.gz   # default-features build
+omni-node-submit-<version>-<target>.tar.gz     # --features submit build
+```
+
+Stage 9b does **not** add a release / publishing pipeline — only the
+naming convention is reserved here for future use.
 
 ---
 
