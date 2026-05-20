@@ -79,14 +79,17 @@ bs58       = "0.5"
 # Used by `omni-sumchain` only.
 ureq       = "2.10"
 
-# ─── Phase 5 Stage 7b: SUM Chain vendored primitives ─────────────────────────
-# Pinned to chain rev `d83e45a4` (chain-team-confirmed for the v2 outer-tx
-# spec). Used by `omni-sumchain` only. The chain repo
-# (SUM-INNOVATION/sum-chain) is private; developers and CI need a GitHub
-# credential (PAT or SSH key) with read access. See
-# `crates/omni-sumchain/README.md` for setup notes.
-sumchain-primitives = { git = "https://github.com/SUM-INNOVATION/sum-chain", rev = "d83e45a4", package = "sumchain-primitives" }
-sumchain-crypto     = { git = "https://github.com/SUM-INNOVATION/sum-chain", rev = "d83e45a4", package = "sumchain-crypto" }
+# ─── Phase 5 Stage 7b / 9c: SUM Chain primitives ─────────────────────────────
+# Stage 9c: swapped from the private `SUM-INNOVATION/sum-chain` git
+# source at rev `d83e45a4` to the chain team's public crates.io
+# release (`sumchain-primitives` / `sumchain-crypto` v0.1.0, dual-
+# licensed MIT OR Apache-2.0, byte-equivalent to rev d83e45a4 for the
+# InferenceAttestation surface OmniNode consumes). Used by
+# `omni-sumchain` only, and only behind the `submit` feature.
+# Default builds resolve entirely from the crates.io index; no
+# GitHub credential is required.
+sumchain-primitives = "0.1.0"
+sumchain-crypto     = "0.1.0"
 
 # ─── Phase 3: FFI ────────────────────────────────────────────────────────────
 

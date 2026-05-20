@@ -23,7 +23,7 @@ use sumchain_primitives::inference_attestation::{
     InferenceAttestationDigest as ChainDigest,
     InferenceAttestationTxData as ChainTxData,
 };
-use sumchain_primitives::Address;
+use sumchain_primitives::{Address, SignedTransaction, TransactionV2, TxInner, TxPayload};
 
 fn sample_local_digest() -> LocalDigest {
     LocalDigest {
@@ -135,4 +135,131 @@ fn parity_address_from_pubkey_matches_omninode_derivation() {
             pubkey[0], addr_local, addr_chain
         );
     }
+}
+
+// ── #4 / Stage 9c: TransactionV2 signing-hash stability ─────────────────────
+
+/// Helper: build a deterministic `TransactionV2` for the Stage 9c
+/// parity tests. Same inputs ⇒ same wire bytes ⇒ same signing hash.
+fn sample_transaction_v2() -> TransactionV2 {
+    let digest = sample_chain_digest(&sample_local_digest());
+    let mut sig = [0u8; 64];
+    for (i, b) in sig.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    let tx_data = ChainTxData {
+        digest,
+        verifier_signature: sig,
+    };
+    // Deterministic non-zero pubkey so the derived `from` is stable
+    // across runs without depending on a verifier seed.
+    let pubkey: [u8; 32] = [
+        0x3b, 0x6a, 0x27, 0xbc, 0xce, 0xb6, 0xa4, 0x2d, 0x62, 0xa3, 0xa8, 0xd0,
+        0x2a, 0x6f, 0x0d, 0x73, 0x65, 0x32, 0x15, 0x77, 0x1d, 0xe2, 0x43, 0xa6,
+        0x3a, 0xc0, 0x48, 0xa1, 0x8b, 0x59, 0xda, 0x29,
+    ];
+    TransactionV2 {
+        chain_id: 31337,
+        from: Address::from_public_key(&pubkey),
+        fee: 1000u128,
+        nonce: 0,
+        payload: TxPayload::InferenceAttestation(tx_data),
+    }
+}
+
+/// Frozen-bytes test: a known `TransactionV2` must produce the same
+/// 32-byte BLAKE3 `signing_hash()` across builds. If a future chain
+/// rev bump changes the bincode wire format or the hash function,
+/// this test fails loudly. The expected bytes are captured by running
+/// this test once against a known-good build; do NOT update them
+/// without confirming the chain change is intentional and notifying
+/// the OmniNode team (cc'd on the chain's InferenceAttestation-
+/// surface PRs per the 2026-05-19 publishing agreement).
+#[test]
+fn parity_transaction_v2_signing_hash_is_stable() {
+    let tx = sample_transaction_v2();
+    let hash = tx.signing_hash();
+    let actual: [u8; 32] = *hash.as_bytes();
+
+    // Frozen against sumchain-primitives v0.1.0 (crates.io, dual-
+    // licensed MIT OR Apache-2.0, byte-equivalent to chain rev
+    // d83e45a4 for the InferenceAttestation surface OmniNode
+    // consumes). The byte sequence is the BLAKE3 hash of the
+    // bincode-1.3 encoding of `sample_transaction_v2()`.
+    const EXPECTED: [u8; 32] = [
+        0x7e, 0x0f, 0xa2, 0xf1, 0x61, 0x0d, 0x03, 0x76, 0x9c, 0x6b, 0xd2, 0xf1,
+        0x0a, 0x3d, 0x4c, 0xa9, 0x2a, 0xb6, 0x2d, 0x6d, 0x59, 0x99, 0x34, 0x60,
+        0xad, 0xe5, 0x57, 0x38, 0x27, 0x9c, 0x8f, 0x24,
+    ];
+
+    assert_eq!(
+        actual, EXPECTED,
+        "TransactionV2::signing_hash() bytes drifted vs the frozen \
+         value. If this is an intentional chain wire-format change \
+         (sumchain-primitives bump), update EXPECTED with the new \
+         capture AND notify OmniNode per the publishing agreement."
+    );
+}
+
+// ── #5 / Stage 9c: SignedTransaction hex round-trip ─────────────────────────
+
+/// `SignedTransaction::to_hex(...).from_hex(...).to_hex(...)` must
+/// be byte-stable: a SignedTransaction the chain emits to hex can be
+/// parsed and re-emitted without divergence. This test does not need
+/// a chain-produced fixture — it builds a SignedTransaction in-test
+/// with a deterministic signature and proves the crate's own
+/// encoding is symmetric. The chain-produced fixture (Stage 9c.1
+/// follow-up) will be a stronger gate against real on-chain bytes.
+#[test]
+fn parity_signed_transaction_hex_roundtrip_is_stable() {
+    use sumchain_crypto::{sign, PrivateKey};
+
+    let tx = sample_transaction_v2();
+
+    // Deterministic seed → deterministic signature → deterministic hex.
+    let seed = [42u8; 32];
+    let sk = PrivateKey::from_bytes(seed);
+    let pk = sk.public_key();
+    let outer_hash = tx.signing_hash();
+    let sig = sign(outer_hash.as_bytes(), &sk);
+
+    let signed =
+        SignedTransaction::new_v2(tx, sig.to_bytes(), *pk.as_bytes());
+
+    let hex_1 = signed.to_hex();
+    let reparsed = SignedTransaction::from_hex(&hex_1)
+        .expect("to_hex output must round-trip through from_hex");
+    let hex_2 = reparsed.to_hex();
+
+    assert_eq!(
+        hex_1, hex_2,
+        "SignedTransaction hex round-trip diverged: \
+         to_hex/from_hex/to_hex must be a no-op."
+    );
+
+    // Sanity check: the reparsed inner tx is V2 (we built a V2), and
+    // its chain_id and fee match the original. Pins both that the
+    // payload arm is preserved and that the integer fields survive
+    // the bincode round-trip.
+    let TxInner::V2(reparsed_v2) = reparsed.inner else {
+        panic!("expected reparsed.inner to be TxInner::V2");
+    };
+    assert_eq!(reparsed_v2.chain_id, 31337);
+    assert_eq!(reparsed_v2.fee, 1000u128);
+    assert!(matches!(
+        reparsed_v2.payload,
+        TxPayload::InferenceAttestation(_)
+    ));
+
+    // Bare hex (no `0x` prefix); lowercase. Same shape as the
+    // canonical chain wire format documented in the Stage 8b
+    // mainnet smoke audit.
+    assert!(
+        !hex_1.starts_with("0x") && !hex_1.starts_with("0X"),
+        "SignedTransaction::to_hex must emit BARE hex (no 0x prefix)"
+    );
+    assert!(
+        hex_1.chars().all(|c| c.is_ascii_hexdigit()),
+        "SignedTransaction::to_hex must be ASCII hex digits only"
+    );
 }
