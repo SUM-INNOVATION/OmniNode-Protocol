@@ -1384,12 +1384,12 @@ Folds the first real mainnet finalization back into the operator surface: a genu
 
 Two outcomes that make the now-proven operator path *adoptable*:
 
-**1. Default builds no longer need the private SUM Chain repo.** The vendored `sumchain-primitives` / `sumchain-crypto` git deps move behind a default-off `submit` cargo feature. `cargo build -p omni-node` (default) works for any operator running monitor-only / read-only commands — no GitHub access to `SUM-INNOVATION/sum-chain` required. Submit operators opt in with `--features submit`.
+**1. Submit code path moves behind a `submit` cargo feature.** Stage 9a introduced the feature gate: the `sumchain-primitives` / `sumchain-crypto` deps (then sourced from the private chain repo) are marked `optional = true` and only pulled in by `--features submit`, and the `Smoke` / `loop --allow-submit` / `loop --allow-mainnet-submit` CLI variants are `#[cfg(feature = "submit")]`-gated. The original goal — that `cargo build -p omni-node` (default) compile without ever touching the chain repo — turned out to need more than the feature gate (Cargo still clones git sources at resolution time regardless of optional-ness). **Stage 9c later closed that gap** by moving both crates to the public crates.io index (v0.1.0, MIT OR Apache-2.0); fresh source builds are now credential-free for both feature configurations. See the Stage 9b / Stage 9c sections below for the full arc.
 
-| Build invocation | Pulls private repo? | Subcommands compiled in |
+| Build invocation | Pulls chain crates? | Subcommands compiled in |
 |---|---|---|
-| `cargo build -p omni-node` (default) | **no** | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) |
-| `cargo build -p omni-node --features submit` | yes (one-time `cargo fetch`) | all of the above plus `smoke`, `loop --allow-submit [--allow-mainnet-submit]` |
+| `cargo build -p omni-node` (default) | **no** (feature off — sumchain-* absent from compile graph) | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) |
+| `cargo build -p omni-node --features submit` | yes (sumchain-primitives + sumchain-crypto from crates.io as of Stage 9c) | all of the above plus `smoke`, `loop --allow-submit [--allow-mainnet-submit]` |
 
 Verified empirically (Stage 9a CI gate):
 
@@ -1421,7 +1421,7 @@ No mutating registry-repair tools ship in Stage 9a — registry inspection stays
 | `cargo test -p omni-sumchain` | **86** (read-only suites + the new `no_submit_feature` typed-error test) | **103** (full suite incl. parity, submit-construction; the 5 `#[ignore]`'d live tests still self-skip) |
 | `cargo build -p omni-node` / `--features submit` | warning-clean / warning-clean | — |
 
-**What Stage 9a deliberately does not do:** no Stage 6 chain-wire or fixture changes (byte-stable); no Stage 7b tx-construction changes — the cfg-gating moves modules without modifying bytes, and the parity tests still assert byte-equivalence with vendored chain primitives under `--features submit`; no synthetic mainnet support; no daemonization / systemd code (sample unit is docs-only); no JSON output mode (deferred); no mutating registry-repair tools; no new chain RPCs / `omni-sumchain` methods; no publishing of `sumchain-primitives` / `sumchain-crypto` (chain team's call); no edits outside `crates/omni-node/` + `crates/omni-sumchain/` (Cargo.toml + cfg attributes only, no tx bytes) + `docs/operator-runbook.md` + `README.md`.
+**What Stage 9a deliberately does not do:** no Stage 6 chain-wire or fixture changes (byte-stable); no Stage 7b tx-construction changes — the cfg-gating moves modules without modifying bytes, and the parity tests still assert byte-equivalence with the chain primitives under `--features submit` (Stage 9a referred to these as "vendored" because the deps were still git-sourced at the time; Stage 9c later moved them to public crates.io, byte-equivalent); no synthetic mainnet support; no daemonization / systemd code (sample unit is docs-only); no JSON output mode (deferred); no mutating registry-repair tools; no new chain RPCs / `omni-sumchain` methods; no publishing of `sumchain-primitives` / `sumchain-crypto` (chain team's call — superseded by Stage 9c, where the chain team did publish); no edits outside `crates/omni-node/` + `crates/omni-sumchain/` (Cargo.toml + cfg attributes only, no tx bytes) + `docs/operator-runbook.md` + `README.md`.
 
 ---
 
@@ -1714,7 +1714,7 @@ OmniNode-Protocol/
 │   │       └── fixtures/
 │   │           └── chain_attestation_vectors.json  # Stage 6 frozen deliverable: 3 chain attestation test vectors
 │   │
-│   ├── omni-sumchain/                  # Phase 5 Stage 7a + 7b + 9a: SUM Chain adapter (read/query default-on; submit + vendored chain primitives behind the `submit` cargo feature, default-off)
+│   ├── omni-sumchain/                  # Phase 5 Stage 7a + 7b + 9a + 9c: SUM Chain adapter (read/query default-on; submit + public chain primitives from crates.io v0.1.0 behind the `submit` cargo feature, default-off)
 │   │   ├── Cargo.toml                 # depends on omni-zkml + omni-types + ureq + sumchain-primitives + sumchain-crypto + serde + serde_json + thiserror + tracing (dev: bincode1)
 │   │   ├── README.md                  # operational setup (extra-alloc.json funding, env vars, live-test guide, Stage 7b submission flow)
 │   │   ├── src/
@@ -1724,13 +1724,13 @@ OmniNode-Protocol/
 │   │   │   ├── rpc.rs                 # JsonRpcTransport trait, UreqTransport (sync HTTP), FakeJsonRpcTransport (Arc<Mutex<_>> test fixture)
 │   │   │   ├── status.rs              # map_status_info: chain status JSON -> omni_zkml::AttestationStatus (strict variant matching)
 │   │   │   ├── outer_sign.rs          # Stage 7b: outer_sign_transaction_v2 — TransactionV2::signing_hash() + sumchain_crypto::sign + SignedTransaction::new_v2
-│   │   │   └── tx.rs                  # Stage 7b: build_and_submit_signed_transaction (4 gates → Stage 6 inner pipeline → local→vendored conversion → TransactionV2 → outer-sign → bare-hex sum_sendRawTransaction)
+│   │   │   └── tx.rs                  # Stage 7b: build_and_submit_signed_transaction (4 gates → Stage 6 inner pipeline → local→chain type conversion → TransactionV2 → outer-sign → bare-hex sum_sendRawTransaction)
 │   │   └── tests/
 │   │       ├── unit_status_mapping.rs        # 10 hermetic status-mapping tests
 │   │       ├── unit_dto.rs                   # 14 hermetic DTO parse tests (pre-patch + post-patch ChainParamsInfo including v2_enabled_from_height)
 │   │       ├── unit_rpc_envelope.rs          # 16 hermetic RPC envelope + Stage 5.1 integration tests (includes Stage 7b happy-path receipt)
 │   │       ├── unit_submit_construction.rs   # 15 hermetic Stage 7b construction tests (gate ordering, RPC caching, bare-hex shape, min-fee round-trip, {tx_hash} object + bare-string + 3 negative parse paths)
-│   │       ├── parity_vendored_primitives.rs # 3 byte-equivalence tests: Stage 6 local digest/tx-data + bs58 address derivation == vendored chain types under bincode 1.3
+│   │       ├── parity_vendored_primitives.rs # 5 byte-equivalence tests: Stage 6 local digest/tx-data + bs58 address derivation == public chain types (sumchain-primitives v0.1.0) under bincode 1.3, plus Stage 9c TransactionV2 signing-hash + SignedTransaction hex-roundtrip stability
 │   │       ├── stage6_wire_parity.rs         # 1 cross-crate smoke against the Stage 6 chain-team fixture
 │   │       └── live_local_mirror.rs          # 5 #[ignore]'d live tests, env-gated by OMNINODE_SUMCHAIN_RPC_URL (+ OMNINODE_VERIFIER_SEED_HEX for Stage 7b submit roundtrip)
 │   │
