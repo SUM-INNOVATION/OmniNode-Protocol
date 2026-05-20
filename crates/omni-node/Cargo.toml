@@ -11,14 +11,16 @@ name = "omni-node"
 path = "src/main.rs"
 
 [features]
-# Stage 9a: default-OFF. With `submit`, the binary gains the
+# Stage 9a + 9c: default-OFF. With `submit`, the binary gains the
 # attestation submit / retry path (`operator smoke`, retry-enabled
-# `operator loop`) and `omni-sumchain` pulls the vendored
-# `sumchain-primitives` / `sumchain-crypto` from the private
-# `SUM-INNOVATION/sum-chain` repo. Without it, only the read-only
-# operator surface (watch-activation, preflight, query [+--tx-hash],
-# derive-address, registry list/show, monitor-only loop) is compiled
-# and the build needs no access to that private repo.
+# `operator loop`) and `omni-sumchain` pulls the public chain
+# primitives (`sumchain-primitives` + `sumchain-crypto` v0.1.0,
+# crates.io, MIT OR Apache-2.0). Without `submit`, only the
+# read-only operator surface (watch-activation, preflight,
+# query [+--tx-hash], derive-address, registry list/show,
+# monitor-only loop) is compiled and the chain primitives are absent
+# from the compile graph entirely. Both builds resolve from public
+# sources only — no GitHub credential is required at any step.
 default = []
 submit  = ["omni-sumchain/submit"]
 

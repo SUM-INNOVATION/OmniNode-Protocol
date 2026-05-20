@@ -8,11 +8,13 @@ Phase 5 Stage 7a + 7b — SUM Chain adapter for `omni-zkml::ChainClient`.
 `v2_is_active`.
 
 **Stage 7b (submit):** `submit_attestation` is fully implemented using
-vendored chain primitives (`sumchain-primitives` + `sumchain-crypto`
-pinned to chain rev `d83e45a4`). Flow: four pre-flight gates →
-Stage 6 inner pipeline → local-to-vendored conversion (parity-tested
-under bincode 1.3) → outer-tx assembly → outer `BLAKE3+Ed25519` sign
-via `sumchain-crypto` → bare-hex `sum_sendRawTransaction`.
+the public chain primitives (`sumchain-primitives` + `sumchain-crypto`
+v0.1.0, crates.io, dual-licensed MIT OR Apache-2.0, byte-equivalent to
+chain rev `d83e45a4` for the InferenceAttestation surface). Flow:
+four pre-flight gates → Stage 6 inner pipeline → local-to-chain type
+conversion (parity-tested under bincode 1.3) → outer-tx assembly →
+outer `BLAKE3+Ed25519` sign via `sumchain-crypto` → bare-hex
+`sum_sendRawTransaction`.
 
 ## What ships
 
@@ -38,15 +40,18 @@ via `sumchain-crypto` → bare-hex `sum_sendRawTransaction`.
 
 - **`ChainClient::submit_attestation(...)`** — real implementation. Four
   pre-flight gates (omninode-active, v2-active, verifier-address
-  consistency), then Stage 6 inner pipeline, then conversion to
-  vendored `sumchain_primitives` types, then outer-tx assembly + sign,
+  consistency), then Stage 6 inner pipeline, then conversion to the
+  public `sumchain_primitives` types, then outer-tx assembly + sign,
   then bare-hex `sum_sendRawTransaction`. Submission flow detailed in
   [`src/tx.rs`](src/tx.rs).
-- **Vendored chain primitives** at rev `d83e45a4`:
-  `sumchain-primitives` (TransactionV2, TxPayload, SignedTransaction,
-  Address) and `sumchain-crypto` (Ed25519 sign/verify, key derivation).
-- **Parity-verified** local-to-vendored byte equivalence under bincode
-  1.3 (3 tests in `tests/parity_vendored_primitives.rs`).
+- **Public chain primitives** from crates.io (v0.1.0, MIT OR Apache-2.0,
+  byte-equivalent to chain rev `d83e45a4` for the InferenceAttestation
+  surface): `sumchain-primitives` (TransactionV2, TxPayload,
+  SignedTransaction, Address) and `sumchain-crypto` (Ed25519
+  sign/verify, key derivation).
+- **Parity-verified** local-to-chain byte equivalence under bincode
+  1.3, plus signing-hash + hex-roundtrip stability
+  (5 tests in `tests/parity_vendored_primitives.rs`).
 
 Default `cargo test` is fully hermetic — `UreqTransport` is exercised
 only by `#[ignore]`'d live tests gated on env vars.
@@ -68,10 +73,13 @@ only by `#[ignore]`'d live tests gated on env vars.
 ## Running tests
 
 ```bash
-# Hermetic (default) — runs in CI; no network.
-# Requires GitHub credentials for SUM-INNOVATION/sum-chain on first
-# build (vendored chain primitives) — see "Auth setup" below.
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p omni-sumchain
+# Hermetic (default) — runs in CI; no network, no GitHub credentials.
+# The chain primitives are public crates.io deps (sumchain-primitives
+# / sumchain-crypto v0.1.0) and resolve against the crates.io index.
+cargo test -p omni-sumchain
+
+# Submit path tests (workspace + crates.io resolution; no live RPC).
+cargo test -p omni-sumchain --features submit
 
 # Live read tests against an activated local mirror (developer-only).
 OMNINODE_SUMCHAIN_RPC_URL=http://localhost:8545 \
@@ -87,24 +95,17 @@ OMNINODE_VERIFIER_SEED_HEX=<64 hex chars> \
 `#[ignore]`'d live tests self-skip when the required env vars are
 unset, so `cargo test -- --ignored` without them still exits 0.
 
-## Auth setup (vendored chain deps)
+## Auth setup (chain deps)
 
-The chain repo `SUM-INNOVATION/sum-chain` is currently private. The
-workspace pins the chain primitives via Cargo git deps at rev
-`d83e45a4`; first `cargo fetch` / `cargo build` against the workspace
-needs git auth that has read access to the chain repo.
-
-Easiest path: configure GitHub auth via the `gh` CLI or an SSH key,
-then set `CARGO_NET_GIT_FETCH_WITH_CLI=true` so cargo defers to git's
-native auth (which respects `gh auth`, SSH keys, OS keychain, etc.):
-
-```bash
-export CARGO_NET_GIT_FETCH_WITH_CLI=true
-cargo fetch  # one-time; lock file pins the chain commit
-```
-
-CI invocations should set the same env var and either ship a deploy
-key or use a PAT in a credential helper.
+As of Stage 9c, the chain primitives ship from crates.io
+(`sumchain-primitives` / `sumchain-crypto` v0.1.0, dual-licensed
+MIT OR Apache-2.0). No GitHub credential, deploy key, or PAT is
+required on any code path — `cargo fetch` / `cargo build` /
+`cargo test` for both default and `--features submit` builds resolve
+entirely from the public crates.io index. The chain crates are
+byte-equivalent to chain rev `d83e45a4` for the InferenceAttestation
+surface; the `tests/parity_vendored_primitives.rs` parity suite pins
+that equivalence under bincode 1.3 + BLAKE3 signing.
 
 ## Operational setup for live tests
 

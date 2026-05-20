@@ -434,11 +434,12 @@ Adapt paths, the user, environment file, and the RPC URL to your
 deployment. Build the binary appropriately for the desired mode:
 
 ```bash
-# Monitor-only (default, no SUM-chain credentials needed):
+# Monitor-only (default; resolves from crates.io only):
 cargo build --release -p omni-node
 sudo install -m 0755 target/release/omni-node /usr/local/bin/omni-node
 
-# Retry-enabled (requires GitHub access to SUM-INNOVATION/sum-chain):
+# Retry-enabled (also crates.io only; Stage 9c — no GitHub access
+# required; the chain primitives ship from public crates.io v0.1.0):
 cargo build --release -p omni-node --features submit
 sudo install -m 0755 target/release/omni-node /usr/local/bin/omni-node
 ```

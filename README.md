@@ -1169,11 +1169,13 @@ Stage 7b ships the real `submit_attestation` implementation. The Stage 5 `ChainC
 
 **Local-mirror activation.** Stage 7b is gated at runtime on the chain mirror exposing **both** `omninode_enabled_from_height` and `v2_enabled_from_height` as `Some(_)`. The chain-team-confirmed local-mirror branch `snip-local-mirror-omninode @ b586ff3f` sets both to `0` (activation-from-genesis) on `chain_id = 31337`.
 
-**Vendored chain primitives** (auth required for first build):
+**Chain primitives** (as shipped at Stage 7b):
 - `sumchain-primitives = { git = "https://github.com/SUM-INNOVATION/sum-chain", rev = "d83e45a4", package = "sumchain-primitives" }`
 - `sumchain-crypto = { git = "...", rev = "d83e45a4", package = "sumchain-crypto" }`
 
-The chain repo is currently private. First `cargo fetch` / `cargo build` from a fresh clone needs `CARGO_NET_GIT_FETCH_WITH_CLI=true` plus GitHub credentials (PAT in credential helper, SSH key, or `gh auth login`) with read access to `SUM-INNOVATION/sum-chain`. CI needs an equivalent deploy key or PAT. See [crates/omni-sumchain/README.md](crates/omni-sumchain/README.md) for the setup guide.
+> **Superseded by Stage 9c.** The chain team has since published both crates to the public crates.io index as `v0.1.0` (dual-licensed MIT OR Apache-2.0, byte-equivalent to rev `d83e45a4` for the InferenceAttestation surface). No GitHub credential is required for any build — `cargo fetch` / `cargo build` / `cargo test` resolve from crates.io alone. See the **Phase 5 Stage 9c** section below for the full migration. The text that follows describes the original Stage 7b state for historical record.
+
+At Stage 7b, the chain repo was private. First `cargo fetch` / `cargo build` from a fresh clone needed `CARGO_NET_GIT_FETCH_WITH_CLI=true` plus GitHub credentials (PAT in credential helper, SSH key, or `gh auth login`) with read access to `SUM-INNOVATION/sum-chain`. CI needed an equivalent deploy key or PAT. Stage 9c removed this requirement entirely.
 
 **Live-test setup additions.** Stage 7b's live submit roundtrip needs:
 1. `OMNINODE_SUMCHAIN_RPC_URL=http://localhost:8545` (Stage 7a).
