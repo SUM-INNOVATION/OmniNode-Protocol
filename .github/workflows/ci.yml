@@ -1,31 +1,47 @@
-# OmniNode Protocol — Stage 9b CI matrix.
+# OmniNode Protocol — CI matrix (decoupling gates PAUSED pending Stage 9c).
 #
-# Triggers: push to `main` + pull_request targeting `main`.
+# Stage 9b originally shipped a HARD GATE matrix that would have
+# enforced Stage 9a's claim that fresh source builds need no GitHub
+# access to the private `SUM-INNOVATION/sum-chain` repo. On the very
+# first run against `origin/main` the gates correctly exposed that
+# the claim was wrong:
 #
-# Jobs:
-#   1. default-build-test          — public, no secrets.
-#   2. default-tree-check          — public, no secrets; HARD GATE: fails
-#                                    if the default `omni-node` build
-#                                    pulls private SUM Chain crates.
-#   3. stage6-fixture-check        — public, no secrets; HARD GATE: fails
-#                                    if `crates/omni-zkml/tests/fixtures/
-#                                    chain_attestation_vectors.json` or
-#                                    `crates/omni-zkml/src/chain_wire.rs`
-#                                    has changed in the PR / push diff.
-#   4. check-submit-auth           — public; outputs whether
-#                                    SUM_CHAIN_DEPLOY_KEY or
-#                                    SUM_CHAIN_PAT is configured.
-#   5. submit-build-test           — runs IFF (4) found a credential.
-#                                    Gated as a clear SKIP (not a red
-#                                    failure) on external forks or when
-#                                    the secret is absent.
-#   6. submit-skip-notice          — runs IFF no credential. Emits a
-#                                    `::notice::` so reviewers see why
-#                                    the submit suite did not execute.
+#   - `cargo build -p omni-node` and `cargo tree -p omni-node`,
+#     even with no feature flags, fail at workspace resolution time
+#     on a runner without GitHub credentials. Cargo clones git
+#     dependencies — INCLUDING `optional = true` ones — to satisfy
+#     resolution before any feature gate is evaluated. So even
+#     though Stage 9a moved the submit code path behind a feature,
+#     the git dep is still in the workspace and Cargo still tries
+#     to fetch it.
 #
-# Live `omni-sumchain` tests (`#[ignore]`'d, env-var-gated against
-# `OMNINODE_SUMCHAIN_RPC_URL` / `OMNINODE_VERIFIER_SEED_HEX`) are NOT
-# run in CI. They remain operator-driven.
+# Adding credentials to the default CI jobs would only hide the bug;
+# the whole point of those gates was to PROVE that fresh / external
+# operators can build the read-only surface without private repo
+# access. They cannot, yet.
+#
+# Track A (chain team publishes `sumchain-primitives` /
+# `sumchain-crypto` to crates.io) is the real fix. Once those crates
+# are public, the workspace dep swap in Stage 9c eliminates the git
+# source entirely, Cargo never needs to clone anything private, and
+# the gates we wrote will simply pass on a fresh runner without
+# modification.
+#
+# Until Track A lands:
+#   - `stage6-fixture-check` stays — it only needs `git diff`, no
+#     Cargo resolution involved. Useful even today.
+#   - A `decoupling-status-notice` job emits a `::notice::` on every
+#     run so PR reviewers see the true current state, not a stale
+#     "HARD GATE" badge.
+#   - `default-build-test`, `default-tree-check`, `check-submit-auth`,
+#     `submit-build-test`, and `submit-skip-notice` are REMOVED from
+#     this file. The Stage 9b commit (`fa1cacf`) preserves their full
+#     design in git history; Stage 9c will reintroduce the cargo-side
+#     gates fresh against the public dep source.
+#
+# DO NOT re-enable cargo-touching gates by credentialing the default
+# jobs. The decoupling claim must become literally true at the
+# resolution layer (Stage 9c), not hidden behind CI secrets.
 
 name: CI
 
@@ -37,82 +53,35 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Speed up subsequent runs without paying the unstable-flag tax.
-  CARGO_INCREMENTAL: "0"
 
 jobs:
-  # ── (1) Default features: read-only operator surface ────────────────────────
-  default-build-test:
-    name: default (read-only) — build + test
+  decoupling-status-notice:
+    name: Stage 9a/9b decoupling — partial; awaiting Stage 9c (public sumchain crates)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Show toolchain (honours rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup show
-
-      - name: Cache cargo registry / git / target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-default-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-default-
-
-      - name: cargo build -p omni-node (default features)
-        run: cargo build -p omni-node
-
-      - name: cargo test (workspace minus omni-bridge / PyO3)
-        run: |
-          cargo test \
-            -p omni-net \
-            -p omni-pipeline \
-            -p omni-store \
-            -p omni-types \
-            -p omni-zkml \
-            -p omni-sumchain \
-            -p omni-node
-
-  # ── (2) Default dep-tree: HARD GATE on the Stage 9a decoupling ──────────────
-  default-tree-check:
-    name: default tree — must NOT contain private SUM Chain crates
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Show toolchain
-        run: rustup show active-toolchain || rustup show
-
-      - name: Cache cargo registry / git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-tree-default-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-tree-default-
-
-      - name: Assert `omni-node` default tree has NO sumchain-(crypto|primitives)
+      - name: Decoupling status
         shell: bash
         run: |
-          set -euo pipefail
-          tree_out="$(cargo tree -p omni-node)"
-          if echo "$tree_out" | grep -E 'sumchain-(crypto|primitives)'; then
-            {
-              echo "::error::Default \`omni-node\` build pulls private SUM Chain crates."
-              echo "Stage 9a's decoupling has regressed. Default builds must not need"
-              echo "GitHub access to SUM-INNOVATION/sum-chain. To gate the submit"
-              echo "path, rebuild with --features submit."
-            } >&2
-            exit 1
-          fi
-          echo "default tree: no sumchain-crypto / sumchain-primitives — decoupling intact."
+          cat <<'EOF'
+          ::notice::Decoupling gates paused until Stage 9c (public sumchain crates land).
+          Stage 9a moved the submit code path behind a cargo feature,
+          but fresh source builds still require GitHub access to the
+          private SUM Chain repo at Cargo resolution time. Cargo
+          clones optional git deps even when the feature is off.
 
-  # ── (3) Stage 6 byte-stability ──────────────────────────────────────────────
+          Adding credentials to default CI would just hide this from
+          fresh / external operators. The real fix is Track A: chain
+          team publishes sumchain-primitives / sumchain-crypto on
+          crates.io. The cargo-side gates from the original Stage 9b
+          workflow (default-build-test, default-tree-check,
+          submit-build-test) are removed from this file and will be
+          reintroduced in Stage 9c fresh against the public dep
+          source.
+
+          Stage 6 chain-wire + fixture byte-stability still runs
+          below — it does not need Cargo resolution.
+          EOF
+
   stage6-fixture-check:
     name: Stage 6 chain-wire + fixture — byte-stable
     runs-on: ubuntu-latest
@@ -131,8 +100,6 @@ jobs:
           else
             ref="${{ github.event.before }}"
           fi
-          # First-commit / shallow / force-push edge cases give us
-          # 40 zeroes or empty; treat as "no usable base — skip".
           if [ -z "$ref" ] || [ "$ref" = "0000000000000000000000000000000000000000" ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
@@ -169,151 +136,3 @@ jobs:
             exit 1
           fi
           echo "Stage 6 fixture + chain_wire.rs: byte-identical vs $base."
-
-  # ── (4) Probe for SUM Chain credentials ─────────────────────────────────────
-  #
-  # We deliberately do NOT reference `secrets.*` in job-level `if:` (gives
-  # GHA expression headaches across runner versions); a guard job emits a
-  # plain string output that downstream jobs gate on. The probe never
-  # echoes the secret value itself — only whether it's present.
-  check-submit-auth:
-    name: probe — SUM Chain credentials present?
-    runs-on: ubuntu-latest
-    outputs:
-      auth: ${{ steps.probe.outputs.auth }}
-    steps:
-      - id: probe
-        env:
-          DEPLOY_KEY_PRESENT: ${{ secrets.SUM_CHAIN_DEPLOY_KEY != '' }}
-          PAT_PRESENT:        ${{ secrets.SUM_CHAIN_PAT != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$DEPLOY_KEY_PRESENT" = "true" ]; then
-            echo "auth=deploy_key" >> "$GITHUB_OUTPUT"
-          elif [ "$PAT_PRESENT" = "true" ]; then
-            echo "auth=pat"        >> "$GITHUB_OUTPUT"
-          else
-            echo "auth=none"       >> "$GITHUB_OUTPUT"
-          fi
-
-  # ── (5) Submit feature: needs private SUM Chain repo access ─────────────────
-  submit-build-test:
-    name: --features submit — build + test
-    runs-on: ubuntu-latest
-    needs: check-submit-auth
-    if: ${{ needs.check-submit-auth.outputs.auth != 'none' }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Show toolchain
-        run: rustup show active-toolchain || rustup show
-
-      # Prefer the deploy key when available; PAT is the fallback.
-      # Both branches install a REPO-SCOPED git `insteadOf` rewrite so
-      # Cargo's vendored chain dep — declared at
-      # `https://github.com/SUM-INNOVATION/sum-chain` — actually
-      # resolves through the configured credential. Without the
-      # rewrite, the ssh-agent / token sits idle while Cargo runs
-      # anonymous HTTPS against a private repo and 404s.
-      - name: Configure SSH agent (deploy key)
-        if: ${{ needs.check-submit-auth.outputs.auth == 'deploy_key' }}
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SUM_CHAIN_DEPLOY_KEY }}
-
-      - name: Rewrite SUM Chain HTTPS URL to SSH (deploy-key branch)
-        if: ${{ needs.check-submit-auth.outputs.auth == 'deploy_key' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Repo-scoped: only the chain repo gets rerouted to SSH, so
-          # other workspace deps and cargo registry traffic keep their
-          # default transport. ssh-agent (above) supplies the key;
-          # webfactory/ssh-agent has already added github.com to
-          # known_hosts.
-          git config --global \
-            "url.git@github.com:SUM-INNOVATION/sum-chain.insteadOf" \
-            "https://github.com/SUM-INNOVATION/sum-chain"
-
-      - name: Configure git credential (PAT fallback)
-        if: ${{ needs.check-submit-auth.outputs.auth == 'pat' }}
-        shell: bash
-        env:
-          SUM_CHAIN_PAT: ${{ secrets.SUM_CHAIN_PAT }}
-        run: |
-          set -euo pipefail
-          # Repo-scoped (matches the deploy-key branch): the PAT is
-          # only used for the chain repo. `x-access-token` is the
-          # GitHub-recommended username for PATs.
-          git config --global \
-            "url.https://x-access-token:${SUM_CHAIN_PAT}@github.com/SUM-INNOVATION/sum-chain.insteadOf" \
-            "https://github.com/SUM-INNOVATION/sum-chain"
-
-      - name: Cache cargo (with submit feature)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-submit-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-submit-
-
-      - name: cargo build -p omni-node --features submit
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-        run: cargo build -p omni-node --features submit
-
-      - name: cargo test -p omni-sumchain --features submit
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-        # Live tests are `#[ignore]`'d and need OMNINODE_SUMCHAIN_RPC_URL
-        # / OMNINODE_VERIFIER_SEED_HEX; we deliberately do NOT pass
-        # `-- --ignored`. CI never touches mainnet / a local mirror.
-        run: cargo test -p omni-sumchain --features submit
-
-      - name: cargo test -p omni-node --features submit
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-        run: cargo test -p omni-node --features submit
-
-      - name: Assert `omni-node --features submit` tree DOES contain vendored chain crates
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! cargo tree -p omni-node --features submit | grep -Eq 'sumchain-(crypto|primitives)'; then
-            {
-              echo "::error::--features submit no longer pulls the vendored chain"
-              echo "crates — the submit feature has gone inert. Re-check"
-              echo "omni-sumchain's [features] table and the dep gating."
-            } >&2
-            exit 1
-          fi
-          echo "submit tree: vendored chain crates present as expected."
-
-  # ── (6) Clear-skip notice when no credential is configured ─────────────────
-  submit-skip-notice:
-    name: --features submit — skipped (no SUM Chain credential)
-    runs-on: ubuntu-latest
-    needs: check-submit-auth
-    if: ${{ needs.check-submit-auth.outputs.auth == 'none' }}
-    steps:
-      - name: Explain skip
-        shell: bash
-        run: |
-          {
-            echo "::notice::Submit-feature CI skipped — no SUM Chain credential available."
-            echo "Expected for:"
-            echo "  - External-fork PRs (GitHub does not flow secrets to forks)."
-            echo "  - Repositories without SUM_CHAIN_DEPLOY_KEY or SUM_CHAIN_PAT configured."
-            echo
-            echo "Default build, default tree check, and the Stage 6 byte-stability"
-            echo "gate still ran. Operators with chain credentials can verify the"
-            echo "submit path locally:"
-            echo "  cargo test -p omni-sumchain --features submit"
-            echo "  cargo test -p omni-node     --features submit"
-          }

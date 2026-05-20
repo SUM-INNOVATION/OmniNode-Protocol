@@ -25,19 +25,30 @@ The protocol is built on four pillars:
 
 ## Choosing your build (operator quick-reference)
 
-OmniNode separates the **read-only operator surface** (default build, no
-private deps) from the **submit-capable surface** (`--features submit`,
-which pulls vendored `sumchain-primitives` / `sumchain-crypto` from
-the chain team's private repo). Most operators want the default build.
+OmniNode separates the **read-only operator surface** from the
+**submit-capable surface** at the cargo-feature level. Most operators
+want the default build.
 
 | You want to … | Build | Subcommands you get |
 |---|---|---|
 | Watch activation, query the chain, inspect your local registry, derive an address, run the lifecycle loop **monitor-only** | `cargo build -p omni-node` | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) |
 | Submit attestations, run the lifecycle loop with retry | `cargo build -p omni-node --features submit` | all of the above **plus** `smoke` and `loop --allow-submit [--allow-mainnet-submit]` |
 
-Default builds need no GitHub access to `SUM-INNOVATION/sum-chain`.
-Stage 9b's CI workflow enforces this on every push / PR — see the
-full operator guidance in [`docs/operator-runbook.md`](docs/operator-runbook.md).
+> **Source-build status — Stage 9a/9b (interim) → Stage 9c (final).** Stage 9a
+> feature-gated the submit **code path**: a default build's binary
+> contains only the read-only subcommands. **But** fresh source
+> builds still require GitHub access to the private
+> `SUM-INNOVATION/sum-chain` repo today, because Cargo resolves git
+> dependencies — including `optional = true` ones — at workspace
+> resolution time, before any feature is evaluated. The Stage 9b CI
+> workflow surfaced this on its first run on `main`; the cargo-side
+> gates are paused until Stage 9c lands. **Stage 9c — chain team
+> publishes `sumchain-primitives` / `sumchain-crypto` to crates.io**
+> — is the actual fix; once those crates are public, the workspace
+> dep swap eliminates the git source entirely and fresh default
+> builds become credential-free. See
+> [`docs/operator-runbook.md`](docs/operator-runbook.md) for the
+> current operator guidance.
 
 ---
 
@@ -102,7 +113,7 @@ full operator guidance in [`docs/operator-runbook.md`](docs/operator-runbook.md)
 | **Phase 5 Stage 8b** — Mainnet activation smoke hardening: read-only `preflight` + `query` + checklist runbook | `omni-node` | **Complete** |
 | **Phase 5 Stage 8c** — Post-mainnet-smoke hardening: warning-clean build, `smoke` summary, `query --tx-hash`, `derive-address` | `omni-node` | **Complete** |
 | **Phase 5 Stage 9a** — Production runbook + build decoupling (`submit` feature; default builds need no private repo); `operator registry list/show` | `omni-node`, `omni-sumchain` | **Complete** |
-| **Phase 5 Stage 9b** — CI matrix + operator distribution docs: HARD GATE on default-tree decoupling, Stage 6 byte-stability gate, secret-gated submit jobs | `.github/workflows`, docs | **Complete** |
+| **Phase 5 Stage 9b** — CI workflow landed; decoupling gates paused after the very first CI run proved Stage 9a's claim was wrong (Cargo resolves optional private git deps before features); Stage 6 byte-stability gate stays. Real fix is Stage 9c (public sumchain crates) | `.github/workflows`, docs | **Partial — gates paused** |
 | Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
@@ -1419,20 +1430,59 @@ No mutating registry-repair tools ship in Stage 9a — registry inspection stays
 
 ---
 
-### Phase 5 Stage 9b: CI Matrix + Operator Distribution Docs — Complete
+### Phase 5 Stage 9b: CI Matrix + Operator Distribution Docs — Partial (gates paused)
 
-**Crate:** none (workflow + docs only) | **Depends on:** Stage 9a | zero source changes; zero protocol changes; Stage 6 fixture + Stage 7b tx construction byte-stable (also a HARD CI gate now)
+**Crate:** none (workflow + docs only) | **Depends on:** Stage 9a | zero source changes; zero protocol changes; Stage 6 fixture + Stage 7b tx construction byte-stable
 
-Converts Stage 9a's manual `cargo tree` and feature-matrix verification into an enforced GitHub Actions workflow at [`.github/workflows/ci.yml`](.github/workflows/ci.yml), and codifies the read-only vs submit-capable build choice as a top-of-README pointer. No source-code changes — Stage 9b is purely operational hardening.
+> **Correction (Stage 9c-pending).** On its very first run against
+> `origin/main`, the Stage 9b CI workflow correctly exposed that
+> Stage 9a's framing — "default builds need no GitHub access to
+> `SUM-INNOVATION/sum-chain`" — was **wrong in the only environment
+> that matters** (a fresh clone / fresh CI runner / new operator's
+> machine). The earlier local verification was contaminated by a
+> pre-existing Cargo git cache that had the SUM Chain repo from
+> prior Stage 7b work.
+>
+> Cargo behaviour: `optional = true` on a git dependency only
+> controls whether the dep is **compiled and linked**. Cargo still
+> **clones** the git source at workspace resolution time to read
+> its `Cargo.toml`, regardless of whether any feature enables the
+> dep. So on a fresh runner without credentials, `cargo build -p
+> omni-node` (default features) fails at resolve before any feature
+> gate matters.
+>
+> Adding credentials to the default CI jobs would just hide the bug
+> from fresh / external operators — the exact failure mode the
+> gates were meant to prevent. So the cargo-side gates
+> (`default-build-test`, `default-tree-check`, the submit
+> matrix) have been **removed** from the live workflow. The Stage 9b
+> commit (`fa1cacf`) preserves their full design in git history.
+> Stage 9c (chain team publishes `sumchain-primitives` /
+> `sumchain-crypto` to crates.io) is the resolution-layer fix; the
+> cargo gates return there, fresh, against the public dep source.
+>
+> The Stage 6 byte-stability gate (`stage6-fixture-check`) still
+> runs — it only needs `git diff`, no Cargo resolution involved —
+> plus a permanent `decoupling-status-notice` job emits a
+> `::notice::` on every run so PR reviewers see the true state.
 
-| CI job | Triggers | Secret required | Outcome on miss |
-|---|---|---|---|
-| `default-build-test` | push to `main`, PR → `main` | none | hard fail on build/test regression |
-| `default-tree-check` | same | none | **HARD GATE** — fails the workflow if `cargo tree -p omni-node` ever pulls `sumchain-crypto` / `sumchain-primitives` (i.e. Stage 9a decoupling regresses) |
-| `stage6-fixture-check` | same | none | **HARD GATE** — fails if `crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json` or `crates/omni-zkml/src/chain_wire.rs` diff is non-empty vs the PR base / push parent |
-| `check-submit-auth` | same | reads `SUM_CHAIN_DEPLOY_KEY` / `SUM_CHAIN_PAT` presence | always green; emits `auth=deploy_key | pat | none` |
-| `submit-build-test` | same, **iff** `check-submit-auth != 'none'` | `SUM_CHAIN_DEPLOY_KEY` preferred, `SUM_CHAIN_PAT` fallback | runs `cargo build / test -p omni-sumchain -p omni-node --features submit`; asserts the submit tree DOES contain the vendored chain crates; live `#[ignore]`'d tests are never run in CI |
-| `submit-skip-notice` | same, **iff** `check-submit-auth == 'none'` | — | emits a `::notice::` explaining the skip (external-fork PRs, repos without the secret) so reviewers see a **clear yellow skip**, not a red failure |
+Converts Stage 9a's manual `cargo tree` and feature-matrix verification into an enforced GitHub Actions workflow at [`.github/workflows/ci.yml`](.github/workflows/ci.yml), and codifies the read-only vs submit-capable build choice as a top-of-README pointer. No source-code changes — Stage 9b is purely operational hardening. The text below describes the original Stage 9b *design*; per the correction above, only `stage6-fixture-check` and a status-notice job are live on `main` today.
+
+> The table below is the **historical Stage 9b design**. Only the
+> `stage6-fixture-check` row is live on `main` today, alongside a
+> permanent `decoupling-status-notice` job not in the original
+> table. Every other row is **paused pending Stage 9c**; the
+> design will return there against the public dep source.
+
+| CI job | Triggers | Secret required | Status today | Outcome on miss (when live) |
+|---|---|---|---|---|
+| `default-build-test` | push to `main`, PR → `main` | none | **paused (Stage 9c)** | hard fail on build/test regression |
+| `default-tree-check` | same | none | **paused (Stage 9c)** | fails if `cargo tree -p omni-node` ever pulls `sumchain-crypto` / `sumchain-primitives` |
+| `stage6-fixture-check` | same | none | **live** | fails if `crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json` or `crates/omni-zkml/src/chain_wire.rs` diff is non-empty vs the PR base / push parent |
+| `check-submit-auth` | same | reads `SUM_CHAIN_DEPLOY_KEY` / `SUM_CHAIN_PAT` presence | **paused (Stage 9c)** | always green; emits `auth=deploy_key | pat | none` |
+| `submit-build-test` | same, **iff** `check-submit-auth != 'none'` | `SUM_CHAIN_DEPLOY_KEY` preferred, `SUM_CHAIN_PAT` fallback | **paused (Stage 9c)** | runs `cargo build / test -p omni-sumchain -p omni-node --features submit`; asserts the submit tree DOES contain the vendored chain crates; live `#[ignore]`'d tests are never run in CI |
+| `submit-skip-notice` | same, **iff** `check-submit-auth == 'none'` | — | **paused (Stage 9c)** | emits a `::notice::` explaining the skip (external-fork PRs, repos without the secret) so reviewers see a **clear yellow skip**, not a red failure |
+| `decoupling-status-notice` | same | none | **live** (added by the corrective revert) | always-green job; emits a `::notice::` on every run pointing at this section |
 
 **Secret gating shape (Q1):** prefer `SUM_CHAIN_DEPLOY_KEY` (read-only deploy key on the chain team's repo — least privilege) via `webfactory/ssh-agent`; fall back to `SUM_CHAIN_PAT` rewritten as an `https://x-access-token:<PAT>@github.com/.insteadOf` git config. The probe job never echoes the secret value, only its presence as a string output (`deploy_key | pat | none`).
 
@@ -1659,7 +1709,7 @@ OmniNode-Protocol/
 │
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                      # Stage 9b: CI matrix (default build/test + HARD GATES on default tree decoupling + Stage 6 byte-stability; secret-gated --features submit jobs with clear-skip for forks)
+│       └── ci.yml                      # Stage 9b interim: decoupling gates PAUSED pending Stage 9c (Cargo resolves optional private git deps before features); live jobs = decoupling-status-notice + stage6-fixture-check only
 │
 ├── docs/                              # Architecture documentation
 │   ├── mainnet-smoke-audit.md         # Stage 8b: frozen historical record of the 2026-05-19 first mainnet finalization
