@@ -6,6 +6,14 @@ license.workspace    = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Stage 9a: default-OFF. The submit path pulls vendored chain
+# primitives from the private `SUM-INNOVATION/sum-chain` repo;
+# default builds (read-only operator surface) do not need it. Submit
+# operators opt in with `--features submit`.
+default = []
+submit  = ["dep:sumchain-primitives", "dep:sumchain-crypto"]
+
 [dependencies]
 omni-types          = { workspace = true }
 omni-zkml           = { workspace = true }
@@ -14,12 +22,15 @@ serde_json          = { workspace = true }
 thiserror           = { workspace = true }
 tracing             = { workspace = true }
 ureq                = { workspace = true }
-sumchain-primitives = { workspace = true }
-sumchain-crypto     = { workspace = true }
+# Vendored chain primitives — optional, only pulled in by `submit`.
+sumchain-primitives = { workspace = true, optional = true }
+sumchain-crypto     = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 # Stage 7b — used by tests/parity_vendored_primitives.rs only, to
 # bincode-1.3-encode the vendored chain types and compare against
-# Stage 6's public canonical-bytes function.
+# Stage 6's public canonical-bytes function. Itself optional in spirit
+# (the parity test is `--features submit`-gated), but kept here so
+# `cargo test --features submit` resolves without further flags.
 bincode1 = { package = "bincode", version = "1.3" }

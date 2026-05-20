@@ -1,5 +1,13 @@
 //! Stage 7b — `submit_attestation` construction tests.
 //!
+//! Stage 9a: file-level `#![cfg(feature = "submit")]`. These tests
+//! exercise the real Stage 7b construction path (which itself is
+//! `submit`-gated) and use `SignedTransaction::from_hex` in
+//! `submit_attestation_uses_min_fee_unconditionally` — that type only
+//! exists with the vendored chain primitives.
+#![cfg(feature = "submit")]
+
+//!
 //! Hermetic tests pinning the gate ordering, RPC call shapes, and
 //! Stage 5.1 contract preservation. All tests use
 //! [`FakeJsonRpcTransport`]; no live HTTP.

@@ -1,5 +1,11 @@
 //! Stage 7b — local-vs-vendored parity tests.
 //!
+//! Stage 9a: file-level `#![cfg(feature = "submit")]`. Tests import
+//! `sumchain_primitives::*`, which is only present with the vendored
+//! chain crates pulled in by the `submit` feature.
+#![cfg(feature = "submit")]
+
+//!
 //! Stage 6 defines `omni_zkml::InferenceAttestationDigest` and
 //! (implicitly) `InferenceAttestationTxData` as the canonical OmniNode-
 //! internal byte layout. Stage 7b's submit path converts these into the

@@ -42,20 +42,29 @@
 //! `tokio::task::spawn_blocking`; config and an `Arc`'d client factory
 //! are moved into each blocking unit so no borrow escapes.
 
-use std::path::{Path, PathBuf};
+#[cfg(feature = "submit")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(feature = "submit")]
+use std::time::Instant;
+use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use tracing::{debug, info, warn};
 
 use omni_sumchain::{BlockFinality, JsonRpcTransport, SumChainClient, UreqTransport};
-use omni_types::phase5::{InferenceAttestation, InferenceCommitment, SnipV2ObjectId};
+use omni_types::phase5::InferenceAttestation;
+#[cfg(any(feature = "submit", test))]
+use omni_types::phase5::{InferenceCommitment, SnipV2ObjectId};
+#[cfg(feature = "submit")]
+use omni_zkml::{submit_attestation_workflow_with_block, ChainClient};
 use omni_zkml::{
     poll_attestations_workflow, retry_dropped_attestations_workflow,
-    signer_chain_address_base58, submit_attestation_workflow_with_block,
-    sweep_stale_attestations_workflow, AttestationRegistry, ChainClient,
-    ChainClientError, RegistryError, StalenessPolicy,
+    signer_chain_address_base58,
+    sweep_stale_attestations_workflow, AttestationId, AttestationRecord,
+    AttestationRegistry, ChainClientError, LocalAttestationStatus,
+    RegistryError, StalenessPolicy,
 };
 
 /// Read-only commands and the gate phase use a zero seed — the SUM
@@ -75,24 +84,28 @@ pub(crate) enum OperatorError {
     #[error("chain_id mismatch: --expect-chain-id {expected}, chain reports {actual}")]
     ChainIdMismatch { expected: u64, actual: u64 },
 
+    #[cfg(feature = "submit")]
     #[error(
         "mainnet smoke (chain_id 1) requires --attestation-json; refusing to \
          synthesize an artificial attestation onto mainnet"
     )]
     MainnetRequiresAttestationJson,
 
+    #[cfg(feature = "submit")]
     #[error(
         "--synthetic is forbidden on mainnet (chain_id 1); Stage 8a has no \
          synthetic-mainnet path"
     )]
     SyntheticMainnetForbidden,
 
+    #[cfg(feature = "submit")]
     #[error(
         "smoke needs an attestation source: pass --attestation-json, or \
          (non-mainnet only) --synthetic"
     )]
     SyntheticRequiresExplicitFlag,
 
+    #[cfg(feature = "submit")]
     #[error("--attestation-json and --synthetic are mutually exclusive")]
     ConflictingSmokeSource,
 
@@ -105,6 +118,7 @@ pub(crate) enum OperatorError {
     )]
     MainnetSubmitNotPermitted,
 
+    #[cfg(feature = "submit")]
     #[error(
         "chain not activated; refusing to submit \
          (omninode_active={omninode}, v2_active={v2})"
@@ -136,9 +150,11 @@ pub(crate) enum OperatorError {
     #[error("could not parse --attestation-json as InferenceAttestation: {0}")]
     AttestationJsonParse(String),
 
+    #[cfg(feature = "submit")]
     #[error("smoke did not reach Finalized before --confirm-timeout-secs; last status: {last}")]
     SmokeConfirmTimeout { last: String },
 
+    #[cfg(feature = "submit")]
     #[error("smoke submission reached chain status Failed: {reason}")]
     SmokeFailed { reason: String },
 
@@ -154,6 +170,7 @@ pub(crate) enum OperatorError {
         verifier_address: String,
     },
 
+    #[cfg(feature = "submit")]
     #[error("smoke interrupted (Ctrl-C) before finality was confirmed")]
     SmokeInterrupted,
 
@@ -165,6 +182,15 @@ pub(crate) enum OperatorError {
 
     #[error("internal invariant violated: {0}")]
     Internal(String),
+
+    #[error("attestation id malformed: {0}")]
+    AttestationIdMalformed(String),
+
+    #[error(
+        "invalid --status filter {0:?}; expected one of: \
+         pending | submitted | included | finalized | failed | dropped"
+    )]
+    InvalidStatusFilter(String),
 
     #[error("chain client error: {0}")]
     Chain(#[from] ChainClientError),
@@ -189,14 +215,19 @@ pub(crate) enum OperatorError {
 pub(crate) enum SeedSource {
     Env,
     // The variants below are test-injection seams only. They are
-    // `#[cfg(test)]`-gated (not `#[allow(dead_code)]`-suppressed) so the
-    // production build genuinely contains only `Env` — no dead code,
-    // no lint suppression.
+    // `#[cfg(test)]`-gated (not `#[allow(dead_code)]`-suppressed) so
+    // the production build genuinely contains only `Env`.
+    // `MalformedForTest` additionally requires `feature = "submit"`:
+    // its only caller is the submit-gated
+    // `smoke_mainnet_rejects_synthetic_before_malformed_seed` test
+    // that pins gate-7-precedes-seed-resolution against a malformed
+    // seed; with submit off, the variant has no caller anywhere and
+    // would otherwise be dead-code under `cargo test`.
     #[cfg(test)]
     Explicit([u8; 32]),
     #[cfg(test)]
     AbsentForTest,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "submit"))]
     MalformedForTest(String),
 }
 
@@ -212,7 +243,7 @@ impl SeedSource {
             SeedSource::Explicit(s) => Ok(*s),
             #[cfg(test)]
             SeedSource::AbsentForTest => Err(OperatorError::SeedMissing),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "submit"))]
             SeedSource::MalformedForTest(h) => parse_seed_hex(h),
         }
     }
@@ -263,6 +294,12 @@ fn blocks_remaining(head: u64, activation: Option<u64>) -> Option<u64> {
     activation.map(|a| a.saturating_sub(head))
 }
 
+// Stage 9a: `SmokeSource` + `resolve_smoke_source` only exist with
+// the `submit` feature — both are consumed exclusively by `smoke_core`
+// and its hermetic tests, which are themselves submit-gated. Pure
+// helpers `synth_attestation` (below) stays default-on because the
+// `preflight` tests use it as an InferenceAttestation builder.
+#[cfg(feature = "submit")]
 #[derive(Debug, PartialEq, Eq)]
 enum SmokeSource {
     File(PathBuf),
@@ -272,6 +309,7 @@ enum SmokeSource {
 /// Gate 7 / attestation-source resolution. **Pure** and seed-free, so
 /// callers can (and the runner does) evaluate it before the verifier
 /// seed is ever touched.
+#[cfg(feature = "submit")]
 fn resolve_smoke_source(
     chain_id: u64,
     attestation_json: Option<&Path>,
@@ -298,6 +336,10 @@ fn resolve_smoke_source(
     }
 }
 
+// Used by `smoke_core` (submit-feature) and by `preflight` hermetic
+// tests under `cfg(test)`. Production binaries without the submit
+// feature have no caller, hence the conditional cfg.
+#[cfg(any(feature = "submit", test))]
 fn synth_attestation(verifier_address: &str, head: u64) -> InferenceAttestation {
     InferenceAttestation {
         commitment: InferenceCommitment {
@@ -335,8 +377,13 @@ enum OperatorCmd {
     /// Poll until OmniNode + V2 activation, then exit 0. Read-only.
     WatchActivation(WatchArgs),
     /// Submit one attestation and poll it to Finalized (Included = progress).
+    /// Stage 9a: only present with `--features submit`.
+    #[cfg(feature = "submit")]
     Smoke(SmokeArgs),
-    /// Periodic poll → stale-sweep → (retry) lifecycle loop.
+    /// Periodic poll → stale-sweep → (retry) lifecycle loop. The
+    /// retry path + its `--allow-submit` / `--allow-mainnet-submit`
+    /// flags require `--features submit`; monitor-only loop works
+    /// without it.
     Loop(LoopArgs),
     /// Read-only: validate seed ↔ attestation-json (+ optional chain snapshot).
     Preflight(PreflightArgs),
@@ -344,6 +391,43 @@ enum OperatorCmd {
     Query(QueryArgs),
     /// Read-only: print the chain address derived from OMNINODE_VERIFIER_SEED_HEX.
     DeriveAddress,
+    /// Read-only: list / show records in a local attestation registry.
+    Registry(RegistryArgs),
+}
+
+#[derive(Args)]
+struct RegistryArgs {
+    #[command(subcommand)]
+    cmd: RegistryCmd,
+}
+
+#[derive(Subcommand)]
+enum RegistryCmd {
+    /// List all records in the registry (optionally filtered by local status).
+    List(RegistryListArgs),
+    /// Pretty-print a single record by `AttestationId` (64-char lowercase hex).
+    Show(RegistryShowArgs),
+}
+
+#[derive(Args)]
+struct RegistryListArgs {
+    #[arg(long)]
+    registry_path: PathBuf,
+    /// Optional filter on local status. Accepts case-insensitive:
+    /// `pending | submitted | included | finalized | failed | dropped`.
+    #[arg(long)]
+    status: Option<String>,
+}
+
+#[derive(Args)]
+struct RegistryShowArgs {
+    #[arg(long)]
+    registry_path: PathBuf,
+    /// `AttestationId` as 64-char lowercase hex (no `0x` prefix), e.g.
+    /// the value printed by `operator registry list` or `operator
+    /// preflight`.
+    #[arg(long)]
+    id: String,
 }
 
 #[derive(Args)]
@@ -358,6 +442,7 @@ struct WatchArgs {
     max_ticks: Option<u64>,
 }
 
+#[cfg(feature = "submit")]
 #[derive(Args)]
 struct SmokeArgs {
     #[arg(long)]
@@ -420,8 +505,13 @@ struct LoopArgs {
     staleness_threshold_blocks: u64,
     #[arg(long, default_value_t = 30)]
     poll_interval_secs: u64,
+    /// Stage 9a: present only with `--features submit`. Without it,
+    /// `loop` runs strictly monitor-only and these flags don't appear
+    /// in `--help` (cleaner output than a flag that can only fail).
+    #[cfg(feature = "submit")]
     #[arg(long)]
     allow_submit: bool,
+    #[cfg(feature = "submit")]
     #[arg(long)]
     allow_mainnet_submit: bool,
     #[arg(long)]
@@ -453,6 +543,7 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
             )
             .await?;
         }
+        #[cfg(feature = "submit")]
         OperatorCmd::Smoke(a) => {
             let url = resolve_rpc_url(a.rpc_url.clone())?;
             let outcome = smoke_core(
@@ -480,8 +571,14 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
                     registry_path: a.registry_path,
                     staleness_threshold_blocks: a.staleness_threshold_blocks,
                     poll_interval_secs: a.poll_interval_secs,
+                    #[cfg(feature = "submit")]
                     allow_submit: a.allow_submit,
+                    #[cfg(not(feature = "submit"))]
+                    allow_submit: false,
+                    #[cfg(feature = "submit")]
                     allow_mainnet_submit: a.allow_mainnet_submit,
+                    #[cfg(not(feature = "submit"))]
+                    allow_mainnet_submit: false,
                     max_ticks: a.max_ticks,
                     seed_source: SeedSource::Env,
                 },
@@ -530,6 +627,35 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
             info!(verifier_address = %addr, "derive-address");
             println!("{addr}");
         }
+        OperatorCmd::Registry(a) => match a.cmd {
+            RegistryCmd::List(la) => {
+                let rows = registry_list_core(la.registry_path, la.status).await?;
+                for r in &rows {
+                    // Bare stdout one-liner — scriptable
+                    // (`operator registry list | grep submitted`).
+                    println!(
+                        "{}  {:<9}  tx={}  block={}  updated={}",
+                        r.id_hex,
+                        r.status,
+                        r.tx_id.as_deref().unwrap_or("-"),
+                        r.submitted_at_block
+                            .map(|b| b.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        r.updated_at,
+                    );
+                }
+                info!(rows = rows.len(), "registry list complete");
+            }
+            RegistryCmd::Show(sa) => {
+                let record = registry_show_core(sa.registry_path, sa.id).await?;
+                let json = serde_json::to_string_pretty(&record).map_err(|e| {
+                    OperatorError::Internal(format!(
+                        "AttestationRecord serialise failed: {e}"
+                    ))
+                })?;
+                println!("{json}");
+            }
+        },
     }
     Ok(())
 }
@@ -542,6 +668,7 @@ struct WatchConfig {
     max_ticks: Option<u64>,
 }
 
+#[cfg(feature = "submit")]
 #[derive(Clone)]
 struct SmokeConfig {
     expect_chain_id: u64,
@@ -651,10 +778,16 @@ struct WatchSnapshot {
 }
 
 // ── smoke ─────────────────────────────────────────────────────────────────────
+//
+// Stage 9a: the entire smoke surface (SmokeOutcome / SmokePending /
+// smoke_core / print_smoke_summary) is `#[cfg(feature = "submit")]`.
+// Without the feature, `operator smoke` is not part of the CLI and
+// none of these symbols are compiled into the binary.
 
 /// Structured result of a successful `smoke` run. Returned by
 /// [`smoke_core`] (testable) and rendered by [`print_smoke_summary`]
 /// for the operator. Only constructed once the tx reaches `Finalized`.
+#[cfg(feature = "submit")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SmokeOutcome {
     pub attestation_id: String,
@@ -667,6 +800,7 @@ pub(crate) struct SmokeOutcome {
 }
 
 /// Phase-A result handed from the submit blocking unit to the poll loop.
+#[cfg(feature = "submit")]
 struct SmokePending {
     tx_id: String,
     attestation_id: String,
@@ -675,6 +809,7 @@ struct SmokePending {
     submitted_at_block: Option<u64>,
 }
 
+#[cfg(feature = "submit")]
 async fn smoke_core<T>(
     make_client: ClientFactory<T>,
     cfg: SmokeConfig,
@@ -831,6 +966,7 @@ where
 
 /// Render a successful [`SmokeOutcome`] as one consolidated operator
 /// summary block (Stage 8c Q2).
+#[cfg(feature = "submit")]
 fn print_smoke_summary(o: &SmokeOutcome) {
     info!(
         attestation_id = %o.attestation_id,
@@ -1190,6 +1326,118 @@ async fn derive_address_core(seed_source: SeedSource) -> Result<String, Operator
     .await
 }
 
+// ── registry list / show (Stage 9a) ───────────────────────────────────────────
+
+/// Canonical lowercase label for a local status — used both by
+/// `registry list` output and by `--status` filter matching.
+fn status_label(s: &LocalAttestationStatus) -> &'static str {
+    match s {
+        LocalAttestationStatus::Pending => "pending",
+        LocalAttestationStatus::Submitted => "submitted",
+        LocalAttestationStatus::Included => "included",
+        LocalAttestationStatus::Finalized => "finalized",
+        LocalAttestationStatus::Failed { .. } => "failed",
+        LocalAttestationStatus::Dropped { .. } => "dropped",
+    }
+}
+
+/// Parse / validate a `--status` filter. Case-insensitive; unknown
+/// values surface a typed `InvalidStatusFilter` so the operator gets
+/// a clear list of accepted values.
+fn parse_status_filter(s: &str) -> Result<&'static str, OperatorError> {
+    match s.to_ascii_lowercase().as_str() {
+        "pending" => Ok("pending"),
+        "submitted" => Ok("submitted"),
+        "included" => Ok("included"),
+        "finalized" => Ok("finalized"),
+        "failed" => Ok("failed"),
+        "dropped" => Ok("dropped"),
+        _ => Err(OperatorError::InvalidStatusFilter(s.to_string())),
+    }
+}
+
+/// 64-char lowercase hex → `AttestationId`. Case-insensitive in the
+/// hex parser (operators may paste from mixed-case sources), but the
+/// canonical render is lowercase via `to_hex()`.
+fn parse_attestation_id_hex(s: &str) -> Result<AttestationId, OperatorError> {
+    if s.len() != 64 {
+        return Err(OperatorError::AttestationIdMalformed(format!(
+            "expected 64 hex chars, got {}",
+            s.len()
+        )));
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        bytes[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|e| OperatorError::AttestationIdMalformed(e.to_string()))?;
+    }
+    Ok(AttestationId::from_bytes(bytes))
+}
+
+/// Single row of `operator registry list` output — the structured
+/// form so tests can assert without capturing stdout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryListRow {
+    pub id_hex: String,
+    pub status: &'static str,
+    pub tx_id: Option<String>,
+    pub submitted_at_block: Option<u64>,
+    pub updated_at: String,
+}
+
+/// Read-only registry list. Opens the registry, applies the optional
+/// status filter, returns structured rows. Sorted ascending by
+/// `id_hex` (the registry's natural order). Zero chain access.
+async fn registry_list_core(
+    registry_path: PathBuf,
+    status_filter: Option<String>,
+) -> Result<Vec<RegistryListRow>, OperatorError> {
+    run_blocking(move || -> Result<Vec<RegistryListRow>, OperatorError> {
+        // Validate filter up-front so a typo gets a clear error before
+        // we read the disk.
+        let filter: Option<&'static str> = match status_filter.as_deref() {
+            Some(s) => Some(parse_status_filter(s)?),
+            None => None,
+        };
+        let registry = AttestationRegistry::open(registry_path)?;
+        let records = registry.list()?;
+        let mut rows = Vec::with_capacity(records.len());
+        for record in records {
+            let label = status_label(&record.status);
+            if let Some(f) = filter {
+                if f != label {
+                    continue;
+                }
+            }
+            rows.push(RegistryListRow {
+                id_hex: record.id.to_hex(),
+                status: label,
+                tx_id: record.receipt.as_ref().map(|r| r.tx_id.clone()),
+                submitted_at_block: record.submitted_at_block,
+                updated_at: record.updated_at.to_string(),
+            });
+        }
+        Ok(rows)
+    })
+    .await
+}
+
+/// Read-only registry show by `AttestationId`. Loads the record;
+/// returns it for callers (dispatch pretty-prints JSON). Missing ids
+/// surface as `RegistryError::RecordNotFound` via the `?` from
+/// `registry.load`.
+async fn registry_show_core(
+    registry_path: PathBuf,
+    id_hex: String,
+) -> Result<AttestationRecord, OperatorError> {
+    run_blocking(move || -> Result<AttestationRecord, OperatorError> {
+        let id = parse_attestation_id_hex(&id_hex)?;
+        let registry = AttestationRegistry::open(registry_path)?;
+        Ok(registry.load(&id)?)
+    })
+    .await
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1226,6 +1474,10 @@ mod tests {
         f
     }
 
+    // Stage 9a: `add_submit_responses` stays default-on — it's also
+    // used by `loop_monitor_only_never_submits` to *prove* the
+    // monitor-only loop ignores seeded submit RPCs. `status_json` and
+    // `submit_fake_with_status` below are submit-only.
     fn add_submit_responses(f: &FakeJsonRpcTransport) {
         f.set_response("sum_getNonce", Ok(json!(0)));
         f.set_response(
@@ -1238,6 +1490,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "submit")]
     fn status_json(status: &str) -> serde_json::Value {
         json!({"status": status, "included_at_height": 101, "reason": null})
     }
@@ -1245,6 +1498,7 @@ mod tests {
     /// Activated non-mainnet fake wired for a synthetic submit, with the
     /// status RPC seeded to `status` (overridable mid-test via the
     /// shared `Arc<Mutex>` for sequenced included→finalized coverage).
+    #[cfg(feature = "submit")]
     fn submit_fake_with_status(status: &str) -> FakeJsonRpcTransport {
         let f = activated_fake(31337);
         f.set_response("sum_getNonce", Ok(json!(0)));
@@ -1302,6 +1556,7 @@ mod tests {
         assert_eq!(blocks_remaining(10, None), None);
     }
 
+    #[cfg(feature = "submit")]
     #[test]
     fn resolve_smoke_source_matrix() {
         let p = Some(Path::new("/tmp/a.json"));
@@ -1402,6 +1657,7 @@ mod tests {
 
     // ── smoke: gate-7-before-seed guarantee ──────────────────────────
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_mainnet_without_attestation_json_is_refused_before_seed() {
         let fake = activated_fake(1);
@@ -1425,6 +1681,7 @@ mod tests {
         assert_eq!(submit_calls(&fake), 0);
     }
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_mainnet_rejects_synthetic_before_malformed_seed() {
         let fake = activated_fake(1);
@@ -1447,6 +1704,7 @@ mod tests {
         assert_eq!(submit_calls(&fake), 0);
     }
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_nonmainnet_synthetic_requires_explicit_flag() {
         let fake = activated_fake(31337);
@@ -1464,6 +1722,7 @@ mod tests {
         assert!(matches!(err, OperatorError::SyntheticRequiresExplicitFlag));
     }
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_attestation_json_verifier_mismatch_is_refused() {
         let fake = activated_fake(1);
@@ -1491,6 +1750,7 @@ mod tests {
         assert_eq!(submit_calls(&fake), 0);
     }
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_attestation_json_malformed_errors_cleanly() {
         let fake = activated_fake(1);
@@ -1513,6 +1773,7 @@ mod tests {
         assert_eq!(submit_calls(&fake), 0);
     }
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_mainnet_with_attestation_json_proceeds_to_finalized() {
         let fake = activated_fake(1);
@@ -1536,6 +1797,7 @@ mod tests {
         assert_eq!(submit_calls(&fake), 1);
     }
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_mainnet_without_mainnet_flag_is_refused() {
         let fake = activated_fake(1);
@@ -1564,6 +1826,7 @@ mod tests {
 
     /// Chain stays `included` forever → smoke must NOT declare success;
     /// it times out with the last observed status reflecting Included.
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_included_only_times_out() {
         let fake = submit_fake_with_status("included");
@@ -1595,6 +1858,7 @@ mod tests {
     /// Chain reports `included`, then (mid-poll, via the shared fake)
     /// flips to `finalized` → smoke succeeds only after finality, and
     /// must have polled status at least twice.
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_included_then_finalized_succeeds() {
         let dir = tempfile::tempdir().unwrap();
@@ -1680,6 +1944,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn loop_submit_mode_retries_dropped_record() {
         let fake = activated_fake(31337);
@@ -1718,6 +1983,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn loop_mainnet_without_mainnet_flag_fails_at_startup() {
         let fake = activated_fake(1);
@@ -2055,6 +2321,7 @@ mod tests {
 
     // ── Stage 8c: smoke returns a populated SmokeOutcome ─────────────
 
+    #[cfg(feature = "submit")]
     #[tokio::test]
     async fn smoke_outcome_carries_tx_hash_and_finalization_fields() {
         let fake = activated_fake(1);
@@ -2082,5 +2349,160 @@ mod tests {
         assert_eq!(outcome.included_at_height, Some(101)); // from the extra finalization read
         assert!(!outcome.attestation_id.is_empty());
         assert_eq!(submit_calls(&fake), 1);
+    }
+
+    // ── Stage 9a: registry list / show ────────────────────────────────
+
+    use omni_zkml::SubmissionReceipt;
+
+    fn seed_three_records(registry_path: &std::path::Path) -> Vec<AttestationId> {
+        let reg = AttestationRegistry::open(registry_path.to_path_buf()).unwrap();
+        let a = reg.insert(synth_attestation("addr-a", 1)).unwrap();
+        let b = reg.insert(synth_attestation("addr-b", 2)).unwrap();
+        let c = reg.insert(synth_attestation("addr-c", 3)).unwrap();
+        // b is submitted, c is dropped, a stays pending.
+        reg.mark_submitted_with_block(
+            &b.id,
+            SubmissionReceipt { tx_id: "0xbeef".into(), note: None },
+            42,
+        )
+        .unwrap();
+        reg.mark_submitted_with_block(
+            &c.id,
+            SubmissionReceipt { tx_id: "0xstale".into(), note: None },
+            10,
+        )
+        .unwrap();
+        reg.mark_dropped(&c.id, Some("manual".into())).unwrap();
+        vec![a.id, b.id, c.id]
+    }
+
+    #[test]
+    fn parse_attestation_id_hex_matrix() {
+        // Valid 64 lowercase hex
+        let s = "d77d8e95c96e6ae2264cbe3baf1383d9a3ea82e59a49d7fbf97574a04d791f1d";
+        let id = parse_attestation_id_hex(s).unwrap();
+        assert_eq!(id.to_hex(), s);
+        // Mixed case accepted at parse time (canonical output still lowercase).
+        let mixed = "D77D8E95C96E6AE2264CBE3BAF1383D9A3EA82E59A49D7FBF97574A04D791F1D";
+        assert_eq!(parse_attestation_id_hex(mixed).unwrap().to_hex(), s);
+        // Wrong length
+        assert!(matches!(
+            parse_attestation_id_hex("abcd"),
+            Err(OperatorError::AttestationIdMalformed(_))
+        ));
+        // Non-hex char
+        assert!(matches!(
+            parse_attestation_id_hex(&"z".repeat(64)),
+            Err(OperatorError::AttestationIdMalformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_status_filter_matrix() {
+        for (input, expected) in [
+            ("pending", "pending"),
+            ("Pending", "pending"),
+            ("SUBMITTED", "submitted"),
+            ("included", "included"),
+            ("finalized", "finalized"),
+            ("failed", "failed"),
+            ("dropped", "dropped"),
+        ] {
+            assert_eq!(parse_status_filter(input).unwrap(), expected);
+        }
+        assert!(matches!(
+            parse_status_filter("garbage"),
+            Err(OperatorError::InvalidStatusFilter(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn registry_list_empty_returns_empty_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = AttestationRegistry::open(dir.path().join("reg")).unwrap();
+        let rows = registry_list_core(dir.path().join("reg"), None).await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn registry_list_returns_all_records_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = seed_three_records(&dir.path().join("reg"));
+        let rows = registry_list_core(dir.path().join("reg"), None).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        // Sorted by id_hex ascending (registry's `list()` contract).
+        let hexes: Vec<&str> = rows.iter().map(|r| r.id_hex.as_str()).collect();
+        let mut sorted = hexes.clone();
+        sorted.sort();
+        assert_eq!(hexes, sorted);
+        // Status mix present.
+        let statuses: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.status).collect();
+        assert!(statuses.contains("pending"));
+        assert!(statuses.contains("submitted"));
+        assert!(statuses.contains("dropped"));
+    }
+
+    #[tokio::test]
+    async fn registry_list_status_filter_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = seed_three_records(&dir.path().join("reg"));
+        let rows = registry_list_core(dir.path().join("reg"), Some("submitted".into()))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "submitted");
+        assert_eq!(rows[0].tx_id.as_deref(), Some("0xbeef"));
+        assert_eq!(rows[0].submitted_at_block, Some(42));
+    }
+
+    #[tokio::test]
+    async fn registry_list_invalid_status_filter_is_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = AttestationRegistry::open(dir.path().join("reg")).unwrap();
+        let err = registry_list_core(dir.path().join("reg"), Some("nope".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OperatorError::InvalidStatusFilter(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn registry_show_returns_loaded_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = seed_three_records(&dir.path().join("reg"));
+        let target = ids[1]; // the submitted one
+        let rec = registry_show_core(dir.path().join("reg"), target.to_hex())
+            .await
+            .unwrap();
+        assert_eq!(rec.id, target);
+        assert_eq!(rec.status, LocalAttestationStatus::Submitted);
+        assert_eq!(rec.receipt.as_ref().unwrap().tx_id, "0xbeef");
+    }
+
+    #[tokio::test]
+    async fn registry_show_missing_id_returns_record_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = AttestationRegistry::open(dir.path().join("reg")).unwrap();
+        let phantom = "0".repeat(64);
+        let err = registry_show_core(dir.path().join("reg"), phantom)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::Registry(RegistryError::RecordNotFound(_))),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_show_malformed_id_is_refused_before_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = registry_show_core(dir.path().join("reg"), "abc".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::AttestationIdMalformed(_)),
+            "got {err:?}"
+        );
     }
 }

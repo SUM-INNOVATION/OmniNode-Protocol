@@ -23,6 +23,7 @@ use crate::dto::{
 };
 use crate::rpc::{JsonRpcTransport, UreqTransport};
 use crate::status::map_status_info;
+#[cfg(feature = "submit")]
 use crate::tx::build_and_submit_signed_transaction;
 
 // ── SumChainClient ────────────────────────────────────────────────────────────
@@ -266,25 +267,39 @@ impl<T: JsonRpcTransport> ChainClient for SumChainClient<T> {
         map_status_info(info)
     }
 
-    /// Stage 7b — real implementation.
+    /// Stage 7b — real implementation, gated behind the `submit`
+    /// feature (Stage 9a). With `submit`, delegates to
+    /// [`crate::tx::build_and_submit_signed_transaction`] (four
+    /// pre-flight gates → Stage 6 inner pipeline → vendored chain
+    /// types → outer-sign via `sumchain-crypto` →
+    /// `sum_sendRawTransaction`). Without `submit`, returns a typed
+    /// `ChainClientError::Other` so the `ChainClient` trait stays
+    /// satisfied for the read-only operator surface (`query`,
+    /// `poll_attestations_workflow`, etc.) while default builds need
+    /// no access to the private `SUM-INNOVATION/sum-chain` repo.
     ///
-    /// Delegates the full submit flow to
-    /// [`crate::tx::build_and_submit_signed_transaction`], which
-    /// performs the four pre-flight gates (omninode-active,
-    /// v2-active, verifier-address consistency), runs the Stage 6
-    /// inner pipeline, converts to the vendored chain primitives,
-    /// outer-signs via `sumchain-crypto`, and posts to
-    /// `sum_sendRawTransaction`.
-    ///
-    /// Stage 5.1 contract preserved: any error returned here surfaces
-    /// through `submit_attestation_workflow` as
+    /// Stage 5.1 contract preserved either way: any error returned
+    /// here surfaces through `submit_attestation_workflow` as
     /// `RegistryError::ChainClient(_)` and leaves the local record at
     /// its pre-submit state.
     fn submit_attestation(
         &self,
         attestation: &InferenceAttestation,
     ) -> std::result::Result<SubmissionReceipt, ChainClientError> {
-        build_and_submit_signed_transaction(self, attestation)
+        #[cfg(feature = "submit")]
+        {
+            build_and_submit_signed_transaction(self, attestation)
+        }
+        #[cfg(not(feature = "submit"))]
+        {
+            let _ = attestation;
+            Err(ChainClientError::Other(
+                "omni-sumchain built without the `submit` feature; \
+                 rebuild with --features submit to enable \
+                 sum_sendRawTransaction"
+                    .into(),
+            ))
+        }
     }
 }
 

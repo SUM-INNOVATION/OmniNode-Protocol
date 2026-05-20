@@ -83,6 +83,7 @@ The protocol is built on four pillars:
 | **Phase 5 Stage 8a** — Operator surface: activation watch / smoke / lifecycle loop (safe-by-default CLI) | `omni-node` | **Complete** |
 | **Phase 5 Stage 8b** — Mainnet activation smoke hardening: read-only `preflight` + `query` + checklist runbook | `omni-node` | **Complete** |
 | **Phase 5 Stage 8c** — Post-mainnet-smoke hardening: warning-clean build, `smoke` summary, `query --tx-hash`, `derive-address` | `omni-node` | **Complete** |
+| **Phase 5 Stage 9a** — Production runbook + build decoupling (`submit` feature; default builds need no private repo); `operator registry list/show` | `omni-node`, `omni-sumchain` | **Complete** |
 | Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
@@ -1309,7 +1310,7 @@ Stage 8b de-risks the mainnet activation smoke. The concrete gap Stage 8a expose
 
 At/after activation (head ≥ 6,000,000):
 
-4. `omni-node operator smoke --expect-chain-id 1 --registry-path <P> --attestation-json ./first-attestation.json --allow-submit --allow-mainnet-submit [--confirm-timeout-secs N]`. **Timeout guidance (empirically corrected, Stage 8c):** the first mainnet smoke (2026-05-19, see [docs/mainnet-smoke-audit.md](docs/mainnet-smoke-audit.md)) finalized in ~**11 s** / ~1 block past submit, so the default `--confirm-timeout-secs 60` is comfortably sufficient on SUM Chain mainnet — no need to inflate it. No block time is hardcoded; raise it only if your endpoint or network conditions warrant. Record the **tx hash**.
+4. `cargo run -p omni-node --features submit -- operator smoke --expect-chain-id 1 --registry-path <P> --attestation-json ./first-attestation.json --allow-submit --allow-mainnet-submit [--confirm-timeout-secs N]`. **Stage 9a:** the `submit` cargo feature is default-off; the binary used in steps 1–3 (read-only) does not need it, but `smoke` does. **Timeout guidance (empirically corrected, Stage 8c):** the first mainnet smoke (2026-05-19, see [docs/mainnet-smoke-audit.md](docs/mainnet-smoke-audit.md)) finalized in ~**11 s** / ~1 block past submit, so the default `--confirm-timeout-secs 60` is comfortably sufficient on SUM Chain mainnet — no need to inflate it. No block time is hardcoded; raise it only if your endpoint or network conditions warrant. Record the **tx hash**.
 5. Confirm chain status reaches **`Finalized`** — Stage 8a returns success only on `Finalized`; `Included` is logged as progress.
 6. `omni-node operator query --expect-chain-id 1 --session-id <S> --verifier-address <A>` — confirm the chain's stored attestation matches; record `included_at_height`, `tx_hash`, `finalized`.
 
@@ -1318,7 +1319,7 @@ At/after activation (head ≥ 6,000,000):
 1. **Local idempotency.** Re-run the *exact same* `smoke` command with the *same* `--registry-path`. Expected: the local record is already `Finalized`, so `submit_attestation_workflow_with_block`'s `insert` short-circuits — **no new chain submission**, the finalized record is reused, smoke re-polls to `Finalized`. This proves the local registry prevents accidental double-submit; it does **not** exercise chain-side duplicate rejection.
 2. **Chain duplicate rejection.** Only if intentionally exercising chain rejection: from a fresh/empty registry (or a controlled one-off path that bypasses local idempotency), resubmit the same `(session_id, verifier_address)`. Expected: the chain rejects the duplicate or reports `Failed` with the documented duplicate behavior. **Stage 8b does not ship a bypass-local-idempotency duplicate-submit tool** — this remains a manual/external check or a later explicit diagnostic command.
 
-**Operational sequencing.** Start the lifecycle loop **monitor-only first** (`operator loop … ` with no `--allow-submit`) to confirm poll/sweep behave; only after the smoke is clean add `--allow-submit --allow-mainnet-submit` to enable the retry sweep.
+**Operational sequencing.** Start the lifecycle loop **monitor-only first** (`cargo run -p omni-node -- operator loop …` with no `--allow-submit` and no feature flag) to confirm poll/sweep behave; only after the smoke is clean rebuild with `--features submit` and add `--allow-submit --allow-mainnet-submit` to enable the retry sweep.
 
 **Results template to record:** `tx_hash`, `included_at_height`, finalized height + `finalized` status, `AttestationId`, local-idempotency rerun outcome.
 
@@ -1349,6 +1350,53 @@ Folds the first real mainnet finalization back into the operator surface: a genu
 **Audit note immutability:** [docs/mainnet-smoke-audit.md](docs/mainnet-smoke-audit.md) records the 2026-05-19 run as a frozen historical record; Stage 8c added only a short "follow-up hardening" pointer at its foot — the smoke facts themselves are unedited.
 
 **What Stage 8c deliberately does not do:** no Stage 6 chain-wire / Stage 7b tx-construction changes (no concrete bug surfaced); no synthetic mainnet support; no daemonization/systemd (first mainnet smoke just passed — observability/UX hardening is the correct increment before a supervised long-running process); no new chain RPCs / `omni-sumchain` changes; no `--confirm-timeout-secs` default change (docs corrected instead); no edits outside `crates/omni-node/`.
+
+---
+
+### Phase 5 Stage 9a: Production Operator Runbook + Build Decoupling — Complete
+
+**Crates:** `omni-node`, `omni-sumchain` (additive feature) | **Depends on:** Stage 8c + the 2026-05-19 mainnet smoke ([docs/mainnet-smoke-audit.md](docs/mainnet-smoke-audit.md)) | no new external crates; zero protocol changes; Stage 6 fixture + Stage 7b tx-construction byte-stable
+
+Two outcomes that make the now-proven operator path *adoptable*:
+
+**1. Default builds no longer need the private SUM Chain repo.** The vendored `sumchain-primitives` / `sumchain-crypto` git deps move behind a default-off `submit` cargo feature. `cargo build -p omni-node` (default) works for any operator running monitor-only / read-only commands — no GitHub access to `SUM-INNOVATION/sum-chain` required. Submit operators opt in with `--features submit`.
+
+| Build invocation | Pulls private repo? | Subcommands compiled in |
+|---|---|---|
+| `cargo build -p omni-node` (default) | **no** | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) |
+| `cargo build -p omni-node --features submit` | yes (one-time `cargo fetch`) | all of the above plus `smoke`, `loop --allow-submit [--allow-mainnet-submit]` |
+
+Verified empirically (Stage 9a CI gate):
+
+```bash
+cargo tree -p omni-node                  | grep -E 'sumchain-(crypto|primitives)'   # (no rows)
+cargo tree -p omni-node --features submit | grep -E 'sumchain-(crypto|primitives)'  # sumchain-crypto + sumchain-primitives appear
+```
+
+When `submit` is off, `SumChainClient::submit_attestation` still satisfies the `ChainClient` trait but returns a typed `ChainClientError::Other("omni-sumchain built without the `submit` feature; …")` — read-only consumers (poll / query workflows) continue to compile and work generically. `OperatorCmd::Smoke` and the loop's `--allow-submit` / `--allow-mainnet-submit` flags are `#[cfg(feature = "submit")]`-gated at the CLI level (Q2): without the feature they don't appear in `--help` at all (cleaner than a flag that can only fail).
+
+**2. Read-only `operator registry list / show`.** Two new subcommands inspect the local attestation registry without any chain access or mutation:
+
+| Subcommand | Behaviour |
+|---|---|
+| `operator registry list --registry-path <P> [--status <S>]` | One bare-stdout line per record (`<id-hex>  <status>  tx=…  block=…  updated=…`) for grep-ability. Optional status filter (`pending\|submitted\|included\|finalized\|failed\|dropped`, case-insensitive); typed `InvalidStatusFilter` on an unknown value. |
+| `operator registry show --registry-path <P> --id <hex>` | Pretty-prints the full `AttestationRecord` JSON (digest, attestation, receipt, error_message, submitted_at_block). Missing id → typed `RegistryError::RecordNotFound`. Malformed hex → typed `AttestationIdMalformed` (refused before any disk read). |
+
+No mutating registry-repair tools ship in Stage 9a — registry inspection stays strictly read-only.
+
+**3. Runbook.** A canonical operator runbook lives at [docs/operator-runbook.md](docs/operator-runbook.md): build matrix, daily preflight, submit / loop / monitor sequencing, registry inspection, recovery after process interruption, backup / rotation, what-to-report-on-incident fields, `RUST_LOG` guidance, the stable tracing-field markers to grep, and a **docs-only systemd unit sample** (no installer, no service-manager code in the binary). README's Stage 8b runbook step 4 was updated to use `cargo run -p omni-node --features submit -- operator smoke …` (read-only steps 1–3 stay plain).
+
+**Audit-note immutability:** the 2026-05-19 [mainnet smoke audit](docs/mainnet-smoke-audit.md) remains historical. Stage 9a's hardening is described here in the README, not by editing the audit's recorded facts.
+
+**Tests** (default-on, hermetic) — feature matrix:
+
+| Suite | Default features | `--features submit` |
+|---|---|---|
+| `cargo test -p omni-node` | **33** (24 prior Stage 8c read-only + 9 new Stage 9a: 2 parse matrices + 7 registry list/show) | **46** (37 prior Stage 8c full set + 9 new) |
+| `cargo test -p omni-sumchain` | **86** (read-only suites + the new `no_submit_feature` typed-error test) | **103** (full suite incl. parity, submit-construction; the 5 `#[ignore]`'d live tests still self-skip) |
+| `cargo build -p omni-node` / `--features submit` | warning-clean / warning-clean | — |
+
+**What Stage 9a deliberately does not do:** no Stage 6 chain-wire or fixture changes (byte-stable); no Stage 7b tx-construction changes — the cfg-gating moves modules without modifying bytes, and the parity tests still assert byte-equivalence with vendored chain primitives under `--features submit`; no synthetic mainnet support; no daemonization / systemd code (sample unit is docs-only); no JSON output mode (deferred); no mutating registry-repair tools; no new chain RPCs / `omni-sumchain` methods; no publishing of `sumchain-primitives` / `sumchain-crypto` (chain team's call); no edits outside `crates/omni-node/` + `crates/omni-sumchain/` (Cargo.toml + cfg attributes only, no tx bytes) + `docs/operator-runbook.md` + `README.md`.
 
 ---
 
@@ -1517,7 +1565,7 @@ OmniNode-Protocol/
 │   │       └── fixtures/
 │   │           └── chain_attestation_vectors.json  # Stage 6 frozen deliverable: 3 chain attestation test vectors
 │   │
-│   ├── omni-sumchain/                  # Phase 5 Stage 7a + 7b: SUM Chain adapter (read/query + real submit)
+│   ├── omni-sumchain/                  # Phase 5 Stage 7a + 7b + 9a: SUM Chain adapter (read/query default-on; submit + vendored chain primitives behind the `submit` cargo feature, default-off)
 │   │   ├── Cargo.toml                 # depends on omni-zkml + omni-types + ureq + sumchain-primitives + sumchain-crypto + serde + serde_json + thiserror + tracing (dev: bincode1)
 │   │   ├── README.md                  # operational setup (extra-alloc.json funding, env vars, live-test guide, Stage 7b submission flow)
 │   │   ├── src/
@@ -1541,7 +1589,7 @@ OmniNode-Protocol/
 │       ├── Cargo.toml                 # + omni-zkml + omni-sumchain + thiserror (dev: tempfile)
 │       └── src/
 │           ├── main.rs                # listen | shard <path> | fetch <cid> | send <msg> | operator <…>
-│           └── operator.rs            # Stage 8a/8b/8c: operator watch-activation | smoke | loop | preflight | query [--tx-hash] | derive-address (safe-by-default, hermetic-tested, warning-clean)
+│           └── operator.rs            # Stage 8a/8b/8c/9a: operator watch-activation | smoke[submit] | loop[+submit retry] | preflight | query [--tx-hash] | derive-address | registry list/show (safe-by-default, hermetic-tested, warning-clean; smoke + retry gated behind `--features submit`)
 │
 ├── pyproject.toml                     # maturin build config for omninode Python package
 ├── python/                            # Python ML package (Phase 3)
@@ -1554,6 +1602,8 @@ OmniNode-Protocol/
 ├── proto/                              # Protobuf schema definitions
 │
 ├── docs/                              # Architecture documentation
+│   ├── mainnet-smoke-audit.md         # Stage 8b: frozen historical record of the 2026-05-19 first mainnet finalization
+│   └── operator-runbook.md            # Stage 9a: canonical operator runbook (build matrix, daily commands, recovery, RUST_LOG, systemd sample)
 │
 ├── scripts/                           # Development scripts
 │

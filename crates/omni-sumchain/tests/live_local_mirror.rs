@@ -146,6 +146,12 @@ fn live_omninode_is_active_after_chain_patch() {
 ///
 /// Skipped (with a clear message) if either env var is unset, so
 /// `cargo test -- --ignored` without the env vars exits 0.
+///
+/// Stage 9a: `#[cfg(feature = "submit")]` — the submit path itself
+/// only exists with the feature. The other live tests in this file
+/// (chain params, block height, unknown tx) are read-only and stay
+/// default-on.
+#[cfg(feature = "submit")]
 #[test]
 #[ignore]
 fn live_submit_roundtrip() {

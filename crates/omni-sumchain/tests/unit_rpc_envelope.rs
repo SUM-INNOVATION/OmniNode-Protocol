@@ -265,6 +265,11 @@ fn omninode_is_active_returns_false_when_head_below_activation() {
 /// `Ok(SubmissionReceipt)` and the fake transport saw a
 /// `sum_sendRawTransaction` call. Detailed gate / RPC-shape pinning
 /// lives in `tests/unit_submit_construction.rs`.
+// Stage 9a: this end-to-end happy-path test exercises the real Stage
+// 7b submit pipeline, which is only compiled with `--features submit`.
+// The default-features no-submit case is covered by
+// `tests/no_submit_feature.rs::submit_attestation_without_feature_returns_typed_error`.
+#[cfg(feature = "submit")]
 #[test]
 fn submit_attestation_happy_path_returns_receipt() {
     use omni_types::phase5::{InferenceAttestation, InferenceCommitment, SnipV2ObjectId};

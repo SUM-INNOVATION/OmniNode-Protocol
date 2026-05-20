@@ -10,6 +10,18 @@ rust-version.workspace = true
 name = "omni-node"
 path = "src/main.rs"
 
+[features]
+# Stage 9a: default-OFF. With `submit`, the binary gains the
+# attestation submit / retry path (`operator smoke`, retry-enabled
+# `operator loop`) and `omni-sumchain` pulls the vendored
+# `sumchain-primitives` / `sumchain-crypto` from the private
+# `SUM-INNOVATION/sum-chain` repo. Without it, only the read-only
+# operator surface (watch-activation, preflight, query [+--tx-hash],
+# derive-address, registry list/show, monitor-only loop) is compiled
+# and the build needs no access to that private repo.
+default = []
+submit  = ["omni-sumchain/submit"]
+
 [dependencies]
 omni-types         = { workspace = true }
 omni-net           = { workspace = true }
