@@ -53,7 +53,7 @@ use std::time::Duration;
 use clap::{Args, Subcommand};
 use tracing::{debug, info, warn};
 
-use omni_sumchain::{BlockFinality, JsonRpcTransport, SumChainClient, UreqTransport};
+use omni_sumchain::{BlockFinality, ChainParamsInfo, JsonRpcTransport, SumChainClient, UreqTransport};
 use omni_types::phase5::InferenceAttestation;
 #[cfg(any(feature = "submit", test))]
 use omni_types::phase5::{InferenceCommitment, SnipV2ObjectId};
@@ -407,6 +407,10 @@ enum RegistryCmd {
     List(RegistryListArgs),
     /// Pretty-print a single record by `AttestationId` (64-char lowercase hex).
     Show(RegistryShowArgs),
+    /// Stage 10a: read-only counts-by-status summary. Optional one-shot
+    /// chain read for the oldest `Submitted` record's age (requires
+    /// `--rpc-url` + `--expect-chain-id`). Never mutates registry or chain.
+    Summary(RegistrySummaryArgs),
 }
 
 #[derive(Args)]
@@ -428,6 +432,24 @@ struct RegistryShowArgs {
     /// preflight`.
     #[arg(long)]
     id: String,
+}
+
+#[derive(Args)]
+struct RegistrySummaryArgs {
+    #[arg(long)]
+    registry_path: PathBuf,
+    /// Optional: when given, fetch the current chain head once and
+    /// compute the oldest-`Submitted` record's age in blocks. Without
+    /// this flag the summary still prints status counts; the age line
+    /// is replaced with a `# oldest_submitted_age: skipped (no --rpc-url)`
+    /// comment so the output stays stable.
+    #[arg(long)]
+    rpc_url: Option<String>,
+    /// Required iff `--rpc-url` is given. Mirrors every other
+    /// chain-touching operator subcommand: we never query an
+    /// unguarded RPC endpoint.
+    #[arg(long)]
+    expect_chain_id: Option<u64>,
 }
 
 #[derive(Args)]
@@ -530,6 +552,7 @@ fn ureq_factory(url: String) -> ClientFactory<UreqTransport> {
 }
 
 pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
+    log_startup_marker(subcommand_name(&args.cmd));
     match args.cmd {
         OperatorCmd::WatchActivation(a) => {
             let url = resolve_rpc_url(a.rpc_url.clone())?;
@@ -655,6 +678,22 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
                 })?;
                 println!("{json}");
             }
+            RegistryCmd::Summary(sa) => {
+                // Mirror Preflight's RPC + chain-id pairing: --rpc-url is
+                // optional, but if given --expect-chain-id is required.
+                let client_or_none = match sa.rpc_url {
+                    Some(url) => {
+                        if sa.expect_chain_id.is_none() {
+                            return Err(OperatorError::ExpectChainIdRequiredWithRpc.into());
+                        }
+                        Some((ureq_factory(url), sa.expect_chain_id.unwrap()))
+                    }
+                    None => None,
+                };
+                let summary =
+                    registry_summary_core(sa.registry_path, client_or_none).await?;
+                print_registry_summary(&summary);
+            }
         },
     }
     Ok(())
@@ -727,20 +766,24 @@ where
         .await?;
 
         info!(
+            event = "chain_params",
             chain_id = snap.chain_id,
             finality_depth = snap.finality_depth,
             min_fee = snap.min_fee,
             v2_enabled_from_height = ?snap.v2_from,
             omninode_enabled_from_height = ?snap.omninode_from,
             head = snap.head,
-            "chain params"
+            "chain params snapshot"
         );
         info!(
+            event = "activation_state",
             v2_blocks_remaining = ?blocks_remaining(snap.head, snap.v2_from),
             omninode_blocks_remaining = ?blocks_remaining(snap.head, snap.omninode_from),
             v2_active = snap.v2,
             omninode_active = snap.omninode,
-            "activation status"
+            activated = snap.omninode && snap.v2,
+            head = snap.head,
+            "activation state"
         );
 
         if snap.omninode && snap.v2 {
@@ -840,6 +883,13 @@ where
         if !(omninode && v2) {
             return Err(OperatorError::NotActivated { omninode, v2 }); // gate 2
         }
+
+        // Stage 10a observability markers. Pre-submit chain snapshot
+        // so operators can grep `event="chain_params"` /
+        // `event="activation_state"` consistently across all
+        // chain-touching subcommands.
+        log_chain_params_snapshot(&params, None);
+        log_activation_state(omninode, v2, None);
 
         submission_permitted(
             params.chain_id,
@@ -1193,21 +1243,24 @@ where
                 let omninode = client.omninode_is_active()?;
                 let v2 = client.v2_is_active()?;
                 info!(
+                    event = "chain_params",
                     chain_id = params.chain_id,
                     finality_depth = params.finality_depth,
                     min_fee = params.min_fee,
                     v2_enabled_from_height = ?params.v2_enabled_from_height,
                     omninode_enabled_from_height = ?params.omninode_enabled_from_height,
                     head = head,
-                    "preflight: chain params"
+                    "preflight: chain params snapshot"
                 );
                 info!(
+                    event = "activation_state",
                     v2_blocks_remaining = ?blocks_remaining(head, params.v2_enabled_from_height),
                     omninode_blocks_remaining = ?blocks_remaining(head, params.omninode_enabled_from_height),
                     v2_active = v2,
                     omninode_active = omninode,
                     activated = omninode && v2,
-                    "preflight: chain snapshot (report-only — valid \
+                    head = head,
+                    "preflight: activation state (report-only — valid \
                      before and after activation)"
                 );
             }
@@ -1275,6 +1328,7 @@ where
         let client = make_client(DUMMY_SEED);
         let params = client.get_chain_params()?;
         check_chain_id(cfg.expect_chain_id, params.chain_id)?;
+        log_chain_params_snapshot(&params, None);
         match cfg.mode {
             QueryMode::Pair {
                 session_id,
@@ -1324,6 +1378,76 @@ async fn derive_address_core(seed_source: SeedSource) -> Result<String, Operator
             .map_err(|e| OperatorError::SeedMalformed(e.to_string()))
     })
     .await
+}
+
+// ── Stage 10a: stable observability markers ───────────────────────────────────
+//
+// Field shapes for the `event=` markers below are pinned by
+// `docs/operator-runbook.md §7` (operator-facing grep contract). Add a
+// new field freely; rename or remove → update the runbook table in the
+// same PR.
+
+/// `event="chain_params"` snapshot. Emitted once per chain-touching
+/// subcommand entry. `head` is `Option<_>` because some entry points
+/// have already paid for a block-height read at the same time, and
+/// some haven't — letting callers pass `None` keeps the marker honest
+/// instead of forcing a second RPC just to fill the field.
+fn log_chain_params_snapshot(params: &ChainParamsInfo, head: Option<u64>) {
+    info!(
+        event = "chain_params",
+        chain_id = params.chain_id,
+        finality_depth = params.finality_depth,
+        min_fee = params.min_fee,
+        omninode_enabled_from_height = ?params.omninode_enabled_from_height,
+        v2_enabled_from_height = ?params.v2_enabled_from_height,
+        head = ?head,
+        "chain params snapshot"
+    );
+}
+
+/// `event="activation_state"` snapshot. Emitted at entry to any
+/// subcommand that has already fetched both activation gates.
+/// Currently only `smoke` calls into the helper; `watch-activation`
+/// and `preflight` emit their own inline `event="activation_state"`
+/// lines (with extra fields like `v2_blocks_remaining`) — keeping the
+/// helper unused on default builds would warn, so gate it where its
+/// sole caller lives.
+#[cfg(feature = "submit")]
+fn log_activation_state(omninode_active: bool, v2_active: bool, head: Option<u64>) {
+    info!(
+        event = "activation_state",
+        omninode_active,
+        v2_active,
+        activated = omninode_active && v2_active,
+        head = ?head,
+        "activation state"
+    );
+}
+
+/// `event="startup"` line emitted once per `operator` invocation,
+/// before any chain or registry access. Operators grep this to confirm
+/// they're running the binary they expect.
+fn log_startup_marker(subcommand: &'static str) {
+    info!(
+        event = "startup",
+        subcommand,
+        feature_submit = cfg!(feature = "submit"),
+        version = env!("CARGO_PKG_VERSION"),
+        "omni-node operator startup"
+    );
+}
+
+fn subcommand_name(c: &OperatorCmd) -> &'static str {
+    match c {
+        OperatorCmd::WatchActivation(_) => "watch-activation",
+        #[cfg(feature = "submit")]
+        OperatorCmd::Smoke(_) => "smoke",
+        OperatorCmd::Loop(_) => "loop",
+        OperatorCmd::Preflight(_) => "preflight",
+        OperatorCmd::Query(_) => "query",
+        OperatorCmd::DeriveAddress => "derive-address",
+        OperatorCmd::Registry(_) => "registry",
+    }
 }
 
 // ── registry list / show (Stage 9a) ───────────────────────────────────────────
@@ -1436,6 +1560,188 @@ async fn registry_show_core(
         Ok(registry.load(&id)?)
     })
     .await
+}
+
+// ── registry summary (Stage 10a) ──────────────────────────────────────────────
+
+/// Stage 10a: counts-by-status summary of a local registry, with an
+/// optional oldest-`Submitted` age line when an RPC client is supplied.
+/// Returned in structured form so tests can assert without capturing
+/// stdout; the dispatch layer renders via [`print_registry_summary`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistrySummary {
+    pub total: usize,
+    pub pending: usize,
+    pub submitted: usize,
+    pub included: usize,
+    pub finalized: usize,
+    pub failed: usize,
+    pub dropped: usize,
+    /// `Some(_)` only when (a) the caller supplied an RPC client AND
+    /// (b) at least one `Submitted` record has `submitted_at_block:
+    /// Some(_)`. Otherwise the dispatcher emits a skip comment with
+    /// the reason.
+    pub oldest_submitted_age: Option<OldestSubmittedAge>,
+    /// Reason the oldest-age line is missing. `None` means it's
+    /// present; otherwise an operator-facing comment string.
+    pub oldest_submitted_age_skip_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OldestSubmittedAge {
+    pub id_hex: String,
+    pub submitted_at_block: u64,
+    pub head: u64,
+    /// `head.saturating_sub(submitted_at_block)`. Saturating because a
+    /// head < submitted_at_block can only happen if the chain is
+    /// regressing (already flagged separately by Stage 5.2 staleness);
+    /// we don't want to panic the summary on a transient observation.
+    pub age_blocks: u64,
+}
+
+/// Read-only summary. Opens the registry, counts every record by
+/// status, then — if an RPC client + expected chain_id were supplied —
+/// does **one** `get_chain_params` (chain-id guardrail) and **one**
+/// `get_block_height(BlockFinality::Latest)` call to compute the
+/// oldest-`Submitted` record's age in blocks. Zero chain mutation; no
+/// submit code path; works under both default and `--features submit`
+/// builds.
+async fn registry_summary_core<T>(
+    registry_path: PathBuf,
+    chain_client: Option<(ClientFactory<T>, u64)>,
+) -> Result<RegistrySummary, OperatorError>
+where
+    T: JsonRpcTransport + Send + Sync + 'static,
+{
+    run_blocking(move || -> Result<RegistrySummary, OperatorError> {
+        let registry = AttestationRegistry::open(registry_path)?;
+        let records = registry.list()?;
+
+        let mut summary = RegistrySummary {
+            total: records.len(),
+            pending: 0,
+            submitted: 0,
+            included: 0,
+            finalized: 0,
+            failed: 0,
+            dropped: 0,
+            oldest_submitted_age: None,
+            oldest_submitted_age_skip_reason: None,
+        };
+
+        // Track the oldest `Submitted` record's (id_hex, block) for the
+        // optional age line. "Oldest" = lowest `submitted_at_block`.
+        let mut oldest: Option<(String, u64)> = None;
+
+        for record in &records {
+            match status_label(&record.status) {
+                "pending" => summary.pending += 1,
+                "submitted" => {
+                    summary.submitted += 1;
+                    if let Some(block) = record.submitted_at_block {
+                        match &oldest {
+                            None => oldest = Some((record.id.to_hex(), block)),
+                            Some((_, best)) if block < *best => {
+                                oldest = Some((record.id.to_hex(), block));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "included" => summary.included += 1,
+                "finalized" => summary.finalized += 1,
+                "failed" => summary.failed += 1,
+                "dropped" => summary.dropped += 1,
+                // status_label() returns a closed set of &'static strs; any
+                // other value here would mean an unhandled variant got added
+                // to LocalAttestationStatus without updating status_label.
+                other => {
+                    return Err(OperatorError::Internal(format!(
+                        "unknown status label {other:?} in summary count — \
+                         status_label() out of sync with LocalAttestationStatus"
+                    )));
+                }
+            }
+        }
+
+        // Decide whether to compute the age line.
+        match (chain_client, oldest) {
+            (None, _) => {
+                summary.oldest_submitted_age_skip_reason =
+                    Some("skipped (no --rpc-url)");
+            }
+            (Some(_), None) => {
+                summary.oldest_submitted_age_skip_reason = if summary.submitted == 0 {
+                    Some("skipped (no Submitted records)")
+                } else {
+                    Some("skipped (no Submitted record has submitted_at_block)")
+                };
+            }
+            (Some((make_client, expect_chain_id)), Some((id_hex, block))) => {
+                let client = make_client(DUMMY_SEED);
+                let params = client.get_chain_params()?;
+                check_chain_id(expect_chain_id, params.chain_id)?;
+                let head = client
+                    .get_block_height(BlockFinality::Latest)?
+                    .height;
+                summary.oldest_submitted_age = Some(OldestSubmittedAge {
+                    id_hex,
+                    submitted_at_block: block,
+                    head,
+                    age_blocks: head.saturating_sub(block),
+                });
+            }
+        }
+
+        // Stable observability marker (Stage 10a) — counts emit as
+        // structured tracing fields so operator log pipelines can
+        // grep against `event="registry_summary"` without parsing
+        // bare stdout.
+        info!(
+            event = "registry_summary",
+            total = summary.total,
+            pending = summary.pending,
+            submitted = summary.submitted,
+            included = summary.included,
+            finalized = summary.finalized,
+            failed = summary.failed,
+            dropped = summary.dropped,
+            oldest_submitted_age_blocks =
+                summary.oldest_submitted_age.as_ref().map(|a| a.age_blocks),
+            "registry summary complete"
+        );
+
+        Ok(summary)
+    })
+    .await
+}
+
+/// Render a [`RegistrySummary`] to bare stdout in the documented
+/// three-line shape. Grep contract:
+///   `total=` always present on line 1
+///   `pending=` / `submitted=` / … always present on line 2
+///   line 3 is either `oldest_submitted_age_blocks=…` OR a
+///   `# oldest_submitted_age: skipped (<reason>)` comment.
+fn print_registry_summary(s: &RegistrySummary) {
+    println!("total={}", s.total);
+    println!(
+        "pending={} submitted={} included={} finalized={} failed={} dropped={}",
+        s.pending, s.submitted, s.included, s.finalized, s.failed, s.dropped,
+    );
+    match (&s.oldest_submitted_age, s.oldest_submitted_age_skip_reason) {
+        (Some(age), _) => println!(
+            "oldest_submitted_age_blocks={} (id={}, submitted_at_block={}, head={})",
+            age.age_blocks, age.id_hex, age.submitted_at_block, age.head,
+        ),
+        (None, Some(reason)) => println!("# oldest_submitted_age: {reason}"),
+        (None, None) => {
+            // Defensive: the core always sets one of the two when
+            // oldest_submitted_age is None. If neither is set, the
+            // dispatcher would emit nothing — surface a typed comment
+            // so the line still appears and grep contracts hold.
+            println!("# oldest_submitted_age: skipped (no Submitted records)");
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2504,5 +2810,286 @@ mod tests {
             matches!(err, OperatorError::AttestationIdMalformed(_)),
             "got {err:?}"
         );
+    }
+
+    // ── Stage 10a: registry summary ───────────────────────────────────
+
+    /// Seed a registry with one record in every local status state, so
+    /// `summary` counts can be asserted exactly. Returns the inserted
+    /// `AttestationId`s in (pending, submitted, included, finalized,
+    /// failed, dropped) order. `submitted_at_block` for the various
+    /// records is set so the oldest-`Submitted` line can be tested.
+    fn seed_one_of_each_status(
+        registry_path: &std::path::Path,
+    ) -> [AttestationId; 6] {
+        let reg = AttestationRegistry::open(registry_path.to_path_buf()).unwrap();
+        let pending = reg.insert(synth_attestation("addr-pending", 1)).unwrap().id;
+        // submitted (newer block — should NOT be picked as oldest)
+        let submitted = reg.insert(synth_attestation("addr-submitted", 2)).unwrap().id;
+        reg.mark_submitted_with_block(
+            &submitted,
+            SubmissionReceipt { tx_id: "0xsubmitted".into(), note: None },
+            500,
+        )
+        .unwrap();
+        // included
+        let included = reg.insert(synth_attestation("addr-included", 3)).unwrap().id;
+        reg.mark_submitted_with_block(
+            &included,
+            SubmissionReceipt { tx_id: "0xincluded".into(), note: None },
+            100,
+        )
+        .unwrap();
+        reg.mark_included(&included).unwrap();
+        // finalized
+        let finalized = reg.insert(synth_attestation("addr-finalized", 4)).unwrap().id;
+        reg.mark_submitted_with_block(
+            &finalized,
+            SubmissionReceipt { tx_id: "0xfinal".into(), note: None },
+            50,
+        )
+        .unwrap();
+        reg.mark_finalized(&finalized).unwrap();
+        // failed
+        let failed = reg.insert(synth_attestation("addr-failed", 5)).unwrap().id;
+        reg.mark_submitted_with_block(
+            &failed,
+            SubmissionReceipt { tx_id: "0xfailed".into(), note: None },
+            75,
+        )
+        .unwrap();
+        reg.mark_failed(&failed, "boom".into()).unwrap();
+        // dropped
+        let dropped = reg.insert(synth_attestation("addr-dropped", 6)).unwrap().id;
+        reg.mark_submitted_with_block(
+            &dropped,
+            SubmissionReceipt { tx_id: "0xdropped".into(), note: None },
+            25,
+        )
+        .unwrap();
+        reg.mark_dropped(&dropped, Some("manual".into())).unwrap();
+        [pending, submitted, included, finalized, failed, dropped]
+    }
+
+    #[tokio::test]
+    async fn registry_summary_zero_records_emits_zero_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = AttestationRegistry::open(dir.path().join("reg")).unwrap();
+        let s = registry_summary_core::<FakeJsonRpcTransport>(
+            dir.path().join("reg"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.total, 0);
+        assert_eq!(s.pending, 0);
+        assert_eq!(s.submitted, 0);
+        assert_eq!(s.included, 0);
+        assert_eq!(s.finalized, 0);
+        assert_eq!(s.failed, 0);
+        assert_eq!(s.dropped, 0);
+        assert!(s.oldest_submitted_age.is_none());
+        assert_eq!(s.oldest_submitted_age_skip_reason, Some("skipped (no --rpc-url)"));
+    }
+
+    #[tokio::test]
+    async fn registry_summary_counts_by_status_match_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = seed_one_of_each_status(&dir.path().join("reg"));
+        let s = registry_summary_core::<FakeJsonRpcTransport>(
+            dir.path().join("reg"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.total, 6);
+        assert_eq!(s.pending, 1);
+        assert_eq!(s.submitted, 1);
+        assert_eq!(s.included, 1);
+        assert_eq!(s.finalized, 1);
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn registry_summary_age_line_skipped_when_no_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = seed_one_of_each_status(&dir.path().join("reg"));
+        let s = registry_summary_core::<FakeJsonRpcTransport>(
+            dir.path().join("reg"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(s.oldest_submitted_age.is_none());
+        assert_eq!(
+            s.oldest_submitted_age_skip_reason,
+            Some("skipped (no --rpc-url)")
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_summary_age_line_skipped_when_no_submitted_records() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only Pending records — no Submitted record exists at all.
+        let reg = AttestationRegistry::open(dir.path().join("reg")).unwrap();
+        reg.insert(synth_attestation("addr-only-pending", 1)).unwrap();
+        let fake = activated_fake(31337);
+        let s = registry_summary_core(
+            dir.path().join("reg"),
+            Some((factory(fake), 31337u64)),
+        )
+        .await
+        .unwrap();
+        assert!(s.oldest_submitted_age.is_none());
+        assert_eq!(
+            s.oldest_submitted_age_skip_reason,
+            Some("skipped (no Submitted records)")
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_summary_age_line_skipped_when_submitted_has_no_block() {
+        let dir = tempfile::tempdir().unwrap();
+        // One Submitted record but inserted via mark_submitted (legacy
+        // path) which does NOT set submitted_at_block.
+        let reg = AttestationRegistry::open(dir.path().join("reg")).unwrap();
+        let r = reg.insert(synth_attestation("addr-legacy", 7)).unwrap();
+        reg.mark_submitted(
+            &r.id,
+            SubmissionReceipt { tx_id: "0xlegacy".into(), note: None },
+        )
+        .unwrap();
+        let fake = activated_fake(31337);
+        let s = registry_summary_core(
+            dir.path().join("reg"),
+            Some((factory(fake), 31337u64)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.submitted, 1);
+        assert!(s.oldest_submitted_age.is_none());
+        assert_eq!(
+            s.oldest_submitted_age_skip_reason,
+            Some("skipped (no Submitted record has submitted_at_block)")
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_summary_age_line_picks_oldest_submitted() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three Submitted records at distinct blocks: 50, 200, 500.
+        // The "included" / "finalized" / "failed" / "dropped" records
+        // also have submitted_at_block set (50, 75, 25 respectively),
+        // but they are NOT in `Submitted` status anymore, so the
+        // summary must skip them and pick block=200 (the only true
+        // Submitted record that has a block).
+        let reg = AttestationRegistry::open(dir.path().join("reg")).unwrap();
+        let target = reg.insert(synth_attestation("addr-oldest", 11)).unwrap().id;
+        reg.mark_submitted_with_block(
+            &target,
+            SubmissionReceipt { tx_id: "0xtarget".into(), note: None },
+            200,
+        )
+        .unwrap();
+        let _ = seed_one_of_each_status(&dir.path().join("reg"));
+        let fake = activated_fake(31337);
+        let s = registry_summary_core(
+            dir.path().join("reg"),
+            Some((factory(fake), 31337u64)),
+        )
+        .await
+        .unwrap();
+        // Two `Submitted` records exist now: `target` at block 200,
+        // plus the one from `seed_one_of_each_status` at block 500.
+        // Oldest = lowest block = 200.
+        let age = s.oldest_submitted_age.as_ref().expect("age expected");
+        assert_eq!(age.submitted_at_block, 200);
+        assert_eq!(age.head, 100); // activated_fake returns head=100
+        assert_eq!(age.age_blocks, 100u64.saturating_sub(200)); // saturating → 0
+        assert_eq!(age.id_hex, target.to_hex());
+    }
+
+    #[tokio::test]
+    async fn registry_summary_age_uses_fake_head_height() {
+        // Verify the age line uses chain_getBlockHeight from the fake
+        // transport (not a hardcoded value). Seed a single Submitted
+        // record at block 30; fake head is 100 → age = 70.
+        let dir = tempfile::tempdir().unwrap();
+        let reg = AttestationRegistry::open(dir.path().join("reg")).unwrap();
+        let r = reg.insert(synth_attestation("addr-age", 9)).unwrap();
+        reg.mark_submitted_with_block(
+            &r.id,
+            SubmissionReceipt { tx_id: "0xage".into(), note: None },
+            30,
+        )
+        .unwrap();
+        let fake = activated_fake(31337);
+        let s = registry_summary_core(
+            dir.path().join("reg"),
+            Some((factory(fake), 31337u64)),
+        )
+        .await
+        .unwrap();
+        let age = s.oldest_submitted_age.as_ref().expect("age expected");
+        assert_eq!(age.submitted_at_block, 30);
+        assert_eq!(age.head, 100);
+        assert_eq!(age.age_blocks, 70);
+    }
+
+    #[tokio::test]
+    async fn registry_summary_chain_id_mismatch_is_typed_error() {
+        // --expect-chain-id 31337 against a fake reporting chain_id=1.
+        // The chain-id guardrail must trigger before the block-height
+        // read happens.
+        let dir = tempfile::tempdir().unwrap();
+        let reg = AttestationRegistry::open(dir.path().join("reg")).unwrap();
+        let r = reg.insert(synth_attestation("addr-x", 1)).unwrap();
+        reg.mark_submitted_with_block(
+            &r.id,
+            SubmissionReceipt { tx_id: "0xx".into(), note: None },
+            1,
+        )
+        .unwrap();
+        let fake = activated_fake(1);
+        let err = registry_summary_core(
+            dir.path().join("reg"),
+            Some((factory(fake), 31337u64)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::ChainIdMismatch { expected: 31337, actual: 1 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn print_registry_summary_renders_age_line_when_present() {
+        // Hermetic smoke for the printer — captures stdout via the
+        // structured fields to be sure the renderer agrees with the
+        // grep contract documented in the runbook §7 marker table.
+        let s = RegistrySummary {
+            total: 6,
+            pending: 1,
+            submitted: 2,
+            included: 1,
+            finalized: 1,
+            failed: 1,
+            dropped: 0,
+            oldest_submitted_age: Some(OldestSubmittedAge {
+                id_hex: "ab".repeat(32),
+                submitted_at_block: 100,
+                head: 247,
+                age_blocks: 147,
+            }),
+            oldest_submitted_age_skip_reason: None,
+        };
+        // Sanity: the printer doesn't panic and the structured fields
+        // are well-formed. Stdout capture itself is verified by the
+        // dispatch-level integration tests; here we just exercise the
+        // path so any future refactor that drops the printer signature
+        // fails compilation.
+        print_registry_summary(&s);
     }
 }

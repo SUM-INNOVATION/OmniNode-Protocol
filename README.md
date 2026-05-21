@@ -108,6 +108,8 @@ operator runbook.
 | **Phase 5 Stage 9b** — CI workflow + secret-gated submit matrix (superseded by 9c; original gates restored against the public dep source) | `.github/workflows`, docs | **Superseded by 9c** |
 | **Phase 5 Stage 9c** — Public SUM Chain crates (`sumchain-primitives` / `sumchain-crypto` v0.1.0, crates.io, MIT OR Apache-2.0); cargo-side CI gates restored; fresh source builds need no private repo access | `Cargo.toml`, `.github/workflows`, docs | **Complete** |
 | **Phase 5 Stage 9c.1** — Chain-produced signed-transaction fixture for the 2026-05-19 mainnet smoke tx; byte-roundtrip + `SignedTransaction::hash()` gate against authoritative on-chain bytes | `omni-sumchain/tests` | **Complete** |
+| **Phase 5 Stage 10a** — Operator observability + release readiness: `operator registry summary`, stable `event=` log markers, failure-triage matrix, release-readiness checklist (docs-only) | `omni-node`, `docs/operator-runbook.md` | **Complete** |
+| Phase 5 Stage 10b — Release artifact workflow + signing (deferred from 10a) | `.github/workflows`, `docs/` | Planned |
 | Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
@@ -1585,6 +1587,84 @@ Adds the **authoritative chain-produced byte-roundtrip gate** Stage 9c flagged a
 
 ---
 
+### Phase 5 Stage 10a: Operator Observability + Release Readiness — Complete
+
+**Crates touched:** [`crates/omni-node/src/operator.rs`](crates/omni-node/src/operator.rs) (new subcommand + 9 hermetic tests + 3 stable log marker helpers), [`docs/operator-runbook.md`](docs/operator-runbook.md) (§1a `--help` capture, §6 summary docs, §7 marker contract, §11 failure-triage matrix, §13 quick-reference rows, new §14 release checklist), README.md (this section + status row). | **Depends on:** Stage 9c.1; the 2026-05-19 mainnet smoke proved the submit path works on chain and Stage 9c/9c.1 closed the build-risk loop — Stage 10a is the operator-experience layer that follows. | **Zero protocol changes; zero new chain RPCs; Stage 6 chain-wire + fixture and Stage 7b tx construction byte-stable.**
+
+Makes `omni-node` operable as a real operator binary: a counts-by-status registry summary, stable structured log markers, a failure-state triage matrix grounded in the typed surface that actually exists today, and a documented release-readiness checklist. No release artifact workflow in this stage (deferred to Stage 10b until there's a concrete operator audience asking for downloadable binaries).
+
+**1. `operator registry summary` (new read-only subcommand).** Bare-stdout three-line shape:
+
+```text
+total=12
+pending=2 submitted=4 included=1 finalized=3 failed=1 dropped=1
+oldest_submitted_age_blocks=147 (id=ab12…, submitted_at_block=6049055, head=6049202)
+```
+
+The third line is replaced with a stable `# oldest_submitted_age: skipped (<reason>)` comment when:
+- `--rpc-url` is omitted (default-build path; no chain access at all);
+- the registry has no `Submitted` records; or
+- the only Submitted records were inserted via the legacy `mark_submitted` (no `submitted_at_block`).
+
+`--expect-chain-id` is **required** when `--rpc-url` is supplied — `summary` never queries an unguarded chain endpoint (matches every other chain-touching operator subcommand). When provided, it does exactly one `get_chain_params` + one `get_block_height(Latest)` and computes the oldest `Submitted` record's age in blocks. Never writes; never submits.
+
+**2. Stable `event=` log markers.** Three new structured tracing markers join the existing free-form lines, pinned by [`docs/operator-runbook.md` §7a](docs/operator-runbook.md):
+
+| `event=` | Emitter | Key fields |
+|---|---|---|
+| `startup` | every `operator` invocation, before any chain/registry access | `subcommand`, `feature_submit`, `version` |
+| `chain_params` | first chain read in `watch-activation`, `smoke`, `preflight`, `query`, loop entry | `chain_id`, `finality_depth`, `min_fee`, `omninode_enabled_from_height`, `v2_enabled_from_height`, `head` |
+| `activation_state` | `watch-activation` per tick, `smoke` pre-submit, `preflight` (with RPC), loop tick | `omninode_active`, `v2_active`, `activated`, `head` |
+| `registry_summary` | `operator registry summary` | the six per-status counts + `oldest_submitted_age_blocks` |
+
+These coexist with the existing Stage 9a free-form markers (`SMOKE SUMMARY`, `loop tick complete`, etc.) — operator pipelines can choose either; new pipelines should prefer `event=` for structured grep.
+
+**3. Failure-triage matrix in [runbook §11a](docs/operator-runbook.md).** Maps eleven concrete failure states (chain `Unknown` persisting, chain `Failed { reason: String }`, RPC errors, stale Submitted → local Dropped, duplicate / idempotency conflicts, verifier-address mismatch, insufficient balance / fee, queryable record missing receipt, `SmokeConfirmTimeout`, `SmokeInterrupted`, `MainnetSubmitNotPermitted`) to:
+
+- the typed surface signal the operator should grep / catch for;
+- whether it's fully detectable today or only partially (string-opaque);
+- the recommended local action;
+- the escalation packet to send the chain team.
+
+> **Known limitation flagged explicitly in §11a.** [`ChainClientError`](crates/omni-zkml/src/error.rs) is currently the single-variant `Other(String)`. Fee, balance, transport, and signature failures all funnel through that variant — operator triage must parse the string. Stage 10a does **not** add new error variants (that would be a typed-surface change). Splitting `ChainClientError` into a typed taxonomy is a candidate for a later stage if operator feedback shows the parsing burden is real.
+
+**4. Release-readiness docs ([runbook §1a "Capturing `--help` for verification"](docs/operator-runbook.md) + [new §14](docs/operator-runbook.md)).** Documentation-only, no automation. Covers:
+- the exact build commands for read-only vs. submit binaries;
+- a `--help` capture + diff workflow for verifying the binary on a destination host without rebuilding;
+- a manual SHA-256 recording step alongside the git tag;
+- a 10-item release checklist (CI green, Stage 6 byte-stable across the release window, local test parity, Cargo version = git tag, runbook re-read, audit-doc immutability, Stage 9c.1 hash gate green, `--version` capture, SHA-256, `--help` snapshots).
+
+**5. No release-artifact workflow.** Confirmed deferred to Stage 10b. There is currently no external operator audience expecting downloadable `omni-node` binaries; until there is, the release checklist is a manual operator checkpoint and not a CI job. Stage 10b will evaluate `workflow_dispatch` artifact builds + checksum publication when readiness arrives.
+
+**Tests.** Nine new hermetic tests in [`crates/omni-node/src/operator.rs`](crates/omni-node/src/operator.rs) cover the summary subcommand:
+
+| Test | What it pins |
+|---|---|
+| `registry_summary_zero_records_emits_zero_total` | empty registry → `total=0`, all six per-status fields zero, skip reason `(no --rpc-url)` |
+| `registry_summary_counts_by_status_match_seed` | one record in each of the six statuses → exact counts |
+| `registry_summary_age_line_skipped_when_no_rpc` | no `--rpc-url` → skip reason set; `oldest_submitted_age` is `None` |
+| `registry_summary_age_line_skipped_when_no_submitted_records` | RPC available but no Submitted records → skip reason `(no Submitted records)` |
+| `registry_summary_age_line_skipped_when_submitted_has_no_block` | Submitted record exists but `submitted_at_block` is None (legacy `mark_submitted` path) → skip reason `(no Submitted record has submitted_at_block)` |
+| `registry_summary_age_line_picks_oldest_submitted` | multiple Submitted records → picks the one with the smallest `submitted_at_block`; never picks Included / Failed / Dropped records that happen to also carry a block |
+| `registry_summary_age_uses_fake_head_height` | `age_blocks = head − submitted_at_block` against a `FakeJsonRpcTransport`-supplied head |
+| `registry_summary_chain_id_mismatch_is_typed_error` | `--expect-chain-id` vs chain `chain_id` mismatch → typed `OperatorError::ChainIdMismatch` before the height read |
+| `print_registry_summary_renders_age_line_when_present` | the bare-stdout renderer signature stays stable (compilation gate) |
+
+Result counts: **`cargo test -p omni-node` 42/42 pass** (was 33 in Stage 9a); **`cargo test -p omni-node --features submit` 55/55 pass** (was 46 in Stage 9a). All other suites unchanged.
+
+**What Stage 10a deliberately does not do:**
+- No Stage 6 chain-wire / fixture changes (byte-stable).
+- No Stage 7b transaction-construction changes; no edits to `crates/omni-sumchain/src/{tx,outer_sign,client}.rs`.
+- No new chain RPCs.
+- No new `ChainClientError` variants (the opaque-string reality is documented honestly in §11a; splitting the taxonomy is a candidate for a future stage).
+- No Prometheus / OTLP / metrics endpoint; no `--json` output mode for operator commands; no metrics backend of any kind.
+- No release-artifact workflow / signing pipeline (deferred to Stage 10b).
+- No daemonization / systemd code (the sample unit in §12 stays docs-only).
+- No edits to `docs/mainnet-smoke-audit.md` (immutability rule stands).
+- No edits to `omni-types` / `omni-store` / `omni-net` / `omni-pipeline` / `omni-bridge` / `python/omninode`.
+
+---
+
 ### Phase 5 Stage 8+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
@@ -1777,7 +1857,7 @@ OmniNode-Protocol/
 │       ├── Cargo.toml                 # + omni-zkml + omni-sumchain + thiserror (dev: tempfile)
 │       └── src/
 │           ├── main.rs                # listen | shard <path> | fetch <cid> | send <msg> | operator <…>
-│           └── operator.rs            # Stage 8a/8b/8c/9a: operator watch-activation | smoke[submit] | loop[+submit retry] | preflight | query [--tx-hash] | derive-address | registry list/show (safe-by-default, hermetic-tested, warning-clean; smoke + retry gated behind `--features submit`)
+│           └── operator.rs            # Stage 8a/8b/8c/9a/10a: operator watch-activation | smoke[submit] | loop[+submit retry] | preflight | query [--tx-hash] | derive-address | registry list/show/summary (Stage 10a: + summary subcommand, + stable event= log markers for startup / chain_params / activation_state / registry_summary; safe-by-default, hermetic-tested, warning-clean; smoke + retry gated behind `--features submit`)
 │
 ├── pyproject.toml                     # maturin build config for omninode Python package
 ├── python/                            # Python ML package (Phase 3)

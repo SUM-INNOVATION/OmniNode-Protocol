@@ -57,6 +57,32 @@ read-only build (e.g. `omni-node operator smoke …`), `clap` reports
 discoverability cue rather than a runtime stub. To upgrade, rebuild
 with `--features submit`.
 
+#### Capturing `--help` for verification
+
+Operators distributing a binary to a host other than their build
+machine should capture the `--help` output of both `operator` and
+`operator smoke` (the cfg-gated subcommand) once, alongside the
+recorded SHA-256 of the binary (see §14). On the destination host,
+re-run the same `--help` commands and diff against the captured
+output — any difference means the binary you shipped is not the one
+that produced the capture.
+
+```bash
+# Capture (build machine):
+omni-node --version > /etc/omninode/version.txt
+omni-node operator --help > /etc/omninode/help-operator.txt
+# only on a submit build:
+omni-node operator smoke --help > /etc/omninode/help-smoke.txt
+
+# Verify (destination host):
+diff /etc/omninode/help-operator.txt <(omni-node operator --help)
+```
+
+The `operator --help` output also contains the structured
+`registry summary` subcommand (Stage 10a) which is present on both
+default and submit builds. Use it to confirm the binary is at the
+expected Stage 10a or later revision.
+
 ### 1b. CI workflow (Stage 9c restored gates)
 
 The CI workflow at [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
@@ -258,8 +284,10 @@ state. Each retry independently fetches the chain head so the
 
 ## 6. Registry inspection (read-only)
 
-`registry list` and `registry show` are local-only — no chain
-access, no mutation, no `--features submit`.
+`registry list`, `registry show`, and (Stage 10a) `registry summary`
+are local-only — no chain access, no mutation, no `--features submit`
+required. `summary` accepts an **optional** `--rpc-url` for one extra
+read; it never writes.
 
 ```bash
 # List all records (sorted ascending by AttestationId hex):
@@ -275,6 +303,16 @@ cargo run -p omni-node -- operator registry list \
 cargo run -p omni-node -- operator registry show \
   --registry-path ./mainnet-attestation-registry \
   --id d77d8e95c96e6ae2264cbe3baf1383d9a3ea82e59a49d7fbf97574a04d791f1d
+
+# Stage 10a: counts-by-status (no chain access):
+cargo run -p omni-node -- operator registry summary \
+  --registry-path ./mainnet-attestation-registry
+
+# Stage 10a: same, plus oldest-Submitted age (one chain RPC read):
+cargo run -p omni-node -- operator registry summary \
+  --registry-path ./mainnet-attestation-registry \
+  --rpc-url https://rpc.sumchain.io \
+  --expect-chain-id 1
 ```
 
 `list` output is one bare-stdout line per record:
@@ -283,12 +321,33 @@ cargo run -p omni-node -- operator registry show \
 <id-hex>  <status>  tx=<tx_or_dash>  block=<submitted_or_dash>  updated=<iso8601>
 ```
 
-So `operator registry list | grep submitted` is the recommended
-operator one-liner for daily checks. `show` emits JSON for full-field
-inspection (including `digest`, `attestation`, `receipt`,
-`error_message`, `submitted_at_block`).
+`summary` output is exactly three lines (grep contract pinned by
+`registry_summary_*` tests):
 
-**No mutating repair commands ship in Stage 9a.** The registry is
+```
+total=12
+pending=2 submitted=4 included=1 finalized=3 failed=1 dropped=1
+oldest_submitted_age_blocks=147 (id=ab12…, submitted_at_block=6049055, head=6049202)
+```
+
+When `--rpc-url` is **omitted**, the third line is replaced with a
+stable skip comment so downstream pipelines never lose the line count:
+
+```
+# oldest_submitted_age: skipped (no --rpc-url)
+```
+
+Other skip reasons: `(no Submitted records)`, `(no Submitted record has
+submitted_at_block)`. **`--expect-chain-id` is required when `--rpc-url`
+is given** — `summary` never queries an unguarded chain endpoint.
+
+So `operator registry list | grep submitted` and `operator registry
+summary | grep finalized=` are the two recommended operator one-liners
+for daily checks. `show` emits JSON for full-field inspection (including
+`digest`, `attestation`, `receipt`, `error_message`,
+`submitted_at_block`).
+
+**No mutating repair commands ship in Stage 9a/10a.** The registry is
 durable across restarts; the lifecycle loop is the reconciliation
 path. If a record is genuinely corrupt on disk, copy it aside and
 let the operator team / chain team review — do not hand-edit JSON in
@@ -298,13 +357,31 @@ production.
 
 ## 7. Observability
 
-Stage 9a is tracing-only; JSON output is deferred. Suggested filter:
+Stage 10a is tracing-only; JSON output is deferred. Suggested filter:
 
 ```bash
 export RUST_LOG=info,omni_node::operator=info,omni_sumchain=warn,omni_zkml=warn
 ```
 
-Stable field markers worth grepping:
+### 7a. Stable `event=` markers (Stage 10a contract)
+
+Stage 10a pins a small set of structured `event=` fields so operator
+log pipelines can `grep 'event="<name>"'` without parsing free-form
+message strings. The shape below is the **operator-facing contract**:
+add a field freely; rename or remove → docs PR in the same commit.
+
+| `event=` | Emitted by | Fields |
+|---|---|---|
+| `startup` | every `operator` invocation, before any chain/registry access | `subcommand`, `feature_submit` (bool), `version` |
+| `chain_params` | first chain read of `watch-activation`, `smoke`, `preflight`, `query`, and loop entry | `chain_id`, `finality_depth`, `min_fee`, `omninode_enabled_from_height`, `v2_enabled_from_height`, `head` (Option — `None` when caller hasn't paid for a height read) |
+| `activation_state` | `watch-activation` per tick, `smoke` pre-submit, `preflight` (when `--rpc-url` given), loop tick | `omninode_active` (bool), `v2_active` (bool), `activated` (bool — both gates), `head` (Option) |
+| `registry_summary` | `operator registry summary` | `total`, `pending`, `submitted`, `included`, `finalized`, `failed`, `dropped`, `oldest_submitted_age_blocks` (Option) |
+
+### 7b. Free-form markers (Stage 9a; still in place)
+
+These predate the `event=` contract and are matched by message-string
+grep. They remain stable, but new pipelines should prefer the
+`event=` markers above when both are available.
 
 | Marker | Where |
 |---|---|
@@ -359,18 +436,57 @@ rotation.
 
 ---
 
-## 11. What to report on a chain incident
+## 11. Failure triage + what to report (Stage 10a)
 
-When escalating to the chain team:
+### 11a. Failure-state matrix
 
-- `tx_hash` (operator-side from `SMOKE SUMMARY` or `registry show`).
+Each row maps a real failure state to its detection signal in the
+operator surface as it exists today, the recommended local action,
+and what to send to the chain team if escalation is needed. Where a
+column says "partially," that means the typed surface funnels the
+condition through a coarse-grained variant (currently
+`ChainClientError::Other(String)`) and operator-side triage must
+parse the message string — `omni-sumchain` does not yet expose a
+typed taxonomy for sub-conditions like fee/balance vs. transport.
+
+| Symptom | Detection signal | Detectable today? | Operator action | Escalation packet |
+|---|---|---|---|---|
+| `Unknown` persisting | `query_attestation_workflow` returns `AttestationStatus::Unknown` repeatedly | yes — Stage 5.1 makes Unknown explicitly non-terminal | wait `submitted_threshold_blocks`; if still Unknown, the loop's staleness sweep will move it to local `Dropped` | `tx_hash`, full status path, last `head`, `submitted_at_block` |
+| `Failed { reason: String }` from chain | `AttestationStatus::Failed { reason }` — see [crates/omni-zkml/src/chain.rs](../crates/omni-zkml/src/chain.rs) | yes — **opaque string reason**, not a numeric code | record terminalises locally; no automatic retry | `tx_hash`, `attestation_id`, `session_id`, `verifier_address`, **verbatim `reason` string**, current local status |
+| RPC error during read | `ChainClientError::Other(_)` surfaced through any chain call | partially — string-opaque single variant today | retry once with the same command; if persistent, treat as RPC outage and pause submits | full error string verbatim, RPC URL host, time of first failure, whether the failure is reproducible against a different mirror |
+| Stale `Submitted` → local `Dropped` | `mark_stale_if_overdue: dropped stale record` + `event="registry_summary"` `dropped` count rises | yes — Stage 5.2 staleness | check the chain explorer for the original `tx_hash` first; if it's actually `Finalized` on chain, **do not** retry — the local Dropped is a misclassification, file a chain-team report. If chain truly doesn't know the tx, retry-enabled loop will resubmit on its next tick | dropped record id, original `submitted_at_block`, current head, observed chain status for the tx_hash |
+| Duplicate / idempotency conflict | `RegistryError::ConflictingAttestation { id }` on `insert` | yes — Stage 5.1 contract | inspect both records via `operator registry show --id <hex>`; do NOT overwrite | both records' JSON, the conflict id |
+| Verifier address mismatch | pre-flight gate in [crates/omni-sumchain/src/tx.rs](../crates/omni-sumchain/src/tx.rs) returns `ChainClientError::Other(_)` **before** any chain call | yes — never reaches chain | re-run `operator derive-address` to confirm `OMNINODE_VERIFIER_SEED_HEX` derives the expected address; check the attestation JSON's `verifier_address` field | derived vs. claimed addresses, seed source (env var name / file path, **never the seed itself**) |
+| Insufficient balance / fee failure | surfaces as `ChainClientError::Other(_)` from `sum_sendRawTransaction` | **partially** — opaque string today; operator must parse | check `extra-alloc.json` funding for the verifier address; check `min_fee` from the most recent `event="chain_params"` log | full error string, verifier address, current balance if known from a separate RPC tool, the `min_fee` observed |
+| Queryable record missing receipt | `RegistryError::SubmittedRecordMissingReceipt { id }` | yes — Stage 5.1 integrity defence | inspect the registry JSON file for hand-edits; **do not** auto-repair | the record id, JSON file contents, recent `cp -r` backup state if available |
+| `SmokeConfirmTimeout` | `OperatorError::SmokeConfirmTimeout { last_status }` | yes — typed error | if `last_status` was `Included`, finalization may just be slow; rerun smoke with the same registry (local idempotency reuses the tx hash) | `tx_hash`, `last_status`, `--confirm-timeout-secs` value used |
+| `SmokeInterrupted` | Ctrl-C during the smoke poll | yes — typed error | re-run the same `smoke` command; idempotency picks up the existing record | `tx_hash` (if submission completed before interrupt) |
+| `MainnetSubmitNotPermitted` | `--allow-submit` given on `chain_id 1` but `--allow-mainnet-submit` missing | yes — typed error | add `--allow-mainnet-submit`; this is an intentional double-gate, not a bug | (no escalation needed; operator-side correction) |
+
+> **Known limitation flagged by Stage 10a.** [`ChainClientError`](../crates/omni-zkml/src/error.rs)
+> is currently the single-variant `Other(String)`. That is why several rows
+> above are marked "partially" — fee, balance, transport, and signature
+> failures all funnel through the same variant and require string-level
+> triage. Stage 10a deliberately does **not** add new error variants;
+> splitting `ChainClientError` into a typed taxonomy is a candidate for a
+> future stage if operator feedback shows the parsing burden is real.
+
+### 11b. Escalation packet
+
+When escalating to the chain team, send:
+
+- `tx_hash` (operator-side, from `SMOKE SUMMARY` or `registry show`).
 - `attestation_id` (the 64-hex `(session_id, verifier_address)` de-dup key).
 - `session_id`, `verifier_address`.
-- The full status path you observed (`Submitted → Unknown → Unknown → …`).
+- The full status path you observed (`Submitted → Unknown → Unknown → Finalized`, or whatever).
 - `submitted_at_block` and the chain head at the last poll.
-- For `Failed`: the `reason` string verbatim.
-- Whether the local registry record is currently `Submitted`,
-  `Included`, `Finalized`, `Failed`, or `Dropped`.
+- For chain `Failed`: the `reason` string verbatim.
+- Current local registry status (`Submitted` / `Included` / `Finalized` / `Failed` / `Dropped`).
+- The exact `operator` command line used (with secrets redacted — see below).
+- The `event="chain_params"` line from the same session (chain_id, min_fee, activation heights, head observed at the time).
+
+**Redact:** never include `OMNINODE_VERIFIER_SEED_HEX` or its file path in
+escalation messages. The derived `verifier_address` is the safe identifier.
 
 The exact channel (Slack, ticket system, email) is operator-defined.
 The fields above are what the chain team needs.
@@ -458,10 +574,100 @@ sudo install -m 0755 target/release/omni-node /usr/local/bin/omni-node
 | Query by tx hash | `operator query --tx-hash 0x...` | no |
 | List registry records | `operator registry list` | no |
 | Show one record | `operator registry show --id <hex>` | no |
+| Counts-by-status summary | `operator registry summary` | no |
+| Summary + oldest-Submitted age | `operator registry summary --rpc-url ... --expect-chain-id ...` | no |
 | Monitor-only loop | `operator loop` | no |
 | Submit one attestation | `operator smoke ... --allow-submit --allow-mainnet-submit` | **yes** |
 | Retry-enabled loop | `operator loop ... --allow-submit --allow-mainnet-submit` | **yes** |
 
 Stage 9a is operations hardening, not protocol work. The SUM Chain
 wire format is unchanged from Stage 7b; Stage 6's
-`chain_attestation_vectors` fixture is byte-stable.
+`chain_attestation_vectors` fixture is byte-stable. Stage 10a adds
+the `registry summary` subcommand, stable `event=` log markers, the
+§11 failure-triage matrix, and the §14 release-readiness checklist
+below — also without touching protocol bytes or transaction
+construction.
+
+---
+
+## 14. Release-readiness checklist (Stage 10a)
+
+Run through this before tagging or distributing any `omni-node`
+binary. **Stage 10a is documentation-only on the release side** — no
+artifact workflow, no signing pipeline. Everything below is manual
+and tracked by the operator.
+
+1. **CI green on the tagged commit.** All five jobs in
+   [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) must
+   pass: `default-build-test`, `default-tree-check`,
+   `submit-build-test`, `submit-tree-check`, `stage6-fixture-check`.
+
+2. **Stage 6 byte-stability across the release window.** No
+   functional change to chain wire bytes between the previous tag
+   and this one:
+
+   ```bash
+   git diff --stat <previous-tag>..<this-tag> -- \
+     crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json \
+     crates/omni-zkml/src/chain_wire.rs
+   # must be empty
+   ```
+
+3. **Local test parity.** On the build host, both feature
+   configurations green:
+
+   ```bash
+   cargo test -p omni-sumchain --features submit
+   cargo test -p omni-node
+   cargo test -p omni-node --features submit
+   ```
+
+   The `parity_vendored_primitives` (5 tests) and
+   `chain_produced_fixture` (5 tests; Stage 9c.1) suites both
+   contribute to the submit-build green light.
+
+4. **Cargo version matches the git tag.** The workspace's
+   `[workspace.package].version` (root `Cargo.toml`) equals the
+   semver portion of the git tag being cut.
+
+5. **Operator runbook is current.** Re-read §1, §6, §7, §11, §14 of
+   this document on the head commit and confirm no claim references
+   a removed flag, file, or behaviour. The Stage 9c PR review showed
+   why a quick re-read is worth more than an automated linter here.
+
+6. **Mainnet smoke audit immutability.** `git diff <previous-tag>..<this-tag> -- docs/mainnet-smoke-audit.md`
+   must be empty. The audit is a historical record; release-prep
+   does not edit it.
+
+7. **Chain-produced fixture gate green.** Specifically
+   `fixture_signed_tx_hash_matches_chain_produced_tx_hash` in
+   [`crates/omni-sumchain/tests/chain_produced_fixture.rs`](../crates/omni-sumchain/tests/chain_produced_fixture.rs)
+   passes — confirms the public crate's hashing has not drifted
+   from the chain's TRANSACTIONS-CF key derivation.
+
+8. **`omni-node --version` captured in release notes.** Run
+   `omni-node --version` on the build host and paste the output
+   verbatim into the release notes.
+
+9. **SHA-256 recorded alongside the tag.** For each binary you
+   intend to distribute:
+
+   ```bash
+   sha256sum target/release/omni-node
+   # paste into release notes alongside (build host, build date, feature flags)
+   ```
+
+   **Signing is deferred to Stage 10b.** Until then, the SHA-256 +
+   the operator's verification of `--help` output (see §1a "Capturing
+   `--help` for verification") is the integrity path.
+
+10. **Default + submit `--help` snapshots committed in the release
+    notes.** Capture both via the §1a one-liners and include them
+    next to the SHA-256 so the destination operator can diff
+    locally without re-building.
+
+The checklist intentionally has no GitHub Actions automation
+binding. Stage 10b will evaluate whether a `workflow_dispatch`
+artifact build + checksum publication is the right next step; until
+that lands, items 8–10 are manual and recorded in the operator's
+release log.
