@@ -46,6 +46,8 @@ target/wheels/
 *.swo
 *~
 .fleet/
+# Claude Code local metadata (scheduled_tasks.lock, etc.) — never committed.
+.claude/
 
 # Keys & Secrets
 *.pem
