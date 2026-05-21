@@ -111,8 +111,10 @@ operator runbook.
 | **Phase 5 Stage 9c** — Public SUM Chain crates (`sumchain-primitives` / `sumchain-crypto` v0.1.0, crates.io, MIT OR Apache-2.0); cargo-side CI gates restored; fresh source builds need no private repo access | `Cargo.toml`, `.github/workflows`, docs | **Complete** |
 | **Phase 5 Stage 9c.1** — Chain-produced signed-transaction fixture for the 2026-05-19 mainnet smoke tx; byte-roundtrip + `SignedTransaction::hash()` gate against authoritative on-chain bytes | `omni-sumchain/tests` | **Complete** |
 | **Phase 5 Stage 10a** — Operator observability + release readiness: `operator registry summary`, stable `event=` log markers, failure-triage matrix, release-readiness checklist (docs-only) | `omni-node`, `docs/operator-runbook.md` | **Complete** |
+| **Phase 5 Stage 11a** — Real zkML proof generation integration (trait + hermetic fixture harness): `ProofBackend` / `ProofVerifier` traits, `MockProofBackend` (mainnet-refused), `ProofMetadata` committed inside SNIP V2 proof artifact, end-to-end fixture pipeline, `build_mock_v1_attestation` replaces placeholder synthetic path | `omni-zkml`, `omni-node`, `.github/workflows` | **Complete** |
 | Phase 5 Stage 10b — Release artifact workflow + signing (deferred from 10a) | `.github/workflows`, `docs/` | Planned |
-| Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
+| Phase 5 Stage 11b — Real proof backend integration (ezkl / risc0 / sp1) replacing `mock-v1`; mainnet-eligible | `omni-zkml`, `Cargo.toml` | Planned |
+| Phase 5 Stage 8+ — SUM Chain Tokenomics (staking / slashing / disputes / chain-side proof verification) | `contracts/` | Planned |
 
 ---
 
@@ -1667,6 +1669,82 @@ Result counts: **`cargo test -p omni-node` 42/42 pass** (was 33 in Stage 9a); **
 
 ---
 
+### Phase 5 Stage 11a: Real zkML Proof Generation Integration — Complete
+
+**Crates touched:** new [`crates/omni-zkml/src/proof.rs`](crates/omni-zkml/src/proof.rs) (traits + mock impls + orchestrator), [`crates/omni-zkml/src/error.rs`](crates/omni-zkml/src/error.rs) (typed errors), [`crates/omni-zkml/tests/proof_pipeline_vectors.rs`](crates/omni-zkml/tests/proof_pipeline_vectors.rs) + [fixture JSON](crates/omni-zkml/tests/fixtures/proof_pipeline_vectors.json), [`crates/omni-node/src/operator.rs`](crates/omni-node/src/operator.rs) (new `build_mock_v1_attestation` + mainnet guard + 2 new tests), [`crates/omni-node/Cargo.toml`](crates/omni-node/Cargo.toml) (adds `blake3` dep), [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (new `stage11a-fixture-check` job), [`docs/operator-runbook.md`](docs/operator-runbook.md) (§4 + §11a + §14 updates), README. | **Depends on:** Stage 9c.1 chain-produced fixture + Stage 10a operator observability + Phase 5 RC audit `d695e41`. | **Zero protocol changes; zero new chain RPCs; Stage 6 chain-wire + fixture and Stage 7b tx construction byte-stable.**
+
+Replaces the pre-Stage-11a placeholder proof surface — where [`crates/omni-node/src/operator.rs`](crates/omni-node/src/operator.rs)'s `synth_attestation` fabricated `model_hash="a".repeat(64)` / `manifest_snip_root=[0x11;32]` / `response_hash="b".repeat(64)` / `proof_snip_root=[0x22;32]` for every commitment field (the bytes that landed on chain in the 2026-05-19 mainnet smoke, see [`docs/mainnet-smoke-audit.md`](docs/mainnet-smoke-audit.md) and [`docs/phase5-rc-audit.md`](docs/phase5-rc-audit.md)) — with a real backend-trait-driven pipeline. Stage 11a is **trait + hermetic fixture harness first**: the real proof system (ezkl / risc0 / sp1 / …) is deliberately deferred to Stage 11b so we don't ship heavyweight prover dependencies before the trait shape has been validated end-to-end.
+
+**1. `ProofBackend` + `ProofVerifier` traits ([crates/omni-zkml/src/proof.rs](crates/omni-zkml/src/proof.rs)).**
+
+```rust
+pub trait ProofBackend {
+    fn prove(&self, model: &[u8], input: &[u8], output: &[u8])
+        -> Result<Vec<u8>, ProofBackendError>;
+    fn backend_id(&self) -> &'static str;
+}
+
+pub trait ProofVerifier {
+    fn verify(&self, proof: &[u8], public_inputs: &PublicInputs)
+        -> Result<bool, ProofVerifierError>;
+}
+```
+
+`PublicInputs` is a typed struct (not opaque `&[u8]`) carrying `model_hash` / `input_hash` / `output_hash` as 32-byte BLAKE3 hashes. Stage 11b can extend the struct without rewriting verifier impls.
+
+**2. `MockProofBackend` (`backend_id = "mock-v1"`) + `MockProofVerifier`.** Deterministic 64-byte "proof" computed as two domain-separated BLAKE3s over `(model_hash || input_hash || output_hash)`. **Not cryptographic.** Tampering with proof bytes or public inputs causes verification to fail — useful for hermetic tests of the pipeline shape, useless for mainnet soundness.
+
+**3. `ProofMetadata` committed inside the SNIP V2 proof artifact.** Per Stage 11a OQ4: `input_hash` does NOT go on the chain-wire digest. Instead, a `ProofMetadata { backend_id, model_hash, input_hash, response_hash }` struct lives inside a canonical JSON envelope (`ProofArtifactBody`), and the BLAKE3 of that envelope becomes the `proof_snip_root` already committed on the chain digest. **Stage 6 chain-wire bytes are unchanged** — and the verifier still has every field it needs (via SNIP V2 fetch + envelope parse).
+
+**4. End-to-end orchestrator [`produce_proof_artifact`](crates/omni-zkml/src/proof.rs).** Wraps backend invocation, metadata composition, canonical JSON serialization, file write, and SNIP V2 publish via the existing Stage 3 [`publish_proof_artifacts`](crates/omni-zkml/src/artifact.rs#L103) plumbing. `build_commitment` is **untouched** — proof concerns live in the new orchestrator (per Stage 11a correction 1).
+
+**5. Operator binary wiring.** New [`build_mock_v1_attestation`](crates/omni-node/src/operator.rs) replaces the production smoke `--synthetic` call to `synth_attestation`. The new function:
+- runs `MockProofBackend.prove(...)` over deterministic synthetic `(model, input, output)` bytes tied to `(verifier_address, head)`;
+- builds a real `InferenceCommitment` with BLAKE3-derived hashes + BLAKE3-derived `proof_snip_root` (matching what a SNIP V2 publish would emit);
+- hard-refuses `chain_id == 1` with `OperatorError::MockBackendRefusedOnMainnet { backend_id }` **before any submit-side RPC**, even with `--allow-mainnet-submit` (Stage 11a OQ5 hard requirement, defense-in-depth alongside Stage 8b's `SyntheticMainnetForbidden`).
+
+`synth_attestation` is preserved as a `#[cfg(test)]`-only fixture so the existing dozen-plus test sites that exercise the registry / chain plumbing don't need rewriting. The production binary genuinely no longer contains the placeholder fabricator.
+
+**6. Hermetic Stage 11a fixture.** New [`crates/omni-zkml/tests/proof_pipeline_vectors.rs`](crates/omni-zkml/tests/proof_pipeline_vectors.rs) + [`tests/fixtures/proof_pipeline_vectors.json`](crates/omni-zkml/tests/fixtures/proof_pipeline_vectors.json) with **3 vectors** covering short bytes, empty-input edge case, and longer ASCII bodies. Each vector pins (committed verbatim):
+
+| Field group | Bytes captured |
+|---|---|
+| Raw inputs | model bytes, input bytes, output bytes, verifier Ed25519 seed |
+| Expected hashes | `model_hash` / `input_hash` / `response_hash` (all BLAKE3 hex) |
+| Expected proof | 64 bytes from `MockProofBackend`, hex-encoded |
+| Expected envelope | full canonical `ProofArtifactBody` JSON bytes (hex) + their BLAKE3 = `proof_snip_root` |
+| Expected `manifest_root` | deterministic BLAKE3 over `("omninode.stage11a.fixture.manifest" || model_bytes)` |
+| Expected commitment | full `InferenceCommitment` field-by-field (session_id, model_hash, manifest_snip_root, response_hash, proof_snip_root) |
+| Expected chain-wire | canonical-digest bytes + signing-input bytes (both via Stage 6 `compute_chain_attestation_vector`) |
+| Expected signature | Ed25519 sig bytes + signer address (base58) + signer pubkey (hex) |
+
+Regen via `OMNINODE_REGEN_PROOF_PIPELINE_VECTORS=1`. Verify-by-default. A drift at **any** layer (mock backend, canonical envelope shape, BLAKE3 chain, commitment field ordering, chain-wire bincode, Ed25519 signing) fails this test loudly.
+
+**7. New CI hard gate: `stage11a-fixture-check`.** Mirrors `stage6-fixture-check`: asserts `proof_pipeline_vectors.json` is byte-identical against the PR base / push parent. The CI matrix is now **six jobs**: `default-build-test`, `default-tree-check`, `submit-build-test`, `submit-tree-check`, `stage6-fixture-check`, `stage11a-fixture-check`.
+
+**Tests.** Counts under Stage 11a:
+
+| Suite | Default features | `--features submit` |
+|---|---|---|
+| `cargo test -p omni-zkml` | **152** (was 142 at Stage 10a; +10: 8 new proof.rs unit tests + 3 new fixture tests minus internal rearrangement) | same |
+| `cargo test -p omni-node` | **43** | **58** (was 56 at Stage 10a; +2 new: `build_mock_v1_attestation_produces_real_blake3_commitment_on_nonmainnet`, `build_mock_v1_attestation_refuses_mainnet_with_explicit_error`) |
+| `cargo test -p omni-sumchain --features submit` | — | same (Stage 11a doesn't touch sumchain) |
+
+**Mainnet smoke history.** The 2026-05-19 mainnet smoke (tx `0x3a9cbf85…c32a56`, pinned by Stage 9c.1) is **unchanged** by Stage 11a. The mainnet-smoke-audit doc and the Phase 5 RC audit doc remain immutable; Stage 11a's effect is only forward — future submits cannot route the mock backend onto mainnet.
+
+**What Stage 11a deliberately does not do:**
+- **No Stage 6 chain-wire / fixture changes.** `chain_attestation_vectors.json` and `chain_wire.rs` byte-stable per the Stage 6 baseline `509f7fd`; CI's `stage6-fixture-check` enforces this on every push/PR.
+- **No Stage 7b changes.** No edits to `crates/omni-sumchain/src/tx.rs`, `outer_sign.rs`, or `client.rs`. Submit transaction construction doesn't know proofs got real.
+- **No `build_commitment` signature change** — proof concerns live in the new orchestrator (Stage 11a correction 1).
+- **No real prover dependency.** ezkl / risc0 / sp1 / halo2 / plonky2 not added — Stage 11b's job.
+- **No tokenomics / staking / slashing / disputes / chain-side proof verification.** Stage 8+ territory.
+- **No retry-loop proof regeneration.** Retry of a dropped Submitted record reuses the existing attestation in the registry; it does NOT regenerate a new proof. Whether the dropped-record workflow can ever regenerate proofs depends on whether the model / input / output bytes are persisted; in Stage 11a they are not (synthetic inputs are derived from `(verifier_address, head)` on each call; that's enough for the synthetic path's idempotency but not enough to re-derive a different proof from a real attestation). **Documented as deferred.**
+- **No `--proof-backend` CLI flag.** Stage 11a ships only one backend (`mock-v1`); a flag with one accepted value would be pure scaffold. Stage 11b adds the flag when there's more than one option.
+- **No `docs/mainnet-smoke-audit.md` or `docs/phase5-rc-audit.md` edits** (both immutable).
+- **No edits to `omni-types` / `omni-store` / `omni-net` / `omni-pipeline` / `omni-bridge` / `python/omninode`.**
+
+---
+
 ### Phase 5 Stage 8+: zkML Proof Generation & SUM Chain Tokenomics — Planned
 
 **Crate:** `omni-zkml` | **Smart Contracts:** `contracts/` | **Depends on:** `omni-pipeline`, `omni-net`, `omni-types`
@@ -1815,7 +1893,7 @@ OmniNode-Protocol/
 │   │       ├── transport.rs            # PipelineMessage bincode encode/decode helpers
 │   │       └── error.rs               # PipelineError enum (thiserror)
 │   │
-│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope + chain abstraction & registry + chain wire + staleness + orchestration (later: zk proofs)
+│   ├── omni-zkml/                      # Phase 5: Proof artifact flow + attestation envelope + chain abstraction & registry + chain wire + staleness + orchestration + Stage 11a proof backend trait + mock impl
 │   │   ├── Cargo.toml                 # depends on omni-store + omni-types + blake3 + bincode + bs58 + libp2p-identity + serde + serde_json + chrono + thiserror + tracing
 │   │   ├── src/
 │   │   │   ├── lib.rs                 # module declarations and root re-exports
@@ -1826,11 +1904,14 @@ OmniNode-Protocol/
 │   │   │   ├── chain_wire.rs          # Stage 6: InferenceAttestationDigest, InferenceAttestationTxData, canonical/signing bytes, Ed25519 signing, chain-address bs58, ChainAttestationVector
 │   │   │   ├── staleness.rs           # Stage 5.2: StalenessPolicy, StalenessPolicyError, is_record_stale (pure), mark_stale_if_overdue (workflow)
 │   │   │   ├── orchestration.rs       # Stage 5.3: OrchestrationClient trait + submit_attestation_workflow_with_block + poll_attestations_workflow + sweep_stale_attestations_workflow + retry_dropped_attestations_workflow
-│   │   │   └── error.rs               # ProofArtifactError + SignerError + AttestationError + ChainClientError + RegistryError + ChainWireError (with Result / AttestationResult / RegistryResult / ChainWireResult)
+│   │   │   ├── proof.rs               # Stage 11a: ProofBackend / ProofVerifier traits, MockProofBackend (mock-v1, mainnet-refused), MockProofVerifier, PublicInputs, ProofMetadata, ProofArtifactBody, produce_proof_artifact orchestrator
+│   │   │   └── error.rs               # ProofArtifactError + SignerError + AttestationError + ChainClientError + RegistryError + ChainWireError + Stage 11a ProofBackendError + ProofVerifierError + ProofPipelineError (with Result / AttestationResult / RegistryResult / ChainWireResult)
 │   │   └── tests/
 │   │       ├── chain_attestation_vectors.rs        # Stage 6 integration test (verify-by-default, regen via OMNINODE_REGEN_VECTORS=1)
+│   │       ├── proof_pipeline_vectors.rs           # Stage 11a integration test: 3 byte-stable vectors covering MockProofBackend → ProofArtifactBody → SNIP root → InferenceCommitment → chain digest → Ed25519 signature (regen via OMNINODE_REGEN_PROOF_PIPELINE_VECTORS=1)
 │   │       └── fixtures/
-│   │           └── chain_attestation_vectors.json  # Stage 6 frozen deliverable: 3 chain attestation test vectors
+│   │           ├── chain_attestation_vectors.json  # Stage 6 frozen deliverable: 3 chain attestation test vectors
+│   │           └── proof_pipeline_vectors.json     # Stage 11a frozen fixture: 3 proof-pipeline vectors (CI hard-gated by stage11a-fixture-check)
 │   │
 │   ├── omni-sumchain/                  # Phase 5 Stage 7a + 7b + 9a + 9c: SUM Chain adapter (read/query default-on; submit + public chain primitives from crates.io v0.1.0 behind the `submit` cargo feature, default-off)
 │   │   ├── Cargo.toml                 # depends on omni-zkml + omni-types + ureq + sumchain-primitives + sumchain-crypto + serde + serde_json + thiserror + tracing (dev: bincode1)
@@ -1859,7 +1940,7 @@ OmniNode-Protocol/
 │       ├── Cargo.toml                 # + omni-zkml + omni-sumchain + thiserror (dev: tempfile)
 │       └── src/
 │           ├── main.rs                # listen | shard <path> | fetch <cid> | send <msg> | operator <…>
-│           └── operator.rs            # Stage 8a/8b/8c/9a/10a: operator watch-activation | smoke[submit] | loop[+submit retry] | preflight | query [--tx-hash] | derive-address | registry list/show/summary (Stage 10a: + summary subcommand, + stable event= log markers for startup / chain_params / activation_state / registry_summary; safe-by-default, hermetic-tested, warning-clean; smoke + retry gated behind `--features submit`)
+│           └── operator.rs            # Stage 8a/8b/8c/9a/10a/11a: operator watch-activation | smoke[submit] | loop[+submit retry] | preflight | query [--tx-hash] | derive-address | registry list/show/summary (Stage 10a: + summary subcommand, + stable event= log markers for startup / chain_params / activation_state / registry_summary. Stage 11a: replaces synth_attestation placeholder with build_mock_v1_attestation (real MockProofBackend pipeline; hard-refuses mainnet); synth_attestation kept as #[cfg(test)] fixture only. Safe-by-default, hermetic-tested, warning-clean; smoke + retry gated behind `--features submit`)
 │
 ├── pyproject.toml                     # maturin build config for omninode Python package
 ├── python/                            # Python ML package (Phase 3)

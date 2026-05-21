@@ -227,7 +227,19 @@ cargo run -p omni-node --features submit -- operator smoke \
 Notes:
 - The attestation file **must** be a real operator-provided
   `InferenceAttestation`. `--synthetic` is **forbidden on mainnet**
-  and not even available in the CLI flag set.
+  and not even available in the CLI flag set. **Stage 11a** adds a
+  second backstop: even if `--synthetic` were somehow taken, the
+  mock proof backend (`mock-v1`) is hard-refused on `chain_id == 1`
+  with `OperatorError::MockBackendRefusedOnMainnet`, **before any
+  submit-side RPC**.
+- On non-mainnet chains (`chain_id != 1`), `--synthetic` no longer
+  fabricates placeholder bytes. Stage 11a wires the synthetic path
+  through [`MockProofBackend`](../crates/omni-zkml/src/proof.rs) so
+  the resulting commitment carries real BLAKE3 hashes of synthetic
+  inputs and a real (non-cryptographic) proof envelope. The
+  `verifier_signature` field in the registered `InferenceAttestation`
+  is marked `stage11a-mock-v1` so operators reading the registry
+  can tell which builder produced the record.
 - `Included` is treated as progress only; success is reported solely
   on `Finalized`.
 - On success, the consolidated `SMOKE SUMMARY` line carries
@@ -462,6 +474,7 @@ typed taxonomy for sub-conditions like fee/balance vs. transport.
 | `SmokeConfirmTimeout` | `OperatorError::SmokeConfirmTimeout { last_status }` | yes — typed error | if `last_status` was `Included`, finalization may just be slow; rerun smoke with the same registry (local idempotency reuses the tx hash) | `tx_hash`, `last_status`, `--confirm-timeout-secs` value used |
 | `SmokeInterrupted` | Ctrl-C during the smoke poll | yes — typed error | re-run the same `smoke` command; idempotency picks up the existing record | `tx_hash` (if submission completed before interrupt) |
 | `MainnetSubmitNotPermitted` | `--allow-submit` given on `chain_id 1` but `--allow-mainnet-submit` missing | yes — typed error | add `--allow-mainnet-submit`; this is an intentional double-gate, not a bug | (no escalation needed; operator-side correction) |
+| `MockBackendRefusedOnMainnet` (**Stage 11a**) | `OperatorError::MockBackendRefusedOnMainnet { backend_id }` — fires when the smoke `--synthetic` path is taken on `chain_id == 1`, even with `--allow-mainnet-submit` | yes — typed error, **before any submit RPC** | mainnet smoke requires a real attestation JSON (`--attestation-json`) produced off-binary by a real prover; the mock backend (`mock-v1`) is non-cryptographic by design and is hard-refused on mainnet | (no escalation needed; operator-side correction. If a real prover is available, use `--attestation-json` and re-run; if not, wait for Stage 11b's real backend) |
 
 > **Known limitation flagged by Stage 10a.** [`ChainClientError`](../crates/omni-zkml/src/error.rs)
 > is currently the single-variant `Other(String)`. That is why several rows
@@ -597,10 +610,11 @@ binary. **Stage 10a is documentation-only on the release side** — no
 artifact workflow, no signing pipeline. Everything below is manual
 and tracked by the operator.
 
-1. **CI green on the tagged commit.** All five jobs in
+1. **CI green on the tagged commit.** All six jobs in
    [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) must
    pass: `default-build-test`, `default-tree-check`,
-   `submit-build-test`, `submit-tree-check`, `stage6-fixture-check`.
+   `submit-build-test`, `submit-tree-check`, `stage6-fixture-check`,
+   and (Stage 11a) `stage11a-fixture-check`.
 
 2. **Stage 6 byte-stability across the release window.** No
    functional change to chain wire bytes between the previous tag
@@ -644,6 +658,14 @@ and tracked by the operator.
    [`crates/omni-sumchain/tests/chain_produced_fixture.rs`](../crates/omni-sumchain/tests/chain_produced_fixture.rs)
    passes — confirms the public crate's hashing has not drifted
    from the chain's TRANSACTIONS-CF key derivation.
+
+7a. **Stage 11a proof pipeline fixture gate green.** The three
+   vectors in [`crates/omni-zkml/tests/fixtures/proof_pipeline_vectors.json`](../crates/omni-zkml/tests/fixtures/proof_pipeline_vectors.json)
+   are byte-identical against the committed values. Run
+   `cargo test -p omni-zkml --test proof_pipeline_vectors` locally
+   to confirm. Drift here (mock backend formula, canonical envelope
+   shape, BLAKE3 chain, chain-wire path, Ed25519 signing) is a real
+   regression — see §11a's `MockBackendRefusedOnMainnet` row.
 
 8. **`omni-node --version` captured in release notes.** Run
    `omni-node --version` on the build host and paste the output

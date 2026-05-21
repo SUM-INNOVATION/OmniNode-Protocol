@@ -245,3 +245,90 @@ jobs:
             exit 1
           fi
           echo "Stage 6 fixture + chain_wire.rs: byte-identical vs $base."
+
+  # ── (6) Stage 11a proof pipeline fixture byte-stability ─────────────────────
+  #
+  # Mirrors the Stage 6 gate above for the Stage 11a hermetic fixture.
+  # `proof_pipeline_vectors.json` records the full mock-backend proof
+  # pipeline output (BLAKE3 hashes, mock proof bytes, canonical proof
+  # envelope, commitment, chain-wire digest, Ed25519 signature). The
+  # vectors are deterministic for the committed inputs in
+  # `crates/omni-zkml/tests/proof_pipeline_vectors.rs`. Any drift —
+  # whether in `MockProofBackend`, the canonical JSON envelope, the
+  # Stage 6 chain-wire path, or the Stage 4 attestation envelope —
+  # surfaces here loudly.
+  stage11a-fixture-check:
+    name: Stage 11a proof pipeline fixture — byte-stable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve base ref
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            ref="${{ github.event.pull_request.base.sha }}"
+          else
+            ref="${{ github.event.before }}"
+          fi
+          if [ -z "$ref" ] || [ "$ref" = "0000000000000000000000000000000000000000" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true"  >> "$GITHUB_OUTPUT"
+            echo "ref=$ref"        >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip — no usable base ref
+        if: steps.base.outputs.available == 'false'
+        run: |
+          echo "::notice::No usable base ref (initial push or shallow). Stage 11a"
+          echo "          proof pipeline byte-stability is still required; will"
+          echo "          re-verify on the next push or PR."
+
+      - name: Assert proof pipeline fixture byte-identical
+        if: steps.base.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ steps.base.outputs.ref }}"
+          fixture="crates/omni-zkml/tests/fixtures/proof_pipeline_vectors.json"
+
+          # Distinguish "file is being introduced by this PR" from "file
+          # exists on base and is being modified". On the introductory PR
+          # the file isn't on the base ref at all, so a plain `git diff`
+          # against base reports a +N-line addition — but that's the
+          # baseline being established, not drift. Once the fixture
+          # exists on main, every subsequent PR is gated strictly.
+          if ! git cat-file -e "$base:$fixture" 2>/dev/null; then
+            echo "::notice::Stage 11a proof pipeline fixture is being"
+            echo "          introduced by this PR (file does not exist at"
+            echo "          base $base). Byte-stability gate skipped for"
+            echo "          this introductory commit. The fixture becomes"
+            echo "          immutable for all subsequent PRs."
+            exit 0
+          fi
+
+          diff_out="$(git diff --stat "$base"..HEAD -- "$fixture")"
+          if [ -n "$diff_out" ]; then
+            {
+              echo "::error::Stage 11a proof pipeline byte-stability gate failed."
+              echo "This file is byte-stable across all post-Stage-11a work:"
+              echo "  $fixture"
+              echo
+              echo "If the change is intentional (e.g. MockProofBackend formula"
+              echo "bumped to mock-v2), regenerate the fixture with"
+              echo "OMNINODE_REGEN_PROOF_PIPELINE_VECTORS=1 and document the"
+              echo "reason in the PR body. Drift without justification is a"
+              echo "real regression — the mock pipeline is meant to be a stable"
+              echo "deterministic contract."
+              echo
+              echo "Observed diff vs $base:"
+              echo "$diff_out"
+            } >&2
+            exit 1
+          fi
+          echo "Stage 11a proof pipeline fixture: byte-identical vs $base."

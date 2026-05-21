@@ -2482,6 +2482,7 @@ name = "omni-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "omni-net",
  "omni-store",

@@ -37,6 +37,12 @@ tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
 serde_json         = { workspace = true }
 thiserror          = { workspace = true }
+# Stage 11a: BLAKE3 of synthetic-mode model/input/output bytes inside
+# the mock-v1 attestation builder (`build_mock_v1_attestation`). The
+# canonical proof envelope BLAKE3 is also computed here; we don't go
+# through a SnipV2Adapter in synthetic mode (it's deliberately not
+# published to a real SNIP store).
+blake3             = { workspace = true }
 
 [dev-dependencies]
 tempfile           = { workspace = true }
