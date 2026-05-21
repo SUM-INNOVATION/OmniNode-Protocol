@@ -98,6 +98,8 @@ operator runbook.
 | **Phase 5 Stage 3** — Proof artifact flow (publish + commitment) | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 4** — Local verifier attestation envelope (canonical bytes + digest + Signer trait) | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 5** — Chain client abstraction + offline attestation registry | `omni-zkml` | **Complete** |
+| **Phase 5 Stage 5.2** — Client-local staleness / retry policy (`StalenessPolicy`, `mark_stale_if_overdue`, `submitted_at_block`) | `omni-zkml` | **Complete** |
+| **Phase 5 Stage 5.3** — End-to-end attestation orchestration (`OrchestrationClient` supertrait + `submit_attestation_workflow_with_block` + sweep / retry helpers) | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 6** — Chain wire fixture & signing-spec deliverables (Ed25519 + bs58 checksum address) | `omni-zkml` | **Complete** |
 | **Phase 5 Stage 7a** — SUM Chain adapter (read/query against JSON-RPC; typed stub for submit) | `omni-sumchain` | **Complete** |
 | **Phase 5 Stage 7b** — SUM Chain submit path (outer `SignedTransaction` via vendored chain primitives) | `omni-sumchain` | **Complete** |
