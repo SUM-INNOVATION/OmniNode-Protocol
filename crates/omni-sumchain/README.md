@@ -52,6 +52,13 @@ outer `BLAKE3+Ed25519` sign via `sumchain-crypto` → bare-hex
 - **Parity-verified** local-to-chain byte equivalence under bincode
   1.3, plus signing-hash + hex-roundtrip stability
   (5 tests in `tests/parity_vendored_primitives.rs`).
+- **Chain-produced byte-roundtrip gate** (Stage 9c.1): 5 tests in
+  `tests/chain_produced_fixture.rs` pin `from_hex` / `to_hex` /
+  `SignedTransaction::hash()` against the raw on-chain bytes of the
+  2026-05-19 mainnet smoke transaction
+  (`0x3a9cbf85…c32a56`). Fixture + provenance live in
+  `tests/fixtures/chain_produced_signed_tx.json`; `--features submit`
+  gated.
 
 Default `cargo test` is fully hermetic — `UreqTransport` is exercised
 only by `#[ignore]`'d live tests gated on env vars.
@@ -104,7 +111,9 @@ required on any code path — `cargo fetch` / `cargo build` /
 `cargo test` for both default and `--features submit` builds resolve
 entirely from the public crates.io index. The chain crates are
 byte-equivalent to chain rev `d83e45a4` for the InferenceAttestation
-surface; the `tests/parity_vendored_primitives.rs` parity suite pins
+surface; the `tests/parity_vendored_primitives.rs` parity suite and
+the Stage 9c.1 `tests/chain_produced_fixture.rs` chain-produced-bytes
+gate together pin
 that equivalence under bincode 1.3 + BLAKE3 signing.
 
 ## Operational setup for live tests
