@@ -66,6 +66,12 @@ use omni_zkml::{
     AttestationRegistry, ChainClientError, LocalAttestationStatus,
     RegistryError, StalenessPolicy,
 };
+// Stage 11a: trait import for `MockProofBackend::prove()` in
+// `build_mock_v1_attestation`. The trait method isn't in the prelude;
+// importing the trait lets us call `prove(...)` without going through
+// a UFCS hop.
+#[cfg(feature = "submit")]
+use omni_zkml::ProofBackend;
 
 /// Read-only commands and the gate phase use a zero seed — the SUM
 /// Chain adapter ignores the seed for reads; only signing consumes it.
@@ -97,6 +103,26 @@ pub(crate) enum OperatorError {
          synthetic-mainnet path"
     )]
     SyntheticMainnetForbidden,
+
+    /// Stage 11a guardrail. The mock proof backend (`mock-v1`) is
+    /// non-cryptographic by design — it produces deterministic
+    /// BLAKE3-chain bytes, not a soundness-proving SNARK / STARK —
+    /// and must never reach mainnet, including with
+    /// `--allow-mainnet-submit`. Stage 8b's
+    /// [`OperatorError::SyntheticMainnetForbidden`] already refuses the
+    /// only path that currently selects `mock-v1` (the smoke
+    /// `--synthetic` flag); this variant is the explicit, backend-id-
+    /// keyed defense-in-depth check that fires regardless of how the
+    /// caller arrived at the mock backend.
+    #[cfg(feature = "submit")]
+    #[error(
+        "mainnet submit (chain_id 1) refuses proof backend {backend_id:?}: \
+         the mock backend is non-cryptographic and cannot be used for \
+         mainnet submission, even with --allow-mainnet-submit. Use a real \
+         proof backend (Stage 11b) or run the operator against a \
+         non-mainnet chain."
+    )]
+    MockBackendRefusedOnMainnet { backend_id: String },
 
     #[cfg(feature = "submit")]
     #[error(
@@ -336,10 +362,28 @@ fn resolve_smoke_source(
     }
 }
 
-// Used by `smoke_core` (submit-feature) and by `preflight` hermetic
-// tests under `cfg(test)`. Production binaries without the submit
-// feature have no caller, hence the conditional cfg.
-#[cfg(any(feature = "submit", test))]
+// Stage 8a/9c.1 legacy synthetic helper. Produces a structurally well-formed
+// `InferenceAttestation` with placeholder commitment bytes (`model_hash =
+// "a".repeat(64)`, `manifest_snip_root = [0x11; 32]`, etc.). This is the
+// pre-Stage-11a fabrication path; it's preserved as a TEST-ONLY fixture
+// because the hermetic tests in this file insert these structurally-shaped
+// records into the registry / chain plumbing without needing real proof
+// generation. The production `SmokeSource::Synthetic` path no longer calls
+// it (Stage 11a) — see [`build_mock_v1_attestation`] below.
+//
+// **Do not use `synth_attestation` from production code paths.** The
+// 2026-05-19 mainnet smoke submitted these placeholder bytes onto chain;
+// that remains the documented historical anomaly per
+// `docs/mainnet-smoke-audit.md`. Stage 11a's job is only to prevent future
+// submits from doing the same — see
+// [`OperatorError::MockBackendRefusedOnMainnet`].
+//
+// `cfg(test)` only: pre-Stage-11a the submit-feature build called this
+// from the smoke `--synthetic` path; that call site now uses
+// [`build_mock_v1_attestation`], and the helper has no other production
+// caller. Keeping it `#[cfg(test)]` makes the production binary genuinely
+// not contain the placeholder fabricator.
+#[cfg(test)]
 fn synth_attestation(verifier_address: &str, head: u64) -> InferenceAttestation {
     InferenceAttestation {
         commitment: InferenceCommitment {
@@ -352,6 +396,118 @@ fn synth_attestation(verifier_address: &str, head: u64) -> InferenceAttestation 
         verifier_address: verifier_address.to_string(),
         verifier_signature: "stage8a-smoke".into(),
     }
+}
+
+/// Stage 11a production synthetic-smoke attestation builder. Replaces
+/// [`synth_attestation`] as the smoke `--synthetic` source. Differences:
+///
+/// 1. **Real proof bytes.** Runs [`omni_zkml::MockProofBackend`] over
+///    deterministic synthetic `(model, input, output)` bytes so the
+///    resulting commitment fields are honest BLAKE3 hashes of real
+///    content — no more `"a".repeat(64)` / `[0x11; 32]` placeholders.
+/// 2. **Real `proof_snip_root`.** Computed as BLAKE3 of the canonical
+///    [`omni_zkml::ProofArtifactBody`] envelope (metadata + proof
+///    bytes), matching what a real SNIP V2 publish through `sum-node`
+///    would emit. The bytes themselves are not published to a SNIP
+///    store in Stage 11a's synthetic smoke path — that's
+///    Stage-11b-and-beyond — but the root is honest.
+/// 3. **Mainnet hard refusal.** `chain_id == 1` returns
+///    [`OperatorError::MockBackendRefusedOnMainnet`] *before* any
+///    bytes are produced, regardless of `--allow-mainnet-submit`.
+///    This is the Stage 11a OQ5 requirement and a defense-in-depth
+///    backstop alongside [`OperatorError::SyntheticMainnetForbidden`]
+///    (which already covers the only currently-reachable path here).
+///
+/// The `verifier_signature` field remains a marker string — the actual
+/// on-chain Ed25519 signature is computed inside `omni_sumchain::tx` at
+/// submit time from the operator's seed via Stage 6's
+/// `sign_chain_attestation_digest`.
+#[cfg(feature = "submit")]
+fn build_mock_v1_attestation(
+    verifier_address: &str,
+    chain_id: u64,
+    head: u64,
+) -> Result<InferenceAttestation, OperatorError> {
+    if chain_id == 1 {
+        return Err(OperatorError::MockBackendRefusedOnMainnet {
+            backend_id: omni_zkml::MOCK_BACKEND_ID.to_string(),
+        });
+    }
+
+    let session_id = format!("omninode-stage11a-smoke-{verifier_address}-{head}");
+
+    // Deterministic synthetic inputs. Tied to the verifier address and
+    // head height so multiple smoke runs against the same chain don't
+    // collide on `(session_id, verifier_address)` — the registry's
+    // Stage 5.1 dedup key.
+    let model_bytes =
+        format!("omninode.stage11a.synthetic.model.{verifier_address}.{head}")
+            .into_bytes();
+    let input_bytes =
+        format!("omninode.stage11a.synthetic.input.{verifier_address}.{head}")
+            .into_bytes();
+    let output_bytes =
+        format!("omninode.stage11a.synthetic.output.{verifier_address}.{head}")
+            .into_bytes();
+
+    // Run the mock backend; pin the real backend_id here so
+    // ProofMetadata carries the same identifier the mainnet guard
+    // refused on. Stage 11a's MockProofBackend is infallible; the
+    // mapping below preserves the typed-error contract for Stage 11b.
+    let proof_bytes = omni_zkml::MockProofBackend
+        .prove(&model_bytes, &input_bytes, &output_bytes)
+        .map_err(|e| OperatorError::Internal(format!("MockProofBackend.prove: {e}")))?;
+
+    // Compute the BLAKE3 hashes used by both the commitment and the
+    // proof-metadata envelope.
+    let model_hash_hex = blake3::hash(&model_bytes).to_hex().to_string();
+    let input_hash_hex = blake3::hash(&input_bytes).to_hex().to_string();
+    let response_hash_hex = blake3::hash(&output_bytes).to_hex().to_string();
+
+    // Canonical proof envelope. BLAKE3 of the envelope bytes is the
+    // proof_snip_root the chain commits to (same algorithm the test
+    // fake adapter uses; production sum-node ingest produces the same
+    // root for the same bytes when configured for public lifecycle).
+    let metadata = omni_zkml::ProofMetadata {
+        backend_id: omni_zkml::MOCK_BACKEND_ID.to_string(),
+        model_hash: model_hash_hex.clone(),
+        input_hash: input_hash_hex,
+        response_hash: response_hash_hex.clone(),
+    };
+    let body = omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes);
+    let body_bytes = body
+        .to_canonical_bytes()
+        .map_err(|e| OperatorError::Internal(format!("proof envelope serialize: {e}")))?;
+    let mut proof_root = [0u8; 32];
+    proof_root.copy_from_slice(blake3::hash(&body_bytes).as_bytes());
+    let proof_snip_root = SnipV2ObjectId::from_bytes(proof_root);
+
+    // Deterministic synthetic manifest_root tied to the model bytes —
+    // hermetic, reproducible, distinct per `(verifier_address, head)`
+    // pair. Stage 11b will replace this with a real Stage 2 manifest
+    // root once the production pipeline owns model publishing too.
+    let manifest_snip_root = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"omninode.stage11a.synthetic.manifest");
+        hasher.update(&model_bytes);
+        let mut id = [0u8; 32];
+        id.copy_from_slice(hasher.finalize().as_bytes());
+        SnipV2ObjectId::from_bytes(id)
+    };
+
+    Ok(InferenceAttestation {
+        commitment: InferenceCommitment {
+            session_id,
+            model_hash: model_hash_hex,
+            manifest_snip_root,
+            response_hash: response_hash_hex,
+            proof_snip_root,
+        },
+        verifier_address: verifier_address.to_string(),
+        // Local-only metadata; the on-chain Ed25519 signature is computed
+        // inside omni-sumchain::tx at submit time from the seed.
+        verifier_signature: format!("stage11a-{}", omni_zkml::MOCK_BACKEND_ID),
+    })
 }
 
 async fn run_blocking<F, R>(f: F) -> Result<R, OperatorError>
@@ -922,7 +1078,10 @@ where
             }
             SmokeSource::Synthetic => {
                 let head = probe.get_block_height(BlockFinality::Latest)?.height;
-                synth_attestation(&derived, head)
+                // Stage 11a: real proof bytes + mainnet-refusal guard.
+                // Replaces the pre-11a `synth_attestation(...)` call which
+                // fabricated placeholder bytes for every commitment field.
+                build_mock_v1_attestation(&derived, cfg_a.expect_chain_id, head)?
             }
         };
 
@@ -2014,6 +2173,83 @@ mod tests {
             "gate 7 must fire before seed parsing; got {err:?}"
         );
         assert_eq!(submit_calls(&fake), 0);
+    }
+
+    // ── Stage 11a: mock-v1 attestation builder ───────────────────────
+
+    #[cfg(feature = "submit")]
+    #[test]
+    fn build_mock_v1_attestation_produces_real_blake3_commitment_on_nonmainnet() {
+        // Non-mainnet chain_id is the only allowed path. Confirm the
+        // returned attestation has *real* BLAKE3-derived commitment
+        // bytes — no `"a".repeat(64)` / `[0x11; 32]` Stage 8a-style
+        // placeholders.
+        let verifier_address = "2mvPk4h883B7DrcZvwy7yWKXyGYHuVzGP"; // shape-only
+        let head = 12345u64;
+        let chain_id = 31337u64; // non-mainnet
+        let att = build_mock_v1_attestation(verifier_address, chain_id, head).unwrap();
+
+        // session_id is the Stage 11a-prefixed shape (was stage8a-).
+        assert!(
+            att.commitment.session_id.starts_with("omninode-stage11a-smoke-"),
+            "session_id should carry the Stage 11a prefix; got {}",
+            att.commitment.session_id
+        );
+
+        // model_hash / response_hash must be real BLAKE3 hex (64 lowercase
+        // hex chars, NOT the pre-11a `"a".repeat(64)` / `"b".repeat(64)`
+        // placeholders).
+        assert_eq!(att.commitment.model_hash.len(), 64);
+        assert_eq!(att.commitment.response_hash.len(), 64);
+        assert_ne!(att.commitment.model_hash, "a".repeat(64));
+        assert_ne!(att.commitment.response_hash, "b".repeat(64));
+        assert!(att
+            .commitment
+            .model_hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(att
+            .commitment
+            .response_hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        // manifest_snip_root and proof_snip_root must NOT be the pre-11a
+        // `[0x11; 32]` / `[0x22; 32]` constants.
+        assert_ne!(
+            att.commitment.manifest_snip_root,
+            SnipV2ObjectId::from_bytes([0x11u8; 32])
+        );
+        assert_ne!(
+            att.commitment.proof_snip_root,
+            SnipV2ObjectId::from_bytes([0x22u8; 32])
+        );
+
+        // Determinism: same inputs → same attestation. This is what makes
+        // the synthetic path retry-safe under Stage 5.1's
+        // `(session_id, verifier_address)` dedup.
+        let att2 = build_mock_v1_attestation(verifier_address, chain_id, head).unwrap();
+        assert_eq!(att.commitment, att2.commitment);
+
+        // verifier_signature carries the Stage 11a + backend marker so
+        // operators reading the registry can tell which builder produced
+        // the record.
+        assert_eq!(att.verifier_signature, "stage11a-mock-v1");
+    }
+
+    #[cfg(feature = "submit")]
+    #[test]
+    fn build_mock_v1_attestation_refuses_mainnet_with_explicit_error() {
+        // The Stage 11a OQ5 hard requirement: mainnet must reject
+        // backend_id == "mock-v1" before any submit-side RPC, even with
+        // --allow-mainnet-submit. We assert via the typed error variant
+        // and confirm the backend_id is captured verbatim so operator
+        // logs / triage can grep on it.
+        let err = build_mock_v1_attestation("addr", 1, 0).unwrap_err();
+        assert!(
+            matches!(err, OperatorError::MockBackendRefusedOnMainnet { ref backend_id } if backend_id == "mock-v1"),
+            "expected MockBackendRefusedOnMainnet {{ backend_id: \"mock-v1\" }}, got {err:?}"
+        );
     }
 
     #[cfg(feature = "submit")]

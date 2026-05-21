@@ -182,3 +182,56 @@ pub enum ChainWireError {
 /// Stage 6 result alias. Distinct from the Stage 3/4/5 aliases so the
 /// chain-wire surface stays in its own typed lane.
 pub type ChainWireResult<T> = std::result::Result<T, ChainWireError>;
+
+// ── Stage 11a: proof generation / verification ──────────────────────────────────
+
+/// Failure returned by a [`crate::proof::ProofBackend`] implementation when
+/// proof generation cannot complete. Stage 11a's [`crate::proof::MockProofBackend`]
+/// is infallible and never produces this; the variant exists for the real
+/// backends Stage 11b will plug in (ezkl / risc0 / sp1 / …).
+///
+/// Intentionally `Clone` so the operator binary can record the same backend
+/// failure in both the registry's `error_message` field and the tracing
+/// event without re-running the prover.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ProofBackendError {
+    /// Generic catch-all for backend-internal failures (e.g. the prover
+    /// crashed, ran out of memory, timed out, produced ill-formed output).
+    /// The string is the backend's own diagnostic, captured verbatim.
+    #[error("proof backend failure: {0}")]
+    BackendInternal(String),
+}
+
+/// Failure returned by a [`crate::proof::ProofVerifier`] implementation.
+/// Distinct from "verification returned false" — that's a normal
+/// `Ok(false)`, not an error.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ProofVerifierError {
+    /// The verifier hit an internal failure (input parse error, malformed
+    /// proof structure, runtime panic caught and translated). A successful
+    /// "the proof does not satisfy the public inputs" result is `Ok(false)`,
+    /// **not** this variant.
+    #[error("proof verifier failure: {0}")]
+    VerifierInternal(String),
+}
+
+/// Composite failure returned by [`crate::proof::produce_proof_artifact`]
+/// — the Stage 11a orchestrator that wraps backend invocation, metadata
+/// composition, file write, and SNIP V2 publish.
+///
+/// Wraps the underlying typed errors so the operator binary can pattern-
+/// match on the failure stage without parsing strings.
+#[derive(Debug, thiserror::Error)]
+pub enum ProofPipelineError {
+    #[error("proof backend failed: {0}")]
+    Backend(#[from] ProofBackendError),
+
+    #[error("proof artifact filesystem I/O failure: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("proof artifact JSON envelope serialization failure: {0}")]
+    Serialize(#[from] serde_json::Error),
+
+    #[error("proof artifact publish failure: {0}")]
+    Artifact(#[from] ProofArtifactError),
+}

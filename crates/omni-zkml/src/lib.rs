@@ -49,6 +49,7 @@ pub mod chain;
 pub mod chain_wire;
 pub mod error;
 pub mod orchestration;
+pub mod proof;
 pub mod registry;
 pub mod staleness;
 
@@ -68,7 +69,13 @@ pub use chain_wire::{
 };
 pub use error::{
     AttestationError, AttestationResult, ChainClientError, ChainWireError, ChainWireResult,
-    ProofArtifactError, RegistryError, RegistryResult, Result, SignerError,
+    ProofArtifactError, ProofBackendError, ProofPipelineError, ProofVerifierError, RegistryError,
+    RegistryResult, Result, SignerError,
+};
+pub use proof::{
+    produce_proof_artifact, MockProofBackend, MockProofVerifier, ProofArtifactBody, ProofBackend,
+    ProofMetadata, ProofPipelineInputs, ProofPipelineOutputs, ProofVerifier, PublicInputs,
+    MOCK_BACKEND_ID,
 };
 pub use registry::{
     compute_attestation_id, query_attestation_workflow, submit_attestation_workflow,
