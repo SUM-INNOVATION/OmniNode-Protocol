@@ -1079,15 +1079,23 @@ where
 
             let params = read_client.get_chain_params()?;
             check_chain_id(expect, params.chain_id)?;
+            log_chain_params_snapshot(&params, None);
 
             let polled = poll_attestations_workflow(&registry, &read_client)?;
             let swept = sweep_stale_attestations_workflow(&registry, &read_client, &pol)?;
 
+            // Stage 10a: activation is a read-only check with no side
+            // effects, so emit `event="activation_state"` every tick
+            // — both monitor-only and retry-enabled — rather than
+            // only when the retry path runs. The `omninode` / `v2`
+            // values then gate the retry step below.
+            let omninode = read_client.omninode_is_active()?;
+            let v2 = read_client.v2_is_active()?;
+            log_activation_state(omninode, v2, None);
+
             let mut retried = Vec::new();
             let mut retry_skipped_reason: Option<&'static str> = None;
             if submit_permitted {
-                let omninode = read_client.omninode_is_active()?;
-                let v2 = read_client.v2_is_active()?;
                 if omninode && v2 {
                     let submit_client = mc(seed);
                     retried =
@@ -1407,12 +1415,10 @@ fn log_chain_params_snapshot(params: &ChainParamsInfo, head: Option<u64>) {
 
 /// `event="activation_state"` snapshot. Emitted at entry to any
 /// subcommand that has already fetched both activation gates.
-/// Currently only `smoke` calls into the helper; `watch-activation`
-/// and `preflight` emit their own inline `event="activation_state"`
-/// lines (with extra fields like `v2_blocks_remaining`) — keeping the
-/// helper unused on default builds would warn, so gate it where its
-/// sole caller lives.
-#[cfg(feature = "submit")]
+/// Used by `smoke` (cfg-gated) and by `loop_core` (every tick, both
+/// monitor-only and retry-enabled). `watch-activation` and
+/// `preflight` emit their own inline `event="activation_state"`
+/// lines because they carry extra fields like `v2_blocks_remaining`.
 fn log_activation_state(omninode_active: bool, v2_active: bool, head: Option<u64>) {
     info!(
         event = "activation_state",
@@ -2247,6 +2253,55 @@ mod tests {
             submit_calls(&fake),
             0,
             "monitor-only loop must never reach sum_sendRawTransaction"
+        );
+    }
+
+    /// Stage 10a: monitor-only loop ticks must perform the same
+    /// read-only activation check that retry-enabled ticks do, so the
+    /// `event="chain_params"` and `event="activation_state"` markers
+    /// fire every tick regardless of submit mode. The Stage 9c+ chain
+    /// fake records every method call, so we assert via observable
+    /// RPC traffic: at least one `chain_getChainParams` and one
+    /// `chain_getBlockHeight` must reach the chain in a monitor-only
+    /// tick (pre-Stage-10a, monitor-only ticks skipped the activation
+    /// reads entirely and never touched `chain_getBlockHeight`).
+    #[tokio::test]
+    async fn loop_monitor_only_reads_activation_state_every_tick() {
+        let fake = activated_fake(31337);
+        add_submit_responses(&fake);
+        let dir = tempfile::tempdir().unwrap();
+        let reg_path = dir.path().join("registry");
+        let _ = AttestationRegistry::open(reg_path.clone()).unwrap();
+
+        let cfg = LoopConfig {
+            expect_chain_id: 31337,
+            registry_path: reg_path,
+            staleness_threshold_blocks: 10,
+            poll_interval_secs: 0,
+            allow_submit: false, // monitor-only
+            allow_mainnet_submit: false,
+            max_ticks: Some(1),
+            seed_source: SeedSource::AbsentForTest,
+        };
+        loop_core(factory(fake.clone()), cfg).await.unwrap();
+
+        let methods: Vec<String> =
+            fake.calls().into_iter().map(|(m, _)| m).collect();
+        assert!(
+            methods.iter().any(|m| m == "chain_getChainParams"),
+            "monitor-only tick must fetch chain_getChainParams (for \
+             event=\"chain_params\"); recorded methods: {methods:?}"
+        );
+        assert!(
+            methods.iter().any(|m| m == "chain_getBlockHeight"),
+            "monitor-only tick must fetch chain_getBlockHeight (for \
+             event=\"activation_state\"); recorded methods: {methods:?}"
+        );
+        assert_eq!(
+            submit_calls(&fake),
+            0,
+            "the new activation-state reads must NOT introduce any \
+             submit-side RPCs in monitor-only mode"
         );
     }
 
