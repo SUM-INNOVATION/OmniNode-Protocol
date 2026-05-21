@@ -295,13 +295,29 @@ jobs:
         run: |
           set -euo pipefail
           base="${{ steps.base.outputs.ref }}"
-          diff_out="$(git diff --stat "$base"..HEAD -- \
-            crates/omni-zkml/tests/fixtures/proof_pipeline_vectors.json)"
+          fixture="crates/omni-zkml/tests/fixtures/proof_pipeline_vectors.json"
+
+          # Distinguish "file is being introduced by this PR" from "file
+          # exists on base and is being modified". On the introductory PR
+          # the file isn't on the base ref at all, so a plain `git diff`
+          # against base reports a +N-line addition — but that's the
+          # baseline being established, not drift. Once the fixture
+          # exists on main, every subsequent PR is gated strictly.
+          if ! git cat-file -e "$base:$fixture" 2>/dev/null; then
+            echo "::notice::Stage 11a proof pipeline fixture is being"
+            echo "          introduced by this PR (file does not exist at"
+            echo "          base $base). Byte-stability gate skipped for"
+            echo "          this introductory commit. The fixture becomes"
+            echo "          immutable for all subsequent PRs."
+            exit 0
+          fi
+
+          diff_out="$(git diff --stat "$base"..HEAD -- "$fixture")"
           if [ -n "$diff_out" ]; then
             {
               echo "::error::Stage 11a proof pipeline byte-stability gate failed."
               echo "This file is byte-stable across all post-Stage-11a work:"
-              echo "  crates/omni-zkml/tests/fixtures/proof_pipeline_vectors.json"
+              echo "  $fixture"
               echo
               echo "If the change is intentional (e.g. MockProofBackend formula"
               echo "bumped to mock-v2), regenerate the fixture with"
