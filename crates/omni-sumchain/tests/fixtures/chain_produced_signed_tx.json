@@ -1,0 +1,31 @@
+{
+  "name": "mainnet-smoke-2026-05-19",
+  "source": "SUM Chain mainnet",
+  "tx_hash": "0x3a9cbf85945136e55a3ab8bb04a09d406d52438d9c2fa1f77850a706a1c32a56",
+  "tx_hash_recomputed": "0x3a9cbf85945136e55a3ab8bb04a09d406d52438d9c2fa1f77850a706a1c32a56",
+  "hash_match": true,
+  "signed_tx_hex": "0100000001000000000000001376ff623e41dc5b7e811b6b135e046af26a64bce80300000000000000000000000000000500000000000000150000001c000000000000006d61696e6e65742d736d6f6b652d323032362d30352d31382d303031aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1111111111111111111111111111111111111111111111111111111111111111bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb22222222222222222222222222222222222222222222222222222222222222221e8ba5914f16abba02704f1f7dfc51b6b82094bb1706d4863605f7aef82abf63b628a64f246140daec08d5b2b0a7594fb3edbd551049e1d9f157f6666b03800b6ed2385ea7f543fc3342f702dea4cd25f2a7fcbec819766c564eb6ab72e247cef6d9242be2bbd64cbca4e4ec657b6db86c5ba82c49a9d85074496ecc5dffcc093dd09085d0ba78adf7064f05732ed7d1ea790016dcf6c0f3293c4e29a1cc298a",
+  "chain_id": 1,
+  "session_id": "mainnet-smoke-2026-05-18-001",
+  "verifier_address": "2mvPk4h883B7DrcZvwy7yWKXyGYHuVzGP",
+  "attestation_id": "d77d8e95c96e6ae2264cbe3baf1383d9a3ea82e59a49d7fbf97574a04d791f1d",
+  "included_at_block_height": 6049201,
+  "tx_index_in_block": 0,
+  "status": "Success",
+  "fee_paid": 1000,
+  "provenance": {
+    "chain_repo": "https://github.com/SUM-INNOVATION/sum-chain",
+    "chain_commit": "82e83e4d0e5a8bc8f516f7333d10ab73f14ac050",
+    "sumchain_primitives_ver": "0.1.0",
+    "sumchain_crypto_ver": "0.1.0",
+    "extracted_at_utc": "2026-05-20T22:45:44Z",
+    "extracted_by": "validator_0x1e0 (operator on validator1)",
+    "extraction_command": "CHAIN_DB=<validator_db_path> TX_HASH=0x3a9cbf85945136e55a3ab8bb04a09d406d52438d9c2fa1f77850a706a1c32a56 cargo run --release -p sumchain-storage --example extract_tx"
+  },
+  "notes": {
+    "chain_id_source": "The validator META CF carries only latest_block_hash, latest_block_height, finalized_hash, finalized_height; it does NOT carry a chain_id key. chain_id = 1 above is sourced from the validator's genesis.json AND is encoded directly inside the V2 transaction body. Bytes [4..12] of the raw payload are 01 00 00 00 00 00 00 00 (little-endian u64). Both sources agree.",
+    "hash_methodology": "TxStore::put writes bincode::serialize(&signed_tx) as the value, and SignedTransaction::hash() = blake3(bincode::serialize(self)). Therefore tx_hash_recomputed is BLAKE3 over the raw bytes pulled directly from the TRANSACTIONS CF, independent of any local decode round-trip. Matching the CF key means the stored row is intact and the raw bytes in signed_tx_hex are exactly what the writer hashed under.",
+    "digest_payload": "The model_hash (0xaa..), manifest_root (0x11..), response_hash (0xbb..), and proof_root (0x22..) fields inside the decoded payload are smoke-test placeholder bytes — consistent with a smoke test exercising the submit path with non-semantic digests — and are NOT real model/proof data. Stage 9c.1 asserts structure + byte-roundtrip; it does not treat the digest payload as meaningful content.",
+    "hex_prefix_acceptance": "Stored here as bare hex. SignedTransaction::from_hex accepts both bare and 0x-prefixed forms; the test exercises both and asserts that re-emission is always bare."
+  }
+}

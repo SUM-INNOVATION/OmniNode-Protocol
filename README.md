@@ -107,6 +107,7 @@ operator runbook.
 | **Phase 5 Stage 9a** — Production runbook + build decoupling (`submit` feature; default builds need no private repo); `operator registry list/show` | `omni-node`, `omni-sumchain` | **Complete** |
 | **Phase 5 Stage 9b** — CI workflow + secret-gated submit matrix (superseded by 9c; original gates restored against the public dep source) | `.github/workflows`, docs | **Superseded by 9c** |
 | **Phase 5 Stage 9c** — Public SUM Chain crates (`sumchain-primitives` / `sumchain-crypto` v0.1.0, crates.io, MIT OR Apache-2.0); cargo-side CI gates restored; fresh source builds need no private repo access | `Cargo.toml`, `.github/workflows`, docs | **Complete** |
+| **Phase 5 Stage 9c.1** — Chain-produced signed-transaction fixture for the 2026-05-19 mainnet smoke tx; byte-roundtrip + `SignedTransaction::hash()` gate against authoritative on-chain bytes | `omni-sumchain/tests` | **Complete** |
 | Phase 5 Stage 8+ — zkML proof generation & SUM Chain Tokenomics | `omni-zkml`, `contracts/` | Planned |
 
 ---
@@ -1533,7 +1534,7 @@ These join the three existing Stage 7b parity tests (`InferenceAttestationDigest
 
 The `decoupling-status-notice`, `check-submit-auth`, and `submit-skip-notice` jobs are **removed** (no longer needed; the decoupling is real now).
 
-**Stage 9c.1 follow-up (deliberately not in this stage):** the chain team offered to extract the raw `SignedTransaction::to_hex` payload for the 2026-05-19 mainnet smoke tx (`0x3a9cbf85945136e55a3ab8bb04a09d406d52438d9c2fa1f77850a706a1c32a56`) and bundle it with a provenance stub for OmniNode to commit as the **authoritative chain-produced byte-roundtrip gate**. That fixture was not part of the publish-notification handoff; Stage 9c proceeded without it on the principle that the public-crate migration should not be blocked. **Stage 9c.1** picks the fixture up when the chain team hands it over — it'll add one new test file (`crates/omni-sumchain/tests/chain_produced_fixture.rs`) and one fixture file (`crates/omni-sumchain/tests/fixtures/chain_produced_signed_tx.json`), nothing else.
+**Stage 9c.1 follow-up — landed (see section below):** the chain team handed over the raw `SignedTransaction::to_hex` payload + BLAKE3-recomputed provenance for the 2026-05-19 mainnet smoke tx (`0x3a9cbf85945136e55a3ab8bb04a09d406d52438d9c2fa1f77850a706a1c32a56`) on 2026-05-20. Stage 9c.1 commits the fixture and adds a byte-roundtrip + `SignedTransaction::hash()` test against the authoritative on-chain bytes. See the **Phase 5 Stage 9c.1** section below.
 
 **What Stage 9c deliberately does not do:**
 - No Stage 6 chain-wire / fixture changes — the byte-stability gate re-runs against the public crates and passes.
@@ -1543,9 +1544,44 @@ The `decoupling-status-notice`, `check-submit-auth`, and `submit-skip-notice` jo
 - No `cargo clippy` / `cargo deny` / SBOM / supply-chain scanning jobs in CI.
 - No cron / drift-detection jobs.
 - No daemonization / systemd code.
-- No chain-produced byte-roundtrip fixture (queued as Stage 9c.1).
+- No chain-produced byte-roundtrip fixture (landed in Stage 9c.1; see below).
 - No edits to `docs/mainnet-smoke-audit.md` (immutability rule stands).
 - No edits to `omni-types` / `omni-store` / `omni-net` / `omni-pipeline` / `omni-bridge` / `python/omninode`.
+
+---
+
+### Phase 5 Stage 9c.1: Chain-Produced Signed Transaction Fixture — Complete
+
+**Crates touched:** `crates/omni-sumchain/tests/` only (one fixture, one test, plus doc pointers in this README and `crates/omni-sumchain/README.md`) | **Depends on:** Stage 9c (public `sumchain-primitives` v0.1.0) + chain-team handoff 2026-05-20 of raw signed-tx bytes for the 2026-05-19 mainnet smoke (`0x3a9cbf85945136e55a3ab8bb04a09d406d52438d9c2fa1f77850a706a1c32a56`) | zero changes to `omni-sumchain/src/`, `omni-zkml`, Stage 6 fixture, or any other workspace member; Stage 6 + Stage 7b byte-stable.
+
+Adds the **authoritative chain-produced byte-roundtrip gate** Stage 9c flagged as a follow-up. Where `parity_vendored_primitives.rs` builds a synthetic `TransactionV2` in-test and proves local-vs-public byte equivalence under deterministic inputs, this stage takes real bytes the chain wrote to its own TRANSACTIONS column family and proves they round-trip through the public crate intact.
+
+**Files added:**
+
+| Path | Purpose |
+|---|---|
+| `crates/omni-sumchain/tests/fixtures/chain_produced_signed_tx.json` | Bare-hex `signed_tx_hex` for the 2026-05-19 mainnet smoke tx, with `tx_hash`, `chain_id`, `session_id`, `verifier_address`, `fee_paid`, `included_at_block_height`, and a `provenance` block (chain repo + commit `82e83e4d0e5a8bc8f516f7333d10ab73f14ac050`, crate versions, extraction command, UTC timestamp, operator). Two methodology notes (chain-id source disclosure + BLAKE3-over-bincode-on-CF-write) and one smoke-pattern-digest disclosure are preserved verbatim. |
+| `crates/omni-sumchain/tests/chain_produced_fixture.rs` | file-level `#![cfg(feature = "submit")]`; five tests pinning structure, byte-roundtrip, and chain-produced hash equivalence. |
+
+**Tests** (all under `cargo test -p omni-sumchain --features submit`):
+
+| Test | What it pins |
+|---|---|
+| `fixture_signed_tx_hex_is_bare_lowercase_ascii_hex` | The fixture string is stored bare (no `0x` prefix), ASCII hex digits only, lowercase. Lowercase pinned for *this fixture string only* — not asserted as a protocol-level guarantee about `SignedTransaction::to_hex()`. |
+| `fixture_bare_hex_roundtrips_byte_identical` | `SignedTransaction::from_hex(bare).to_hex() == bare` byte-identically against the chain-produced bytes. |
+| `fixture_0x_prefixed_hex_is_accepted_and_reemits_bare` | `SignedTransaction::from_hex("0x" + bare)` succeeds and re-emits identically to the bare form (pins the documented `from_hex` prefix-acceptance behaviour). |
+| `fixture_decodes_to_v2_inference_attestation_with_expected_fields` | Decoded `TxInner::V2`; `chain_id == 1`, `fee == 1000`, `from.to_base58() == "2mvPk4h883B7DrcZvwy7yWKXyGYHuVzGP"`, payload arm is `TxPayload::InferenceAttestation`, `digest.session_id == "mainnet-smoke-2026-05-18-001"`. |
+| `fixture_signed_tx_hash_matches_chain_produced_tx_hash` | `sumchain_primitives::SignedTransaction::hash().to_hex() == fixture.tx_hash`. The public hash method is `Hash::hash(bincode::serialize(self))`, exactly the chain's TRANSACTIONS-CF key derivation — so a match pins both that the fixture bytes are the exact stored row and that the public crate's hashing has not drifted from the chain's internal hashing. A future divergence fails loudly. |
+
+**Smoke-pattern digest disclosure.** The decoded payload's `model_hash` (`0xaa…`), `manifest_root` (`0x11…`), `response_hash` (`0xbb…`), and `proof_root` (`0x22…`) are smoke-test placeholder bytes — the 2026-05-19 smoke exercised the submit path with non-semantic digests. Stage 9c.1 asserts structure and byte-roundtrip; it does not treat the digest payload as meaningful content. This is documented in both the fixture's `notes.digest_payload` block and the test module's preamble.
+
+**What Stage 9c.1 deliberately does not do:**
+- No changes to `omni-sumchain/src/tx.rs`, `outer_sign.rs`, or `client.rs`.
+- No changes to Stage 6 chain-wire / fixture (`crates/omni-zkml/src/chain_wire.rs`, `chain_attestation_vectors.json`).
+- No local reconstruction of the signed-tx hex from a verifier seed; no synthetic fallback.
+- No edits to `docs/mainnet-smoke-audit.md` (immutability rule stands).
+- No behaviour changes anywhere; purely additive test surface.
+- No new CI workflow jobs — the existing `submit-build-test` job already runs `cargo test -p omni-sumchain --features submit`, which now picks up `chain_produced_fixture.rs` automatically.
 
 ---
 
@@ -1731,6 +1767,9 @@ OmniNode-Protocol/
 │   │       ├── unit_rpc_envelope.rs          # 16 hermetic RPC envelope + Stage 5.1 integration tests (includes Stage 7b happy-path receipt)
 │   │       ├── unit_submit_construction.rs   # 15 hermetic Stage 7b construction tests (gate ordering, RPC caching, bare-hex shape, min-fee round-trip, {tx_hash} object + bare-string + 3 negative parse paths)
 │   │       ├── parity_vendored_primitives.rs # 5 byte-equivalence tests: Stage 6 local digest/tx-data + bs58 address derivation == public chain types (sumchain-primitives v0.1.0) under bincode 1.3, plus Stage 9c TransactionV2 signing-hash + SignedTransaction hex-roundtrip stability
+│   │       ├── chain_produced_fixture.rs     # Stage 9c.1: 5 tests pinning byte-roundtrip + SignedTransaction::hash() against real on-chain bytes from the 2026-05-19 mainnet smoke (`--features submit` gated)
+│   │       ├── fixtures/
+│   │       │   └── chain_produced_signed_tx.json # Stage 9c.1: raw signed_tx_hex + chain-team provenance + methodology notes for tx 0x3a9cbf85…c32a56
 │   │       ├── stage6_wire_parity.rs         # 1 cross-crate smoke against the Stage 6 chain-team fixture
 │   │       └── live_local_mirror.rs          # 5 #[ignore]'d live tests, env-gated by OMNINODE_SUMCHAIN_RPC_URL (+ OMNINODE_VERIFIER_SEED_HEX for Stage 7b submit roundtrip)
 │   │
