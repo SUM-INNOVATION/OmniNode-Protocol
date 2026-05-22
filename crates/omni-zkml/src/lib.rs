@@ -73,9 +73,10 @@ pub use error::{
     RegistryResult, Result, SignerError,
 };
 pub use proof::{
-    produce_proof_artifact, MockProofBackend, MockProofVerifier, ProofArtifactBody, ProofBackend,
-    ProofMetadata, ProofPipelineInputs, ProofPipelineOutputs, ProofVerifier, PublicInputs,
-    MOCK_BACKEND_ID,
+    check_mainnet_eligible, produce_proof_artifact, MainnetRefusalReason, MockProofBackend,
+    MockProofVerifier, ModelFormat, ProofArtifactBody, ProofBackend, ProofMetadata,
+    ProofPipelineInputs, ProofPipelineOutputs, ProofSystem, ProofVerifier, PublicInputs,
+    MAINNET_APPROVED_PROOF_SYSTEMS, MOCK_BACKEND_ID,
 };
 pub use registry::{
     compute_attestation_id, query_attestation_workflow, submit_attestation_workflow,

@@ -124,6 +124,93 @@ pub(crate) enum OperatorError {
     )]
     MockBackendRefusedOnMainnet { backend_id: String },
 
+    // ── Stage 11b.0: mainnet refusal variants ─────────────────────────
+    //
+    // These wrap [`omni_zkml::MainnetRefusalReason`] into operator-
+    // facing typed errors. The Stage 11a `MockBackendRefusedOnMainnet`
+    // variant above is preserved for back-compat (the synthetic smoke
+    // path's existing refusal still routes through it via the
+    // [`map_mainnet_refusal`] helper below).
+
+    /// Stage 11b.0 layer 1 — the proof artifact carries
+    /// `testnet_or_dev_only: Some(true)`. The producer explicitly
+    /// disclaimed mainnet eligibility.
+    #[cfg(feature = "submit")]
+    #[error(
+        "proof artifact is marked testnet/dev only (backend_id = {backend_id:?}); \
+         the producer explicitly disclaimed mainnet eligibility"
+    )]
+    TestnetOnlyProofRefusedOnMainnet { backend_id: String },
+
+    /// Stage 11b.0 layer 3 — bounded reference proof systems
+    /// (currently `Stage11bOnnxReference`) are architecture-
+    /// validation fixtures, not production attestation. Hard-refused
+    /// on mainnet regardless of any other state.
+    #[cfg(feature = "submit")]
+    #[error(
+        "bounded reference proof system refused on mainnet (backend_id = {backend_id:?}): \
+         reference fixtures are for architecture validation only, not production"
+    )]
+    BoundedReferenceProofRefusedOnMainnet { backend_id: String },
+
+    /// Stage 11b.0 layer 4 — `model_format = Gguf` claim. No GGUF
+    /// inference proof backend is approved at any stage through
+    /// Stage 11b.0. Declaration is honest; mainnet claim is refused.
+    #[cfg(feature = "submit")]
+    #[error(
+        "GGUF proof claim refused on mainnet (backend_id = {backend_id:?}): \
+         no GGUF inference proof backend is approved — awaiting Stage 11d \
+         strategy + chain-team review"
+    )]
+    GgufProofClaimRefusedOnMainnet { backend_id: String },
+
+    /// Stage 11b.0 layer 5 — model_format is `Other(_)` or absent on
+    /// a non-mock backend. Stringly-typed formats are refused on
+    /// mainnet until promoted to a first-class enum variant.
+    #[cfg(feature = "submit")]
+    #[error(
+        "unknown / non-first-class model_format refused on mainnet \
+         (backend_id = {backend_id:?})"
+    )]
+    UnknownModelFormatRefusedOnMainnet { backend_id: String },
+
+    /// Stage 11b.0 layer 6 — proof_system is not in
+    /// [`omni_zkml::MAINNET_APPROVED_PROOF_SYSTEMS`]. The allowlist is
+    /// empty by design at end of Stage 11b.0; mainnet eligibility is
+    /// a Stage 11c+ deliverable with chain-team review.
+    #[cfg(feature = "submit")]
+    #[error(
+        "proof system not in the mainnet allowlist (backend_id = {backend_id:?}): \
+         Stage 11b ships with the allowlist empty by design — mainnet \
+         eligibility is a Stage 11c+ deliverable"
+    )]
+    ProofSystemNotMainnetApproved { backend_id: String },
+
+    /// Stage 11b.0: `operator verify-proof` could not locate a
+    /// `ProofVerifier` impl for the proof artifact's declared proof
+    /// system. Stage 11b.0 ships only [`omni_zkml::MockProofVerifier`];
+    /// other proof systems return this error until backends land in
+    /// Stage 11c+.
+    #[error(
+        "no verifier registered for proof system {proof_system}; \
+         Stage 11b.0 ships only MockProofVerifier"
+    )]
+    NoVerifierForProofSystem { proof_system: String },
+
+    /// Stage 11b.0: `operator verify-proof` could not parse the
+    /// `--proof-artifact` JSON.
+    #[error("failed to parse proof artifact JSON: {0}")]
+    ProofArtifactParse(String),
+
+    /// Stage 11b.0: `operator verify-proof` could not read the
+    /// `--proof-artifact` file.
+    #[error("failed to read --proof-artifact {path}: {source}")]
+    ProofArtifactRead {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[cfg(feature = "submit")]
     #[error(
         "smoke needs an attestation source: pass --attestation-json, or \
@@ -468,12 +555,17 @@ fn build_mock_v1_attestation(
     // proof_snip_root the chain commits to (same algorithm the test
     // fake adapter uses; production sum-node ingest produces the same
     // root for the same bytes when configured for public lifecycle).
-    let metadata = omni_zkml::ProofMetadata {
-        backend_id: omni_zkml::MOCK_BACKEND_ID.to_string(),
-        model_hash: model_hash_hex.clone(),
-        input_hash: input_hash_hex,
-        response_hash: response_hash_hex.clone(),
-    };
+    // Stage 11b.0: use the Stage-11a-compat constructor — the mock
+    // backend's metadata is the "minimal Stage 11a" shape, with all
+    // Stage 11b.0 fields defaulting to None. This keeps the resulting
+    // proof envelope JSON byte-identical against the Stage 11a
+    // fixture (every new optional field uses `serde(skip_if_none)`).
+    let metadata = omni_zkml::ProofMetadata::new_stage11a(
+        omni_zkml::MOCK_BACKEND_ID.to_string(),
+        model_hash_hex.clone(),
+        input_hash_hex,
+        response_hash_hex.clone(),
+    );
     let body = omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes);
     let body_bytes = body
         .to_canonical_bytes()
@@ -549,6 +641,28 @@ enum OperatorCmd {
     DeriveAddress,
     /// Read-only: list / show records in a local attestation registry.
     Registry(RegistryArgs),
+    /// Stage 11b.0: read-only — parse a proof artifact JSON, look up
+    /// the matching verifier by proof_system, run verify, and report
+    /// mainnet eligibility. Default-build accessible (no submit
+    /// feature required). Stage 11b.0 ships only MockProofVerifier;
+    /// other proof systems return NoVerifierForProofSystem until
+    /// backends land in Stage 11c+.
+    ///
+    /// **Inspect/report semantics, not strict-validator semantics.**
+    /// Stage 11b.0 `verify-proof` exits `0` on a successful inspection
+    /// run *regardless of whether `verified` is `true` or `false`* —
+    /// the boolean is reported in stdout (`verified=...`,
+    /// `mainnet_eligible=...`) and as structured fields on the
+    /// `event="proof_verification"` tracing line. Operators consuming
+    /// this from scripts should grep the stdout or the tracing
+    /// stream, not check the exit code. The CLI exits non-zero only
+    /// on typed errors (`ProofArtifactRead`, `ProofArtifactParse`,
+    /// `NoVerifierForProofSystem`). **A "strict validator" exit code
+    /// where `verified=false` returns non-zero is a deferred UX
+    /// decision** for Stage 11c (when real backends land) or
+    /// Stage 10b (as part of release artifact tooling) — not a
+    /// behaviour change to make in Stage 11b.0.
+    VerifyProof(VerifyProofArgs),
 }
 
 #[derive(Args)]
@@ -588,6 +702,15 @@ struct RegistryShowArgs {
     /// preflight`.
     #[arg(long)]
     id: String,
+}
+
+#[derive(Args)]
+struct VerifyProofArgs {
+    /// Path to a `ProofArtifactBody` JSON file (the canonical envelope
+    /// shipped inside the SNIP V2 proof artifact). The file's bytes
+    /// must parse via [`omni_zkml::ProofArtifactBody`]'s serde shape.
+    #[arg(long)]
+    proof_artifact: PathBuf,
 }
 
 #[derive(Args)]
@@ -851,6 +974,9 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
                 print_registry_summary(&summary);
             }
         },
+        OperatorCmd::VerifyProof(a) => {
+            verify_proof_core(a.proof_artifact).await?;
+        }
     }
     Ok(())
 }
@@ -1612,7 +1738,143 @@ fn subcommand_name(c: &OperatorCmd) -> &'static str {
         OperatorCmd::Query(_) => "query",
         OperatorCmd::DeriveAddress => "derive-address",
         OperatorCmd::Registry(_) => "registry",
+        OperatorCmd::VerifyProof(_) => "verify-proof",
     }
+}
+
+// ── Stage 11b.0: verify-proof + mainnet refusal mapping ────────────────────────
+
+/// Stage 11b.0 — map a typed [`omni_zkml::MainnetRefusalReason`] into
+/// the operator binary's typed [`OperatorError`] surface. Keeps the
+/// operator-facing wording consistent with the rest of the surface;
+/// every refusal layer in `check_mainnet_eligible` maps 1:1 to one
+/// variant here.
+#[cfg(feature = "submit")]
+#[allow(dead_code)] // Used by future submit-path wiring (Stage 11c+);
+                    // exists in Stage 11b.0 so the mapping is in tree.
+fn map_mainnet_refusal(reason: omni_zkml::MainnetRefusalReason) -> OperatorError {
+    use omni_zkml::MainnetRefusalReason as R;
+    match reason {
+        R::TestnetOrDevOnly { backend_id } => {
+            OperatorError::TestnetOnlyProofRefusedOnMainnet { backend_id }
+        }
+        R::MockBackend { backend_id, .. } => {
+            // Preserve Stage 11a's variant name for back-compat —
+            // any caller pattern-matching on
+            // `MockBackendRefusedOnMainnet` continues to work.
+            OperatorError::MockBackendRefusedOnMainnet { backend_id }
+        }
+        R::BoundedReference { backend_id, .. } => {
+            OperatorError::BoundedReferenceProofRefusedOnMainnet { backend_id }
+        }
+        R::GgufClaim { backend_id, .. } => {
+            OperatorError::GgufProofClaimRefusedOnMainnet { backend_id }
+        }
+        R::UnknownModelFormat { backend_id, .. } => {
+            OperatorError::UnknownModelFormatRefusedOnMainnet { backend_id }
+        }
+        R::NotInMainnetAllowlist { backend_id, .. } => {
+            OperatorError::ProofSystemNotMainnetApproved { backend_id }
+        }
+    }
+}
+
+/// Stage 11b.0 — read a `ProofArtifactBody` JSON, route to the
+/// matching verifier by `proof_system`, run verify, and emit a
+/// structured tracing event + bare-stdout summary. Read-only.
+/// Default-build accessible (no `--features submit` required).
+///
+/// Stage 11b.0 ships only the [`omni_zkml::MockProofVerifier`] in the
+/// verifier registry. Any other `proof_system` value returns
+/// `OperatorError::NoVerifierForProofSystem` — Stage 11c+ wires real
+/// verifiers in as backends land.
+async fn verify_proof_core(proof_artifact_path: PathBuf) -> Result<(), OperatorError> {
+    run_blocking(move || -> Result<(), OperatorError> {
+        let bytes = std::fs::read(&proof_artifact_path).map_err(|e| {
+            OperatorError::ProofArtifactRead {
+                path: proof_artifact_path.display().to_string(),
+                source: e,
+            }
+        })?;
+        let body: omni_zkml::ProofArtifactBody = serde_json::from_slice(&bytes)
+            .map_err(|e| OperatorError::ProofArtifactParse(e.to_string()))?;
+
+        // Look up the verifier. Stage 11b.0 ships only MockProofVerifier;
+        // None proof_system is treated as Stage 11a vintage Mock.
+        let verify_result = match body.metadata.proof_system {
+            Some(omni_zkml::ProofSystem::Mock) | None => {
+                let proof_bytes = body.proof_bytes().map_err(|e| {
+                    OperatorError::ProofArtifactParse(format!(
+                        "proof_bytes_hex decode failed: {e}"
+                    ))
+                })?;
+                let pi = body.metadata.public_inputs().map_err(|e| {
+                    OperatorError::ProofArtifactParse(format!(
+                        "public_inputs decode failed: {e}"
+                    ))
+                })?;
+                use omni_zkml::ProofVerifier;
+                omni_zkml::MockProofVerifier
+                    .verify(&proof_bytes, &pi)
+                    .map_err(|e| {
+                        OperatorError::ProofArtifactParse(format!(
+                            "verifier failure: {e}"
+                        ))
+                    })?
+            }
+            Some(other) => {
+                return Err(OperatorError::NoVerifierForProofSystem {
+                    proof_system: format!("{other:?}"),
+                });
+            }
+        };
+
+        // Always-evaluated: mainnet refusal reason. Stage 11b.0
+        // invariant — `check_mainnet_eligible` returns Err for every
+        // input, since the allowlist is empty.
+        let mainnet = omni_zkml::check_mainnet_eligible(&body.metadata);
+        let mainnet_refusal_str = match &mainnet {
+            Ok(()) => "ok".to_string(), // unreachable in Stage 11b.0
+            Err(reason) => format!("{reason}"),
+        };
+
+        info!(
+            event = "proof_verification",
+            backend_id = %body.metadata.backend_id,
+            proof_system = ?body.metadata.proof_system,
+            model_format = ?body.metadata.model_format,
+            verified = verify_result,
+            mainnet_eligible = mainnet.is_ok(),
+            mainnet_refusal = %mainnet_refusal_str,
+            "proof artifact verified"
+        );
+
+        // Bare-stdout summary — same grep-friendly shape as
+        // `registry summary` / `registry list`.
+        println!("backend_id={}", body.metadata.backend_id);
+        println!(
+            "proof_system={}",
+            body.metadata
+                .proof_system
+                .map(|p| format!("{p:?}"))
+                .unwrap_or_else(|| "none".to_string()),
+        );
+        println!(
+            "model_format={}",
+            body.metadata
+                .model_format
+                .as_ref()
+                .map(|m| format!("{m:?}"))
+                .unwrap_or_else(|| "none".to_string()),
+        );
+        println!("verified={verify_result}");
+        println!("mainnet_eligible={}", mainnet.is_ok());
+        if let Err(reason) = &mainnet {
+            println!("mainnet_refusal={reason}");
+        }
+        Ok(())
+    })
+    .await
 }
 
 // ── registry list / show (Stage 9a) ───────────────────────────────────────────
@@ -3382,5 +3644,158 @@ mod tests {
         // path so any future refactor that drops the printer signature
         // fails compilation.
         print_registry_summary(&s);
+    }
+
+    // ── Stage 11b.0: verify-proof + mainnet refusal mapping ───────────
+
+    /// Helper to write a `ProofArtifactBody` (Stage 11a vintage —
+    /// mock-v1, no Stage 11b.0 fields) to a temp file. Returns the
+    /// file path. Used by the verify-proof tests below.
+    fn write_stage11a_mock_proof_artifact(dir: &std::path::Path) -> std::path::PathBuf {
+        use omni_zkml::ProofBackend;
+        let proof_bytes = omni_zkml::MockProofBackend
+            .prove(b"vm", b"vi", b"vo")
+            .unwrap();
+        let metadata = omni_zkml::ProofMetadata::new_stage11a(
+            omni_zkml::MOCK_BACKEND_ID.to_string(),
+            blake3::hash(b"vm").to_hex().to_string(),
+            blake3::hash(b"vi").to_hex().to_string(),
+            blake3::hash(b"vo").to_hex().to_string(),
+        );
+        let body = omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes);
+        let bytes = body.to_canonical_bytes().unwrap();
+        let path = dir.join("proof_artifact.json");
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn verify_proof_accepts_stage11a_mock_artifact_and_refuses_mainnet() {
+        // A Stage 11a-vintage mock proof artifact (no Stage 11b.0
+        // fields) parses, verifies, and is reported as
+        // mainnet-ineligible (refusal layer 2: absent proof_system
+        // treated as Mock).
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_stage11a_mock_proof_artifact(dir.path());
+        verify_proof_core(path).await.unwrap();
+        // verify_proof_core prints to stdout + emits a tracing event.
+        // We don't capture stdout here — the unit test for the
+        // refusal-mapping helper covers the typed outcome side.
+    }
+
+    #[tokio::test]
+    async fn verify_proof_returns_no_verifier_for_unknown_proof_system() {
+        // Construct a proof artifact whose proof_system is Ezkl —
+        // no verifier is registered for it in Stage 11b.0, so the
+        // verify-proof subcommand must return
+        // NoVerifierForProofSystem.
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = omni_zkml::ProofMetadata {
+            backend_id: "ezkl-onnx-prod-future".into(),
+            model_hash: blake3::hash(b"m").to_hex().to_string(),
+            input_hash: blake3::hash(b"i").to_hex().to_string(),
+            response_hash: blake3::hash(b"o").to_hex().to_string(),
+            model_format: Some(omni_zkml::ModelFormat::Onnx),
+            proof_system: Some(omni_zkml::ProofSystem::Ezkl),
+            circuit_id_hex: None,
+            verification_key_hex: None,
+            public_inputs: None,
+            testnet_or_dev_only: None,
+        };
+        let body = omni_zkml::ProofArtifactBody::from_components(metadata, &[0xab, 0xcd]);
+        let bytes = body.to_canonical_bytes().unwrap();
+        let path = dir.path().join("ezkl_proof.json");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = verify_proof_core(path).await.unwrap_err();
+        assert!(
+            matches!(err, OperatorError::NoVerifierForProofSystem { ref proof_system } if proof_system.contains("Ezkl")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_proof_returns_typed_read_error_for_missing_file() {
+        let phantom = std::path::PathBuf::from("/nonexistent/proof_artifact.json");
+        let err = verify_proof_core(phantom).await.unwrap_err();
+        assert!(
+            matches!(err, OperatorError::ProofArtifactRead { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_proof_returns_typed_parse_error_for_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, b"this is not JSON").unwrap();
+        let err = verify_proof_core(path).await.unwrap_err();
+        assert!(
+            matches!(err, OperatorError::ProofArtifactParse(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "submit")]
+    #[test]
+    fn map_mainnet_refusal_preserves_stage11a_mock_variant() {
+        // Stage 11a's MockBackendRefusedOnMainnet must survive the
+        // generalization — preserves the typed contract Stage 11a
+        // pinned.
+        let reason = omni_zkml::MainnetRefusalReason::MockBackend {
+            backend_id: "mock-v1".to_string(),
+            proof_system: Some(omni_zkml::ProofSystem::Mock),
+        };
+        let mapped = map_mainnet_refusal(reason);
+        assert!(
+            matches!(mapped, OperatorError::MockBackendRefusedOnMainnet { ref backend_id } if backend_id == "mock-v1"),
+            "got {mapped:?}"
+        );
+    }
+
+    #[cfg(feature = "submit")]
+    #[test]
+    fn map_mainnet_refusal_covers_every_stage11b0_layer() {
+        use omni_zkml::MainnetRefusalReason as R;
+        // Every layer's reason maps to a distinct operator-error
+        // variant. The match below is exhaustive on the source enum;
+        // any future MainnetRefusalReason variant added without a
+        // mapping fails compilation.
+        let cases: [(R, fn(&OperatorError) -> bool); 6] = [
+            (
+                R::TestnetOrDevOnly { backend_id: "x".into() },
+                |e| matches!(e, OperatorError::TestnetOnlyProofRefusedOnMainnet { .. }),
+            ),
+            (
+                R::MockBackend { backend_id: "x".into(), proof_system: None },
+                |e| matches!(e, OperatorError::MockBackendRefusedOnMainnet { .. }),
+            ),
+            (
+                R::BoundedReference {
+                    backend_id: "x".into(),
+                    proof_system: omni_zkml::ProofSystem::Stage11bOnnxReference,
+                },
+                |e| matches!(e, OperatorError::BoundedReferenceProofRefusedOnMainnet { .. }),
+            ),
+            (
+                R::GgufClaim { backend_id: "x".into(), proof_system: None },
+                |e| matches!(e, OperatorError::GgufProofClaimRefusedOnMainnet { .. }),
+            ),
+            (
+                R::UnknownModelFormat { backend_id: "x".into(), model_format: None },
+                |e| matches!(e, OperatorError::UnknownModelFormatRefusedOnMainnet { .. }),
+            ),
+            (
+                R::NotInMainnetAllowlist {
+                    backend_id: "x".into(),
+                    proof_system: omni_zkml::ProofSystem::Ezkl,
+                },
+                |e| matches!(e, OperatorError::ProofSystemNotMainnetApproved { .. }),
+            ),
+        ];
+        for (reason, check) in cases {
+            let mapped = map_mainnet_refusal(reason.clone());
+            assert!(check(&mapped), "wrong mapping for {reason:?}: got {mapped:?}");
+        }
     }
 }

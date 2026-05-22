@@ -69,6 +69,79 @@ use crate::error::{ProofBackendError, ProofPipelineError, ProofVerifierError};
 /// this constant; do NOT rename without coordinating the operator-side check.
 pub const MOCK_BACKEND_ID: &str = "mock-v1";
 
+// ── ModelFormat + ProofSystem (Stage 11b.0) ─────────────────────────────────
+
+/// Stage 11b.0 — declared format of the model whose inference a proof
+/// binds. Recorded in [`ProofMetadata::model_format`] and consulted by
+/// the mainnet refusal logic in [`check_mainnet_eligible`].
+///
+/// **`ModelFormat::Other(_)` is always refused on mainnet** until a
+/// future stage promotes it to a first-class enum variant with
+/// chain-team review (Stage 11b.0 hard rule). `Gguf` is declared but
+/// has no approved backend until Stage 11d ships an approved
+/// strategy; declaring `Gguf` on a proof artifact is honest about the
+/// intent but still refused on mainnet by the same logic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelFormat {
+    /// ONNX (Open Neural Network Exchange). The format ezkl and most
+    /// production ML provers operate on. **No backend approved for
+    /// mainnet at end of Stage 11b.0** — Stage 11c targets this slot.
+    Onnx,
+    /// GGUF (llama.cpp model format). OmniNode's canonical model
+    /// format today. **No proof backend approved at any stage through
+    /// Stage 11b.0.** Stage 11d will pick from the strategies
+    /// documented in the runbook's "GGUF proofs" section; mainnet
+    /// eligibility is then conditional on chain-team review. Until
+    /// then, declaring `Gguf` makes the refusal explicit instead of
+    /// hidden — the architecture refuses the claim with a clear
+    /// "no GGUF proof backend approved" message.
+    Gguf,
+    /// Stringly-typed escape hatch for future formats. **Always
+    /// refused on mainnet** unless and until promoted to a first-class
+    /// enum variant with chain-team review.
+    Other(String),
+}
+
+/// Stage 11b.0 — declared proof system that produced a proof. Recorded
+/// in [`ProofMetadata::proof_system`]; the mainnet refusal logic in
+/// [`check_mainnet_eligible`] consults this to route through layered
+/// refusals.
+///
+/// **The mainnet allowlist `MAINNET_APPROVED_PROOF_SYSTEMS` is empty at
+/// end of Stage 11b.0.** No `ProofSystem` variant is mainnet-eligible
+/// in 11b.0. Stage 11c is the earliest point at which a real proof
+/// system can be added — and only after chain-team review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProofSystem {
+    /// Stage 11a — [`MockProofBackend`]. **Non-cryptographic; mainnet
+    /// hard-refused.** Hermetic test scaffold only.
+    Mock,
+    /// Stage 11b.1 (planned) — bounded ONNX reference proof backend
+    /// (e.g., a ~1k-param MLP via ezkl). Architecture-validation
+    /// fixture; **testnet/dev only, mainnet hard-refused.** Not
+    /// "production zkML" — the artifact's
+    /// [`ProofMetadata::testnet_or_dev_only`] flag MUST be `Some(true)`
+    /// for any 11b.1 producer.
+    Stage11bOnnxReference,
+    /// Stage 11c (planned) — production ezkl ONNX prover. Mainnet
+    /// eligibility deferred to Stage 11c's plan + chain-team review.
+    Ezkl,
+    /// Stage 11d (planned) — GGUF-compatible proof strategy chosen at
+    /// Stage 11d planning time. **No proof readiness claim today.**
+    GgufStrategyTbd,
+}
+
+/// Stage 11b.0 — the mainnet allowlist of proof systems whose
+/// artifacts may even be considered for mainnet attestation. **Empty
+/// by design** at end of Stage 11b.0 and Stage 11b.1: no proof system
+/// shipped through 11b is mainnet-eligible. Stage 11c is the earliest
+/// stage that may add an entry, gated on chain-team review of the
+/// on-chain semantics.
+///
+/// The `mainnet_allowlist_is_empty_at_stage_11b0` test pins this
+/// invariant.
+pub const MAINNET_APPROVED_PROOF_SYSTEMS: &[ProofSystem] = &[];
+
 // ── PublicInputs ────────────────────────────────────────────────────────────
 
 /// Inputs a proof commits to. Typed (not opaque `&[u8]`) per Stage 11a OQ3
@@ -99,6 +172,15 @@ pub struct PublicInputs {
 /// same inputs (same `(model, input, output)` ⇒ same proof bytes). Stage
 /// 11b may relax this if the chosen real backend has a salt / randomness
 /// parameter, but that's an explicit decision then.
+///
+/// Stage 11b.0 extends the trait with four self-describing methods so
+/// the off-chain verifier / mainnet refusal logic can route by
+/// `proof_system`, refuse by `model_format`, and enforce the
+/// "local-prover-only / no centralized service" architectural property.
+/// Three methods are **defaulted** for back-compat with Stage 11a
+/// implementations; [`ProofBackend::is_local_only`] is **required** so
+/// every new backend has to declare its decentralization stance
+/// explicitly — never by inheritance from a default.
 pub trait ProofBackend {
     /// Produce proof bytes binding `(model, input, output)`.
     fn prove(
@@ -112,6 +194,52 @@ pub trait ProofBackend {
     /// Recorded in [`ProofMetadata::backend_id`] so verifiers can pick the
     /// matching [`ProofVerifier`].
     fn backend_id(&self) -> &'static str;
+
+    /// Stage 11b.0 — what proof system this backend uses. Recorded in
+    /// [`ProofMetadata::proof_system`]; consumers route verification
+    /// through the matching [`ProofVerifier`] and the mainnet refusal
+    /// logic in [`check_mainnet_eligible`]. Defaults to
+    /// [`ProofSystem::Mock`] so any implementor that hasn't migrated
+    /// to Stage 11b.0 schema stays safely refused on mainnet.
+    fn proof_system(&self) -> ProofSystem {
+        ProofSystem::Mock
+    }
+
+    /// Stage 11b.0 — which model formats this backend can produce
+    /// proofs for. Callers MUST consult this list before invoking
+    /// [`ProofBackend::prove`] against bytes of a given format. An
+    /// empty slice (the default) means "format-agnostic" — the case
+    /// for [`MockProofBackend`], which operates on raw bytes without
+    /// caring about their semantic shape.
+    fn supported_formats(&self) -> &[ModelFormat] {
+        &[]
+    }
+
+    /// Stage 11b.0 — circuit / image identifier specific to this
+    /// backend's proof system. For ezkl this is the SHA of the
+    /// compiled circuit; for RISC Zero it would be the image id; for
+    /// the mock backend it's `None`. Recorded in
+    /// [`ProofMetadata::circuit_id_hex`].
+    fn circuit_id(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// Stage 11b.0 — **required, no default.** Returns `true` iff this
+    /// backend's prove path can run entirely on the operator's own
+    /// host without any hosted service / centralized API / vendor
+    /// dependency. Local CPU/GPU proving qualifies; anything that
+    /// requires Bonsai or a hosted prover service does not.
+    ///
+    /// The decentralized proof architecture (Stage 11b.0) requires
+    /// **all mainnet-eligible backends to return `true`**, enforced by
+    /// the [`check_mainnet_eligible`] refusal layer that consults
+    /// the backend registry. Backends that depend on hosted services
+    /// can still implement the trait — but they're hard-refused on
+    /// mainnet.
+    ///
+    /// No default — every implementor must declare. Defense in depth
+    /// against a future backend silently inheriting the wrong answer.
+    fn is_local_only(&self) -> bool;
 }
 
 // ── ProofVerifier ───────────────────────────────────────────────────────────
@@ -119,12 +247,24 @@ pub trait ProofBackend {
 /// Verifier companion of [`ProofBackend`]. Returns `Ok(true)` on a valid
 /// proof, `Ok(false)` on a structurally well-formed but failing proof, and
 /// a typed error only for backend-internal failures (parse, panic, runtime).
+///
+/// Stage 11b.0 — verifiers self-identify their [`ProofSystem`] so the
+/// off-chain verifier-routing logic (e.g., the `operator verify-proof`
+/// subcommand) can dispatch to the right impl by inspecting the proof
+/// artifact's [`ProofMetadata::proof_system`] field.
 pub trait ProofVerifier {
     fn verify(
         &self,
         proof: &[u8],
         public_inputs: &PublicInputs,
     ) -> std::result::Result<bool, ProofVerifierError>;
+
+    /// Stage 11b.0 — the proof system this verifier handles. Defaults
+    /// to [`ProofSystem::Mock`] for back-compat with Stage 11a
+    /// implementors; the [`MockProofVerifier`] overrides explicitly.
+    fn proof_system(&self) -> ProofSystem {
+        ProofSystem::Mock
+    }
 }
 
 // ── Mock backend / verifier ─────────────────────────────────────────────────
@@ -157,6 +297,35 @@ impl ProofBackend for MockProofBackend {
     fn backend_id(&self) -> &'static str {
         MOCK_BACKEND_ID
     }
+
+    /// Stage 11b.0: explicit. The mock backend's proof system is
+    /// `Mock`, which is hard-refused on mainnet by
+    /// [`check_mainnet_eligible`] layer 2.
+    fn proof_system(&self) -> ProofSystem {
+        ProofSystem::Mock
+    }
+
+    /// Stage 11b.0: format-agnostic — the mock operates on raw bytes
+    /// without caring about their semantic shape. The empty slice is
+    /// the correct declaration; consumers querying for ONNX or GGUF
+    /// support will see no match and route to a different backend.
+    fn supported_formats(&self) -> &[ModelFormat] {
+        &[]
+    }
+
+    /// Stage 11b.0: no circuit; the mock's "proof" is a fixed BLAKE3
+    /// chain with no compiled program behind it.
+    fn circuit_id(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// Stage 11b.0: local-only by definition — the mock runs purely
+    /// in-process with no network or hosted service. Declared
+    /// `true` for completeness; the mainnet refusal still fires at
+    /// layer 2 before this property is consulted.
+    fn is_local_only(&self) -> bool {
+        true
+    }
 }
 
 /// Companion verifier for [`MockProofBackend`]. Re-derives the deterministic
@@ -176,6 +345,13 @@ impl ProofVerifier for MockProofVerifier {
             &public_inputs.output_hash,
         );
         Ok(proof == expected.as_slice())
+    }
+
+    /// Stage 11b.0: matches [`MockProofBackend::proof_system`] so the
+    /// verifier-routing layer can dispatch by inspecting the proof
+    /// artifact's [`ProofMetadata::proof_system`] field.
+    fn proof_system(&self) -> ProofSystem {
+        ProofSystem::Mock
     }
 }
 
@@ -235,9 +411,92 @@ pub struct ProofMetadata {
     /// BLAKE3 hex of the response/output bytes (bare lowercase, 64 chars).
     /// Equal to [`omni_types::phase5::InferenceCommitment::response_hash`].
     pub response_hash: String,
+
+    // ── Stage 11b.0 additions (all optional + serde-skip-if-none) ─────
+    //
+    // Every field below uses `#[serde(skip_serializing_if = "Option::is_none",
+    // default)]` so artifacts produced by Stage 11a code that doesn't
+    // populate these fields serialize byte-identically. The Stage 11a
+    // `proof_pipeline_vectors.json` fixture stays byte-stable; the
+    // existing `stage11a_proof_pipeline_vectors_match_committed_fixture`
+    // test confirms.
+    /// Stage 11b.0: declared format of the model whose inference the
+    /// proof binds. `None` on Stage 11a-vintage artifacts produced by
+    /// [`MockProofBackend`]. Consulted by [`check_mainnet_eligible`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model_format: Option<ModelFormat>,
+
+    /// Stage 11b.0: declared proof system that produced the proof.
+    /// `None` is treated as [`ProofSystem::Mock`] by the mainnet
+    /// refusal layer — preserving Stage 11a's "mock-v1 hard-refused"
+    /// guarantee.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub proof_system: Option<ProofSystem>,
+
+    /// Stage 11b.0: 64-char lowercase hex of the backend's
+    /// `circuit_id`. Populated by backends that compile a circuit
+    /// (ezkl, RISC Zero); `None` for [`MockProofBackend`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub circuit_id_hex: Option<String>,
+
+    /// Stage 11b.0: hex of the public verification key the verifier
+    /// needs to check this proof. Populated by backends whose proof
+    /// systems require it (ezkl, Halo2, …); `None` for backends that
+    /// encode the verification key inside the proof bytes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub verification_key_hex: Option<String>,
+
+    /// Stage 11b.0: operator-supplied public inputs the proof binds,
+    /// in a backend-specific JSON shape. Each backend's crate
+    /// documents its expected schema; treated as opaque by the
+    /// refusal logic.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub public_inputs: Option<serde_json::Value>,
+
+    /// Stage 11b.0: explicit "this artifact is testnet/dev only;
+    /// reject on mainnet" flag. Producers MAY set this for hermetic
+    /// or bounded-reference proofs (Stage 11b.1's ONNX reference
+    /// backend will). [`check_mainnet_eligible`] refuses
+    /// `Some(true)` at refusal layer 1, regardless of any other
+    /// state. Note the flag is **opt-in**: `None` does NOT mean
+    /// "mainnet OK" — mainnet eligibility requires the proof system
+    /// to be in [`MAINNET_APPROVED_PROOF_SYSTEMS`] (empty at end of
+    /// Stage 11b).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub testnet_or_dev_only: Option<bool>,
 }
 
 impl ProofMetadata {
+    /// Stage 11a-compatible constructor. All Stage 11b.0 fields
+    /// default to `None`, which means the resulting JSON serializes
+    /// byte-identically to a pre-Stage-11b.0 artifact (every new
+    /// field uses `skip_serializing_if = "Option::is_none"`).
+    ///
+    /// Use this from any code that doesn't have a real backend
+    /// behind it yet — the mock backend's orchestrator path, the
+    /// Stage 11a hermetic fixture vectors, and any test that wants
+    /// to construct a "minimal Stage 11a metadata" without spelling
+    /// out six `None`s.
+    pub fn new_stage11a(
+        backend_id: String,
+        model_hash: String,
+        input_hash: String,
+        response_hash: String,
+    ) -> Self {
+        Self {
+            backend_id,
+            model_hash,
+            input_hash,
+            response_hash,
+            model_format: None,
+            proof_system: None,
+            circuit_id_hex: None,
+            verification_key_hex: None,
+            public_inputs: None,
+            testnet_or_dev_only: None,
+        }
+    }
+
     /// Decode the three hex hashes into the typed [`PublicInputs`] struct
     /// the verifier consumes. Returns a typed `ProofVerifierError` on any
     /// hex parse failure so verifier callers don't have to convert errors.
@@ -248,6 +507,180 @@ impl ProofMetadata {
             output_hash: decode_blake3_hex_lower("response_hash", &self.response_hash)?,
         })
     }
+}
+
+// ── Mainnet refusal (Stage 11b.0) ───────────────────────────────────────────
+
+/// Stage 11b.0 — typed reasons [`check_mainnet_eligible`] returns when
+/// a proof artifact's metadata is refused for mainnet attestation.
+///
+/// Each variant maps 1:1 to one of the six refusal layers documented
+/// in the function below. The operator binary wraps these into its own
+/// typed [`OperatorError`] variants (e.g.
+/// `OperatorError::MockBackendRefusedOnMainnet`,
+/// `OperatorError::GgufProofClaimRefusedOnMainnet`) so the
+/// operator-facing error wording stays consistent with the rest of
+/// the surface.
+///
+/// Implements `thiserror::Error` so the operator binary can
+/// `#[from]` it into its own enum cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MainnetRefusalReason {
+    /// Layer 1: artifact carries `testnet_or_dev_only: Some(true)`.
+    /// Fires before any other check so a developer who knows they're
+    /// producing a non-mainnet artifact gets a clear signal.
+    #[error(
+        "proof artifact is marked testnet/dev only (backend_id = {backend_id:?}); \
+         the producer explicitly disclaimed mainnet eligibility"
+    )]
+    TestnetOrDevOnly { backend_id: String },
+
+    /// Layer 2: proof_system is Mock (or absent — Stage 11a vintage).
+    /// Preserves Stage 11a's `MockBackendRefusedOnMainnet` guarantee.
+    #[error(
+        "proof artifact uses proof system {proof_system:?} (or none declared, treated as Mock); \
+         the mock backend is non-cryptographic and cannot be used for mainnet submission"
+    )]
+    MockBackend {
+        backend_id: String,
+        proof_system: Option<ProofSystem>,
+    },
+
+    /// Layer 3: proof_system is a bounded-reference variant
+    /// (currently `Stage11bOnnxReference`) — architecture-validation
+    /// fixtures only, never mainnet.
+    #[error(
+        "proof artifact uses bounded reference proof system {proof_system:?} \
+         (backend_id = {backend_id:?}); reference fixtures are for architecture \
+         validation only, not production attestation"
+    )]
+    BoundedReference {
+        backend_id: String,
+        proof_system: ProofSystem,
+    },
+
+    /// Layer 4: model_format = Gguf claim. No GGUF inference proof
+    /// backend is approved at any stage through Stage 11b.0;
+    /// declaration is honest but the claim is hard-refused.
+    #[error(
+        "proof artifact declares GGUF model_format with proof_system {proof_system:?} \
+         (backend_id = {backend_id:?}); no GGUF inference proof backend is approved — \
+         awaiting Stage 11d strategy + chain-team review"
+    )]
+    GgufClaim {
+        backend_id: String,
+        proof_system: Option<ProofSystem>,
+    },
+
+    /// Layer 5: model_format = Other(_) or None. Stringly-typed
+    /// formats are always refused on mainnet until promoted to a
+    /// first-class enum variant; absent format on a non-mock backend
+    /// is treated as the same refusal (you have to declare the
+    /// format to be considered).
+    #[error(
+        "proof artifact has model_format = {model_format:?} which is not a \
+         first-class approved format (backend_id = {backend_id:?})"
+    )]
+    UnknownModelFormat {
+        backend_id: String,
+        model_format: Option<ModelFormat>,
+    },
+
+    /// Layer 6: proof_system is not in
+    /// [`MAINNET_APPROVED_PROOF_SYSTEMS`]. **The allowlist is empty
+    /// at end of Stage 11b.0** — no proof system gets through this
+    /// gate yet.
+    #[error(
+        "proof system {proof_system:?} (backend_id = {backend_id:?}) is not in the \
+         mainnet allowlist; Stage 11b ships with the allowlist empty by design — \
+         mainnet eligibility is a Stage 11c+ deliverable with chain-team review"
+    )]
+    NotInMainnetAllowlist {
+        backend_id: String,
+        proof_system: ProofSystem,
+    },
+}
+
+/// Stage 11b.0 — canonical mainnet refusal check.
+///
+/// Six layered refusal checks, evaluated in order. The first match
+/// wins; the returned [`MainnetRefusalReason`] tells the caller
+/// exactly which layer fired. The operator binary maps these into
+/// its own typed `OperatorError` variants so operator-facing wording
+/// stays consistent.
+///
+/// **Stage 11b.0 invariant: no `(metadata)` argument returns
+/// `Ok(())`.** The mainnet allowlist
+/// [`MAINNET_APPROVED_PROOF_SYSTEMS`] is empty at end of Stage 11b.0,
+/// so layer 6 catches every proof system that escaped layers 1–5.
+/// This invariant is pinned by the
+/// `every_proof_system_is_refused_on_mainnet_at_stage_11b0` test.
+///
+/// Mainnet eligibility lands earliest in Stage 11c, with chain-team
+/// review. **No Stage 11b.0 / 11b.1 change should ever cause this
+/// function to return `Ok(())`.**
+pub fn check_mainnet_eligible(
+    meta: &ProofMetadata,
+) -> std::result::Result<(), MainnetRefusalReason> {
+    // Layer 1: explicit testnet/dev flag.
+    if meta.testnet_or_dev_only == Some(true) {
+        return Err(MainnetRefusalReason::TestnetOrDevOnly {
+            backend_id: meta.backend_id.clone(),
+        });
+    }
+
+    // Layer 2: mock-system refusal (Stage 11a guarantee, generalized).
+    // None is treated as Mock — Stage 11a artifacts didn't carry a
+    // proof_system field, and the only Stage 11a backend was the
+    // mock. Treating absence as Mock preserves the refusal contract.
+    match meta.proof_system {
+        Some(ProofSystem::Mock) | None => {
+            return Err(MainnetRefusalReason::MockBackend {
+                backend_id: meta.backend_id.clone(),
+                proof_system: meta.proof_system,
+            });
+        }
+        _ => {}
+    }
+
+    // Layer 3: bounded-reference / architecture-validation backends.
+    if matches!(meta.proof_system, Some(ProofSystem::Stage11bOnnxReference)) {
+        return Err(MainnetRefusalReason::BoundedReference {
+            backend_id: meta.backend_id.clone(),
+            proof_system: meta.proof_system.unwrap(),
+        });
+    }
+
+    // Layer 4: GGUF claims refused until Stage 11d ships an approved
+    // strategy.
+    if matches!(meta.model_format, Some(ModelFormat::Gguf)) {
+        return Err(MainnetRefusalReason::GgufClaim {
+            backend_id: meta.backend_id.clone(),
+            proof_system: meta.proof_system,
+        });
+    }
+
+    // Layer 5: Other(_) escape hatch + absent format on non-mock
+    // backends. Both refused — you have to declare a first-class
+    // approved format to be considered.
+    if matches!(meta.model_format, Some(ModelFormat::Other(_)) | None) {
+        return Err(MainnetRefusalReason::UnknownModelFormat {
+            backend_id: meta.backend_id.clone(),
+            model_format: meta.model_format.clone(),
+        });
+    }
+
+    // Layer 6: mainnet allowlist. EMPTY in Stage 11b.0. Stage 11c
+    // earliest may add an entry (with chain-team review).
+    let ps = meta.proof_system.unwrap();
+    if !MAINNET_APPROVED_PROOF_SYSTEMS.iter().any(|&s| s == ps) {
+        return Err(MainnetRefusalReason::NotInMainnetAllowlist {
+            backend_id: meta.backend_id.clone(),
+            proof_system: ps,
+        });
+    }
+
+    Ok(())
 }
 
 /// The canonical-JSON envelope written to the proof file before SNIP V2
@@ -350,13 +783,18 @@ where
     let proof_bytes =
         backend.prove(inputs.model_bytes, inputs.input_bytes, inputs.output_bytes)?;
 
-    // 3. Assemble metadata + body.
-    let metadata = ProofMetadata {
-        backend_id: backend.backend_id().to_string(),
-        model_hash: model_hash.to_hex().to_string(),
-        input_hash: input_hash.to_hex().to_string(),
-        response_hash: response_hash.to_hex().to_string(),
-    };
+    // 3. Assemble metadata + body. Use the Stage-11a-compat
+    //    constructor so Stage 11b.0 schema fields default to None and
+    //    the resulting envelope JSON stays byte-identical against the
+    //    Stage 11a `proof_pipeline_vectors.json` fixture. Real
+    //    backends in Stage 11c+ will populate the new fields directly
+    //    via struct literal.
+    let metadata = ProofMetadata::new_stage11a(
+        backend.backend_id().to_string(),
+        model_hash.to_hex().to_string(),
+        input_hash.to_hex().to_string(),
+        response_hash.to_hex().to_string(),
+    );
     let body = ProofArtifactBody::from_components(metadata.clone(), &proof_bytes);
     let body_bytes = body.to_canonical_bytes()?;
 
@@ -603,12 +1041,12 @@ mod tests {
     #[test]
     fn proof_artifact_body_roundtrips_canonical_bytes() {
         let body = ProofArtifactBody::from_components(
-            ProofMetadata {
-                backend_id: "mock-v1".to_string(),
-                model_hash: blake3::hash(b"m").to_hex().to_string(),
-                input_hash: blake3::hash(b"i").to_hex().to_string(),
-                response_hash: blake3::hash(b"o").to_hex().to_string(),
-            },
+            ProofMetadata::new_stage11a(
+                "mock-v1".to_string(),
+                blake3::hash(b"m").to_hex().to_string(),
+                blake3::hash(b"i").to_hex().to_string(),
+                blake3::hash(b"o").to_hex().to_string(),
+            ),
             &[0x01, 0x02, 0xab, 0xcd],
         );
         let bytes = body.to_canonical_bytes().unwrap();
@@ -622,12 +1060,12 @@ mod tests {
 
     #[test]
     fn proof_metadata_public_inputs_decodes_hex() {
-        let metadata = ProofMetadata {
-            backend_id: "mock-v1".to_string(),
-            model_hash: blake3::hash(b"m").to_hex().to_string(),
-            input_hash: blake3::hash(b"i").to_hex().to_string(),
-            response_hash: blake3::hash(b"o").to_hex().to_string(),
-        };
+        let metadata = ProofMetadata::new_stage11a(
+            "mock-v1".to_string(),
+            blake3::hash(b"m").to_hex().to_string(),
+            blake3::hash(b"i").to_hex().to_string(),
+            blake3::hash(b"o").to_hex().to_string(),
+        );
         let pi = metadata.public_inputs().unwrap();
         assert_eq!(pi.model_hash, *blake3::hash(b"m").as_bytes());
         assert_eq!(pi.input_hash, *blake3::hash(b"i").as_bytes());
@@ -636,13 +1074,13 @@ mod tests {
 
     #[test]
     fn proof_metadata_public_inputs_rejects_uppercase_hex() {
-        let metadata = ProofMetadata {
-            backend_id: "mock-v1".to_string(),
+        let metadata = ProofMetadata::new_stage11a(
+            "mock-v1".to_string(),
             // Uppercase — must fail the bare-lowercase contract.
-            model_hash: blake3::hash(b"m").to_hex().to_string().to_uppercase(),
-            input_hash: blake3::hash(b"i").to_hex().to_string(),
-            response_hash: blake3::hash(b"o").to_hex().to_string(),
-        };
+            blake3::hash(b"m").to_hex().to_string().to_uppercase(),
+            blake3::hash(b"i").to_hex().to_string(),
+            blake3::hash(b"o").to_hex().to_string(),
+        );
         let err = metadata.public_inputs().unwrap_err();
         assert!(
             matches!(err, ProofVerifierError::VerifierInternal(ref s) if s.contains("uppercase")),
@@ -703,5 +1141,213 @@ mod tests {
         let recovered_proof = parsed.proof_bytes().unwrap();
         let pi = parsed.metadata.public_inputs().unwrap();
         assert_eq!(MockProofVerifier.verify(&recovered_proof, &pi).unwrap(), true);
+    }
+
+    // ── Stage 11b.0 — trait extensions + schema + mainnet refusal ──
+
+    #[test]
+    fn mock_backend_declares_local_only_and_mock_system() {
+        assert!(MockProofBackend.is_local_only());
+        assert_eq!(MockProofBackend.proof_system(), ProofSystem::Mock);
+        assert!(MockProofBackend.supported_formats().is_empty());
+        assert!(MockProofBackend.circuit_id().is_none());
+    }
+
+    #[test]
+    fn mock_verifier_declares_mock_system() {
+        assert_eq!(MockProofVerifier.proof_system(), ProofSystem::Mock);
+    }
+
+    #[test]
+    fn mainnet_allowlist_is_empty_at_stage_11b0() {
+        // Pinned invariant per Stage 11b.0 plan: no proof system is
+        // mainnet-eligible at the end of Stage 11b.0. Adding an entry
+        // here is a Stage 11c+ change subject to chain-team review.
+        assert!(
+            MAINNET_APPROVED_PROOF_SYSTEMS.is_empty(),
+            "MAINNET_APPROVED_PROOF_SYSTEMS must stay empty in Stage 11b — \
+             any addition requires chain-team review"
+        );
+    }
+
+    /// Stage 11b.0 invariant: every `ProofSystem` variant is refused
+    /// on mainnet at the end of Stage 11b.0. Walks the full enum and
+    /// asserts the refusal helper returns Err for each.
+    #[test]
+    fn every_proof_system_is_refused_on_mainnet_at_stage_11b0() {
+        for ps in [
+            ProofSystem::Mock,
+            ProofSystem::Stage11bOnnxReference,
+            ProofSystem::Ezkl,
+            ProofSystem::GgufStrategyTbd,
+        ] {
+            let meta = ProofMetadata {
+                backend_id: format!("test-backend-for-{ps:?}"),
+                model_hash: blake3::hash(b"m").to_hex().to_string(),
+                input_hash: blake3::hash(b"i").to_hex().to_string(),
+                response_hash: blake3::hash(b"o").to_hex().to_string(),
+                model_format: Some(ModelFormat::Onnx),
+                proof_system: Some(ps),
+                circuit_id_hex: None,
+                verification_key_hex: None,
+                public_inputs: None,
+                testnet_or_dev_only: None,
+            };
+            let err = check_mainnet_eligible(&meta).unwrap_err();
+            // The variant should be SOMETHING — we don't care which
+            // layer fires, only that *some* layer fires.
+            // Concretely: Mock → MockBackend, Stage11bOnnxReference →
+            // BoundedReference, Ezkl + GgufStrategyTbd → fall to
+            // NotInMainnetAllowlist (allowlist empty).
+            match (ps, &err) {
+                (ProofSystem::Mock, MainnetRefusalReason::MockBackend { .. }) => {}
+                (ProofSystem::Stage11bOnnxReference, MainnetRefusalReason::BoundedReference { .. }) => {}
+                (ProofSystem::Ezkl | ProofSystem::GgufStrategyTbd,
+                    MainnetRefusalReason::NotInMainnetAllowlist { .. }) => {}
+                _ => panic!("unexpected refusal for {ps:?}: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn refusal_layer_1_testnet_or_dev_flag_fires_first() {
+        // testnet_or_dev_only takes precedence over even the Mock
+        // refusal (layer 1 before layer 2).
+        let meta = ProofMetadata {
+            backend_id: "any".into(),
+            model_hash: blake3::hash(b"m").to_hex().to_string(),
+            input_hash: blake3::hash(b"i").to_hex().to_string(),
+            response_hash: blake3::hash(b"o").to_hex().to_string(),
+            model_format: Some(ModelFormat::Onnx),
+            proof_system: Some(ProofSystem::Mock),
+            circuit_id_hex: None,
+            verification_key_hex: None,
+            public_inputs: None,
+            testnet_or_dev_only: Some(true),
+        };
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(matches!(err, MainnetRefusalReason::TestnetOrDevOnly { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn refusal_layer_2_mock_or_absent_proof_system() {
+        // Absent proof_system is treated as Mock (Stage 11a vintage).
+        let meta = ProofMetadata::new_stage11a(
+            "stage11a-style".into(),
+            blake3::hash(b"m").to_hex().to_string(),
+            blake3::hash(b"i").to_hex().to_string(),
+            blake3::hash(b"o").to_hex().to_string(),
+        );
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(matches!(err, MainnetRefusalReason::MockBackend { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn refusal_layer_3_bounded_reference_system() {
+        let meta = ProofMetadata {
+            backend_id: "ezkl-onnx-reference-v1".into(),
+            model_hash: blake3::hash(b"m").to_hex().to_string(),
+            input_hash: blake3::hash(b"i").to_hex().to_string(),
+            response_hash: blake3::hash(b"o").to_hex().to_string(),
+            model_format: Some(ModelFormat::Onnx),
+            proof_system: Some(ProofSystem::Stage11bOnnxReference),
+            circuit_id_hex: None,
+            verification_key_hex: None,
+            public_inputs: None,
+            testnet_or_dev_only: None,
+        };
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(matches!(err, MainnetRefusalReason::BoundedReference { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn refusal_layer_4_gguf_format_claim() {
+        let meta = ProofMetadata {
+            backend_id: "any".into(),
+            model_hash: blake3::hash(b"m").to_hex().to_string(),
+            input_hash: blake3::hash(b"i").to_hex().to_string(),
+            response_hash: blake3::hash(b"o").to_hex().to_string(),
+            model_format: Some(ModelFormat::Gguf),
+            proof_system: Some(ProofSystem::Ezkl), // anything non-mock to pass layer 2
+            circuit_id_hex: None,
+            verification_key_hex: None,
+            public_inputs: None,
+            testnet_or_dev_only: None,
+        };
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(matches!(err, MainnetRefusalReason::GgufClaim { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn refusal_layer_5_other_or_unknown_model_format() {
+        // Other(_) refused.
+        let meta = ProofMetadata {
+            backend_id: "any".into(),
+            model_hash: blake3::hash(b"m").to_hex().to_string(),
+            input_hash: blake3::hash(b"i").to_hex().to_string(),
+            response_hash: blake3::hash(b"o").to_hex().to_string(),
+            model_format: Some(ModelFormat::Other("custom-format-v0".into())),
+            proof_system: Some(ProofSystem::Ezkl),
+            circuit_id_hex: None,
+            verification_key_hex: None,
+            public_inputs: None,
+            testnet_or_dev_only: None,
+        };
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(matches!(err, MainnetRefusalReason::UnknownModelFormat { .. }), "got {err:?}");
+
+        // Absent (None) format on a non-mock backend is the same refusal.
+        let meta_absent = ProofMetadata {
+            model_format: None,
+            ..meta
+        };
+        let err2 = check_mainnet_eligible(&meta_absent).unwrap_err();
+        assert!(matches!(err2, MainnetRefusalReason::UnknownModelFormat { .. }), "got {err2:?}");
+    }
+
+    #[test]
+    fn refusal_layer_6_not_in_empty_allowlist() {
+        // Non-mock, non-bounded, ONNX format → falls through to
+        // layer 6, refused because the allowlist is empty.
+        let meta = ProofMetadata {
+            backend_id: "ezkl-onnx-prod-future".into(),
+            model_hash: blake3::hash(b"m").to_hex().to_string(),
+            input_hash: blake3::hash(b"i").to_hex().to_string(),
+            response_hash: blake3::hash(b"o").to_hex().to_string(),
+            model_format: Some(ModelFormat::Onnx),
+            proof_system: Some(ProofSystem::Ezkl),
+            circuit_id_hex: None,
+            verification_key_hex: None,
+            public_inputs: None,
+            testnet_or_dev_only: None,
+        };
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(matches!(err, MainnetRefusalReason::NotInMainnetAllowlist { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn stage11a_compat_metadata_serializes_without_stage11b_fields() {
+        // The Stage 11a compat constructor must produce JSON that
+        // omits all Stage 11b.0 optional fields when None — this is
+        // what keeps `proof_pipeline_vectors.json` byte-stable.
+        let meta = ProofMetadata::new_stage11a(
+            "mock-v1".into(),
+            "00".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+        );
+        let s = serde_json::to_string(&meta).unwrap();
+        assert!(!s.contains("model_format"),
+                "Stage 11a-compat must not emit model_format: {s}");
+        assert!(!s.contains("proof_system"),
+                "Stage 11a-compat must not emit proof_system: {s}");
+        assert!(!s.contains("circuit_id_hex"),
+                "Stage 11a-compat must not emit circuit_id_hex: {s}");
+        assert!(!s.contains("verification_key_hex"),
+                "Stage 11a-compat must not emit verification_key_hex: {s}");
+        assert!(!s.contains("public_inputs"),
+                "Stage 11a-compat must not emit public_inputs: {s}");
+        assert!(!s.contains("testnet_or_dev_only"),
+                "Stage 11a-compat must not emit testnet_or_dev_only: {s}");
     }
 }

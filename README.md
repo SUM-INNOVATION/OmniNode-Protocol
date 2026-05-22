@@ -113,8 +113,11 @@ operator runbook.
 | **Phase 5 Stage 10a** — Operator observability + release readiness: `operator registry summary`, stable `event=` log markers, failure-triage matrix, release-readiness checklist (docs-only) | `omni-node`, `docs/operator-runbook.md` | **Complete** |
 | **Phase 5 Stage 11a** — Real zkML proof generation integration (trait + hermetic fixture harness): `ProofBackend` / `ProofVerifier` traits, `MockProofBackend` (mainnet-refused), `ProofMetadata` committed inside SNIP V2 proof artifact, end-to-end fixture pipeline, `build_mock_v1_attestation` replaces placeholder synthetic path | `omni-zkml`, `omni-node`, `.github/workflows` | **Complete** |
 | Phase 5 Stage 10b — Release artifact workflow + signing (deferred from 10a) | `.github/workflows`, `docs/` | Planned |
-| Phase 5 Stage 11b — Real proof backend integration (ezkl / risc0 / sp1) replacing `mock-v1`; mainnet-eligible | `omni-zkml`, `Cargo.toml` | Planned |
-| Phase 5 Stage 8+ — SUM Chain Tokenomics (staking / slashing / disputes / chain-side proof verification) | `contracts/` | Planned |
+| **Phase 5 Stage 11b.0** — Decentralized proof architecture: multi-backend trait extensions, `ModelFormat` / `ProofSystem` enums, expanded `ProofMetadata` schema (6 new optional fields, serde-skipped — Stage 11a fixture byte-stable), six-layer `check_mainnet_eligible` refusal helper (allowlist empty by design), read-only `operator verify-proof` subcommand. **Zero mainnet eligibility, zero new prover deps, zero chain-wire changes, no zkML claim.** | `omni-zkml`, `omni-node`, `docs/operator-runbook.md` | **Complete** |
+| Phase 5 Stage 11b.1 — Bounded ONNX reference proof backend + fixture (testnet/dev only; not mainnet, not production zkML) | `crates/omni-proofs-ezkl-reference/` (new), `.github/workflows` | Planned |
+| Phase 5 Stage 11c — Production ezkl ONNX prover for real (small) inference networks; first chain-team-reviewed mainnet allowlist entry | `omni-zkml`, `Cargo.toml`, `contracts/` review | Planned |
+| Phase 5 Stage 11d — GGUF-compatible proof strategy (shadow-verifier / partial-inference / replay-based); none of these prove full transformer correctness | `omni-zkml`, `omni-pipeline` integration | Planned |
+| Phase 5 Stage 8+ — SUM Chain Tokenomics (staking / slashing / disputes / chain-side proof verification) — **gated on Stage 11c + chain-team review** | `contracts/` | Planned |
 
 ---
 
@@ -1742,6 +1745,112 @@ Regen via `OMNINODE_REGEN_PROOF_PIPELINE_VECTORS=1`. Verify-by-default. A drift 
 - **No `--proof-backend` CLI flag.** Stage 11a ships only one backend (`mock-v1`); a flag with one accepted value would be pure scaffold. Stage 11b adds the flag when there's more than one option.
 - **No `docs/mainnet-smoke-audit.md` or `docs/phase5-rc-audit.md` edits** (both immutable).
 - **No edits to `omni-types` / `omni-store` / `omni-net` / `omni-pipeline` / `omni-bridge` / `python/omninode`.**
+
+> **Stage 11b.0 framing correction.** Stage 11a's "Real zkML proof generation integration" header above is the historical commit description and is preserved as the milestone record. The corrected Stage 11b scope framing is **"decentralized proof architecture"** — not "production zkML" and not "decentralized compute readiness." The bounded MockProofBackend Stage 11a ships proves *a deterministic BLAKE3 chain over hashes of inputs*, not the operator's ML inference. See the Stage 11b.0 section below for the load-bearing scope clarification, the new typed `ProofSystem` enum, and the conservative mainnet-refusal layers.
+
+---
+
+### Phase 5 Stage 11b.0: Decentralized Proof Architecture — Complete
+
+**Crates touched:** [`crates/omni-zkml/src/proof.rs`](crates/omni-zkml/src/proof.rs) (trait extensions, `ModelFormat` + `ProofSystem` enums, `MainnetRefusalReason`, `check_mainnet_eligible`, 11 new unit tests), [`crates/omni-zkml/src/lib.rs`](crates/omni-zkml/src/lib.rs) (re-exports), [`crates/omni-node/src/operator.rs`](crates/omni-node/src/operator.rs) (6 new typed `OperatorError` variants, `OperatorCmd::VerifyProof` subcommand on default build, `map_mainnet_refusal` helper, 6 new tests), runbook (§6a, §11a, §11c, §13, §14 updates), README. | **Depends on:** Stage 11a (PR #6 merged at `34d1bb8`). | **Zero protocol changes, zero new chain RPCs, Stage 6 chain-wire + fixture byte-stable, Stage 11a `proof_pipeline_vectors.json` byte-identical.**
+
+This stage replaces the misleading "production zkML" framing of the Stage 11a single-backend swap-in with an honest **proof architecture**:
+
+**1. Chain Compatibility Contract — hard constraint, enforced by code + CI:**
+- [`crates/omni-zkml/src/chain_wire.rs`](crates/omni-zkml/src/chain_wire.rs) and [Stage 6 fixture](crates/omni-zkml/tests/fixtures/chain_attestation_vectors.json): untouched (CI `stage6-fixture-check` gates).
+- [`crates/omni-sumchain/src/tx.rs`](crates/omni-sumchain/src/tx.rs) and [`outer_sign.rs`](crates/omni-sumchain/src/outer_sign.rs): untouched.
+- No new SUM Chain RPCs.
+- All Stage 11b.0 proof-system metadata lives inside the SNIP V2 proof artifact (the canonical `ProofArtifactBody` JSON committed by the existing `proof_snip_root`). **The chain payload is byte-identical to Stage 7b.**
+- Chain-side verification and tokenomics are Stage 12+ and require separate approval.
+
+**2. Multi-backend trait extensions ([`omni-zkml`](crates/omni-zkml/src/proof.rs)):**
+
+The Stage 11a `ProofBackend` / `ProofVerifier` traits gain four new methods, three defaulted for back-compat and one required:
+
+| Method | Defaulted? | Purpose |
+|---|---|---|
+| `proof_system() -> ProofSystem` | yes (`Mock`) | Verifier-routing key; consulted by `check_mainnet_eligible`. |
+| `supported_formats() -> &[ModelFormat]` | yes (empty) | Format-aware adapter dispatch; the mock returns empty (format-agnostic). |
+| `circuit_id() -> Option<[u8; 32]>` | yes (`None`) | Compiled-circuit / image-id binding. |
+| `is_local_only() -> bool` | **no — required** | Decentralization invariant: every backend must explicitly declare. |
+
+`ProofVerifier` gains `proof_system()` to mirror the backend side.
+
+**3. Expanded `ProofMetadata` schema, with byte-stable serde:**
+
+Six new optional fields, every one declared `#[serde(skip_serializing_if = "Option::is_none", default)]`:
+
+- `model_format: Option<ModelFormat>` — `Onnx` | `Gguf` | `Other(String)`.
+- `proof_system: Option<ProofSystem>` — `Mock` | `Stage11bOnnxReference` | `Ezkl` | `GgufStrategyTbd`.
+- `circuit_id_hex: Option<String>` — 64-char lowercase hex.
+- `verification_key_hex: Option<String>` — for backends that need an explicit verification key.
+- `public_inputs: Option<serde_json::Value>` — backend-specific opaque shape.
+- `testnet_or_dev_only: Option<bool>` — explicit "this artifact is NOT mainnet-eligible" producer flag.
+
+The Stage 11a `proof_pipeline_vectors.json` fixture is **byte-identical** under this schema — every new field is absent on Stage 11a vintage artifacts, so the JSON serializes the same. A new `ProofMetadata::new_stage11a(...)` constructor is the canonical "Stage 11a-shape" factory; every existing call site uses it (verified by the `stage11a_compat_metadata_serializes_without_stage11b_fields` unit test).
+
+**4. `check_mainnet_eligible()` — six-layer conservative refusal:**
+
+| Layer | Refusal reason | Fires when |
+|---|---|---|
+| 1 | `TestnetOrDevOnly` | `testnet_or_dev_only == Some(true)` — producer explicitly disclaimed mainnet |
+| 2 | `MockBackend` | `proof_system ∈ {Mock, None}` — preserves Stage 11a's `MockBackendRefusedOnMainnet` guarantee |
+| 3 | `BoundedReference` | `proof_system == Stage11bOnnxReference` — reference fixtures never mainnet |
+| 4 | `GgufClaim` | `model_format == Gguf` — no GGUF inference proof backend is approved at any stage through Stage 11b.0 |
+| 5 | `UnknownModelFormat` | `model_format ∈ {Other(_), None}` (non-mock) — stringly-typed formats and absent formats refused |
+| 6 | `NotInMainnetAllowlist` | proof_system not in `MAINNET_APPROVED_PROOF_SYSTEMS` (the const slice) |
+
+**`MAINNET_APPROVED_PROOF_SYSTEMS` is empty by design at end of Stage 11b.0.** No proof system shipped through Stage 11b is mainnet-eligible. Mainnet eligibility lands earliest in Stage 11c, with chain-team review. The `mainnet_allowlist_is_empty_at_stage_11b0` and `every_proof_system_is_refused_on_mainnet_at_stage_11b0` tests pin this invariant.
+
+**5. `operator verify-proof` (new read-only subcommand, default build):**
+
+```bash
+omni-node operator verify-proof --proof-artifact ./some-proof.json
+```
+
+Output (every Stage 11b.0 artifact reports `mainnet_eligible=false`, since the allowlist is empty):
+
+```
+backend_id=mock-v1
+proof_system=none
+model_format=none
+verified=true
+mainnet_eligible=false
+mainnet_refusal=proof artifact uses proof system None (or none declared, treated as Mock); …
+```
+
+Available on default builds (no `--features submit` required). Stage 11b.0 registers only `MockProofVerifier` in the lookup table; other proof systems return the typed `OperatorError::NoVerifierForProofSystem` until backends land in Stage 11c+.
+
+**6. Six new typed `OperatorError` refusal variants** (in addition to Stage 11a's `MockBackendRefusedOnMainnet`, preserved): `TestnetOnlyProofRefusedOnMainnet`, `BoundedReferenceProofRefusedOnMainnet`, `GgufProofClaimRefusedOnMainnet`, `UnknownModelFormatRefusedOnMainnet`, `ProofSystemNotMainnetApproved`, `NoVerifierForProofSystem`. The `map_mainnet_refusal` helper centralizes the 1:1 mapping between `omni_zkml::MainnetRefusalReason` variants and the operator's typed errors.
+
+**7. Decentralized proof architecture — naming + scope:**
+
+This stage is called **"decentralized proof architecture,"** never "decentralized compute readiness" or "production zkML." The criteria for the *readiness* claim are documented and explicitly unmet:
+
+- ✗ at least one non-mock backend (deferred to Stage 11b.1 → Stage 11c).
+- ✗ local prover reproducibility demonstrated (deferred).
+- ✗ verifier-only acceptance by independent nodes (architecture present; demonstration deferred).
+- ✗ clear mainnet semantics matching chain attestation (Stage 11c + chain-team review).
+
+Local proving is the only required path. **No Bonsai, no hosted prover dependency, no centralized service** in any Stage 11b.0 code path or documentation. Remote proving is not mentioned in the Stage 11b.0 codebase.
+
+**Tests:**
+- `cargo test -p omni-zkml`: **152 → 163** (+11 Stage 11b.0 tests: mock-backend trait declarations, mock-verifier declaration, `MAINNET_APPROVED_PROOF_SYSTEMS` emptiness, every-proof-system-refused, six refusal-layer cases, Stage 11a-compat serialization byte-stability).
+- `cargo test -p omni-node`: **43 → 47** (+4 verify-proof tests under default build).
+- `cargo test -p omni-node --features submit`: **58 → 64** (+6: 4 verify-proof + 2 map_mainnet_refusal coverage).
+- `cargo test -p omni-zkml --test proof_pipeline_vectors`: still **3/3** byte-stable — Stage 11a fixture verified intact.
+- Stage 6 byte-stability (`git diff 509f7fd..HEAD` on `chain_wire.rs` + the chain-attestation fixture): empty.
+
+**What Stage 11b.0 deliberately does not do:**
+- **No Stage 11b.1 work in this PR.** No `omni-proofs-ezkl-reference` crate. No ezkl dep. No bounded ONNX reference backend. No prover fixture regen workflow. Stage 11b.1 is a separate plan + PR.
+- **No mainnet allowlist additions.** The `MAINNET_APPROVED_PROOF_SYSTEMS` const slice stays empty.
+- **No public-API moves.** Stage 11a's `omni_zkml::ProofBackend`, `omni_zkml::ProofVerifier`, etc. stay where they are; the trait extensions are additive and back-compat for any Stage 11a implementor.
+- **No new heavy prover deps anywhere.**
+- **No new CI workflow jobs.** Stage 11b.0's checks are pure-Rust unit tests that run inside the existing `default-build-test` job. No `stage11b0-arch-check` shell job; the same invariants are pinned by `mainnet_allowlist_is_empty_at_stage_11b0`, `every_proof_system_is_refused_on_mainnet_at_stage_11b0`, and `stage11a_compat_metadata_serializes_without_stage11b_fields`.
+- **No "zkML" claim** on the bounded reference circuit (Stage 11b.1 deferred) or anywhere in 11b.0 documentation.
+- **No GGUF inference proof readiness claim.** Stage 11b.0 ships the *refusal* infrastructure for GGUF — declaring `model_format = "gguf"` is honest, mainnet refuses the claim, and the runbook (§11c) documents the open menu of Stage 11d strategies.
+- **No edits to** [`docs/mainnet-smoke-audit.md`](docs/mainnet-smoke-audit.md) **or** [`docs/phase5-rc-audit.md`](docs/phase5-rc-audit.md) (both immutable).
+- **No edits to** `omni-types` / `omni-store` / `omni-net` / `omni-pipeline` / `omni-bridge` / `python/omninode` **source.**
 
 ---
 

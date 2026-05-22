@@ -192,12 +192,16 @@ fn compute_vector(input: &Input) -> Stage11aVector {
         .expect("MockProofBackend is infallible");
 
     // 3. Canonical ProofArtifactBody envelope → BLAKE3 = proof_snip_root.
-    let metadata = ProofMetadata {
-        backend_id: MockProofBackend.backend_id().to_string(),
-        model_hash: model_hash_hex.clone(),
-        input_hash: input_hash_hex.clone(),
-        response_hash: response_hash_hex.clone(),
-    };
+    //    Stage 11b.0: use the Stage-11a-compat constructor so the
+    //    envelope JSON stays byte-identical against the committed
+    //    `proof_pipeline_vectors.json` fixture (every new optional
+    //    field uses `serde(skip_if_none)` + defaults to None).
+    let metadata = ProofMetadata::new_stage11a(
+        MockProofBackend.backend_id().to_string(),
+        model_hash_hex.clone(),
+        input_hash_hex.clone(),
+        response_hash_hex.clone(),
+    );
     let body = ProofArtifactBody::from_components(metadata, &proof_bytes);
     let body_bytes = body
         .to_canonical_bytes()
