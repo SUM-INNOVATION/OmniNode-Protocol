@@ -1,0 +1,11 @@
+{
+  "framework": "TensorFlow",
+  "framework_version": "TensorFlow 2.16.x (any recent stable; integer arithmetic only)",
+  "weights_hash": "e022245c1c8887bae4610b4198a023fc473da6a37b55bb4cc3cb63a4e7311bfe",
+  "input": [-5, 10, 20, -100],
+  "output": [32, -32, 17, 8],
+  "generated_at_utc": "2026-05-22T00:00:00Z",
+  "generated_by": "Stage 11b.1.a — developer host (no live export tool in repo yet)",
+  "generation_mode": "ManualFixture",
+  "notes": "TensorFlow can faithfully reproduce the canonical evaluator via explicit `tf.int16` / `tf.int32` integer arithmetic (avoiding `tf.quantization` higher-level machinery, which has its own rounding semantics). The Stage 11b.1.a manifest does NOT ship a live `tools/tensorflow_export.py` script. Values match the canonical evaluator by construction."
+}

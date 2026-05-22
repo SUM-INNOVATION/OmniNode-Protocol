@@ -1,0 +1,11 @@
+{
+  "framework": "Rumus",
+  "framework_version": "RUMUS (deferred — see notes; no live runtime in Stage 11b.1.a)",
+  "weights_hash": "e022245c1c8887bae4610b4198a023fc473da6a37b55bb4cc3cb63a4e7311bfe",
+  "input": [-5, 10, 20, -100],
+  "output": [32, -32, 17, 8],
+  "generated_at_utc": "2026-05-22T00:00:00Z",
+  "generated_by": "Stage 11b.1.a — IntendedRepresentation (RUMUS lacks deterministic CPU fixed-point integer-dense path)",
+  "generation_mode": "IntendedRepresentation",
+  "notes": "RUMUS fixture-only until RUMUS exposes deterministic CPU fixed-point / integer dense ops. The 2026-05-22 investigation found no int16 dtype path or deterministic fixed-point CPU runtime in the current RUMUS surface. This manifest documents what RUMUS SHOULD produce when those primitives land, computed from the canonical evaluator. The cross_framework_equivalence test treats this manifest identically to the others — the canonical evaluator is the single source of truth, and RUMUS will be validated against it once a live runtime path exists. Do NOT interpret this manifest as evidence that RUMUS has reproduced the canonical model today; it has not."
+}

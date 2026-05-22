@@ -407,12 +407,32 @@ directly. **No backend-specific helper logic in operator code** —
 that's the architectural property Stage 11b.0.1 locks in for every
 future backend.
 
-**Mainnet eligibility at end of Stage 11b.0: zero.** The mainnet
-allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in `omni-zkml`) is empty
-by design. Every proof artifact this command verifies will report
-`mainnet_eligible=false` and carry an explicit refusal reason from
-one of the six refusal layers documented in §11a. Mainnet
-eligibility is a Stage 11c+ deliverable with chain-team review.
+**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a: zero.**
+The mainnet allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in
+`omni-zkml`) is empty by design. Every proof artifact this command
+verifies will report `mainnet_eligible=false` and carry an explicit
+refusal reason from one of the six refusal layers documented in §11a.
+Mainnet eligibility is a Stage 11c+ deliverable with chain-team
+review.
+
+**Stage 11b.1.a — multi-framework architectural scaffold.** Adds the
+`ModelFramework` enum (Rumus / PyTorch / TensorFlow / Caffe /
+FrameworkAgnostic), `ModelFormat::Halo2ReferenceMlp`, and
+`ProofSystem::Stage11bHalo2Reference`. The new
+`crates/omni-proofs-halo2-reference/` ships a pure-Rust canonical
+evaluator for a bounded 4→8→4 int16 fixed-point MLP plus committed
+fixture manifests for all five framework variants. **No halo2
+circuit, no prover dependency, no operator-binary changes.** The
+canonical evaluator is the single source of truth; each framework's
+manifest must reproduce its output byte-for-byte (asserted by the
+`cross_framework_equivalence` integration test). RUMUS support is
+explicitly **fixture-only** (`generation_mode: "IntendedRepresentation"`)
+until RUMUS exposes a deterministic CPU fixed-point integer-dense
+path. **OmniNode does not invoke any framework runtime at any
+point** — framework manifests are committed JSON files, parsed by
+pure Rust. Layer 3 of `check_mainnet_eligible` now refuses both
+`Stage11bOnnxReference` AND `Stage11bHalo2Reference` (defense in
+depth alongside the testnet flag + empty allowlist).
 
 **Exit code: inspect/report, not strict-validator.** `verify-proof`
 exits `0` on a successful *inspection* run regardless of whether

@@ -3724,6 +3724,7 @@ mod tests {
             verification_key_hex: None,
             public_inputs: None,
             testnet_or_dev_only: None,
+            model_framework: None,
         };
         let body = omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes);
         let bytes = body.to_canonical_bytes().unwrap();
@@ -3754,6 +3755,7 @@ mod tests {
             verification_key_hex: None,
             public_inputs: None,
             testnet_or_dev_only: None,
+            model_framework: None,
         };
         let body = omni_zkml::ProofArtifactBody::from_components(metadata, &[0xab, 0xcd]);
         let bytes = body.to_canonical_bytes().unwrap();

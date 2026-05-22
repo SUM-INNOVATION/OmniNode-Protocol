@@ -9,6 +9,7 @@ members = [
     "crates/omni-zkml",
     "crates/omni-sumchain",
     "crates/omni-node",
+    "crates/omni-proofs-halo2-reference",
 ]
 
 [workspace.package]

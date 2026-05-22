@@ -1,0 +1,11 @@
+{
+  "framework": "FrameworkAgnostic",
+  "framework_version": "canonical-evaluator-v1 (crates/omni-proofs-halo2-reference)",
+  "weights_hash": "e022245c1c8887bae4610b4198a023fc473da6a37b55bb4cc3cb63a4e7311bfe",
+  "input": [-5, 10, 20, -100],
+  "output": [32, -32, 17, 8],
+  "generated_at_utc": "2026-05-22T00:00:00Z",
+  "generated_by": "Stage 11b.1.a canonical evaluator (crate root)",
+  "generation_mode": "LiveExport",
+  "notes": "FrameworkAgnostic = the canonical evaluator itself, which is the single source of truth. Other frameworks' manifests must reproduce this output byte-for-byte. weights_hash equals BLAKE3 of assets/canonical_spec.json (pinned by build.rs as EXPECTED_SPEC_HASH)."
+}

@@ -1,0 +1,39 @@
+[package]
+name             = "omni-proofs-halo2-reference"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Stage 11b.1.a: pure-Rust scaffold. No halo2 / prover dependencies
+# in this stage. The crate ships:
+#   * the canonical bounded-MLP spec (assets/canonical_spec.json)
+#   * the pure-Rust canonical_evaluate() reference implementation
+#   * canonical byte-encoding helpers
+#   * the FrameworkManifest schema + 5 committed fixture manifests
+#     (RUMUS / PyTorch / TensorFlow / Caffe / FrameworkAgnostic)
+#   * the cross-framework equivalence integration test
+#
+# Stage 11b.1.b will add `verify` and `prove` cargo features that
+# pull halo2_proofs (MIT-OR-Apache-2.0) and ship the actual circuit
+# implementation + verifier. **No halo2 dependency exists yet.**
+#
+# Default `cargo build` pulls zero heavy deps. Everything below is
+# pure-Rust crates.io with explicit compatible licensing.
+
+[features]
+default = []
+# Stage 11b.1.b will populate `verify` and `prove`. Placeholders
+# omitted for now — keeping the Cargo.toml minimal so 11b.1.a
+# doesn't leak heavy-dep intent into 11b.1.a's compile graph.
+
+[dependencies]
+omni-zkml  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+blake3     = { workspace = true }
+thiserror  = { workspace = true }
+
+[build-dependencies]
+blake3 = { workspace = true }

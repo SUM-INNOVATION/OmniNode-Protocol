@@ -2514,6 +2514,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-proofs-halo2-reference"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "omni-zkml",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "omni-store"
 version = "0.1.0"
 dependencies = [

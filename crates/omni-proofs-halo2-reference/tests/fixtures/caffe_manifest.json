@@ -1,0 +1,11 @@
+{
+  "framework": "Caffe",
+  "framework_version": "Caffe (legacy; ecosystem largely unmaintained as of 2026)",
+  "weights_hash": "e022245c1c8887bae4610b4198a023fc473da6a37b55bb4cc3cb63a4e7311bfe",
+  "input": [-5, 10, 20, -100],
+  "output": [32, -32, 17, 8],
+  "generated_at_utc": "2026-05-22T00:00:00Z",
+  "generated_by": "Stage 11b.1.a — developer host with a working legacy Caffe install (manual)",
+  "generation_mode": "ManualFixture",
+  "notes": "Caffe support is ManualFixture in Stage 11b.1.a. Caffe is a legacy framework whose Python bindings have suffered bit-rot in the 2026 ecosystem; no live `tools/caffe_export.py` ships. The intended workflow if a developer wants to reproduce: load `assets/canonical_spec.json`, construct an equivalent prototxt + caffemodel pair, run inference with `caffe.Net.forward` after quantizing to int16, and verify the output equals this manifest's `output` field. The committed values match the canonical evaluator by construction."
+}

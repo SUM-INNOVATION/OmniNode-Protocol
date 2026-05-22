@@ -1,0 +1,11 @@
+{
+  "framework": "PyTorch",
+  "framework_version": "PyTorch 2.4.x (any recent stable; integer arithmetic only)",
+  "weights_hash": "e022245c1c8887bae4610b4198a023fc473da6a37b55bb4cc3cb63a4e7311bfe",
+  "input": [-5, 10, 20, -100],
+  "output": [32, -32, 17, 8],
+  "generated_at_utc": "2026-05-22T00:00:00Z",
+  "generated_by": "Stage 11b.1.a — developer host (no live export tool in repo yet)",
+  "generation_mode": "ManualFixture",
+  "notes": "PyTorch can faithfully reproduce the canonical evaluator's int16 fixed-point arithmetic via explicit integer ops in `torch.int32` / `torch.int16` tensors. The canonical Stage 11b.1.a manifest carries the expected output but does NOT ship a live `tools/pytorch_export.py` script — that lands in a future stage if/when an automated regen workflow is desired. The values committed here equal the canonical evaluator's output by construction; the cross_framework_equivalence test asserts byte-for-byte match."
+}
