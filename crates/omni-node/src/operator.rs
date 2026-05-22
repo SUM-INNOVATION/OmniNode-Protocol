@@ -647,6 +647,21 @@ enum OperatorCmd {
     /// feature required). Stage 11b.0 ships only MockProofVerifier;
     /// other proof systems return NoVerifierForProofSystem until
     /// backends land in Stage 11c+.
+    ///
+    /// **Inspect/report semantics, not strict-validator semantics.**
+    /// Stage 11b.0 `verify-proof` exits `0` on a successful inspection
+    /// run *regardless of whether `verified` is `true` or `false`* —
+    /// the boolean is reported in stdout (`verified=...`,
+    /// `mainnet_eligible=...`) and as structured fields on the
+    /// `event="proof_verification"` tracing line. Operators consuming
+    /// this from scripts should grep the stdout or the tracing
+    /// stream, not check the exit code. The CLI exits non-zero only
+    /// on typed errors (`ProofArtifactRead`, `ProofArtifactParse`,
+    /// `NoVerifierForProofSystem`). **A "strict validator" exit code
+    /// where `verified=false` returns non-zero is a deferred UX
+    /// decision** for Stage 11c (when real backends land) or
+    /// Stage 10b (as part of release artifact tooling) — not a
+    /// behaviour change to make in Stage 11b.0.
     VerifyProof(VerifyProofArgs),
 }
 

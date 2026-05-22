@@ -401,6 +401,21 @@ by design. Every proof artifact this command verifies will report
 one of the six refusal layers documented in §11a. Mainnet
 eligibility is a Stage 11c+ deliverable with chain-team review.
 
+**Exit code: inspect/report, not strict-validator.** `verify-proof`
+exits `0` on a successful *inspection* run regardless of whether
+`verified=true` or `verified=false` — the boolean is the result
+being reported, not a pass/fail gate. Operators consuming this from
+scripts should grep stdout (e.g. `omni-node operator verify-proof
+--proof-artifact ./p.json | grep '^verified='`) or consume the
+structured `event="proof_verification"` tracing fields, not the
+exit code. The CLI exits non-zero only on typed errors —
+`ProofArtifactRead` (file unreadable), `ProofArtifactParse` (JSON
+malformed), `NoVerifierForProofSystem` (proof system has no
+registered verifier in Stage 11b.0). **A "strict validator" exit
+code where `verified=false` returns non-zero is a deferred UX
+decision** for Stage 11c (when real backends land) or Stage 10b
+(release-artifact tooling) — not a behaviour change for Stage 11b.0.
+
 ---
 
 **No mutating repair commands ship in Stage 9a/10a/11b.0.** The registry is
