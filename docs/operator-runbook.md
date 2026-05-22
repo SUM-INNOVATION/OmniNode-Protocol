@@ -359,7 +359,51 @@ for daily checks. `show` emits JSON for full-field inspection (including
 `digest`, `attestation`, `receipt`, `error_message`,
 `submitted_at_block`).
 
-**No mutating repair commands ship in Stage 9a/10a.** The registry is
+### 6a. `operator verify-proof` (Stage 11b.0, default build, read-only)
+
+A new default-build (no `--features submit` required) read-only
+subcommand inspects a proof artifact JSON and reports its mainnet
+eligibility. Part of the **decentralized proof architecture** —
+verification is universal, doesn't require a hosted service, runs on
+pure CPU, and is available to every operator from Stage 11b.0 onward.
+
+```bash
+# Read a ProofArtifactBody JSON and report:
+#   - backend_id / proof_system / model_format
+#   - whether the proof verifies under the registered ProofVerifier
+#   - mainnet eligibility (and refusal reason if refused)
+omni-node operator verify-proof --proof-artifact ./some-proof.json
+```
+
+Output is bare stdout, five or six lines (the sixth appears only when
+mainnet is refused — which is **every Stage 11b.0 artifact**, since
+the mainnet allowlist is empty by design):
+
+```
+backend_id=mock-v1
+proof_system=Mock
+model_format=none
+verified=true
+mainnet_eligible=false
+mainnet_refusal=proof artifact uses proof system Some(Mock) ...
+```
+
+**Stage 11b.0 ships only `MockProofVerifier`.** Verifying an artifact
+whose `proof_system` is anything else (`Stage11bOnnxReference`,
+`Ezkl`, `GgufStrategyTbd`) returns the typed
+`OperatorError::NoVerifierForProofSystem` until backends land in
+Stage 11c+.
+
+**Mainnet eligibility at end of Stage 11b.0: zero.** The mainnet
+allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in `omni-zkml`) is empty
+by design. Every proof artifact this command verifies will report
+`mainnet_eligible=false` and carry an explicit refusal reason from
+one of the six refusal layers documented in §11a. Mainnet
+eligibility is a Stage 11c+ deliverable with chain-team review.
+
+---
+
+**No mutating repair commands ship in Stage 9a/10a/11b.0.** The registry is
 durable across restarts; the lifecycle loop is the reconciliation
 path. If a record is genuinely corrupt on disk, copy it aside and
 let the operator team / chain team review — do not hand-edit JSON in
@@ -474,7 +518,13 @@ typed taxonomy for sub-conditions like fee/balance vs. transport.
 | `SmokeConfirmTimeout` | `OperatorError::SmokeConfirmTimeout { last_status }` | yes — typed error | if `last_status` was `Included`, finalization may just be slow; rerun smoke with the same registry (local idempotency reuses the tx hash) | `tx_hash`, `last_status`, `--confirm-timeout-secs` value used |
 | `SmokeInterrupted` | Ctrl-C during the smoke poll | yes — typed error | re-run the same `smoke` command; idempotency picks up the existing record | `tx_hash` (if submission completed before interrupt) |
 | `MainnetSubmitNotPermitted` | `--allow-submit` given on `chain_id 1` but `--allow-mainnet-submit` missing | yes — typed error | add `--allow-mainnet-submit`; this is an intentional double-gate, not a bug | (no escalation needed; operator-side correction) |
-| `MockBackendRefusedOnMainnet` (**Stage 11a**) | `OperatorError::MockBackendRefusedOnMainnet { backend_id }` — fires when the smoke `--synthetic` path is taken on `chain_id == 1`, even with `--allow-mainnet-submit` | yes — typed error, **before any submit RPC** | mainnet smoke requires a real attestation JSON (`--attestation-json`) produced off-binary by a real prover; the mock backend (`mock-v1`) is non-cryptographic by design and is hard-refused on mainnet | (no escalation needed; operator-side correction. If a real prover is available, use `--attestation-json` and re-run; if not, wait for Stage 11b's real backend) |
+| `MockBackendRefusedOnMainnet` (**Stage 11a**) | `OperatorError::MockBackendRefusedOnMainnet { backend_id }` — fires when the smoke `--synthetic` path is taken on `chain_id == 1`, even with `--allow-mainnet-submit` | yes — typed error, **before any submit RPC** | mainnet smoke requires a real attestation JSON (`--attestation-json`) produced off-binary by a real prover; the mock backend (`mock-v1`) is non-cryptographic by design and is hard-refused on mainnet | (no escalation needed; operator-side correction. If a real prover is available, use `--attestation-json` and re-run; if not, wait for Stage 11c's real backend) |
+| `TestnetOnlyProofRefusedOnMainnet` (**Stage 11b.0**) | proof artifact carries `testnet_or_dev_only: Some(true)` (refusal layer 1) | yes — typed error | the artifact's producer explicitly disclaimed mainnet eligibility; use a mainnet-approved producer | backend_id, producer source |
+| `BoundedReferenceProofRefusedOnMainnet` (**Stage 11b.0**) | proof_system is `Stage11bOnnxReference` (refusal layer 3) | yes — typed error | bounded reference fixtures are for architecture validation, not production; use a mainnet-approved producer (none ship at end of Stage 11b) | backend_id |
+| `GgufProofClaimRefusedOnMainnet` (**Stage 11b.0**) | `model_format == Gguf` (refusal layer 4) | yes — typed error | no GGUF inference proof backend is approved at any stage through Stage 11b.0; wait for Stage 11d strategy + chain-team review. **Declaring GGUF prevents silent fake-GGUF claims**, which is the point. | backend_id, model_hash |
+| `UnknownModelFormatRefusedOnMainnet` (**Stage 11b.0**) | `model_format = Other(_)` or absent on a non-mock backend (refusal layer 5) | yes — typed error | promote the format to a first-class enum variant via a chain-team-reviewed PR, or use an approved format | backend_id, model_format value |
+| `ProofSystemNotMainnetApproved` (**Stage 11b.0**) | proof_system not in `MAINNET_APPROVED_PROOF_SYSTEMS` (refusal layer 6) | yes — typed error | **Stage 11b.0 ships with this allowlist empty by design.** No proof system is mainnet-eligible until Stage 11c+ with chain-team review. | backend_id, proof_system |
+| `NoVerifierForProofSystem` (**Stage 11b.0**) | `operator verify-proof` was handed an artifact whose `proof_system` has no verifier registered | yes — typed error | Stage 11b.0 ships only `MockProofVerifier`; other proof systems are verifier-side stubs awaiting Stage 11c+ | proof_system |
 
 > **Known limitation flagged by Stage 10a.** [`ChainClientError`](../crates/omni-zkml/src/error.rs)
 > is currently the single-variant `Other(String)`. That is why several rows
@@ -483,6 +533,44 @@ typed taxonomy for sub-conditions like fee/balance vs. transport.
 > triage. Stage 10a deliberately does **not** add new error variants;
 > splitting `ChainClientError` into a typed taxonomy is a candidate for a
 > future stage if operator feedback shows the parsing burden is real.
+
+### 11c. GGUF proofs — what's possible today (Stage 11b.0)
+
+OmniNode's canonical model format today is **GGUF** (llama.cpp). Stage
+11b.0 ships the schema slot for declaring `model_format = "gguf"` on
+proof artifacts, but **no GGUF inference proof backend is approved at
+any stage through Stage 11b.0**.
+
+The honest framing — to be repeated wherever Stage 11b is described:
+
+- Full GGUF transformer inference proving is **not feasible** end-to-
+  end with any current production-ready proof system. This is an open
+  research problem.
+- Stage 11d will pick **one or more** of the following strategies and
+  document what each actually proves. None of them prove full
+  transformer inference correctness:
+  - **Shadow verifier circuit**: a small ONNX *verifier net* (provable
+    via the Stage 11c ezkl path) ingests `(model_hash, input_hash,
+    output_hash, derived features)` and outputs a binding. Proves the
+    verifier-net computation, not the GGUF inference itself.
+  - **Partial-inference proof**: a zkVM circuit re-executes a single
+    layer of the transformer (e.g., the final softmax) given hashed
+    intermediate state. Proves that the final emitted token follows
+    from the claimed intermediate activation.
+  - **Replay-based attestation**: K independent operators run the
+    same `(model, input)` and submit attestations; matching
+    `output_hash` values are treated as "K-replicated." This is a
+    **consensus** mechanism, not a proof system.
+- Until Stage 11d ships an approved strategy, **declaring
+  `model_format = "gguf"` on a proof artifact and attempting mainnet
+  submission is hard-refused** by Stage 11b.0's refusal layer 4
+  (`GgufProofClaimRefusedOnMainnet`). The refusal is the point — it
+  prevents silent fake-GGUF claims.
+
+This is the **decentralized proof architecture** — not "decentralized
+compute readiness." The criteria for the latter are documented in the
+Stage 11b.0 README section and **explicitly unmet** at end of Stage
+11b.0.
 
 ### 11b. Escalation packet
 
@@ -589,6 +677,7 @@ sudo install -m 0755 target/release/omni-node /usr/local/bin/omni-node
 | Show one record | `operator registry show --id <hex>` | no |
 | Counts-by-status summary | `operator registry summary` | no |
 | Summary + oldest-Submitted age | `operator registry summary --rpc-url ... --expect-chain-id ...` | no |
+| Verify a proof artifact + report mainnet eligibility | `operator verify-proof --proof-artifact <path>` | no |
 | Monitor-only loop | `operator loop` | no |
 | Submit one attestation | `operator smoke ... --allow-submit --allow-mainnet-submit` | **yes** |
 | Retry-enabled loop | `operator loop ... --allow-submit --allow-mainnet-submit` | **yes** |
@@ -600,6 +689,17 @@ the `registry summary` subcommand, stable `event=` log markers, the
 §11 failure-triage matrix, and the §14 release-readiness checklist
 below — also without touching protocol bytes or transaction
 construction.
+
+**Stage 11b.0 — decentralized proof architecture.** Adds the
+`ProofBackend` / `ProofVerifier` trait extensions, the `ModelFormat`
++ `ProofSystem` enums, the six-layer `check_mainnet_eligible` refusal
+helper, and the `operator verify-proof` read-only subcommand. **Stage
+11b.0 mainnet eligibility is intentionally zero** — the allowlist
+ships empty, and every proof artifact `verify-proof` inspects will
+report `mainnet_eligible=false`. This is **architecture**, not
+production zkML; the criteria for "decentralized compute readiness"
+are explicitly unmet at end of Stage 11b. See §11c for the honest
+GGUF-proofs framing.
 
 ---
 
