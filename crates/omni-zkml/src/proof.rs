@@ -259,6 +259,41 @@ pub trait ProofVerifier {
         public_inputs: &PublicInputs,
     ) -> std::result::Result<bool, ProofVerifierError>;
 
+    /// Stage 11b.0.1 — canonical dispatch entry point for verifying a
+    /// full [`ProofArtifactBody`]. This is what `operator verify-proof`
+    /// (and any other artifact-level consumer) calls uniformly across
+    /// every backend. **Defaulted** to call
+    /// [`Self::verify`] with the artifact's
+    /// proof bytes and hashed [`PublicInputs`], so Stage 11a-shape
+    /// verifiers that only consume the three hashes (the mock backend,
+    /// and any future hash-only verifier) inherit the right behaviour
+    /// automatically.
+    ///
+    /// Backends whose proof system needs backend-specific public
+    /// inputs from [`ProofMetadata::public_inputs`] (the optional
+    /// JSON-shaped field added in Stage 11b.0) **override this
+    /// method**, validate the public-inputs schema themselves, run
+    /// their proof-system-specific verify, and still cross-check the
+    /// universal hashed `PublicInputs` via
+    /// `body.metadata.public_inputs()` (the method on [`ProofMetadata`]
+    /// that decodes the three hex hashes — distinct from the
+    /// optional JSON field of the same name).
+    ///
+    /// This is the **single dispatch point** the operator binary uses;
+    /// no operator-side per-backend helper calls. Future backends
+    /// (Stage 11c+) plug into the dispatch loop by implementing
+    /// `verify_artifact` and adding one match arm in
+    /// `verify_proof_core` — they do not introduce backend-specific
+    /// helper methods on the operator side.
+    fn verify_artifact(
+        &self,
+        body: &ProofArtifactBody,
+    ) -> std::result::Result<bool, ProofVerifierError> {
+        let proof = body.proof_bytes()?;
+        let public_inputs = body.metadata.public_inputs()?;
+        self.verify(&proof, &public_inputs)
+    }
+
     /// Stage 11b.0 — the proof system this verifier handles. Defaults
     /// to [`ProofSystem::Mock`] for back-compat with Stage 11a
     /// implementors; the [`MockProofVerifier`] overrides explicitly.
@@ -1349,5 +1384,95 @@ mod tests {
                 "Stage 11a-compat must not emit public_inputs: {s}");
         assert!(!s.contains("testnet_or_dev_only"),
                 "Stage 11a-compat must not emit testnet_or_dev_only: {s}");
+    }
+
+    // ── Stage 11b.0.1 — ProofVerifier::verify_artifact ─────────────────
+
+    /// Construct a Stage 11a-style mock body for use by the
+    /// `verify_artifact` tests below. Same shape the Stage 11a
+    /// `produce_proof_artifact` orchestrator would emit.
+    fn mock_artifact_body() -> ProofArtifactBody {
+        let proof_bytes = MockProofBackend
+            .prove(b"vm", b"vi", b"vo")
+            .expect("mock backend infallible");
+        let metadata = ProofMetadata::new_stage11a(
+            MOCK_BACKEND_ID.to_string(),
+            blake3::hash(b"vm").to_hex().to_string(),
+            blake3::hash(b"vi").to_hex().to_string(),
+            blake3::hash(b"vo").to_hex().to_string(),
+        );
+        ProofArtifactBody::from_components(metadata, &proof_bytes)
+    }
+
+    #[test]
+    fn mock_verifier_verify_artifact_default_delegates_to_verify() {
+        // The default `verify_artifact` impl on `ProofVerifier` must
+        // produce the same result as calling `verify(&proof, &pi)`
+        // directly. Pins the back-compat contract: any Stage 11a-shape
+        // verifier that didn't override `verify_artifact` gets the
+        // right behaviour for free.
+        let body = mock_artifact_body();
+
+        // Direct path (Stage 11a-style call).
+        let proof = body.proof_bytes().unwrap();
+        let pi = body.metadata.public_inputs().unwrap();
+        let direct = MockProofVerifier.verify(&proof, &pi).unwrap();
+
+        // Stage 11b.0.1 canonical dispatch path.
+        let via_artifact = MockProofVerifier.verify_artifact(&body).unwrap();
+
+        assert_eq!(direct, via_artifact);
+        assert!(via_artifact, "mock proof must verify against canonical bytes");
+    }
+
+    #[test]
+    fn default_verify_artifact_rejects_tampered_proof() {
+        // Defense in depth: even though tampering is detected by the
+        // underlying `verify` for the mock backend, this test pins
+        // that the default `verify_artifact` dispatch surfaces the
+        // rejection. A regression that bypasses `verify` somewhere
+        // in the default impl would fail here.
+        let mut body = mock_artifact_body();
+        // Flip a single bit in the embedded proof hex.
+        let first_char = body.proof_bytes_hex.chars().next().unwrap();
+        let flipped = if first_char == '0' { '1' } else { '0' };
+        body.proof_bytes_hex = format!("{flipped}{}", &body.proof_bytes_hex[1..]);
+
+        let verified = MockProofVerifier.verify_artifact(&body).unwrap();
+        assert!(!verified, "tampered proof must NOT verify");
+    }
+
+    /// Hand-rolled minimal `ProofVerifier` impl that uses the
+    /// `verify_artifact` default (does NOT override it) and counts
+    /// how many times `verify` is called. Pins the architectural
+    /// property: the default `verify_artifact` ends up calling
+    /// `verify` exactly once with the artifact's bytes + hashed
+    /// inputs. A future "optimization" that skipped `verify` from
+    /// the default impl would break this assertion and surface the
+    /// contract change explicitly.
+    struct CountingVerifier {
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl ProofVerifier for CountingVerifier {
+        fn verify(
+            &self,
+            proof: &[u8],
+            public_inputs: &PublicInputs,
+        ) -> std::result::Result<bool, ProofVerifierError> {
+            self.calls.set(self.calls.get() + 1);
+            // Delegate to mock semantics so tampering still rejects.
+            MockProofVerifier.verify(proof, public_inputs)
+        }
+        // Inherits the default `verify_artifact`.
+    }
+
+    #[test]
+    fn default_verify_artifact_invokes_verify_exactly_once() {
+        let body = mock_artifact_body();
+        let v = CountingVerifier { calls: std::cell::Cell::new(0) };
+        let ok = v.verify_artifact(&body).unwrap();
+        assert!(ok);
+        assert_eq!(v.calls.get(), 1, "default verify_artifact must call verify exactly once");
     }
 }

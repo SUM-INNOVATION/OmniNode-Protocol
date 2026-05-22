@@ -641,12 +641,20 @@ enum OperatorCmd {
     DeriveAddress,
     /// Read-only: list / show records in a local attestation registry.
     Registry(RegistryArgs),
-    /// Stage 11b.0: read-only — parse a proof artifact JSON, look up
-    /// the matching verifier by proof_system, run verify, and report
-    /// mainnet eligibility. Default-build accessible (no submit
-    /// feature required). Stage 11b.0 ships only MockProofVerifier;
-    /// other proof systems return NoVerifierForProofSystem until
-    /// backends land in Stage 11c+.
+    /// Stage 11b.0 / 11b.0.1: read-only — parse a proof artifact
+    /// JSON, look up the matching verifier by proof_system, run
+    /// verify, and report mainnet eligibility. Default-build
+    /// accessible (no submit feature required). Stage 11b.0 ships
+    /// only MockProofVerifier; other proof systems return
+    /// NoVerifierForProofSystem until backends land in Stage 11c+.
+    ///
+    /// Stage 11b.0.1: dispatch goes through
+    /// [`omni_zkml::ProofVerifier::verify_artifact`], the
+    /// architecture-wide single entry point. Backends whose proof
+    /// systems need backend-specific public inputs override
+    /// `verify_artifact`; backends that work with the universal
+    /// hashed `PublicInputs` (Mock) inherit the defaulted impl.
+    /// No backend-specific helper calls in operator code.
     ///
     /// **Inspect/report semantics, not strict-validator semantics.**
     /// Stage 11b.0 `verify-proof` exits `0` on a successful inspection
@@ -1779,8 +1787,10 @@ fn map_mainnet_refusal(reason: omni_zkml::MainnetRefusalReason) -> OperatorError
     }
 }
 
-/// Stage 11b.0 — read a `ProofArtifactBody` JSON, route to the
-/// matching verifier by `proof_system`, run verify, and emit a
+/// Stage 11b.0 + Stage 11b.0.1 — read a `ProofArtifactBody` JSON,
+/// route to the matching verifier by `proof_system`, run verify via
+/// [`omni_zkml::ProofVerifier::verify_artifact`] (the
+/// architecture-wide single dispatch entry point), and emit a
 /// structured tracing event + bare-stdout summary. Read-only.
 /// Default-build accessible (no `--features submit` required).
 ///
@@ -1799,23 +1809,26 @@ async fn verify_proof_core(proof_artifact_path: PathBuf) -> Result<(), OperatorE
         let body: omni_zkml::ProofArtifactBody = serde_json::from_slice(&bytes)
             .map_err(|e| OperatorError::ProofArtifactParse(e.to_string()))?;
 
-        // Look up the verifier. Stage 11b.0 ships only MockProofVerifier;
-        // None proof_system is treated as Stage 11a vintage Mock.
+        // Stage 11b.0.1: uniform dispatch via `ProofVerifier::verify_artifact`.
+        // Every backend's verifier is invoked through the same single
+        // call shape; there is NO backend-specific helper logic in
+        // operator-side code. Future verifiers (Stage 11c+) plug in
+        // by adding one match arm here — they do not introduce
+        // operator-side per-backend dispatch code.
+        //
+        // The `MockProofVerifier` inherits the defaulted `verify_artifact`
+        // in [`omni_zkml::ProofVerifier`], which calls `self.verify(&proof,
+        // &public_inputs)` with the artifact's bytes + hashed
+        // PublicInputs — byte-equivalent to the pre-Stage-11b.0.1
+        // direct call.
+        //
+        // None proof_system is treated as Stage 11a vintage Mock
+        // (preserves the Stage 11a verification contract).
         let verify_result = match body.metadata.proof_system {
             Some(omni_zkml::ProofSystem::Mock) | None => {
-                let proof_bytes = body.proof_bytes().map_err(|e| {
-                    OperatorError::ProofArtifactParse(format!(
-                        "proof_bytes_hex decode failed: {e}"
-                    ))
-                })?;
-                let pi = body.metadata.public_inputs().map_err(|e| {
-                    OperatorError::ProofArtifactParse(format!(
-                        "public_inputs decode failed: {e}"
-                    ))
-                })?;
                 use omni_zkml::ProofVerifier;
                 omni_zkml::MockProofVerifier
-                    .verify(&proof_bytes, &pi)
+                    .verify_artifact(&body)
                     .map_err(|e| {
                         OperatorError::ProofArtifactParse(format!(
                             "verifier failure: {e}"
@@ -3681,6 +3694,46 @@ mod tests {
         // verify_proof_core prints to stdout + emits a tracing event.
         // We don't capture stdout here — the unit test for the
         // refusal-mapping helper covers the typed outcome side.
+    }
+
+    /// Stage 11b.0.1 — pins that the verify-proof dispatch routes
+    /// through `verify_artifact` correctly for BOTH the Stage 11a
+    /// vintage `proof_system: None` shape AND the explicit
+    /// `proof_system: Some(Mock)` shape. The dispatch arm matches
+    /// both via the `Some(Mock) | None` pattern; this test confirms
+    /// the explicit-Mock half works end-to-end.
+    #[tokio::test]
+    async fn verify_proof_accepts_explicit_mock_proof_system_artifact() {
+        use omni_zkml::ProofBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let proof_bytes = omni_zkml::MockProofBackend
+            .prove(b"em", b"ei", b"eo")
+            .unwrap();
+        // Build a Stage 11b.0-style metadata: proof_system set
+        // explicitly to Mock + model_format = Onnx (just to exercise
+        // a non-None metadata shape; the verifier itself only checks
+        // bytes against the hashed PublicInputs).
+        let metadata = omni_zkml::ProofMetadata {
+            backend_id: omni_zkml::MOCK_BACKEND_ID.to_string(),
+            model_hash: blake3::hash(b"em").to_hex().to_string(),
+            input_hash: blake3::hash(b"ei").to_hex().to_string(),
+            response_hash: blake3::hash(b"eo").to_hex().to_string(),
+            model_format: Some(omni_zkml::ModelFormat::Onnx),
+            proof_system: Some(omni_zkml::ProofSystem::Mock),
+            circuit_id_hex: None,
+            verification_key_hex: None,
+            public_inputs: None,
+            testnet_or_dev_only: None,
+        };
+        let body = omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes);
+        let bytes = body.to_canonical_bytes().unwrap();
+        let path = dir.path().join("explicit_mock_proof.json");
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Must dispatch through verify_artifact, verify successfully,
+        // and report mainnet-ineligible (refusal layer 2 fires on
+        // explicit Mock proof_system).
+        verify_proof_core(path).await.unwrap();
     }
 
     #[tokio::test]
