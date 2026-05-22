@@ -359,7 +359,7 @@ for daily checks. `show` emits JSON for full-field inspection (including
 `digest`, `attestation`, `receipt`, `error_message`,
 `submitted_at_block`).
 
-### 6a. `operator verify-proof` (Stage 11b.0, default build, read-only)
+### 6a. `operator verify-proof` (Stage 11b.0 + 11b.0.1, default build, read-only)
 
 A new default-build (no `--features submit` required) read-only
 subcommand inspects a proof artifact JSON and reports its mainnet
@@ -393,6 +393,19 @@ whose `proof_system` is anything else (`Stage11bOnnxReference`,
 `Ezkl`, `GgufStrategyTbd`) returns the typed
 `OperatorError::NoVerifierForProofSystem` until backends land in
 Stage 11c+.
+
+**Stage 11b.0.1 — single dispatch entry point.** `verify-proof`
+routes every artifact through `omni_zkml::ProofVerifier::verify_artifact(&body)`,
+a defaulted trait method that takes the full `ProofArtifactBody`.
+The default impl calls `self.verify(&proof, &public_inputs)` with
+the hashed `PublicInputs`, so `MockProofVerifier` (and any future
+Stage 11a-shape verifier) inherits the correct behaviour with zero
+extra code. Real backends whose proof systems need backend-specific
+public inputs (e.g., raw tensor values for a Stage 11c prover)
+override `verify_artifact` and read `body.metadata.public_inputs`
+directly. **No backend-specific helper logic in operator code** —
+that's the architectural property Stage 11b.0.1 locks in for every
+future backend.
 
 **Mainnet eligibility at end of Stage 11b.0: zero.** The mainnet
 allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in `omni-zkml`) is empty
