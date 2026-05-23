@@ -1,0 +1,116 @@
+# omni-proofs-halo2-reference
+
+**Stage 11b.1.a — bounded multi-framework halo2 reference scaffold (four equal primaries).**
+
+This crate ships the pure-Rust **architectural foundation** for the Stage 11b.1 halo2 reference backend. It is not a production zkML system; it is a deliberately bounded scaffold whose job is to:
+
+1. Define a **framework-neutral canonical bounded MLP** (4 → 8 → 4 with ReLU, int16 fixed-point) in `assets/canonical_spec.json`. The spec is the source of truth — no single framework is privileged.
+2. Ship a **pure-Rust canonical evaluator** (`src/canonical.rs`) as the **neutral reference implementation** the cross-framework test runs against. The Rust evaluator is **not** a fifth framework; it is the runnable Rust pin for the canonical spec.
+3. Ship the **`FrameworkManifest` schema** and committed fixture manifests for all five variants — RUMUS, PyTorch, TensorFlow, Caffe, and FrameworkAgnostic — proving cross-framework equivalence at test time without invoking any framework runtime.
+
+**RUMUS, PyTorch, TensorFlow, and Caffe are all equal-status primary compatibility targets.** Each has its own developer-host exporter under `tools/<framework>_export/`.
+
+**What does NOT ship in Stage 11b.1.a:**
+- No halo2 circuit, no halo2 dependency, no SNARK prover.
+- No `ProofBackend` / `ProofVerifier` implementations.
+- No operator-binary dispatch arm.
+- No framework runtime in the operator (PyTorch, TensorFlow, Caffe, RUMUS are not pulled in anywhere in the OmniNode workspace). The four exporters under `tools/` are excluded from the workspace.
+
+Stage 11b.1.b adds the halo2 circuit, the `Halo2ReferenceVerifier` (overriding `omni_zkml::ProofVerifier::verify_artifact`), the `omni-node` opt-in feature, the verifier-only CI gate, and the manual proof-regen workflow.
+
+## Crate layout
+
+```
+src/
+├── lib.rs       — module declarations + re-exports
+├── shared.rs    — constants + EXPECTED_SPEC_HASH (build.rs-emitted)
+├── canonical.rs — canonical_evaluate() — neutral reference implementation
+├── encoding.rs  — canonical byte encoding for i16 tensors
+└── manifest.rs  — FrameworkManifest schema (with spec_hash/input_hash/output_hash)
+
+tests/
+├── cross_framework_equivalence.rs — load all 5 manifests + assert canonical + hash match
+└── fixtures/
+    ├── framework_agnostic_manifest.json
+    ├── pytorch_manifest.json
+    ├── tensorflow_manifest.json
+    ├── caffe_manifest.json
+    └── rumus_manifest.json
+
+assets/
+└── canonical_spec.json — framework-neutral spec (architecture + weights + biases + quantization + canonical_evaluation)
+
+build.rs — compute BLAKE3 of canonical_spec.json at compile time
+```
+
+The four exporters live outside this crate, under the repo root's `tools/`:
+
+```
+tools/                        (excluded from the OmniNode workspace)
+├── rumus_export/             — standalone Cargo package (rumus = "0.4.0")
+├── pytorch_export/           — Python script (torch.int64 explicit)
+├── tensorflow_export/        — Python script (tf.int64 explicit)
+└── caffe_export/             — Python script (real Caffe or pure-NumPy fallback)
+```
+
+## Canonical numeric contract (frozen in `assets/canonical_spec.json`)
+
+- **Architecture:** Dense(4 → 8) → ReLU → Dense(8 → 4). No output activation.
+- **Dtype:** signed 16-bit integers throughout (`i16`).
+- **Accumulator:** widened `i64`.
+- **Scale:** `S = 256 = 2^8` (`scale_log2 = 8`). Logical real `r` maps to `q = round_half_away_from_zero(r * 256)` clamped to `[-32768, 32767]`.
+- **Dense layer arithmetic per output `j`:**
+  1. `acc_i64 = Σ_i (input[i] as i64) * (W[i][j] as i64)` — exact (i16 × i16 fits in i32, fanin bounded).
+  2. `with_bias_i64 = acc_i64 + (bias[j] as i64) << scale_log2` — **bias enters the widened scale² domain BEFORE requantization**.
+  3. `q_i64 = round_half_away_from_zero_div(with_bias_i64, scale_log2)` — nearest, ties round away from zero.
+  4. `output[j] = saturate_to_i16(q_i64)`.
+- **ReLU:** `max(0i16, x)`.
+- **Tensor encoding:** `[i16; 4]` → 8 bytes, little-endian, no header.
+
+These are bit-identical to RUMUS 0.4.0's `rumus::fixed::FixedLinear` + `rumus::fixed::requantize`.
+
+## Frozen canonical evaluation
+
+| Field | Value |
+|---|---|
+| `input` | `[-5, 10, 20, -100]` |
+| `hidden_pre_relu` | `[57, -17, -9, -23, 44, -3, -35, 6]` |
+| `hidden_after_relu` | `[57, 0, 0, 0, 44, 0, 0, 6]` |
+| `output` | `[33, -32, 17, 7]` |
+
+The `canonical_invariant_holds` test asserts `canonical_evaluate(input) == output`. The `every_framework_fixture_matches_canonical_evaluator` integration test asserts the same equivalence for each of the five framework manifests. The `all_manifests_share_identical_hashes` test asserts byte equality of `weights_hash` / `spec_hash` / `input_hash` / `output_hash` across all five manifests.
+
+## Framework exporters
+
+| Exporter | Path | Runtime | Generation mode |
+|---|---|---|---|
+| RUMUS | `tools/rumus_export/` (standalone Cargo pkg) | `rumus = "0.4.0"` via `fixed::FixedLinear` | `LiveExport` |
+| PyTorch | `tools/pytorch_export/` (Python) | `torch.int64` explicit | `LiveExport` |
+| TensorFlow | `tools/tensorflow_export/` (Python) | `tf.int64` explicit | `LiveExport` |
+| Caffe | `tools/caffe_export/` (Python) | real Caffe or pure-NumPy fallback | `LiveExport` or `PureNumpyCompatibility` |
+
+The Caffe fallback is explicit and auditable — the manifest records `generator_metadata.runtime_mode = "pure-numpy-emulation"` and `caffe_runtime_present = false` when the host lacks a real Caffe binding. The arithmetic is byte-identical to the spec in both modes.
+
+Exporters are **developer-host manual tools**; CI does not invoke them. The cross-framework equivalence integration test validates the committed manifests using pure Rust, with no framework runtime in the dep graph.
+
+## RUMUS status
+
+RUMUS 0.4.0 is on crates.io with `MIT OR Apache-2.0` and a first-class deterministic CPU FixedI16 path (`rumus::fixed::FixedLinear`, `rumus::fixed::requantize`). The `tools/rumus_export/` standalone Cargo package consumes it; its `verify-only` mode is the contract check that this exporter still reproduces the canonical bytes.
+
+`tools/rumus_export/` is intentionally outside the OmniNode workspace (root `Cargo.toml` declares `exclude = ["tools"]`) so `cargo build -p omni-node` cannot transitively pull `rumus` into the operator binary.
+
+If a future RUMUS version breaks the contract (the exporter fails compile or fails the round-trip), the right response is to **stop and report** — never silently downgrade the manifest to `IntendedRepresentation` to make CI pass.
+
+## Mainnet posture
+
+Stage 11b.1 artifacts (produced by Stage 11b.1.b's halo2 circuit) will carry `testnet_or_dev_only: Some(true)`. Three independent `omni_zkml::check_mainnet_eligible` refusal layers fire on mainnet:
+
+1. **Layer 1** — `testnet_or_dev_only: Some(true)` → `TestnetOrDevOnly`.
+2. **Layer 3** — `proof_system: Stage11bHalo2Reference` → `BoundedReference`.
+3. **Layer 6** — `MAINNET_APPROVED_PROOF_SYSTEMS` is empty → `NotInMainnetAllowlist`.
+
+**`MAINNET_APPROVED_PROOF_SYSTEMS` remains empty at end of Stage 11b.1 (a + b).** Mainnet eligibility is a Stage 11c+ deliverable with chain-team review.
+
+## License
+
+MIT OR Apache-2.0 (workspace inherited).

@@ -1,0 +1,20 @@
+{
+  "framework": "Caffe",
+  "framework_version": "Caffe (legacy; runtime-mode varies — see generator_metadata.runtime_mode)",
+  "weights_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
+  "input": [-5, 10, 20, -100],
+  "output": [33, -32, 17, 7],
+  "generated_at_utc": "2026-05-22T00:00:00Z",
+  "generated_by": "tools/caffe_export/caffe_export.py — developer-host manual script; defaults to real Caffe if available, falls back to pure-NumPy emulation otherwise. Not invoked by CI.",
+  "generation_mode": "PureNumpyCompatibility",
+  "spec_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
+  "input_hash": "200bd19925ebbafa7ed3869846d0571fb34bb25b4f74224045b0b6d590234e8d",
+  "output_hash": "130702c380646f9ca151c6d6bb2958ecc8675bcf55c5a5c0c37e66c89806728a",
+  "generator_metadata": {
+    "runtime_mode": "pure-numpy-emulation",
+    "caffe_runtime_present": false,
+    "regen_command": "python3 tools/caffe_export/caffe_export.py --regen",
+    "fallback_reason": "Caffe Python bindings are not installable on the 2026 macOS developer host; the exporter ran the canonical contract directly in NumPy. The arithmetic is byte-identical to the spec (deterministic, integer-only). The PureNumpyCompatibility generation_mode + this metadata block make the fallback auditable."
+  },
+  "notes": "Caffe support uses an auditable pure-NumPy fallback when the host lacks a working Caffe binding. When real Caffe is available, the exporter sets generation_mode = LiveExport, runtime_mode = caffe-runtime, and caffe_runtime_present = true. The manifest output is identical in both modes because the canonical arithmetic is deterministic; the manifest distinguishes them so a future audit can tell which path produced the committed bytes."
+}

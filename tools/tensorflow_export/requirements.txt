@@ -1,0 +1,4 @@
+# Stage 11b.1.a — TensorFlow canonical-spec exporter dependencies.
+tensorflow>=2.10,<3.0
+numpy>=1.24
+blake3>=0.3

@@ -96,10 +96,80 @@ pub enum ModelFormat {
     /// hidden — the architecture refuses the claim with a clear
     /// "no GGUF proof backend approved" message.
     Gguf,
+    /// Stage 11b.1: canonical bounded MLP described by a versioned
+    /// JSON spec (architecture + weights + biases + quantization
+    /// rules + canonical evaluation tuple). The model isn't
+    /// imported from an ONNX/GGUF file — it's defined directly by
+    /// the spec and reproduced by every framework's manifest in the
+    /// cross-framework equivalence fixtures. **Testnet/dev only**;
+    /// mainnet hard-refused via Stage 11b.0 refusal layers 1 + 3.
+    Halo2ReferenceMlp,
     /// Stringly-typed escape hatch for future formats. **Always
     /// refused on mainnet** unless and until promoted to a first-class
     /// enum variant with chain-team review.
     Other(String),
+}
+
+/// Stage 11b.1: ML framework that produced (or attested) a proof
+/// artifact. Independent of [`ModelFormat`] — a single framework can
+/// produce ONNX, GGUF, or a halo2-reference fixture; conversely, a
+/// halo2-reference fixture can be reproduced by multiple frameworks
+/// against the canonical spec. The pair `(model_framework,
+/// model_format)` is the full description of an artifact's lineage.
+///
+/// **Operator runtime never executes any of these frameworks.**
+/// Framework integration in Stage 11b.1.a / 11b.1.b is via committed
+/// fixture manifests (developer-host-only tools regenerate them).
+/// No PyTorch / TensorFlow / Caffe / RUMUS runtime appears in the
+/// operator binary, in default CI, or on any code path that runs
+/// during proof verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelFramework {
+    /// RUMUS. **Stage 11b.1.a status: equal-status primary
+    /// (LiveExport).** `rumus = "0.4.0"` ships a first-class
+    /// deterministic CPU FixedI16 integer-dense path
+    /// (`rumus::fixed::FixedLinear` + `rumus::fixed::requantize`)
+    /// implementing the canonical contract bit-identically. The
+    /// committed RUMUS manifest is the live output of
+    /// `tools/rumus_export/` — a standalone Cargo package
+    /// intentionally outside the OmniNode workspace
+    /// (root `Cargo.toml` declares `exclude = ["tools"]`) so the
+    /// operator-binary build graph cannot transitively reach
+    /// `rumus`.
+    Rumus,
+    /// PyTorch. **Stage 11b.1.a status: equal-status primary
+    /// (LiveExport).** Manifest produced by
+    /// `tools/pytorch_export/pytorch_export.py` via explicit
+    /// `torch.int64` integer arithmetic — no `torch.quantization`
+    /// / `torch.ao` APIs. Developer-host-only; never imported by
+    /// the operator binary or by default CI.
+    PyTorch,
+    /// TensorFlow. **Stage 11b.1.a status: equal-status primary
+    /// (LiveExport).** Manifest produced by
+    /// `tools/tensorflow_export/tensorflow_export.py` via explicit
+    /// `tf.int64` integer arithmetic — no `tf.quantization` /
+    /// `tf.lite` APIs. Developer-host-only.
+    TensorFlow,
+    /// Caffe. **Stage 11b.1.a status: equal-status primary.**
+    /// `tools/caffe_export/caffe_export.py` defaults to real
+    /// Caffe if importable (`generation_mode: LiveExport`,
+    /// `generator_metadata.runtime_mode: "caffe-runtime"`) and
+    /// otherwise falls back to an explicit, auditable pure-NumPy
+    /// emulation of the canonical contract
+    /// (`generation_mode: PureNumpyCompatibility`,
+    /// `generator_metadata.runtime_mode: "pure-numpy-emulation"`,
+    /// `caffe_runtime_present: false`). The output bytes are
+    /// byte-identical in both modes because the canonical
+    /// arithmetic is deterministic; the manifest distinguishes
+    /// them so the fallback is never silent.
+    Caffe,
+    /// Framework-agnostic — the framework-neutral canonical spec
+    /// JSON is the source of truth. The Rust canonical evaluator
+    /// is the neutral reference implementation (not a fifth
+    /// framework); the committed `framework_agnostic_manifest.json`
+    /// is a schema-coverage regression fixture with
+    /// `generation_mode: ManualFixture`.
+    FrameworkAgnostic,
 }
 
 /// Stage 11b.0 — declared proof system that produced a proof. Recorded
@@ -116,13 +186,29 @@ pub enum ProofSystem {
     /// Stage 11a — [`MockProofBackend`]. **Non-cryptographic; mainnet
     /// hard-refused.** Hermetic test scaffold only.
     Mock,
-    /// Stage 11b.1 (planned) — bounded ONNX reference proof backend
-    /// (e.g., a ~1k-param MLP via ezkl). Architecture-validation
-    /// fixture; **testnet/dev only, mainnet hard-refused.** Not
-    /// "production zkML" — the artifact's
-    /// [`ProofMetadata::testnet_or_dev_only`] flag MUST be `Some(true)`
-    /// for any 11b.1 producer.
+    /// Stage 11b.0 — bounded ONNX reference proof backend variant,
+    /// **preserved-unused.** The Stage 11b.0 schema shipped this
+    /// variant in anticipation of an ezkl-on-ONNX bounded backend;
+    /// the 2026-05-22 ezkl discovery spike found ezkl lacks an
+    /// explicit license grant (no `LICENSE` file at `v23.0.5`, no
+    /// `Cargo.toml` `license` field), so OmniNode does not depend
+    /// on it. Stage 11b.1 instead uses
+    /// [`ProofSystem::Stage11bHalo2Reference`] below. This variant
+    /// remains in the enum for back-compat (no Stage 11b.0 fixture
+    /// ever referenced it, but the schema slot is preserved so
+    /// removing it isn't a back-compat break either). **Refused on
+    /// mainnet** by [`check_mainnet_eligible`] layer 3, identical
+    /// to the new halo2 variant.
     Stage11bOnnxReference,
+    /// Stage 11b.1 — bounded halo2 reference proof backend (the
+    /// hand-rolled circuit lives in
+    /// `crates/omni-proofs-halo2-reference`, lands in Stage 11b.1.b).
+    /// Architecture-validation fixture; **testnet/dev only, mainnet
+    /// hard-refused.** The artifact's
+    /// [`ProofMetadata::testnet_or_dev_only`] flag MUST be `Some(true)`
+    /// for any 11b.1 producer; refusal layers 1 (testnet flag) and
+    /// 3 (bounded reference) both fire on mainnet.
+    Stage11bHalo2Reference,
     /// Stage 11c (planned) — production ezkl ONNX prover. Mainnet
     /// eligibility deferred to Stage 11c's plan + chain-team review.
     Ezkl,
@@ -490,8 +576,8 @@ pub struct ProofMetadata {
 
     /// Stage 11b.0: explicit "this artifact is testnet/dev only;
     /// reject on mainnet" flag. Producers MAY set this for hermetic
-    /// or bounded-reference proofs (Stage 11b.1's ONNX reference
-    /// backend will). [`check_mainnet_eligible`] refuses
+    /// or bounded-reference proofs (Stage 11b.1's halo2 reference
+    /// backend does). [`check_mainnet_eligible`] refuses
     /// `Some(true)` at refusal layer 1, regardless of any other
     /// state. Note the flag is **opt-in**: `None` does NOT mean
     /// "mainnet OK" — mainnet eligibility requires the proof system
@@ -499,6 +585,16 @@ pub struct ProofMetadata {
     /// Stage 11b).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub testnet_or_dev_only: Option<bool>,
+
+    /// Stage 11b.1.a: which ML framework produced (or attested) the
+    /// artifact. Independent of [`ModelFormat`] — a framework
+    /// describes the producer's runtime lineage, format describes
+    /// the on-disk shape. `FrameworkAgnostic` is the natural value
+    /// for the canonical halo2-reference artifact (the spec is
+    /// reproducible across frameworks). The operator runtime never
+    /// invokes any framework regardless of this field's value.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model_framework: Option<ModelFramework>,
 }
 
 impl ProofMetadata {
@@ -529,6 +625,7 @@ impl ProofMetadata {
             verification_key_hex: None,
             public_inputs: None,
             testnet_or_dev_only: None,
+            model_framework: None,
         }
     }
 
@@ -679,7 +776,13 @@ pub fn check_mainnet_eligible(
     }
 
     // Layer 3: bounded-reference / architecture-validation backends.
-    if matches!(meta.proof_system, Some(ProofSystem::Stage11bOnnxReference)) {
+    // Stage 11b.1.a expands this from `Stage11bOnnxReference` only to
+    // both Stage-11b reference variants — the halo2 reference is
+    // ALSO architecture-validation, not production.
+    if matches!(
+        meta.proof_system,
+        Some(ProofSystem::Stage11bOnnxReference) | Some(ProofSystem::Stage11bHalo2Reference)
+    ) {
         return Err(MainnetRefusalReason::BoundedReference {
             backend_id: meta.backend_id.clone(),
             proof_system: meta.proof_system.unwrap(),
@@ -1210,9 +1313,14 @@ mod tests {
     /// asserts the refusal helper returns Err for each.
     #[test]
     fn every_proof_system_is_refused_on_mainnet_at_stage_11b0() {
+        // Stage 11b.1.a expansion: walks the now-larger enum
+        // (Stage11bHalo2Reference added) and asserts every variant
+        // is still refused on mainnet. The expected refusal layer
+        // per variant is asserted concretely.
         for ps in [
             ProofSystem::Mock,
             ProofSystem::Stage11bOnnxReference,
+            ProofSystem::Stage11bHalo2Reference,
             ProofSystem::Ezkl,
             ProofSystem::GgufStrategyTbd,
         ] {
@@ -1227,18 +1335,22 @@ mod tests {
                 verification_key_hex: None,
                 public_inputs: None,
                 testnet_or_dev_only: None,
+                model_framework: None,
             };
             let err = check_mainnet_eligible(&meta).unwrap_err();
-            // The variant should be SOMETHING — we don't care which
-            // layer fires, only that *some* layer fires.
-            // Concretely: Mock → MockBackend, Stage11bOnnxReference →
-            // BoundedReference, Ezkl + GgufStrategyTbd → fall to
-            // NotInMainnetAllowlist (allowlist empty).
+            // Concretely: Mock → MockBackend,
+            //   Stage11bOnnxReference + Stage11bHalo2Reference → BoundedReference,
+            //   Ezkl + GgufStrategyTbd → NotInMainnetAllowlist (allowlist empty).
             match (ps, &err) {
                 (ProofSystem::Mock, MainnetRefusalReason::MockBackend { .. }) => {}
-                (ProofSystem::Stage11bOnnxReference, MainnetRefusalReason::BoundedReference { .. }) => {}
-                (ProofSystem::Ezkl | ProofSystem::GgufStrategyTbd,
-                    MainnetRefusalReason::NotInMainnetAllowlist { .. }) => {}
+                (
+                    ProofSystem::Stage11bOnnxReference | ProofSystem::Stage11bHalo2Reference,
+                    MainnetRefusalReason::BoundedReference { .. },
+                ) => {}
+                (
+                    ProofSystem::Ezkl | ProofSystem::GgufStrategyTbd,
+                    MainnetRefusalReason::NotInMainnetAllowlist { .. },
+                ) => {}
                 _ => panic!("unexpected refusal for {ps:?}: {err:?}"),
             }
         }
@@ -1259,6 +1371,7 @@ mod tests {
             verification_key_hex: None,
             public_inputs: None,
             testnet_or_dev_only: Some(true),
+            model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
         assert!(matches!(err, MainnetRefusalReason::TestnetOrDevOnly { .. }), "got {err:?}");
@@ -1290,6 +1403,7 @@ mod tests {
             verification_key_hex: None,
             public_inputs: None,
             testnet_or_dev_only: None,
+            model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
         assert!(matches!(err, MainnetRefusalReason::BoundedReference { .. }), "got {err:?}");
@@ -1308,6 +1422,7 @@ mod tests {
             verification_key_hex: None,
             public_inputs: None,
             testnet_or_dev_only: None,
+            model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
         assert!(matches!(err, MainnetRefusalReason::GgufClaim { .. }), "got {err:?}");
@@ -1327,6 +1442,7 @@ mod tests {
             verification_key_hex: None,
             public_inputs: None,
             testnet_or_dev_only: None,
+            model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
         assert!(matches!(err, MainnetRefusalReason::UnknownModelFormat { .. }), "got {err:?}");
@@ -1355,6 +1471,7 @@ mod tests {
             verification_key_hex: None,
             public_inputs: None,
             testnet_or_dev_only: None,
+            model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
         assert!(matches!(err, MainnetRefusalReason::NotInMainnetAllowlist { .. }), "got {err:?}");
@@ -1474,5 +1591,143 @@ mod tests {
         let ok = v.verify_artifact(&body).unwrap();
         assert!(ok);
         assert_eq!(v.calls.get(), 1, "default verify_artifact must call verify exactly once");
+    }
+
+    // ── Stage 11b.1.a — multi-framework schema additions ─────────────
+
+    #[test]
+    fn model_framework_variants_round_trip_via_json() {
+        // Every ModelFramework variant must serialize + deserialize
+        // byte-stable, since they appear in committed fixture
+        // manifests. Pins the surface for cross-framework fixtures.
+        for fw in [
+            ModelFramework::Rumus,
+            ModelFramework::PyTorch,
+            ModelFramework::TensorFlow,
+            ModelFramework::Caffe,
+            ModelFramework::FrameworkAgnostic,
+        ] {
+            let s = serde_json::to_string(&fw).unwrap();
+            let back: ModelFramework = serde_json::from_str(&s).unwrap();
+            assert_eq!(fw, back, "round-trip failed for {fw:?}");
+        }
+    }
+
+    #[test]
+    fn model_format_halo2_reference_mlp_round_trips() {
+        let mf = ModelFormat::Halo2ReferenceMlp;
+        let s = serde_json::to_string(&mf).unwrap();
+        assert_eq!(s, "\"Halo2ReferenceMlp\"");
+        let back: ModelFormat = serde_json::from_str(&s).unwrap();
+        assert_eq!(mf, back);
+    }
+
+    #[test]
+    fn proof_system_stage11b_halo2_reference_round_trips() {
+        let ps = ProofSystem::Stage11bHalo2Reference;
+        let s = serde_json::to_string(&ps).unwrap();
+        assert_eq!(s, "\"Stage11bHalo2Reference\"");
+        let back: ProofSystem = serde_json::from_str(&s).unwrap();
+        assert_eq!(ps, back);
+    }
+
+    #[test]
+    fn proof_metadata_with_model_framework_round_trips() {
+        // Stage 11b.1.a: model_framework is a new optional field. A
+        // metadata with `Some(...)` round-trips faithfully; with
+        // `None`, the field is omitted from JSON (the byte-stability
+        // contract for Stage 11a artifacts).
+        let mut meta = ProofMetadata::new_stage11a(
+            "test".into(),
+            blake3::hash(b"m").to_hex().to_string(),
+            blake3::hash(b"i").to_hex().to_string(),
+            blake3::hash(b"o").to_hex().to_string(),
+        );
+        // None case: must not appear in JSON.
+        let s_none = serde_json::to_string(&meta).unwrap();
+        assert!(!s_none.contains("model_framework"),
+                "model_framework must be skipped when None: {s_none}");
+
+        // Some case: round-trips with the framework name.
+        meta.model_framework = Some(ModelFramework::FrameworkAgnostic);
+        let s_some = serde_json::to_string(&meta).unwrap();
+        assert!(s_some.contains("FrameworkAgnostic"),
+                "model_framework must appear in JSON when Some: {s_some}");
+        let back: ProofMetadata = serde_json::from_str(&s_some).unwrap();
+        assert_eq!(back.model_framework, Some(ModelFramework::FrameworkAgnostic));
+    }
+
+    #[test]
+    fn refusal_layer_3_catches_stage11b_halo2_reference() {
+        // Stage 11b.1.a expansion: layer 3 now refuses both
+        // bounded-reference variants. The original Stage 11b.0
+        // variant Stage11bOnnxReference and the new Stage 11b.1
+        // variant Stage11bHalo2Reference must BOTH hit layer 3.
+        let mut meta = ProofMetadata::new_stage11a(
+            "halo2-reference-mlp-v1".into(),
+            blake3::hash(b"m").to_hex().to_string(),
+            blake3::hash(b"i").to_hex().to_string(),
+            blake3::hash(b"o").to_hex().to_string(),
+        );
+        meta.model_format = Some(ModelFormat::Halo2ReferenceMlp);
+        meta.proof_system = Some(ProofSystem::Stage11bHalo2Reference);
+        // Note: testnet_or_dev_only deliberately NOT set, so layer 1
+        // does not pre-empt — we want layer 3 to fire concretely.
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(
+            matches!(err, MainnetRefusalReason::BoundedReference {
+                proof_system: ProofSystem::Stage11bHalo2Reference, ..
+            }),
+            "expected BoundedReference(Stage11bHalo2Reference), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn halo2_reference_artifact_with_testnet_flag_is_refused_at_layer_1() {
+        // Production-shape: the canonical Stage 11b.1 artifact will
+        // carry testnet_or_dev_only: Some(true). That means refusal
+        // layer 1 fires before layer 3 — pin the precedence.
+        let mut meta = ProofMetadata::new_stage11a(
+            "halo2-reference-mlp-v1".into(),
+            blake3::hash(b"m").to_hex().to_string(),
+            blake3::hash(b"i").to_hex().to_string(),
+            blake3::hash(b"o").to_hex().to_string(),
+        );
+        meta.model_format = Some(ModelFormat::Halo2ReferenceMlp);
+        meta.proof_system = Some(ProofSystem::Stage11bHalo2Reference);
+        meta.testnet_or_dev_only = Some(true);
+        meta.model_framework = Some(ModelFramework::FrameworkAgnostic);
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(
+            matches!(err, MainnetRefusalReason::TestnetOrDevOnly { .. }),
+            "layer 1 (testnet flag) must fire before layer 3 (bounded reference); got {err:?}"
+        );
+    }
+
+    #[test]
+    fn halo2_reference_mlp_format_is_NOT_caught_by_layer_5() {
+        // Stage 11b.1.a adds Halo2ReferenceMlp as a first-class
+        // variant — it must NOT be caught by layer 5
+        // (Other/unknown). Refusal must come from layer 3
+        // (bounded reference) when proof_system is Stage11bHalo2Reference.
+        let mut meta = ProofMetadata::new_stage11a(
+            "halo2-reference-mlp-v1".into(),
+            blake3::hash(b"m").to_hex().to_string(),
+            blake3::hash(b"i").to_hex().to_string(),
+            blake3::hash(b"o").to_hex().to_string(),
+        );
+        meta.model_format = Some(ModelFormat::Halo2ReferenceMlp);
+        meta.proof_system = Some(ProofSystem::Stage11bHalo2Reference);
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        // Must be layer 3, NOT layer 5.
+        assert!(
+            matches!(err, MainnetRefusalReason::BoundedReference { .. }),
+            "Halo2ReferenceMlp should be a first-class format, not Other(_); \
+             expected layer-3 refusal, got {err:?}"
+        );
+        assert!(
+            !matches!(err, MainnetRefusalReason::UnknownModelFormat { .. }),
+            "Halo2ReferenceMlp must NOT be caught by layer 5"
+        );
     }
 }

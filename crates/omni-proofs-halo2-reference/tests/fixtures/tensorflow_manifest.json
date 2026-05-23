@@ -1,0 +1,19 @@
+{
+  "framework": "TensorFlow",
+  "framework_version": "tensorflow 2.x (any recent stable CPU build; integer ops only)",
+  "weights_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
+  "input": [-5, 10, 20, -100],
+  "output": [33, -32, 17, 7],
+  "generated_at_utc": "2026-05-22T00:00:00Z",
+  "generated_by": "tools/tensorflow_export/tensorflow_export.py — developer-host manual script; explicit integer arithmetic via int64 tensors. Not invoked by CI.",
+  "generation_mode": "LiveExport",
+  "spec_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
+  "input_hash": "200bd19925ebbafa7ed3869846d0571fb34bb25b4f74224045b0b6d590234e8d",
+  "output_hash": "130702c380646f9ca151c6d6bb2958ecc8675bcf55c5a5c0c37e66c89806728a",
+  "generator_metadata": {
+    "runtime_mode": "tensorflow-int64-explicit",
+    "tf_quantization_apis_used": false,
+    "regen_command": "python3 tools/tensorflow_export/tensorflow_export.py --regen"
+  },
+  "notes": "TensorFlow reproduces the canonical contract via explicit int64 integer arithmetic (avoiding `tf.quantization` higher-level machinery, which has its own rounding semantics). The export script mirrors the spec's pipeline: i16×i16 → i64 accumulation, bias promotion via shift, round-half-away-from-zero requantization, saturate-to-i16, ReLU max(x,0). Verified byte-for-byte against the canonical evaluator on developer host."
+}

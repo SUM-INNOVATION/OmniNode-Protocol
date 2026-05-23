@@ -1,0 +1,21 @@
+{
+  "framework": "Rumus",
+  "framework_version": "rumus 0.4.0 (crates.io; MIT OR Apache-2.0; default features = [], CPU-only)",
+  "weights_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
+  "input": [-5, 10, 20, -100],
+  "output": [33, -32, 17, 7],
+  "generated_at_utc": "2026-05-22T00:00:00Z",
+  "generated_by": "tools/rumus_export — standalone Cargo package (not a workspace member); uses rumus::fixed::FixedLinear + rumus::fixed::requantize on the canonical W/B/input.",
+  "generation_mode": "LiveExport",
+  "spec_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
+  "input_hash": "200bd19925ebbafa7ed3869846d0571fb34bb25b4f74224045b0b6d590234e8d",
+  "output_hash": "130702c380646f9ca151c6d6bb2958ecc8675bcf55c5a5c0c37e66c89806728a",
+  "generator_metadata": {
+    "runtime_mode": "rumus-fixed-linear",
+    "rumus_version": "0.4.0",
+    "rumus_license": "MIT OR Apache-2.0",
+    "rumus_crate_features": [],
+    "regen_command": "cd tools/rumus_export && cargo run --release"
+  },
+  "notes": "RUMUS 0.4.0 ships a first-class deterministic CPU FixedI16 integer-dense path (`rumus::fixed::FixedLinear` + `requantize`) implementing exactly the canonical arithmetic contract: i16 × i16 products, i64 accumulator, bias promoted to widened scale² domain via `<<scale_log2` BEFORE saturation, round-half-away-from-zero requantization, saturate-to-i16. The Stage 11b.1.a smoke probe verified byte-for-byte reproduction of the canonical output [33,-32,17,7]. `tools/rumus_export/` is intentionally a standalone Cargo package outside the root workspace so the operator-binary build graph cannot reach `rumus`."
+}
