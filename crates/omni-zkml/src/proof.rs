@@ -125,31 +125,50 @@ pub enum ModelFormat {
 /// during proof verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelFramework {
-    /// RUMUS. **Stage 11b.1.a status: fixture-only.** RUMUS does not
-    /// currently expose a deterministic CPU fixed-point integer-dense
-    /// path that the canonical halo2-reference MLP spec requires;
-    /// the committed RUMUS manifest is an *intended representation*
-    /// rather than the output of a live RUMUS run. Documented in
-    /// the runbook + the manifest's `generation_mode` field. Runtime
-    /// integration deferred until RUMUS stabilizes.
+    /// RUMUS. **Stage 11b.1.a status: equal-status primary
+    /// (LiveExport).** `rumus = "0.4.0"` ships a first-class
+    /// deterministic CPU FixedI16 integer-dense path
+    /// (`rumus::fixed::FixedLinear` + `rumus::fixed::requantize`)
+    /// implementing the canonical contract bit-identically. The
+    /// committed RUMUS manifest is the live output of
+    /// `tools/rumus_export/` — a standalone Cargo package
+    /// intentionally outside the OmniNode workspace
+    /// (root `Cargo.toml` declares `exclude = ["tools"]`) so the
+    /// operator-binary build graph cannot transitively reach
+    /// `rumus`.
     Rumus,
-    /// PyTorch. Manifest produced by `tools/pytorch_export.py` —
-    /// developer-host-only; never imported by the operator binary
-    /// or by default CI.
+    /// PyTorch. **Stage 11b.1.a status: equal-status primary
+    /// (LiveExport).** Manifest produced by
+    /// `tools/pytorch_export/pytorch_export.py` via explicit
+    /// `torch.int64` integer arithmetic — no `torch.quantization`
+    /// / `torch.ao` APIs. Developer-host-only; never imported by
+    /// the operator binary or by default CI.
     PyTorch,
-    /// TensorFlow. Same shape as PyTorch — `tools/tensorflow_export.py`
-    /// is a developer-host fixture-gen tool only.
+    /// TensorFlow. **Stage 11b.1.a status: equal-status primary
+    /// (LiveExport).** Manifest produced by
+    /// `tools/tensorflow_export/tensorflow_export.py` via explicit
+    /// `tf.int64` integer arithmetic — no `tf.quantization` /
+    /// `tf.lite` APIs. Developer-host-only.
     TensorFlow,
-    /// Caffe. Older ecosystem; the manifest is generated from a
-    /// static `.prototxt` + `manifest.json` pair on a developer host
-    /// with a working Caffe install. **No live Caffe export tool ships
-    /// in the repo.**
+    /// Caffe. **Stage 11b.1.a status: equal-status primary.**
+    /// `tools/caffe_export/caffe_export.py` defaults to real
+    /// Caffe if importable (`generation_mode: LiveExport`,
+    /// `generator_metadata.runtime_mode: "caffe-runtime"`) and
+    /// otherwise falls back to an explicit, auditable pure-NumPy
+    /// emulation of the canonical contract
+    /// (`generation_mode: PureNumpyCompatibility`,
+    /// `generator_metadata.runtime_mode: "pure-numpy-emulation"`,
+    /// `caffe_runtime_present: false`). The output bytes are
+    /// byte-identical in both modes because the canonical
+    /// arithmetic is deterministic; the manifest distinguishes
+    /// them so the fallback is never silent.
     Caffe,
-    /// Framework-agnostic — the canonical spec JSON alone is the
-    /// model description. The halo2-reference circuit's own
-    /// `ProofArtifactBody` carries this value, since the canonical
-    /// spec is the source of truth and any framework can reproduce
-    /// it without runtime dependency.
+    /// Framework-agnostic — the framework-neutral canonical spec
+    /// JSON is the source of truth. The Rust canonical evaluator
+    /// is the neutral reference implementation (not a fifth
+    /// framework); the committed `framework_agnostic_manifest.json`
+    /// is a schema-coverage regression fixture with
+    /// `generation_mode: ManualFixture`.
     FrameworkAgnostic,
 }
 
