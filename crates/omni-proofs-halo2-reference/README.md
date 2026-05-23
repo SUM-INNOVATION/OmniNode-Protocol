@@ -18,8 +18,9 @@ This crate ships the pure-Rust **architectural foundation** for the Stage 11b.1 
 - An `omni-node` opt-in feature `halo2-reference-verify` that registers the verifier in the `verify-proof` dispatch map. **Default `omni-node` builds pull zero halo2 dependencies**, verified by a CI tree-check.
 - A CI gate that builds + tests the verifier-only feature.
 
-**Stage 11b.1.b non-goals (deliberate):**
-- No general-input range checks on requantization remainders / saturation. The committed fixture is sound under the public-input/output pin; arbitrary-input soundness is a Stage 11c+ deliverable.
+**Stage 11b.1.b scope and non-goals:**
+- **In scope:** circuit-side bit-decomposition range checks on requantization remainders (`r1[j]`, `r2[j]` ∈ [-S/2, S/2]), ReLU magnitudes (∈ [0, 2^15)), and output values (i16 range). Plus the verifier-side `canonical_evaluate` re-run as defense in depth, so an artifact whose claimed output disagrees with the neutral pure-Rust evaluator is rejected before halo2 verify runs.
+- **Non-goals (deferred to Stage 11c+):** no general-input round-half-away tie-break gadget and no explicit saturation gadget. The committed canonical input `[-5, 10, 20, -100]` produces no requantization ties and no i16 saturation, so the range checks alone fully pin the witness for this fixture; arbitrary-input soundness against tie-break ambiguity and saturating inputs is a Stage 11c+ deliverable.
 - No mainnet allowlist entries. `MAINNET_APPROVED_PROOF_SYSTEMS` stays `&[]`; Stage 11b.0 layers 1, 3, 6 hard-refuse the artifact on mainnet.
 - No framework runtime in the operator binary. Prover, exporters, and regen tools live under `tools/` (workspace-excluded).
 
