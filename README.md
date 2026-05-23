@@ -1798,12 +1798,12 @@ The Stage 11a `proof_pipeline_vectors.json` fixture is **byte-identical** under 
 |---|---|---|
 | 1 | `TestnetOrDevOnly` | `testnet_or_dev_only == Some(true)` — producer explicitly disclaimed mainnet |
 | 2 | `MockBackend` | `proof_system ∈ {Mock, None}` — preserves Stage 11a's `MockBackendRefusedOnMainnet` guarantee |
-| 3 | `BoundedReference` | `proof_system == Stage11bOnnxReference` — reference fixtures never mainnet |
+| 3 | `BoundedReference` | `proof_system ∈ {Stage11bOnnxReference, Stage11bHalo2Reference}` — bounded reference fixtures never mainnet |
 | 4 | `GgufClaim` | `model_format == Gguf` — no GGUF inference proof backend is approved at any stage through Stage 11b.0 |
 | 5 | `UnknownModelFormat` | `model_format ∈ {Other(_), None}` (non-mock) — stringly-typed formats and absent formats refused |
 | 6 | `NotInMainnetAllowlist` | proof_system not in `MAINNET_APPROVED_PROOF_SYSTEMS` (the const slice) |
 
-**`MAINNET_APPROVED_PROOF_SYSTEMS` is empty by design at end of Stage 11b.0.** No proof system shipped through Stage 11b is mainnet-eligible. Mainnet eligibility lands earliest in Stage 11c, with chain-team review. The `mainnet_allowlist_is_empty_at_stage_11b0` and `every_proof_system_is_refused_on_mainnet_at_stage_11b0` tests pin this invariant.
+**`MAINNET_APPROVED_PROOF_SYSTEMS` is empty by design through end of Stage 11c.** No proof system shipped through Stages 11b or 11c is mainnet-eligible. Mainnet eligibility lands in a future chain-team-reviewed stage (Stage 11d+). The `mainnet_allowlist_is_empty_at_stage_11b0` and `every_proof_system_is_refused_on_mainnet_at_stage_11b0` tests pin this invariant.
 
 **5. `operator verify-proof` (new read-only subcommand, default build):**
 

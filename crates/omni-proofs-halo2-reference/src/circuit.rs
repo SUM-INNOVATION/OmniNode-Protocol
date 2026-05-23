@@ -1205,11 +1205,15 @@ mod gadget_tests {
         q_sat_bits: [Value<Fp>; NUM_BIT_COLS],
     }
 
+    // SatTestCircuit doesn't use an instance column — the public-
+    // input binding of q_unsat/q_sat is unnecessary for gadget-
+    // isolated tests (the witness fields fully specify the
+    // assignment). Mock prover runs are passed an empty instance
+    // vector. Avoids an unused-field warning.
     #[derive(Clone, Debug)]
     struct SatTestConfig {
         value: [Column<Advice>; 8],
         bit_cols: [Column<Advice>; NUM_BIT_COLS],
-        instance: Column<Instance>,
         s_sat: Selector,
         s_rc16s: Selector,
         s_rc17u: Selector,
@@ -1264,21 +1268,10 @@ mod gadget_tests {
             }
         }
 
-        fn instance(&self) -> Vec<Fp> {
-            // Public inputs aren't strictly required for the
-            // saturation gadget; we just expose q_unsat & q_sat as
-            // a sanity binding so the test "knows" what was tested.
-            let mut v = Vec::new();
-            self.q_unsat.assert_if_known(|x| {
-                v.push(*x);
-                true
-            });
-            self.q_sat.assert_if_known(|x| {
-                v.push(*x);
-                true
-            });
-            v
-        }
+        // SatTestCircuit has no instance column — gadget-isolated
+        // tests rely on the witness assignment + constraint set, not
+        // on public-input binding. MockProver is invoked with an
+        // empty per-circuit instance vector.
     }
 
     impl Circuit<Fp> for SatTestCircuit {
@@ -1296,8 +1289,6 @@ mod gadget_tests {
             }
             let bit_cols: [Column<Advice>; NUM_BIT_COLS] =
                 std::array::from_fn(|_| meta.advice_column());
-            let instance = meta.instance_column();
-            meta.enable_equality(instance);
 
             let s_sat = meta.selector();
             let s_rc16s = meta.selector();
@@ -1393,7 +1384,6 @@ mod gadget_tests {
             SatTestConfig {
                 value,
                 bit_cols,
-                instance,
                 s_sat,
                 s_rc16s,
                 s_rc17u,
@@ -1511,9 +1501,9 @@ mod gadget_tests {
 
     fn run_sat_test(q_unsat: i64) -> Result<(), halo2_proofs::dev::VerifyFailure> {
         let c = SatTestCircuit::from_q_unsat(q_unsat);
-        let inst = c.instance();
         let k = 6;
-        let prover = MockProver::run(k, &c, vec![inst]).expect("mock prover runs");
+        // SatTestCircuit has no instance column; pass empty.
+        let prover = MockProver::run(k, &c, vec![]).expect("mock prover runs");
         prover.verify().map(|_| ()).map_err(|errs| errs.into_iter().next().unwrap())
     }
 
@@ -1557,8 +1547,7 @@ mod gadget_tests {
         let mut c = SatTestCircuit::from_q_unsat(0);
         c.q_sat = known_i64(99); // Lie about the saturation output
         c.q_sat_bits = bits_le_signed(99, 1 << 15, 16);
-        let inst = vec![fp_from_i64(0), fp_from_i64(99)]; // matches the lie
-        let prover = MockProver::run(6, &c, vec![inst]).expect("mock prover runs");
+        let prover = MockProver::run(6, &c, vec![]).expect("mock prover runs");
         assert!(prover.verify().is_err(), "wrong q_sat must fail");
     }
 

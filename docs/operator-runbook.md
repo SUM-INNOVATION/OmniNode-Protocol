@@ -412,8 +412,8 @@ The mainnet allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in
 `omni-zkml`) is empty by design. Every proof artifact this command
 verifies will report `mainnet_eligible=false` and carry an explicit
 refusal reason from one of the six refusal layers documented in §11a.
-Mainnet eligibility is a Stage 11c+ deliverable with chain-team
-review.
+Mainnet eligibility lands in a future chain-team-reviewed stage
+(Stage 11d+); Stage 11c keeps the allowlist empty by design.
 
 **Stage 11b.1.a — multi-framework architectural scaffold (four equal primaries).**
 Adds the `ModelFramework` enum (Rumus / PyTorch / TensorFlow / Caffe /
@@ -647,11 +647,11 @@ typed taxonomy for sub-conditions like fee/balance vs. transport.
 | `MainnetSubmitNotPermitted` | `--allow-submit` given on `chain_id 1` but `--allow-mainnet-submit` missing | yes — typed error | add `--allow-mainnet-submit`; this is an intentional double-gate, not a bug | (no escalation needed; operator-side correction) |
 | `MockBackendRefusedOnMainnet` (**Stage 11a**) | `OperatorError::MockBackendRefusedOnMainnet { backend_id }` — fires when the smoke `--synthetic` path is taken on `chain_id == 1`, even with `--allow-mainnet-submit` | yes — typed error, **before any submit RPC** | mainnet smoke requires a real attestation JSON (`--attestation-json`) produced off-binary by a real prover; the mock backend (`mock-v1`) is non-cryptographic by design and is hard-refused on mainnet | (no escalation needed; operator-side correction. If a real prover is available, use `--attestation-json` and re-run; if not, wait for Stage 11c's real backend) |
 | `TestnetOnlyProofRefusedOnMainnet` (**Stage 11b.0**) | proof artifact carries `testnet_or_dev_only: Some(true)` (refusal layer 1) | yes — typed error | the artifact's producer explicitly disclaimed mainnet eligibility; use a mainnet-approved producer | backend_id, producer source |
-| `BoundedReferenceProofRefusedOnMainnet` (**Stage 11b.0**) | proof_system is `Stage11bOnnxReference` (refusal layer 3) | yes — typed error | bounded reference fixtures are for architecture validation, not production; use a mainnet-approved producer (none ship at end of Stage 11b) | backend_id |
+| `BoundedReferenceProofRefusedOnMainnet` (**Stage 11b.0**) | proof_system ∈ `{Stage11bOnnxReference, Stage11bHalo2Reference}` (refusal layer 3) | yes — typed error | bounded reference fixtures are for architecture validation, not production; use a mainnet-approved producer (none ship through Stage 11c) | backend_id |
 | `GgufProofClaimRefusedOnMainnet` (**Stage 11b.0**) | `model_format == Gguf` (refusal layer 4) | yes — typed error | no GGUF inference proof backend is approved at any stage through Stage 11b.0; wait for Stage 11d strategy + chain-team review. **Declaring GGUF prevents silent fake-GGUF claims**, which is the point. | backend_id, model_hash |
 | `UnknownModelFormatRefusedOnMainnet` (**Stage 11b.0**) | `model_format = Other(_)` or absent on a non-mock backend (refusal layer 5) | yes — typed error | promote the format to a first-class enum variant via a chain-team-reviewed PR, or use an approved format | backend_id, model_format value |
-| `ProofSystemNotMainnetApproved` (**Stage 11b.0**) | proof_system not in `MAINNET_APPROVED_PROOF_SYSTEMS` (refusal layer 6) | yes — typed error | **Stage 11b.0 ships with this allowlist empty by design.** No proof system is mainnet-eligible until Stage 11c+ with chain-team review. | backend_id, proof_system |
-| `NoVerifierForProofSystem` (**Stage 11b.0**) | `operator verify-proof` was handed an artifact whose `proof_system` has no verifier registered | yes — typed error | Stage 11b.0 ships only `MockProofVerifier`; other proof systems are verifier-side stubs awaiting Stage 11c+ | proof_system |
+| `ProofSystemNotMainnetApproved` (**Stage 11b.0**) | proof_system not in `MAINNET_APPROVED_PROOF_SYSTEMS` (refusal layer 6) | yes — typed error | **Stages 11b and 11c ship with this allowlist empty by design.** Mainnet eligibility lands in a future chain-team-reviewed stage (Stage 11d+). | backend_id, proof_system |
+| `NoVerifierForProofSystem` (**Stage 11b.0**) | `operator verify-proof` was handed an artifact whose `proof_system` has no verifier registered | yes — typed error | Stage 11b.0 ships only `MockProofVerifier`; Stage 11b.1.b/11c add `Halo2ReferenceVerifier` under the opt-in `halo2-reference-verify` feature. Other proof systems are verifier-side stubs awaiting future stages. | proof_system |
 
 > **Known limitation flagged by Stage 10a.** [`ChainClientError`](../crates/omni-zkml/src/error.rs)
 > is currently the single-variant `Other(String)`. That is why several rows
