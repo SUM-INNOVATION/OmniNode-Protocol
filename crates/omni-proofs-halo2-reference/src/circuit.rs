@@ -3,66 +3,74 @@
 //! Gated by feature `verify` because both the verifier and the
 //! developer-host prover share this `Circuit<Fp>` definition.
 //!
-//! ## Public inputs (`instance` column, in order)
+//! ## Public inputs (`instance` column)
 //!
 //! ```text
 //! row 0..4 : input[0..4]   (canonical i16 input  lifted to Fp)
 //! row 4..8 : output[0..4]  (canonical i16 output lifted to Fp)
 //! ```
 //!
-//! The verifier binds `metadata.input_hash` to BLAKE3 of the LE-
-//! encoded input bytes and `metadata.response_hash` to BLAKE3 of
-//! the LE-encoded output bytes; here in the circuit we only deal
-//! with the raw field embeddings.
-//!
 //! ## Witnesses
 //!
-//! - `hidden_pre_relu[0..8]` — Layer 1 dense outputs *after*
-//!   bias-pre-saturation + round-half-away requantization. (We
-//!   skip the saturation gadget; see "soundness scope" below.)
+//! - `hidden_pre_relu[0..8]`  — Layer 1 dense outputs *after*
+//!   bias-pre-saturation + round-half-away requantization.
 //! - `hidden_post_relu[0..8]` — ReLU outputs.
-//! - `r1[0..8]` — Layer 1 requantization remainders satisfying
+//! - `r1[0..8]`, `r2[0..4]`  — requantization remainders satisfying
 //!   `with_bias = pre_relu * S + r`.
-//! - `r2[0..4]` — Layer 2 requantization remainders.
 //! - `sign_bits[0..8]`, `magnitudes[0..8]` — ReLU sign-bit gadget
 //!   witnesses (`x = (1 - 2*s) * mag`, `out = (1 - s) * mag`).
+//! - Bit decompositions for the range checks (assigned by the
+//!   prover from the canonical witness values).
 //!
 //! ## Constraints
 //!
-//! - **Layer 1 dense (8 instances):**
-//!   `pre_relu[j] * S + r1[j] = Σ_i (input[i] * W1[i][j]) + B1[j] * S`
-//! - **ReLU sign-bit gadget (8 instances):**
+//! **Dense + requantize (Layer 1 / Layer 2):**
+//!   `pre_relu[j] * S + r[j] = Σ_i (input[i] * W[i][j]) + B[j] * S`
+//!   plus a 9-bit signed range check on `r[j]` ensuring
+//!   `r[j] ∈ [-S/2, S/2]`. This is what makes the dense gate
+//!   sound — without the range check on `r`, the equation is
+//!   satisfiable for any `pre_relu` by absorbing slack into `r`.
+//!
+//! **ReLU sign-bit gadget:**
 //!   `s[j] * (1 - s[j]) = 0`
 //!   `pre_relu[j] = (1 - 2*s[j]) * magnitude[j]`
 //!   `post_relu[j] = (1 - s[j]) * magnitude[j]`
-//! - **Layer 2 dense (4 instances):**
-//!   `output[j] * S + r2[j] = Σ_i (post_relu[i] * W2[i][j]) + B2[j] * S`
-//! - **Public boundary:** input[0..4] and output[0..4] equality-
-//!   constrained to instance column rows 0..8.
+//!   plus a 15-bit unsigned range check on `magnitude[j]` ensuring
+//!   `magnitude[j] ∈ [0, 2^15)`. This bounds both `pre_relu[j]`
+//!   (via `(1 - 2s) * mag`) and `post_relu[j]` (via `(1 - s) * mag`)
+//!   to the i15 range, implicitly asserting Layer 1 did NOT
+//!   saturate.
 //!
-//! ## Soundness scope (deliberate)
+//! **Output range check:**
+//!   16-bit signed range check on `output[j]` ensuring
+//!   `output[j] ∈ [-2^15, 2^15)`. This implicitly asserts Layer 2
+//!   did NOT saturate.
 //!
-//! Range checks on `r1`/`r2`/saturation are intentionally omitted
-//! for Stage 11b.1.b. The committed canonical (input, output)
-//! pair `[-5, 10, 20, -100] → [33, -32, 17, 7]` triggers no
-//! requantization ties (all `with_bias / 256` values are
-//! non-half-integer) and no saturation events (every dense output
-//! stays within i16 range). The chain of linear constraints +
-//! the public-input/output pin forces the prover into the unique
-//! canonical witness assignment; a prover who picks
-//! non-canonical intermediates fails the public output match.
+//! **Public boundary:** input[0..4] and output[0..4] equality-
+//! constrained to instance column rows 0..8.
 //!
-//! Stage 11c (or whenever we want to prove arbitrary inputs) must
-//! add: range checks on `r` (|r| ≤ S/2), bit decomposition for
-//! `pre_relu`/`post_relu`/`output` (i16 range), magnitude range
-//! check, and an explicit saturation gadget for inputs that would
-//! overflow. **This is documented as a known limitation** in the
-//! crate README and operator-runbook.
+//! ## Soundness scope (now documented honestly)
 //!
-//! The circuit is sufficient for the bounded reference fixture
-//! Stage 11b.1.b ships. The Stage 11b.0 mainnet refusal layers 1,
-//! 3, and 6 catch the testnet/dev/bounded-reference posture
-//! regardless of circuit completeness.
+//! The circuit proves `canonical_evaluate(input) == output` for
+//! inputs that:
+//!   (a) produce no requantization tie cases (i.e. no
+//!       `with_bias = ±S/2 · (2k+1)` exact-half-integer outputs);
+//!   (b) produce no i16 saturation at the layer outputs.
+//!
+//! The committed canonical input `[-5, 10, 20, -100]` satisfies
+//! both conditions:
+//!   * Layer 1 with_biases are 14624, -4432, -2344, -5776, 11192,
+//!     -720, -8992, 1608 — none half-integer multiples of S.
+//!   * Layer 2 with_biases are 8344, -8304, 4416, 1848 — same.
+//!   * No pre_relu or output value reaches ±32768.
+//!
+//! Stage 11c+ deliverables for general-input soundness:
+//!   * Explicit round-half-away tie-break gadget.
+//!   * Explicit saturation gadget with three-branch selector.
+//!
+//! The verifier defends-in-depth by independently running the
+//! pure-Rust `canonical_evaluate` and refusing any artifact whose
+//! claimed output disagrees — see `src/verifier.rs` step 7.5.
 
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
@@ -79,11 +87,6 @@ fn fp_expr(x: Fp) -> Expression<Fp> {
     Expression::Constant(x)
 }
 
-/// Fixed-point scale `S = 256 = 2^8` lifted into Fp.
-fn scale_fp() -> Fp {
-    Fp::from(256u64)
-}
-
 /// Embed an `i64` into Fp via signed modular reduction.
 pub fn fp_from_i64(x: i64) -> Fp {
     if x >= 0 {
@@ -98,27 +101,41 @@ pub fn known_i64(x: i64) -> Value<Fp> {
     Value::known(fp_from_i64(x))
 }
 
-/// Circuit configuration — column allocation + selector definitions.
+const NUM_BIT_COLS: usize = 16;
+
+/// Circuit configuration.
 #[derive(Clone, Debug)]
 pub struct BoundedMlpConfig {
-    /// Advice column for input cells (and any value used as an
-    /// equality-constrained witness across regions).
+    /// Advice columns for the dense+ReLU regions.
+    /// 4 columns: typically holds value/op/result/aux cells.
     advice: [Column<Advice>; 4],
+    /// Bit-decomposition advice columns. 16 columns; for range
+    /// checks <16 bits the high bits are constrained to be zero
+    /// by the gate's polynomial expressions.
+    bit_cols: [Column<Advice>; NUM_BIT_COLS],
     /// Instance column carrying the 8 public inputs (4 in + 4 out).
     instance: Column<Instance>,
-    /// Selector for the Layer 1 dense + requantize linear gate.
+
+    /// Layer 1 dense + requantize linear equation.
     s_layer1: Selector,
-    /// Selector for the ReLU sign-bit gadget.
+    /// ReLU sign-bit gadget.
     s_relu: Selector,
-    /// Selector for the Layer 2 dense + requantize linear gate.
+    /// Layer 2 dense + requantize linear equation.
     s_layer2: Selector,
+    /// 9-bit signed range check (r ∈ [-S/2, S/2]).
+    s_rc9: Selector,
+    /// 15-bit unsigned range check (magnitude ∈ [0, 2^15)).
+    s_rc15: Selector,
+    /// 16-bit signed range check (i16 range).
+    s_rc16: Selector,
 }
 
 /// The Stage 11b.1.b halo2 circuit.
 ///
-/// Holds all witness values (inputs, intermediates, outputs).
-/// During key generation, all `Value<Fp>` fields are `Value::unknown()`;
-/// during proving they're populated by the developer-host prover.
+/// Holds all witness values. During key generation, all
+/// `Value<Fp>` fields are `Value::unknown()`; during proving they're
+/// populated by the developer-host prover via
+/// [`Self::from_canonical_input`].
 #[derive(Clone, Debug)]
 pub struct BoundedMlpCircuit {
     pub input: [Value<Fp>; 4],
@@ -129,6 +146,14 @@ pub struct BoundedMlpCircuit {
     pub r2: [Value<Fp>; 4],
     pub sign_bits: [Value<Fp>; 8],
     pub magnitudes: [Value<Fp>; 8],
+    /// Bit decomposition of each `r1[j] + 128` (8 instances × 9 bits).
+    pub r1_bits: [[Value<Fp>; NUM_BIT_COLS]; 8],
+    /// Bit decomposition of each `r2[j] + 128` (4 instances × 9 bits).
+    pub r2_bits: [[Value<Fp>; NUM_BIT_COLS]; 4],
+    /// Bit decomposition of each `magnitude[j]` (8 instances × 15 bits).
+    pub magnitude_bits: [[Value<Fp>; NUM_BIT_COLS]; 8],
+    /// Bit decomposition of each `output[j] + 2^15` (4 instances × 16 bits).
+    pub output_bits: [[Value<Fp>; NUM_BIT_COLS]; 4],
 }
 
 impl Default for BoundedMlpCircuit {
@@ -142,16 +167,38 @@ impl Default for BoundedMlpCircuit {
             r2: [Value::unknown(); 4],
             sign_bits: [Value::unknown(); 8],
             magnitudes: [Value::unknown(); 8],
+            r1_bits: [[Value::unknown(); NUM_BIT_COLS]; 8],
+            r2_bits: [[Value::unknown(); NUM_BIT_COLS]; 4],
+            magnitude_bits: [[Value::unknown(); NUM_BIT_COLS]; 8],
+            output_bits: [[Value::unknown(); NUM_BIT_COLS]; 4],
         }
     }
 }
 
+/// Decompose `(value + offset)` into `n_bits` LE bits, padding the
+/// remaining `NUM_BIT_COLS - n_bits` cells with explicit zeros.
+fn bits_with_offset(value: i64, offset: i64, n_bits: usize) -> [Value<Fp>; NUM_BIT_COLS] {
+    let shifted = value + offset;
+    assert!(
+        shifted >= 0 && shifted < (1i64 << n_bits as u32) + ((n_bits == 9) as i64) * 0,
+        "value {value} + offset {offset} = {shifted} doesn't fit in {n_bits} bits"
+    );
+    let mut bits = [Value::known(Fp::zero()); NUM_BIT_COLS];
+    for i in 0..n_bits {
+        let bit = (shifted >> i) & 1;
+        bits[i] = Value::known(Fp::from(bit as u64));
+    }
+    // For the 9-bit-with-overflow case: shifted can also equal exactly 2^8 = 256
+    // (i.e., r = 128 in our canonical scale). bit_8 then = 1, all lower bits 0.
+    // Both cases are covered by the `>> i & 1` extraction.
+    bits
+}
+
 impl BoundedMlpCircuit {
-    /// Build a fully-populated circuit from the canonical i16 inputs.
+    /// Build a fully-populated circuit from the canonical i16 input.
     /// Runs the canonical evaluator (in i64) to derive every witness.
     /// Developer-host use only.
     pub fn from_canonical_input(input_i16: [i16; 4]) -> Self {
-        const SCALE_LOG2: u32 = 8;
         const S: i64 = 256;
 
         let mut hidden_pre_relu = [0i64; 8];
@@ -161,9 +208,6 @@ impl BoundedMlpCircuit {
                 .map(|i| (input_i16[i] as i64) * (W1[i][j] as i64))
                 .sum();
             let with_bias = acc + (B1[j] as i64) * S;
-            // Round-half-away division identity: with_bias = q * S + r
-            // with |r| ≤ S/2 chosen to match the canonical evaluator.
-            // Use the exact same routine as src/canonical.rs.
             let q = if with_bias >= 0 {
                 (with_bias + S / 2) / S
             } else {
@@ -207,7 +251,18 @@ impl BoundedMlpCircuit {
             r2[j] = r;
         }
 
-        let _ = SCALE_LOG2;
+        // Bit decompositions. Offsets:
+        //   r-bits: +128  (range [-128, 128] → [0, 256])
+        //   magnitude-bits: 0  (range [0, 2^15))
+        //   output-bits: +2^15  (range [-2^15, 2^15) → [0, 2^16))
+        let r1_bits: [[Value<Fp>; NUM_BIT_COLS]; 8] =
+            std::array::from_fn(|j| bits_with_offset(r1[j], 128, 9));
+        let r2_bits: [[Value<Fp>; NUM_BIT_COLS]; 4] =
+            std::array::from_fn(|j| bits_with_offset(r2[j], 128, 9));
+        let magnitude_bits: [[Value<Fp>; NUM_BIT_COLS]; 8] =
+            std::array::from_fn(|j| bits_with_offset(magnitudes[j], 0, 15));
+        let output_bits: [[Value<Fp>; NUM_BIT_COLS]; 4] =
+            std::array::from_fn(|j| bits_with_offset(output[j], 1 << 15, 16));
 
         Self {
             input: [
@@ -228,19 +283,15 @@ impl BoundedMlpCircuit {
             r2: std::array::from_fn(|j| known_i64(r2[j])),
             sign_bits: std::array::from_fn(|j| known_i64(sign_bits[j])),
             magnitudes: std::array::from_fn(|j| known_i64(magnitudes[j])),
+            r1_bits,
+            r2_bits,
+            magnitude_bits,
+            output_bits,
         }
     }
 
-    /// Convenience: derive the i16 output values from the canonical
-    /// input. Used by the verifier to recompute the expected output
-    /// bytes from the public-input field embeddings.
     pub fn canonical_outputs_for(input_i16: [i16; 4]) -> [i16; 4] {
-        // Just delegate to the canonical evaluator — that's the
-        // neutral reference implementation. We expose this so the
-        // verifier can cross-check the public-output instance values
-        // without re-deriving the math itself.
-        let out = crate::canonical::canonical_evaluate(input_i16);
-        out
+        crate::canonical::canonical_evaluate(input_i16)
     }
 }
 
@@ -262,56 +313,36 @@ impl Circuit<Fp> for BoundedMlpCircuit {
         for a in &advice {
             meta.enable_equality(*a);
         }
+
+        let bit_cols: [Column<Advice>; NUM_BIT_COLS] =
+            std::array::from_fn(|_| meta.advice_column());
+
         let instance = meta.instance_column();
         meta.enable_equality(instance);
 
         let s_layer1 = meta.selector();
         let s_relu = meta.selector();
         let s_layer2 = meta.selector();
+        let s_rc9 = meta.selector();
+        let s_rc15 = meta.selector();
+        let s_rc16 = meta.selector();
 
-        // Layer 1 dense + requantize gate.
-        //
+        // ── Layer 1 dense + requantize ──────────────────────────────
         // Row layout (rotation-relative):
         //   row 0: advice[0..4] = input[0..4]
-        //   row 1: advice[0] = pre_relu[j], advice[1] = r1[j],
-        //          advice[2] = unused, advice[3] = unused
-        //   (one gate-set per output j; weights W1[i][j] and bias B1[j]
-        //    are embedded as Fp constants in the gate expression).
-        //
-        // Constraint:
-        //   pre_relu * S + r - (Σ_i input[i] * W1[i][j]) - B1[j] * S = 0
-        //
-        // 8 separate constraint polynomials, one per j, all gated by
-        // s_layer1 at row 0.
+        //   row 1..9: advice[0] = pre_relu[j], advice[1] = r1[j]
         meta.create_gate("layer1_dense", |meta| {
             let s = meta.query_selector(s_layer1);
             let inputs: [_; 4] = std::array::from_fn(|i| {
                 meta.query_advice(advice[i], Rotation::cur())
             });
-            let scale = scale_fp();
-
-            // For each Layer 1 output j we add a polynomial constraint
-            // gated by s_layer1. They share the same row offsets:
-            //   pre_relu[j]    at advice[0], Rotation::next() + (offset based on j)
-            // To keep this gate self-contained without ballooning the
-            // number of advice rotations, we layout 8 successive rows
-            // each holding one (pre_relu[j], r1[j]) pair.
-            //
-            // Effective layout for layer-1 region:
-            //   row 0: input[0..4]
-            //   row 1: pre_relu[0], r1[0]
-            //   row 2: pre_relu[1], r1[1]
-            //   ...
-            //   row 8: pre_relu[7], r1[7]
-            //
-            // The selector s_layer1 is enabled at row 0 and the gate
-            // queries Rotation(1)..Rotation(8) to reach each j.
+            let scale = Fp::from(256u64);
             let mut polys = Vec::with_capacity(8);
             for j in 0..8 {
                 let off = (j as i32) + 1;
                 let pre_relu = meta.query_advice(advice[0], Rotation(off));
                 let r1 = meta.query_advice(advice[1], Rotation(off));
-                let mut sum = pre_relu * fp_expr(Fp::from(256u64))
+                let mut sum = pre_relu * fp_expr(scale)
                     + r1
                     - inputs[0].clone() * fp_expr(fp_from_i64(W1[0][j] as i64))
                     - inputs[1].clone() * fp_expr(fp_from_i64(W1[1][j] as i64))
@@ -323,18 +354,7 @@ impl Circuit<Fp> for BoundedMlpCircuit {
             polys
         });
 
-        // ReLU sign-bit gadget.
-        //
-        // Row layout (per ReLU instance, single row):
-        //   advice[0] = pre_relu  (input)
-        //   advice[1] = sign_bit
-        //   advice[2] = magnitude
-        //   advice[3] = post_relu (output)
-        //
-        // Constraints:
-        //   sign * (1 - sign) = 0
-        //   pre_relu - (1 - 2*sign) * magnitude = 0
-        //   post_relu - (1 - sign) * magnitude = 0
+        // ── ReLU sign-bit gadget ────────────────────────────────────
         meta.create_gate("relu", |meta| {
             let s = meta.query_selector(s_relu);
             let pre_relu = meta.query_advice(advice[0], Rotation::cur());
@@ -344,13 +364,10 @@ impl Circuit<Fp> for BoundedMlpCircuit {
 
             let one = Fp::from(1u64);
             let two = Fp::from(2u64);
-
             let booleanity = sign.clone() * (fp_expr(one) - sign.clone());
-            let decomposition = pre_relu
-                - (fp_expr(one) - fp_expr(two) * sign.clone())
-                    * magnitude.clone();
+            let decomposition =
+                pre_relu - (fp_expr(one) - fp_expr(two) * sign.clone()) * magnitude.clone();
             let relu_eq = post_relu - (fp_expr(one) - sign) * magnitude;
-
             vec![
                 s.clone() * booleanity,
                 s.clone() * decomposition,
@@ -358,15 +375,7 @@ impl Circuit<Fp> for BoundedMlpCircuit {
             ]
         });
 
-        // Layer 2 dense + requantize gate.
-        //
-        // Effective layout for layer-2 region (rotation-relative):
-        //   row 0: post_relu[0..4]    advice[0..4]
-        //   row 1: post_relu[4..8]    advice[0..4]
-        //   row 2: output[0], r2[0]   advice[0..1]
-        //   row 3: output[1], r2[1]
-        //   row 4: output[2], r2[2]
-        //   row 5: output[3], r2[3]
+        // ── Layer 2 dense + requantize ──────────────────────────────
         meta.create_gate("layer2_dense", |meta| {
             let s = meta.query_selector(s_layer2);
             let pr0_3: [_; 4] = std::array::from_fn(|i| {
@@ -375,14 +384,13 @@ impl Circuit<Fp> for BoundedMlpCircuit {
             let pr4_7: [_; 4] = std::array::from_fn(|i| {
                 meta.query_advice(advice[i], Rotation::next())
             });
-            let scale = scale_fp();
-
+            let scale = Fp::from(256u64);
             let mut polys = Vec::with_capacity(4);
             for j in 0..4 {
                 let off = 2 + (j as i32);
                 let out = meta.query_advice(advice[0], Rotation(off));
                 let r2 = meta.query_advice(advice[1], Rotation(off));
-                let mut sum = out * fp_expr(Fp::from(256u64))
+                let mut sum = out * fp_expr(scale)
                     + r2
                     - pr0_3[0].clone() * fp_expr(fp_from_i64(W2[0][j] as i64))
                     - pr0_3[1].clone() * fp_expr(fp_from_i64(W2[1][j] as i64))
@@ -398,12 +406,107 @@ impl Circuit<Fp> for BoundedMlpCircuit {
             polys
         });
 
+        // ── 9-bit signed range check (r ∈ [-S/2, S/2]) ──────────────
+        // Layout (1 row):
+        //   advice[0] = value (the r value)
+        //   bit_cols[0..16] = bits
+        // Constraints:
+        //   bits[0..9] boolean; bits[9..16] = 0
+        //   value + 128 = Σ bits[i] * 2^i  (i=0..8)
+        //   bits[8] * (Σ_{i=0..7} bits[i]) = 0   (overflow: if high bit set, all lower must be 0)
+        meta.create_gate("rc9_signed", |meta| {
+            let s = meta.query_selector(s_rc9);
+            let value = meta.query_advice(advice[0], Rotation::cur());
+            let mut polys = Vec::new();
+
+            // Booleanity for bits 0..8.
+            for i in 0..9 {
+                let b = meta.query_advice(bit_cols[i], Rotation::cur());
+                polys.push(s.clone() * b.clone() * (fp_expr(Fp::one()) - b));
+            }
+            // bits 9..16 must be zero.
+            for i in 9..NUM_BIT_COLS {
+                let b = meta.query_advice(bit_cols[i], Rotation::cur());
+                polys.push(s.clone() * b);
+            }
+            // Sum constraint: value + 128 = Σ_{i=0..8} bits[i] * 2^i.
+            let mut sum = fp_expr(Fp::zero());
+            for i in 0..9 {
+                let b = meta.query_advice(bit_cols[i], Rotation::cur());
+                sum = sum + b * fp_expr(Fp::from(1u64 << i as u32));
+            }
+            polys.push(s.clone() * (sum - value - fp_expr(Fp::from(128u64))));
+            // Overflow constraint: if bit_8 = 1 then all lower bits must be 0.
+            let b_8 = meta.query_advice(bit_cols[8], Rotation::cur());
+            let mut lower_sum = fp_expr(Fp::zero());
+            for i in 0..8 {
+                let b = meta.query_advice(bit_cols[i], Rotation::cur());
+                lower_sum = lower_sum + b;
+            }
+            polys.push(s.clone() * b_8 * lower_sum);
+
+            polys
+        });
+
+        // ── 15-bit unsigned range check (magnitude ∈ [0, 2^15)) ─────
+        meta.create_gate("rc15_unsigned", |meta| {
+            let s = meta.query_selector(s_rc15);
+            let value = meta.query_advice(advice[0], Rotation::cur());
+            let mut polys = Vec::new();
+
+            // Booleanity for bits 0..15.
+            for i in 0..15 {
+                let b = meta.query_advice(bit_cols[i], Rotation::cur());
+                polys.push(s.clone() * b.clone() * (fp_expr(Fp::one()) - b));
+            }
+            // bits 15 must be zero.
+            for i in 15..NUM_BIT_COLS {
+                let b = meta.query_advice(bit_cols[i], Rotation::cur());
+                polys.push(s.clone() * b);
+            }
+            // Sum constraint: value = Σ_{i=0..14} bits[i] * 2^i.
+            let mut sum = fp_expr(Fp::zero());
+            for i in 0..15 {
+                let b = meta.query_advice(bit_cols[i], Rotation::cur());
+                sum = sum + b * fp_expr(Fp::from(1u64 << i as u32));
+            }
+            polys.push(s * (sum - value));
+
+            polys
+        });
+
+        // ── 16-bit signed range check (output ∈ [-2^15, 2^15)) ──────
+        meta.create_gate("rc16_signed", |meta| {
+            let s = meta.query_selector(s_rc16);
+            let value = meta.query_advice(advice[0], Rotation::cur());
+            let mut polys = Vec::new();
+
+            // Booleanity for all 16 bits.
+            for i in 0..NUM_BIT_COLS {
+                let b = meta.query_advice(bit_cols[i], Rotation::cur());
+                polys.push(s.clone() * b.clone() * (fp_expr(Fp::one()) - b));
+            }
+            // Sum constraint: value + 2^15 = Σ_{i=0..15} bits[i] * 2^i.
+            let mut sum = fp_expr(Fp::zero());
+            for i in 0..NUM_BIT_COLS {
+                let b = meta.query_advice(bit_cols[i], Rotation::cur());
+                sum = sum + b * fp_expr(Fp::from(1u64 << i as u32));
+            }
+            polys.push(s * (sum - value - fp_expr(Fp::from(1u64 << 15))));
+
+            polys
+        });
+
         BoundedMlpConfig {
             advice,
+            bit_cols,
             instance,
             s_layer1,
             s_relu,
             s_layer2,
+            s_rc9,
+            s_rc15,
+            s_rc16,
         }
     }
 
@@ -412,9 +515,8 @@ impl Circuit<Fp> for BoundedMlpCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<Fp>,
     ) -> Result<(), Error> {
-        // Region 1: Layer 1 dense.
-        // Row 0: input[0..4]; rows 1..9: (pre_relu[j], r1[j]) for j=0..8.
-        let (input_cells, pre_relu_cells) = layouter.assign_region(
+        // ── Region 1: Layer 1 dense ─────────────────────────────────
+        let (input_cells, pre_relu_cells, r1_cells) = layouter.assign_region(
             || "layer1_dense",
             |mut region| {
                 config.s_layer1.enable(&mut region, 0)?;
@@ -431,6 +533,7 @@ impl Circuit<Fp> for BoundedMlpCircuit {
                     .collect::<Result<_, _>>()?;
 
                 let mut pre_relu_cells = Vec::with_capacity(8);
+                let mut r1_cells = Vec::with_capacity(8);
                 for j in 0..8 {
                     let pre = region.assign_advice(
                         || format!("pre_relu[{j}]"),
@@ -438,40 +541,41 @@ impl Circuit<Fp> for BoundedMlpCircuit {
                         j + 1,
                         || self.hidden_pre_relu[j],
                     )?;
-                    region.assign_advice(
+                    let r1c = region.assign_advice(
                         || format!("r1[{j}]"),
                         config.advice[1],
                         j + 1,
                         || self.r1[j],
                     )?;
                     pre_relu_cells.push(pre);
+                    r1_cells.push(r1c);
                 }
-                Ok((input_cells, pre_relu_cells))
+                Ok((input_cells, pre_relu_cells, r1_cells))
             },
         )?;
 
-        // Region 2: ReLU (8 separate rows).
+        // ── Region 2: ReLU (8 single-row regions) + magnitude cells ─
         let mut post_relu_cells = Vec::with_capacity(8);
+        let mut magnitude_cells = Vec::with_capacity(8);
         for j in 0..8 {
             let pre = pre_relu_cells[j].clone();
-            let cell = layouter.assign_region(
+            let (post, mag) = layouter.assign_region(
                 || format!("relu[{j}]"),
                 |mut region| {
                     config.s_relu.enable(&mut region, 0)?;
-                    let pre_in = pre.copy_advice(
+                    pre.copy_advice(
                         || format!("pre_relu[{j}] copy"),
                         &mut region,
                         config.advice[0],
                         0,
                     )?;
-                    let _ = pre_in;
                     region.assign_advice(
                         || format!("sign[{j}]"),
                         config.advice[1],
                         0,
                         || self.sign_bits[j],
                     )?;
-                    region.assign_advice(
+                    let mag = region.assign_advice(
                         || format!("magnitude[{j}]"),
                         config.advice[2],
                         0,
@@ -483,20 +587,18 @@ impl Circuit<Fp> for BoundedMlpCircuit {
                         0,
                         || self.hidden_post_relu[j],
                     )?;
-                    Ok(post)
+                    Ok((post, mag))
                 },
             )?;
-            post_relu_cells.push(cell);
+            post_relu_cells.push(post);
+            magnitude_cells.push(mag);
         }
 
-        // Region 3: Layer 2 dense.
-        // Row 0: post_relu[0..4]; Row 1: post_relu[4..8].
-        // Rows 2..6: (output[j], r2[j]) for j=0..4.
-        let output_cells = layouter.assign_region(
+        // ── Region 3: Layer 2 dense ─────────────────────────────────
+        let (output_cells, r2_cells) = layouter.assign_region(
             || "layer2_dense",
             |mut region| {
                 config.s_layer2.enable(&mut region, 0)?;
-
                 for (i, cell) in post_relu_cells.iter().take(4).enumerate() {
                     cell.copy_advice(
                         || format!("post_relu[{i}] copy"),
@@ -513,8 +615,8 @@ impl Circuit<Fp> for BoundedMlpCircuit {
                         1,
                     )?;
                 }
-
                 let mut output_cells = Vec::with_capacity(4);
+                let mut r2_cells = Vec::with_capacity(4);
                 for j in 0..4 {
                     let out = region.assign_advice(
                         || format!("output[{j}]"),
@@ -522,19 +624,133 @@ impl Circuit<Fp> for BoundedMlpCircuit {
                         2 + j,
                         || self.output[j],
                     )?;
-                    region.assign_advice(
+                    let r2c = region.assign_advice(
                         || format!("r2[{j}]"),
                         config.advice[1],
                         2 + j,
                         || self.r2[j],
                     )?;
                     output_cells.push(out);
+                    r2_cells.push(r2c);
                 }
-                Ok(output_cells)
+                Ok((output_cells, r2_cells))
             },
         )?;
 
-        // Public-input binding.
+        // ── Range-check regions ─────────────────────────────────────
+        // Each range check is a single-row region: the value at
+        // advice[0] (copied from the source region), bits at
+        // bit_cols[0..16].
+
+        // 9-bit signed range checks for r1[j].
+        for j in 0..8 {
+            let r1c = r1_cells[j].clone();
+            let bits = self.r1_bits[j];
+            layouter.assign_region(
+                || format!("rc9_r1[{j}]"),
+                |mut region| {
+                    config.s_rc9.enable(&mut region, 0)?;
+                    r1c.copy_advice(
+                        || format!("r1[{j}] copy"),
+                        &mut region,
+                        config.advice[0],
+                        0,
+                    )?;
+                    for (i, b) in bits.iter().enumerate() {
+                        region.assign_advice(
+                            || format!("r1[{j}] bit {i}"),
+                            config.bit_cols[i],
+                            0,
+                            || *b,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // 9-bit signed range checks for r2[j].
+        for j in 0..4 {
+            let r2c = r2_cells[j].clone();
+            let bits = self.r2_bits[j];
+            layouter.assign_region(
+                || format!("rc9_r2[{j}]"),
+                |mut region| {
+                    config.s_rc9.enable(&mut region, 0)?;
+                    r2c.copy_advice(
+                        || format!("r2[{j}] copy"),
+                        &mut region,
+                        config.advice[0],
+                        0,
+                    )?;
+                    for (i, b) in bits.iter().enumerate() {
+                        region.assign_advice(
+                            || format!("r2[{j}] bit {i}"),
+                            config.bit_cols[i],
+                            0,
+                            || *b,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // 15-bit unsigned range checks for magnitude[j].
+        for j in 0..8 {
+            let magc = magnitude_cells[j].clone();
+            let bits = self.magnitude_bits[j];
+            layouter.assign_region(
+                || format!("rc15_magnitude[{j}]"),
+                |mut region| {
+                    config.s_rc15.enable(&mut region, 0)?;
+                    magc.copy_advice(
+                        || format!("magnitude[{j}] copy"),
+                        &mut region,
+                        config.advice[0],
+                        0,
+                    )?;
+                    for (i, b) in bits.iter().enumerate() {
+                        region.assign_advice(
+                            || format!("magnitude[{j}] bit {i}"),
+                            config.bit_cols[i],
+                            0,
+                            || *b,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // 16-bit signed range checks for output[j].
+        for j in 0..4 {
+            let outc = output_cells[j].clone();
+            let bits = self.output_bits[j];
+            layouter.assign_region(
+                || format!("rc16_output[{j}]"),
+                |mut region| {
+                    config.s_rc16.enable(&mut region, 0)?;
+                    outc.copy_advice(
+                        || format!("output[{j}] copy"),
+                        &mut region,
+                        config.advice[0],
+                        0,
+                    )?;
+                    for (i, b) in bits.iter().enumerate() {
+                        region.assign_advice(
+                            || format!("output[{j}] bit {i}"),
+                            config.bit_cols[i],
+                            0,
+                            || *b,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // ── Public-input binding ────────────────────────────────────
         for (i, cell) in input_cells.iter().enumerate() {
             layouter.constrain_instance(cell.cell(), config.instance, i)?;
         }
@@ -567,7 +783,7 @@ mod tests {
     fn canonical_input_circuit_satisfies_mock_prover() {
         let circuit = BoundedMlpCircuit::from_canonical_input(CANONICAL_INPUT);
         let instance = instance_for(CANONICAL_INPUT, CANONICAL_OUTPUT);
-        let k = 8;
+        let k = 9;
         let prover = MockProver::run(k, &circuit, vec![instance]).expect("mock prover runs");
         prover.verify().expect("canonical assignment must satisfy constraints");
     }
@@ -578,16 +794,52 @@ mod tests {
         let mut wrong_output = CANONICAL_OUTPUT;
         wrong_output[0] += 1;
         let instance = instance_for(CANONICAL_INPUT, wrong_output);
-        let k = 8;
+        let k = 9;
         let prover = MockProver::run(k, &circuit, vec![instance]).expect("mock prover runs");
         assert!(prover.verify().is_err(), "wrong output must fail constraints");
     }
 
+    /// Soundness regression: prove that the prover cannot satisfy
+    /// the circuit by lying about a single hidden_pre_relu value
+    /// and absorbing the slack into the corresponding r1[j]. Pre-
+    /// range-check, this attack worked (constraint
+    /// `pre*S + r = with_bias` was trivially satisfiable for any
+    /// pre by choosing r = with_bias - pre*S). The 9-bit range
+    /// check on r1[j] closes this attack — the lying r value is
+    /// out of [-128, 128] and bit decomposition fails.
+    #[test]
+    fn slack_absorption_attack_is_rejected_by_range_check() {
+        let mut circuit = BoundedMlpCircuit::from_canonical_input(CANONICAL_INPUT);
+        // Tamper: shift hidden_pre_relu[0] by +1 and adjust r1[0] by -S
+        // (the absorbed slack). The dense equation still holds with
+        // these adjusted values, but |r1[0]| now exceeds S/2 = 128.
+        let pre_orig = 57i64;
+        let r_orig = circuit.r1[0];
+        let _ = r_orig;
+        circuit.hidden_pre_relu[0] = known_i64(pre_orig + 1);
+        circuit.r1[0] = known_i64(
+            // r1[0] must now equal (with_bias - (pre+1)*S) = original_r - S = original_r - 256
+            // For our canonical: with_bias=14624, original_r=14624 - 57*256 = 14624 - 14592 = 32.
+            // New r = 32 - 256 = -224. Out of [-128, 128].
+            32 - 256,
+        );
+        // Adjust the bit decomposition to "honestly" reflect the new
+        // r value — i.e., decompose -224 + 128 = -96 (negative, can't
+        // be decomposed in unsigned bits). Use 0 bits to force the
+        // sum mismatch.
+        circuit.r1_bits[0] = [Value::known(Fp::zero()); NUM_BIT_COLS];
+
+        let instance = instance_for(CANONICAL_INPUT, CANONICAL_OUTPUT);
+        let k = 9;
+        let prover = MockProver::run(k, &circuit, vec![instance]).expect("mock prover runs");
+        assert!(
+            prover.verify().is_err(),
+            "slack-absorption attack must fail under the 9-bit range check on r1"
+        );
+    }
+
     #[test]
     fn fp_from_i64_round_trips_through_signed_embedding() {
-        // Spot-check the signed embedding handles negatives correctly.
-        // Fp = pasta_curves Pallas scalar field. Negative i16 maps to
-        // p - |x| mod p.
         let neg5 = fp_from_i64(-5);
         let pos5 = fp_from_i64(5);
         assert_eq!(neg5 + pos5, Fp::zero());

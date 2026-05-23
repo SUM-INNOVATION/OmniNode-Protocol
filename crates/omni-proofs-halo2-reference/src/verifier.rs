@@ -64,6 +64,7 @@ const EMBEDDED_PARAMS_BIN: &[u8] =
 
 /// Halo2 reference verifier — verifies proofs against the committed
 /// `halo2-mlp-v1` canonical spec.
+#[derive(Debug)]
 pub struct Halo2ReferenceVerifier {
     params: Params<EqAffine>,
     vk: VerifyingKey<EqAffine>,
@@ -233,6 +234,29 @@ impl ProofVerifier for Halo2ReferenceVerifier {
             return Err(ProofVerifierError::VerifierInternal(format!(
                 "response_hash drift: metadata says {:?}, BLAKE3(LE(output)) is {:?}",
                 meta.response_hash, computed_output_hash
+            )));
+        }
+
+        // 7.5. **Defense-in-depth: re-run the neutral canonical
+        // evaluator and refuse if the claimed output disagrees.**
+        //
+        // The halo2 circuit's job is to prove that
+        // `canonical_evaluate(input) == output`, but the circuit's
+        // soundness is bounded — for arbitrary inputs that trigger
+        // requantization ties or i16 saturation, the constraint set
+        // alone does not pin the output uniquely. The bounded
+        // reference fixture committed in this stage avoids both
+        // cases (the canonical `[-5, 10, 20, -100]` input produces
+        // no ties and no saturation), but the verifier defends
+        // against future regressions by independently running the
+        // pure-Rust evaluator. A halo2 proof that disagrees with
+        // the neutral evaluator is rejected here, before the
+        // SNARK verifier even runs.
+        let expected_output = crate::canonical::canonical_evaluate(input_i16);
+        if expected_output != output_i16 {
+            return Err(ProofVerifierError::VerifierInternal(format!(
+                "claimed output {output_i16:?} does not equal canonical_evaluate(input) \
+                 {expected_output:?} — proof rejected before halo2 verify"
             )));
         }
 

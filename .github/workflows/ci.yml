@@ -240,12 +240,15 @@ jobs:
       - name: cargo build -p omni-node --features halo2-reference-verify
         run: cargo build -p omni-node --features halo2-reference-verify
 
+      # Stage 11b.1.b — run the FULL --features verify test suite
+      # (unit tests + integration tests). The earlier scoping to a
+      # single --test target masked compile errors in feature-gated
+      # unit tests inside src/verifier.rs.
       - name: cargo test -p omni-proofs-halo2-reference --features verify
         run: |
           cargo test \
             -p omni-proofs-halo2-reference \
-            --features verify \
-            --test halo2_proof_verifies
+            --features verify
 
   # ── Stage 11b.1.b: opt-in tree-check ───────────────────────────────────────
   #
