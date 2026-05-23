@@ -724,8 +724,8 @@ pub enum MainnetRefusalReason {
     /// gate yet.
     #[error(
         "proof system {proof_system:?} (backend_id = {backend_id:?}) is not in the \
-         mainnet allowlist; Stage 11b ships with the allowlist empty by design — \
-         mainnet eligibility is a Stage 11c+ deliverable with chain-team review"
+         mainnet allowlist; Stage 11b / 11c ship with the allowlist empty by design — \
+         mainnet eligibility lands in a future chain-team-reviewed stage (Stage 11d+)"
     )]
     NotInMainnetAllowlist {
         backend_id: String,
@@ -748,9 +748,9 @@ pub enum MainnetRefusalReason {
 /// This invariant is pinned by the
 /// `every_proof_system_is_refused_on_mainnet_at_stage_11b0` test.
 ///
-/// Mainnet eligibility lands earliest in Stage 11c, with chain-team
-/// review. **No Stage 11b.0 / 11b.1 change should ever cause this
-/// function to return `Ok(())`.**
+/// Mainnet eligibility lands in a future chain-team-reviewed stage
+/// (Stage 11d+); Stage 11c keeps the allowlist empty. **No Stage 11b
+/// or 11c change should ever cause this function to return `Ok(())`.**
 pub fn check_mainnet_eligible(
     meta: &ProofMetadata,
 ) -> std::result::Result<(), MainnetRefusalReason> {
@@ -1705,7 +1705,7 @@ mod tests {
     }
 
     #[test]
-    fn halo2_reference_mlp_format_is_NOT_caught_by_layer_5() {
+    fn halo2_reference_mlp_format_is_not_caught_by_layer_5() {
         // Stage 11b.1.a adds Halo2ReferenceMlp as a first-class
         // variant — it must NOT be caught by layer 5
         // (Other/unknown). Refusal must come from layer 3

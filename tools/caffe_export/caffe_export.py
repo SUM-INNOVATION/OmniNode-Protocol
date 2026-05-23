@@ -191,17 +191,121 @@ def build_manifest(spec_bytes: bytes, spec: dict, output: list[int], runtime_mod
     }
 
 
+def default_corpus_input_path() -> Path:
+    return workspace_root() / "crates/omni-proofs-halo2-reference/tests/fixtures/corpus.json"
+
+
+def default_corpus_output_path() -> Path:
+    return workspace_root() / "crates/omni-proofs-halo2-reference/tests/fixtures/caffe_corpus.json"
+
+
+def run_corpus_mode(spec_path: Path, corpus_in: Path, corpus_out: Path, regen: bool, force_numpy: bool) -> int:
+    """Stage 11c: per-framework corpus mode (Caffe).
+
+    Caffe runtime mode is file-level (per the Stage 11c plan). If
+    real Caffe is unavailable, the whole corpus is generated via
+    the auditable pure-NumPy fallback.
+    """
+    spec_bytes = spec_path.read_bytes()
+    spec = json.loads(spec_bytes)
+    truth = json.loads(corpus_in.read_bytes())
+
+    caffe_module, _caffe_version = (None, None)
+    if not force_numpy:
+        caffe_module, _caffe_version = _try_caffe()
+    use_real_caffe = caffe_module is not None
+    # Caffe runtime stub raises NotImplementedError → fallback to numpy.
+    if use_real_caffe:
+        try:
+            _ = compute_real_caffe(caffe_module, spec)
+        except NotImplementedError:
+            use_real_caffe = False
+
+    runtime_mode = "caffe-runtime" if use_real_caffe else "pure-numpy-emulation"
+    generation_mode = "LiveExport" if use_real_caffe else "PureNumpyCompatibility"
+
+    entries_out = []
+    for entry in truth["entries"]:
+        input_list = list(entry["input"])
+        assert len(input_list) == 4
+        spec_with_input = dict(spec)
+        spec_with_input["canonical_evaluation"] = {**spec["canonical_evaluation"], "input": input_list}
+        if use_real_caffe:
+            output = compute_real_caffe(caffe_module, spec_with_input)
+        else:
+            output = compute_pure_numpy(spec_with_input)
+        if output != list(entry["output"]):
+            sys.exit(
+                f"Caffe corpus drift on entry {entry['label']!r}: caffe path ({runtime_mode}) "
+                f"produced {output}, ground truth has {entry['output']}"
+            )
+        entries_out.append({
+            "label": entry["label"],
+            "input": input_list,
+            "output": output,
+            "input_hash": hex_blake3(encode_le(input_list)),
+            "output_hash": hex_blake3(encode_le(output)),
+            "notes": entry.get("notes", ""),
+        })
+
+    payload = {
+        "framework": "Caffe",
+        "framework_version": "Caffe (legacy; runtime-mode varies per dev host)",
+        "generation_mode": generation_mode,
+        "generator_metadata": {
+            "runtime_mode": runtime_mode,
+            "caffe_runtime_present": use_real_caffe,
+            "numpy_version": np.__version__,
+            "python_version": sys.version.split()[0],
+        },
+        "spec_name": truth["spec_name"],
+        "spec_version": truth["spec_version"],
+        "spec_hash": truth["spec_hash"],
+        "tensor_encoding": truth["tensor_encoding"],
+        "description": f"Caffe corpus generated in {runtime_mode} mode (file-level Stage 11c convention).",
+        "entries": entries_out,
+    }
+    if regen:
+        corpus_out.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"caffe_export corpus regen wrote {corpus_out} ({len(entries_out)} entries, runtime_mode={runtime_mode})")
+    else:
+        on_disk = json.loads(corpus_out.read_bytes())
+        for i, (t, o) in enumerate(zip(payload["entries"], on_disk["entries"])):
+            for key in ("input", "output", "input_hash", "output_hash"):
+                if t[key] != o[key]:
+                    sys.exit(f"caffe_corpus.json entry {i} {key} drift")
+        print(f"caffe_export corpus verify-only OK ({len(entries_out)} entries, runtime_mode={runtime_mode})")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Caffe canonical-spec exporter (with pure-NumPy fallback).")
-    p.add_argument("mode", choices=["verify-only", "regen"], help="Operating mode.")
+    p.add_argument(
+        "mode",
+        choices=["verify-only", "regen", "corpus-verify", "corpus-regen"],
+        help="Operating mode (corpus modes are Stage 11c).",
+    )
     p.add_argument("--spec", type=Path, default=None)
     p.add_argument("--manifest", type=Path, default=None)
+    p.add_argument("--corpus-in", type=Path, default=None)
+    p.add_argument("--corpus-out", type=Path, default=None)
     p.add_argument("--force-numpy", action="store_true",
                    help="Force the pure-NumPy fallback even if real Caffe is importable.")
     args = p.parse_args()
 
     spec_path = args.spec or default_spec_path()
     manifest_path = args.manifest or default_manifest_path()
+
+    if args.mode in ("corpus-verify", "corpus-regen"):
+        corpus_in = args.corpus_in or default_corpus_input_path()
+        corpus_out = args.corpus_out or default_corpus_output_path()
+        return run_corpus_mode(
+            spec_path,
+            corpus_in,
+            corpus_out,
+            regen=(args.mode == "corpus-regen"),
+            force_numpy=args.force_numpy,
+        )
 
     spec_bytes = spec_path.read_bytes()
     spec = json.loads(spec_bytes)

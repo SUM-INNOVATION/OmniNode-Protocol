@@ -1,6 +1,6 @@
 # omni-proofs-halo2-reference
 
-**Stage 11b.1.a + 11b.1.b — bounded multi-framework halo2 reference scaffold + verifier.**
+**Stage 11b.1.a + 11b.1.b + 11c — bounded multi-framework halo2 reference scaffold + verifier with arbitrary-input soundness.**
 
 This crate ships the pure-Rust **architectural foundation** for the Stage 11b.1 halo2 reference backend. It is not a production zkML system; it is a deliberately bounded scaffold whose job is to:
 
@@ -18,11 +18,20 @@ This crate ships the pure-Rust **architectural foundation** for the Stage 11b.1 
 - An `omni-node` opt-in feature `halo2-reference-verify` that registers the verifier in the `verify-proof` dispatch map. **Default `omni-node` builds pull zero halo2 dependencies**, verified by a CI tree-check.
 - A CI gate that builds + tests the verifier-only feature.
 
-**Stage 11b.1.b scope and non-goals:**
-- **In scope:** circuit-side bit-decomposition range checks on requantization remainders (`r1[j]`, `r2[j]` ∈ [-S/2, S/2]), ReLU magnitudes (∈ [0, 2^15)), and output values (i16 range). Plus the verifier-side `canonical_evaluate` re-run as defense in depth, so an artifact whose claimed output disagrees with the neutral pure-Rust evaluator is rejected before halo2 verify runs.
-- **Non-goals (deferred to Stage 11c+):** no general-input round-half-away tie-break gadget and no explicit saturation gadget. The committed canonical input `[-5, 10, 20, -100]` produces no requantization ties and no i16 saturation, so the range checks alone fully pin the witness for this fixture; arbitrary-input soundness against tie-break ambiguity and saturating inputs is a Stage 11c+ deliverable.
-- No mainnet allowlist entries. `MAINNET_APPROVED_PROOF_SYSTEMS` stays `&[]`; Stage 11b.0 layers 1, 3, 6 hard-refuse the artifact on mainnet.
-- No framework runtime in the operator binary. Prover, exporters, and regen tools live under `tools/` (workspace-excluded).
+**Stage 11c scope and non-goals:**
+- **In scope** (Stage 11c upgrades 11b.1.b's "sound for the canonical fixture" to "sound for every i16 input under the frozen `halo2-mlp-v1 / spec_version: 2` numeric contract"):
+  - Complete round-half-away-from-zero (RHAZ) gadget via signed-magnitude Euclidean division (`abs_w + S/2 = q_abs · S + r_pos` with `r_pos ∈ [0, S)`). Ties at ±S/2, ±3S/2, etc. are pinned to the canonical branch by the uniqueness of Euclidean division — no slack remainder, no per-direction branch.
+  - Three-branch saturation gadget (`b_lo` / `b_in` / `b_hi` selectors with branch-correctness aux witnesses range-checked to 17 bits). Output rule: `q_sat = b_lo·(−2^15) + b_in·q_unsat + b_hi·(2^15 − 1)`. Branch-correctness forces `q_unsat` onto the correct side of the boundary whenever a non-`b_in` branch fires.
+  - Range checks at widths 8u / 15u / 16s / 16u / 17u / 23u (bit decomposition).
+  - 8-entry committed test corpus (`tests/fixtures/corpus.json`) exercising no-tie, multiple tie cases, and extreme i16 inputs — every entry runs end-to-end prove+verify in the `--features prove` integration test.
+  - Cross-framework corpus equivalence: `rumus_corpus.json`, `pytorch_corpus.json`, `tensorflow_corpus.json`, `caffe_corpus.json`, `framework_agnostic_corpus.json` — all match the canonical evaluator byte-for-byte; CI validates committed JSON without invoking any framework runtime.
+  - Verifier-side `canonical_evaluate` defense in depth (carried over from 11b.1.b).
+- **Non-goals (precise):**
+  - **This is still not "production zkML".** The bounded 4→8→4 MLP and its committed weights/biases are an architectural-validation fixture. Mainnet allowlist eligibility is a Stage 11d+ deliverable.
+  - No GGUF / tokenomics / chain-side verification claim.
+  - No mainnet allowlist entries. `MAINNET_APPROVED_PROOF_SYSTEMS` stays `&[]`; Stage 11b.0 layers 1, 3, 6 hard-refuse the artifact on mainnet.
+  - No framework runtime in the operator binary. Prover, exporters, and regen tools live under `tools/` (workspace-excluded).
+  - **No general-input soundness *outside* the frozen `halo2-mlp-v1 / spec_version: 2` numeric contract.** A different model (different W/B/scale) requires its own circuit + spec.
 
 ## Crate layout
 
