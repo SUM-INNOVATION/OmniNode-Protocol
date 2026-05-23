@@ -35,6 +35,15 @@ pub mod encoding;
 pub mod manifest;
 pub mod shared;
 
+// Stage 11b.1.b — halo2 circuit + verifier + (developer-host) prover.
+// Default build pulls none of these. CI's verifier job uses `--features verify`.
+#[cfg(feature = "verify")]
+pub mod circuit;
+#[cfg(feature = "verify")]
+pub mod verifier;
+#[cfg(feature = "prove")]
+pub mod prover;
+
 pub use canonical::{canonical_evaluate, CanonicalInput, CanonicalOutput};
 pub use encoding::{
     decode_canonical_input, decode_canonical_output, encode_canonical_input,
@@ -43,5 +52,8 @@ pub use encoding::{
 pub use manifest::{FrameworkManifest, GenerationMode};
 pub use shared::{
     BACKEND_ID, CANONICAL_INPUT, CANONICAL_OUTPUT, CANONICAL_SPEC_NAME, CANONICAL_SPEC_VERSION,
-    EXPECTED_SPEC_HASH,
+    EXPECTED_SPEC_HASH, HALO2_K,
 };
+
+#[cfg(feature = "verify")]
+pub use verifier::Halo2ReferenceVerifier;

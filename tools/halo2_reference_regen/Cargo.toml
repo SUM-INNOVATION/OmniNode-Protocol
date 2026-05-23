@@ -1,0 +1,32 @@
+[package]
+name = "halo2_reference_regen"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Stage 11b.1.b — developer-host fixture regen tool.
+#
+# Standalone (NOT a workspace member). The root Cargo.toml declares
+# `exclude = ["tools"]`, mirroring the `rumus_export` isolation
+# pattern: the operator binary's `cargo build -p omni-node` graph
+# cannot transitively reach halo2_proofs through this tool.
+#
+# Builds via:
+#   cd tools/halo2_reference_regen && cargo run --release [regen|verify-only]
+
+[[bin]]
+name = "halo2_reference_regen"
+path = "src/main.rs"
+
+[dependencies]
+# Path to the in-tree halo2-reference crate. We pull the `prove`
+# feature (which transitively pulls `verify`), so we get the full
+# circuit + prover + verifier surface here.
+omni-proofs-halo2-reference = { path = "../../crates/omni-proofs-halo2-reference", features = ["prove"] }
+omni-zkml                   = { path = "../../crates/omni-zkml" }
+
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3     = "1"
+clap       = { version = "4", features = ["derive"] }

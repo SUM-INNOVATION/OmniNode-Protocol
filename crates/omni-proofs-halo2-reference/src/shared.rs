@@ -34,3 +34,11 @@ pub const CANONICAL_OUTPUT: [i16; 4] = [33, -32, 17, 7];
 // negotiable by the artifact. (Plain comment, not a doc comment,
 // because rustdoc can't attach docs to a macro invocation.)
 include!(concat!(env!("OUT_DIR"), "/expected_spec_hash.rs"));
+
+/// Stage 11b.1.b — halo2 circuit `k` (log2 number of rows in the
+/// constraint system). Sized for the bounded MLP circuit with
+/// headroom for the layer-1 + ReLU + layer-2 regions PLUS the
+/// 9-bit / 15-bit / 16-bit range-check regions on r1[j], r2[j],
+/// magnitude[j], output[j]. Bumping `k` changes the committed
+/// `params.bin`/`proof.bin` fixtures — treat as a frozen pin.
+pub const HALO2_K: u32 = 9;
