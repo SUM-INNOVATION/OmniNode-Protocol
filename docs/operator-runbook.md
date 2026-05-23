@@ -407,7 +407,7 @@ directly. **No backend-specific helper logic in operator code** —
 that's the architectural property Stage 11b.0.1 locks in for every
 future backend.
 
-**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b: zero.**
+**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b / 11c: zero.**
 The mainnet allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in
 `omni-zkml`) is empty by design. Every proof artifact this command
 verifies will report `mainnet_eligible=false` and carry an explicit
@@ -488,6 +488,30 @@ regenerated via the workspace-excluded
 `tools/halo2_reference_regen/` standalone Cargo package — pattern
 identical to `tools/rumus_export/` in Stage 11b.1.a so the
 operator binary's compile graph never reaches the prover.
+
+**Stage 11c — arbitrary-input soundness for the bounded
+`halo2-mlp-v1 / spec_version: 2` numeric contract.** Replaces the
+Stage 11b.1.b "linear identity + remainder-range-check" gates
+with a complete gadget chain: dense linear identity → round-half-
+away-from-zero (RHAZ) gadget via signed-magnitude Euclidean
+division → three-branch saturation gadget (`b_lo` / `b_in` /
+`b_hi` with 17-bit aux witnesses) → ReLU sign-bit gadget. The
+RHAZ gadget's Euclidean division `abs_w + S/2 = q_abs · S + r_pos`
+with `r_pos ∈ [0, S)` is unique, so ties at ±S/2 and ±3S/2 are
+pinned to the canonical round-half-AWAY branch without ambiguity.
+A committed 8-entry test corpus
+(`crates/omni-proofs-halo2-reference/tests/fixtures/corpus.json`)
+exercises the canonical input, the bias-only path, four
+hand-constructed tie cases, and the two extreme i16 inputs;
+cross-framework corpus files (`{rumus,pytorch,tensorflow,caffe,
+framework_agnostic}_corpus.json`) attest that every framework
+reproduces the canonical output byte-for-byte for every entry.
+`HALO2_K` bumped from 9 → 10. Mainnet posture unchanged: layers
+1, 3, 6 still hard-refuse; `MAINNET_APPROVED_PROOF_SYSTEMS` stays
+empty; all artifacts `testnet_or_dev_only: Some(true)`. **Stage
+11c is still not "production zkML";** the bounded MLP is an
+architectural-validation fixture. Production zkML and mainnet
+eligibility are Stage 11d+ deliverables with chain-team review.
 
 **Exit code: inspect/report, not strict-validator.** `verify-proof`
 exits `0` on a successful *inspection* run regardless of whether

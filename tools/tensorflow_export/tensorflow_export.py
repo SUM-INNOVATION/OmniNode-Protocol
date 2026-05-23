@@ -136,15 +136,91 @@ def build_manifest(spec_bytes: bytes, spec: dict, output: list[int]) -> dict:
     }
 
 
+def default_corpus_input_path() -> Path:
+    return workspace_root() / "crates/omni-proofs-halo2-reference/tests/fixtures/corpus.json"
+
+
+def default_corpus_output_path() -> Path:
+    return workspace_root() / "crates/omni-proofs-halo2-reference/tests/fixtures/tensorflow_corpus.json"
+
+
+def run_corpus_mode(spec_path: Path, corpus_in: Path, corpus_out: Path, regen: bool) -> int:
+    """Stage 11c: per-framework corpus mode (TensorFlow)."""
+    spec_bytes = spec_path.read_bytes()
+    spec = json.loads(spec_bytes)
+    truth = json.loads(corpus_in.read_bytes())
+    entries_out = []
+    for entry in truth["entries"]:
+        input_list = list(entry["input"])
+        assert len(input_list) == 4
+        spec_with_input = dict(spec)
+        spec_with_input["canonical_evaluation"] = {**spec["canonical_evaluation"], "input": input_list}
+        output = compute(spec_with_input)
+        if output != list(entry["output"]):
+            sys.exit(
+                f"TensorFlow corpus drift on entry {entry['label']!r}: tf produced {output}, "
+                f"ground truth has {entry['output']}"
+            )
+        entries_out.append({
+            "label": entry["label"],
+            "input": input_list,
+            "output": output,
+            "input_hash": hex_blake3(encode_le(input_list)),
+            "output_hash": hex_blake3(encode_le(output)),
+            "notes": entry.get("notes", ""),
+        })
+    payload = {
+        "framework": "TensorFlow",
+        "framework_version": f"tensorflow {tf.__version__} (CPU int64 explicit; no tf.quantization)",
+        "generation_mode": "LiveExport",
+        "generator_metadata": {
+            "runtime_mode": "tensorflow-int64-explicit",
+            "tensorflow_version": tf.__version__,
+            "numpy_version": np.__version__,
+            "python_version": sys.version.split()[0],
+        },
+        "spec_name": truth["spec_name"],
+        "spec_version": truth["spec_version"],
+        "spec_hash": truth["spec_hash"],
+        "tensor_encoding": truth["tensor_encoding"],
+        "description": "TensorFlow corpus: each entry re-verified via explicit int64 dense+ReLU pipeline.",
+        "entries": entries_out,
+    }
+    if regen:
+        corpus_out.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"tensorflow_export corpus regen wrote {corpus_out} ({len(entries_out)} entries)")
+    else:
+        on_disk = json.loads(corpus_out.read_bytes())
+        for i, (t, o) in enumerate(zip(payload["entries"], on_disk["entries"])):
+            for key in ("input", "output", "input_hash", "output_hash"):
+                if t[key] != o[key]:
+                    sys.exit(f"tensorflow_corpus.json entry {i} {key} drift")
+        print(f"tensorflow_export corpus verify-only OK ({len(entries_out)} entries)")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="TensorFlow canonical-spec exporter.")
-    p.add_argument("mode", choices=["verify-only", "regen"], help="Operating mode.")
+    p.add_argument(
+        "mode",
+        choices=["verify-only", "regen", "corpus-verify", "corpus-regen"],
+        help="Operating mode (corpus modes are Stage 11c).",
+    )
     p.add_argument("--spec", type=Path, default=None)
     p.add_argument("--manifest", type=Path, default=None)
+    p.add_argument("--corpus-in", type=Path, default=None)
+    p.add_argument("--corpus-out", type=Path, default=None)
     args = p.parse_args()
 
     spec_path = args.spec or default_spec_path()
     manifest_path = args.manifest or default_manifest_path()
+
+    if args.mode in ("corpus-verify", "corpus-regen"):
+        corpus_in = args.corpus_in or default_corpus_input_path()
+        corpus_out = args.corpus_out or default_corpus_output_path()
+        return run_corpus_mode(
+            spec_path, corpus_in, corpus_out, regen=(args.mode == "corpus-regen")
+        )
 
     spec_bytes = spec_path.read_bytes()
     spec = json.loads(spec_bytes)

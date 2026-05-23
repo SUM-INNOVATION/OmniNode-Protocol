@@ -1,0 +1,160 @@
+{
+  "description": "RUMUS reproduces every entry via `rumus::fixed::FixedLinear` + `requantize`.",
+  "entries": [
+    {
+      "input": [
+        -5,
+        10,
+        20,
+        -100
+      ],
+      "input_hash": "200bd19925ebbafa7ed3869846d0571fb34bb25b4f74224045b0b6d590234e8d",
+      "label": "canonical",
+      "notes": "Frozen Stage 11b.1.a canonical pair. No requantization ties, no saturation.",
+      "output": [
+        33,
+        -32,
+        17,
+        7
+      ],
+      "output_hash": "130702c380646f9ca151c6d6bb2958ecc8675bcf55c5a5c0c37e66c89806728a"
+    },
+    {
+      "input": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "input_hash": "71e0a99173564931c0b8acc52d2685a8e39c64dc52e3d02390fdac2a12b155cb",
+      "label": "zero_input",
+      "notes": "Bias-only path. Exercises a Layer-2 tie at j=1 (with_bias=-8192, r_pos=0).",
+      "output": [
+        32,
+        -32,
+        20,
+        6
+      ],
+      "output_hash": "9bee60e03d694691e7530bfc83d0c0afdd278d4eb3284a87c009159a38348b7a"
+    },
+    {
+      "input": [
+        0,
+        32,
+        0,
+        0
+      ],
+      "input_hash": "cce7f3a0d68b64c990e07608f95ddc7972289c79151ef6980c3b32532d66db86",
+      "label": "tie_layer1_pos",
+      "notes": "Layer-1 tie at j=7 (with_bias=+2176, +S/2 round-half-away to +9).",
+      "output": [
+        32,
+        -31,
+        20,
+        6
+      ],
+      "output_hash": "c142f068b4001432a59584c42cbe785ee3cf4491a92ad8240a8a000e3dba0eaa"
+    },
+    {
+      "input": [
+        8,
+        0,
+        0,
+        0
+      ],
+      "input_hash": "783b517cbdee46b786ef6dc4968398922606ee8e7a4f04156493f6c881a60dfb",
+      "label": "tie_layer1_neg",
+      "notes": "Two Layer-1 ties: j=1 (with_bias=-8320, neg branch) and j=5 (with_bias=+128, +S/2).",
+      "output": [
+        32,
+        -32,
+        20,
+        6
+      ],
+      "output_hash": "9bee60e03d694691e7530bfc83d0c0afdd278d4eb3284a87c009159a38348b7a"
+    },
+    {
+      "input": [
+        0,
+        8,
+        0,
+        0
+      ],
+      "input_hash": "c1c588cf08603b346cd22559dcbb53070a8f59e57705b39fcb19a4b0e5a61ff7",
+      "label": "tie_layer1_multi",
+      "notes": "Four Layer-1 ties at j=0,2,5,6 — broad coverage.",
+      "output": [
+        32,
+        -31,
+        20,
+        6
+      ],
+      "output_hash": "c142f068b4001432a59584c42cbe785ee3cf4491a92ad8240a8a000e3dba0eaa"
+    },
+    {
+      "input": [
+        32767,
+        32767,
+        32767,
+        32767
+      ],
+      "input_hash": "4cfb1f079498a9d1e5cc4498b64a5143455a3c52e2a6a996dd3a72bc125b5305",
+      "label": "extreme_pos_input",
+      "notes": "Maximum positive i16 inputs. Stresses dense-layer magnitudes; no saturation under frozen spec.",
+      "output": [
+        879,
+        930,
+        1075,
+        868
+      ],
+      "output_hash": "0558597f1129de70ec187ce0ebd8bd0530f478b166970823ecb5c9c4e0e46b8e"
+    },
+    {
+      "input": [
+        -32768,
+        -32768,
+        -32768,
+        -32768
+      ],
+      "input_hash": "8a6c4edc73fff0962b5c92ecb93684865bf97a031be137f4f1c2e30748353986",
+      "label": "extreme_neg_input",
+      "notes": "Minimum negative i16 inputs. No saturation under frozen spec.",
+      "output": [
+        -34,
+        -381,
+        49,
+        450
+      ],
+      "output_hash": "b2e9907e0f389daf77808dc04da3c7809cfffa12042ba6901e354ba976029d24"
+    },
+    {
+      "input": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "input_hash": "fb650186c337f3fd78335483c0b87e4950ba8dc6681a0a0eda9060084e01046e",
+      "label": "mixed_input",
+      "notes": "Small mixed values; non-tie regression coverage.",
+      "output": [
+        32,
+        -31,
+        20,
+        6
+      ],
+      "output_hash": "c142f068b4001432a59584c42cbe785ee3cf4491a92ad8240a8a000e3dba0eaa"
+    }
+  ],
+  "framework": "Rumus",
+  "framework_version": "rumus 0.4.0 (crates.io; MIT OR Apache-2.0)",
+  "generation_mode": "LiveExport",
+  "generator_metadata": {
+    "rumus_version": "0.4.0",
+    "runtime_mode": "rumus-fixed-linear"
+  },
+  "spec_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
+  "spec_name": "halo2-mlp-v1",
+  "spec_version": 2,
+  "tensor_encoding": "i16-little-endian"
+}
