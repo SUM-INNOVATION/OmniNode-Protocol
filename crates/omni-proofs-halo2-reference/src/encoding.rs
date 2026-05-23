@@ -87,12 +87,15 @@ mod tests {
     fn encode_canonical_output_is_8_bytes_little_endian() {
         let bytes = encode_canonical_output(&CANONICAL_OUTPUT);
         assert_eq!(bytes.len(), 8);
-        // CANONICAL_OUTPUT[0] = 32 → 0x20 0x00 (LE i16).
-        assert_eq!(bytes[0], 0x20);
+        // CANONICAL_OUTPUT[0] = 33 → 0x21 0x00 (LE i16).
+        assert_eq!(bytes[0], 0x21);
         assert_eq!(bytes[1], 0x00);
         // CANONICAL_OUTPUT[1] = -32 → 0xE0 0xFF (LE i16).
         assert_eq!(bytes[2], 0xE0);
         assert_eq!(bytes[3], 0xFF);
+        // CANONICAL_OUTPUT[3] = 7 → 0x07 0x00 (LE i16).
+        assert_eq!(bytes[6], 0x07);
+        assert_eq!(bytes[7], 0x00);
     }
 
     #[test]

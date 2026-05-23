@@ -1,0 +1,6 @@
+# Stage 11b.1.a — PyTorch canonical-spec exporter dependencies.
+# Pinned loosely because the script avoids any framework-version-specific
+# APIs (no torch.quantization, no torch.ao, no torch.jit).
+torch>=2.0,<3.0
+numpy>=1.24
+blake3>=0.3

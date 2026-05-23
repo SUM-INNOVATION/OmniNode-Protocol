@@ -1,11 +1,19 @@
 {
   "framework": "PyTorch",
-  "framework_version": "PyTorch 2.4.x (any recent stable; integer arithmetic only)",
-  "weights_hash": "e022245c1c8887bae4610b4198a023fc473da6a37b55bb4cc3cb63a4e7311bfe",
+  "framework_version": "torch 2.x (any recent stable CPU build; integer ops only)",
+  "weights_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
   "input": [-5, 10, 20, -100],
-  "output": [32, -32, 17, 8],
+  "output": [33, -32, 17, 7],
   "generated_at_utc": "2026-05-22T00:00:00Z",
-  "generated_by": "Stage 11b.1.a — developer host (no live export tool in repo yet)",
-  "generation_mode": "ManualFixture",
-  "notes": "PyTorch can faithfully reproduce the canonical evaluator's int16 fixed-point arithmetic via explicit integer ops in `torch.int32` / `torch.int16` tensors. The canonical Stage 11b.1.a manifest carries the expected output but does NOT ship a live `tools/pytorch_export.py` script — that lands in a future stage if/when an automated regen workflow is desired. The values committed here equal the canonical evaluator's output by construction; the cross_framework_equivalence test asserts byte-for-byte match."
+  "generated_by": "tools/pytorch_export/pytorch_export.py — developer-host manual script; explicit integer arithmetic via int64 tensors. Not invoked by CI.",
+  "generation_mode": "LiveExport",
+  "spec_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
+  "input_hash": "200bd19925ebbafa7ed3869846d0571fb34bb25b4f74224045b0b6d590234e8d",
+  "output_hash": "130702c380646f9ca151c6d6bb2958ecc8675bcf55c5a5c0c37e66c89806728a",
+  "generator_metadata": {
+    "runtime_mode": "pytorch-int64-explicit",
+    "torch_quantization_apis_used": false,
+    "regen_command": "python3 tools/pytorch_export/pytorch_export.py --regen"
+  },
+  "notes": "PyTorch reproduces the canonical contract via explicit integer math on int64 tensors (no `torch.quantization` / `torch.ao` APIs). The export script implements i16×i16 → i64 accumulation, bias promotion to scale² domain, round-half-away-from-zero requantization, saturate-to-i16, and ReLU max(x,0) directly. Verified byte-for-byte against the canonical evaluator on developer host."
 }

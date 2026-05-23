@@ -1,0 +1,7 @@
+# Stage 11b.1.a — Caffe canonical-spec exporter dependencies.
+# Real Caffe (PyPI: `caffe`) is optional — the script auto-falls-back
+# to a pure-NumPy emulation that runs the exact canonical arithmetic.
+# Install Caffe separately if you want the LiveExport path; the
+# fallback only needs numpy + blake3.
+numpy>=1.24
+blake3>=0.3

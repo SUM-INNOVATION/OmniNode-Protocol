@@ -415,24 +415,40 @@ refusal reason from one of the six refusal layers documented in §11a.
 Mainnet eligibility is a Stage 11c+ deliverable with chain-team
 review.
 
-**Stage 11b.1.a — multi-framework architectural scaffold.** Adds the
-`ModelFramework` enum (Rumus / PyTorch / TensorFlow / Caffe /
+**Stage 11b.1.a — multi-framework architectural scaffold (four equal primaries).**
+Adds the `ModelFramework` enum (Rumus / PyTorch / TensorFlow / Caffe /
 FrameworkAgnostic), `ModelFormat::Halo2ReferenceMlp`, and
 `ProofSystem::Stage11bHalo2Reference`. The new
-`crates/omni-proofs-halo2-reference/` ships a pure-Rust canonical
-evaluator for a bounded 4→8→4 int16 fixed-point MLP plus committed
-fixture manifests for all five framework variants. **No halo2
-circuit, no prover dependency, no operator-binary changes.** The
-canonical evaluator is the single source of truth; each framework's
-manifest must reproduce its output byte-for-byte (asserted by the
-`cross_framework_equivalence` integration test). RUMUS support is
-explicitly **fixture-only** (`generation_mode: "IntendedRepresentation"`)
-until RUMUS exposes a deterministic CPU fixed-point integer-dense
-path. **OmniNode does not invoke any framework runtime at any
-point** — framework manifests are committed JSON files, parsed by
-pure Rust. Layer 3 of `check_mainnet_eligible` now refuses both
-`Stage11bOnnxReference` AND `Stage11bHalo2Reference` (defense in
-depth alongside the testnet flag + empty allowlist).
+`crates/omni-proofs-halo2-reference/` ships a framework-neutral
+canonical spec (`assets/canonical_spec.json`) for a bounded 4→8→4
+int16 fixed-point MLP plus a pure-Rust canonical evaluator (the
+**neutral reference implementation, not a fifth framework**) and
+committed fixture manifests for all five variants. **RUMUS,
+PyTorch, TensorFlow, and Caffe are all equal-status primary
+compatibility targets**; each has its own developer-host exporter
+under `tools/<framework>_export/` that reads the spec and emits its
+manifest by running the canonical arithmetic through that
+framework's own primitives. RUMUS is now LiveExport via `rumus =
+"0.4.0"`'s `fixed::FixedLinear`. Caffe's exporter records an
+auditable `PureNumpyCompatibility` fallback when the host lacks a
+working Caffe binding (`generator_metadata.runtime_mode =
+"pure-numpy-emulation"`); a host with real Caffe gets
+`runtime_mode = "caffe-runtime"` and `generation_mode = LiveExport`.
+The numeric contract is RUMUS-compatible: i16 tensors, i64
+accumulator, bias added in widened scale² domain BEFORE
+saturation, round-nearest-ties-away-from-zero requantization,
+saturate to i16, ReLU `max(x, 0)`. **No halo2 circuit, no prover
+dependency, no operator-binary changes.** The canonical evaluator
++ cross-framework equivalence test assert byte-for-byte agreement
+plus identical `weights_hash` / `spec_hash` / `input_hash` /
+`output_hash` across all five manifests. **OmniNode does not
+invoke any framework runtime at any point** — framework manifests
+are committed JSON files, parsed by pure Rust; the four exporters
+live under `tools/` (excluded from the workspace) so
+`cargo build -p omni-node` cannot transitively reach them. Layer 3
+of `check_mainnet_eligible` refuses both `Stage11bOnnxReference`
+AND `Stage11bHalo2Reference` (defense in depth alongside the
+testnet flag + empty allowlist).
 
 **Exit code: inspect/report, not strict-validator.** `verify-proof`
 exits `0` on a successful *inspection* run regardless of whether

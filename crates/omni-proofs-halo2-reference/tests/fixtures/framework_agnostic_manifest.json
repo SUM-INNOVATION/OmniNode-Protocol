@@ -1,11 +1,14 @@
 {
   "framework": "FrameworkAgnostic",
-  "framework_version": "canonical-evaluator-v1 (crates/omni-proofs-halo2-reference)",
-  "weights_hash": "e022245c1c8887bae4610b4198a023fc473da6a37b55bb4cc3cb63a4e7311bfe",
+  "framework_version": "canonical-evaluator-v1 (crates/omni-proofs-halo2-reference, spec_version=2)",
+  "weights_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
   "input": [-5, 10, 20, -100],
-  "output": [32, -32, 17, 8],
+  "output": [33, -32, 17, 7],
   "generated_at_utc": "2026-05-22T00:00:00Z",
-  "generated_by": "Stage 11b.1.a canonical evaluator (crate root)",
-  "generation_mode": "LiveExport",
-  "notes": "FrameworkAgnostic = the canonical evaluator itself, which is the single source of truth. Other frameworks' manifests must reproduce this output byte-for-byte. weights_hash equals BLAKE3 of assets/canonical_spec.json (pinned by build.rs as EXPECTED_SPEC_HASH)."
+  "generated_by": "Stage 11b.1.a canonical evaluator (neutral reference implementation in crates/omni-proofs-halo2-reference/src/canonical.rs)",
+  "generation_mode": "ManualFixture",
+  "spec_hash": "4fe9f656e390423e6d03a6e0519c510b1c850e263922fe9a985b4e4493dde0c5",
+  "input_hash": "200bd19925ebbafa7ed3869846d0571fb34bb25b4f74224045b0b6d590234e8d",
+  "output_hash": "130702c380646f9ca151c6d6bb2958ecc8675bcf55c5a5c0c37e66c89806728a",
+  "notes": "FrameworkAgnostic is schema-coverage regression: a self-contained manifest with no framework runtime binding. It is NOT 'the source of truth' — the framework-neutral canonical_spec.json is the source of truth, and the Rust canonical evaluator is the neutral reference implementation. RUMUS, PyTorch, TensorFlow, and Caffe are equal-status primary compatibility targets, each with its own exporter under tools/."
 }

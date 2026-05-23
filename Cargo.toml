@@ -11,6 +11,12 @@ members = [
     "crates/omni-node",
     "crates/omni-proofs-halo2-reference",
 ]
+# Stage 11b.1.a: `tools/` holds developer-host manual fixture
+# generators (rumus_export, pytorch_export, tensorflow_export,
+# caffe_export). They are intentionally excluded from the workspace
+# so the operator binary's build graph cannot transitively pull
+# framework runtimes (RUMUS / PyTorch / TensorFlow / Caffe).
+exclude = ["tools"]
 
 [workspace.package]
 version      = "0.1.0"

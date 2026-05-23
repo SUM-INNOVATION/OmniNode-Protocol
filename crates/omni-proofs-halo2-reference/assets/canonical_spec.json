@@ -1,7 +1,7 @@
 {
   "spec_name": "halo2-mlp-v1",
-  "spec_version": 1,
-  "description": "Stage 11b.1 canonical bounded MLP — 4 -> 8 -> 4 with ReLU, int16 fixed-point arithmetic. Pure-Rust canonical evaluator in crates/omni-proofs-halo2-reference is the single source of truth; every framework's manifest must reproduce these exact bytes. Halo2 circuit proving this spec lands in Stage 11b.1.b. Testnet/dev only; mainnet hard-refused.",
+  "spec_version": 2,
+  "description": "Stage 11b.1 canonical bounded MLP — 4 -> 8 -> 4 with ReLU, int16 fixed-point arithmetic. This specification is framework-neutral; it does not privilege any single framework. RUMUS, PyTorch, TensorFlow, and Caffe are all equal-status primary compatibility targets. The pure-Rust canonical evaluator in crates/omni-proofs-halo2-reference is the neutral reference implementation, not a fifth framework. Every framework's manifest must reproduce the canonical_evaluation.output byte-for-byte. Halo2 circuit proving this spec lands in Stage 11b.1.b. Testnet/dev only; mainnet hard-refused.",
   "architecture": {
     "layers": [
       {"kind": "Dense", "input_dim": 4, "output_dim": 8, "weights_ref": "W1", "biases_ref": "B1"},
@@ -11,9 +11,11 @@
   },
   "quantization": {
     "dtype": "i16",
+    "accumulator_dtype": "i64",
     "scale": 256,
     "scale_log2": 8,
-    "rounding": "truncate-toward-zero",
+    "rounding": "round-nearest-ties-away-from-zero",
+    "bias_application": "widened-domain-before-saturation",
     "overflow": "saturate-to-i16",
     "tensor_encoding": "i16-little-endian"
   },
@@ -51,7 +53,8 @@
   },
   "canonical_evaluation": {
     "input":  [ -5,  10,  20, -100],
-    "hidden_after_relu": [ 58,   0,   0,   0,  43,   0,   0,   7],
-    "output": [ 32, -32,  17,   8]
+    "hidden_pre_relu": [ 57, -17,  -9, -23,  44,  -3, -35,   6],
+    "hidden_after_relu": [ 57,   0,   0,   0,  44,   0,   0,   6],
+    "output": [ 33, -32,  17,   7]
   }
 }

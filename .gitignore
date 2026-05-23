@@ -1,5 +1,8 @@
 # Rust
 /target/
+# Nested target/ under tools/ (standalone Cargo packages outside the workspace,
+# e.g. tools/rumus_export/) must not be committed.
+tools/**/target/
 **/*.rs.bk
 # Cargo.lock is committed — workspace contains binary crate (omni-node)
 
