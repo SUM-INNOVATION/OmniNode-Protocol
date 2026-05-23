@@ -138,3 +138,7 @@ omni-bridge   = { path = "crates/omni-bridge" }
 omni-pipeline = { path = "crates/omni-pipeline" }
 omni-zkml     = { path = "crates/omni-zkml" }
 omni-sumchain = { path = "crates/omni-sumchain" }
+# Stage 11b.1.b — only consumed by `omni-node` under the
+# `halo2-reference-verify` opt-in feature. Default `cargo build`
+# (no features) never reaches this dependency.
+omni-proofs-halo2-reference = { path = "crates/omni-proofs-halo2-reference" }

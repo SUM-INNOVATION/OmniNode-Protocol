@@ -1835,6 +1835,23 @@ async fn verify_proof_core(proof_artifact_path: PathBuf) -> Result<(), OperatorE
                         ))
                     })?
             }
+            #[cfg(feature = "halo2-reference-verify")]
+            Some(omni_zkml::ProofSystem::Stage11bHalo2Reference) => {
+                use omni_zkml::ProofVerifier;
+                let verifier = omni_proofs_halo2_reference::Halo2ReferenceVerifier::from_embedded_fixtures()
+                    .map_err(|e| {
+                        OperatorError::ProofArtifactParse(format!(
+                            "halo2-reference verifier construction failure: {e}"
+                        ))
+                    })?;
+                verifier
+                    .verify_artifact(&body)
+                    .map_err(|e| {
+                        OperatorError::ProofArtifactParse(format!(
+                            "verifier failure: {e}"
+                        ))
+                    })?
+            }
             Some(other) => {
                 return Err(OperatorError::NoVerifierForProofSystem {
                     proof_system: format!("{other:?}"),

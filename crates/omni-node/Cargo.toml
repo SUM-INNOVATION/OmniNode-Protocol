@@ -23,6 +23,11 @@ path = "src/main.rs"
 # sources only — no GitHub credential is required at any step.
 default = []
 submit  = ["omni-sumchain/submit"]
+# Stage 11b.1.b — opt-in feature that pulls the halo2 reference
+# verifier into the operator binary's `verify-proof` dispatch.
+# Default-OFF: the operator binary's compile graph contains zero
+# halo2 / pasta / IPA dependencies unless this feature is set.
+halo2-reference-verify = ["dep:omni-proofs-halo2-reference"]
 
 [dependencies]
 omni-types         = { workspace = true }
@@ -43,6 +48,10 @@ thiserror          = { workspace = true }
 # through a SnipV2Adapter in synthetic mode (it's deliberately not
 # published to a real SNIP store).
 blake3             = { workspace = true }
+# Stage 11b.1.b — opt-in halo2 reference verifier. Only enters the
+# compile graph when `--features halo2-reference-verify` is passed;
+# `cargo build -p omni-node` with default features pulls zero halo2.
+omni-proofs-halo2-reference = { workspace = true, optional = true, features = ["verify"] }
 
 [dev-dependencies]
 tempfile           = { workspace = true }

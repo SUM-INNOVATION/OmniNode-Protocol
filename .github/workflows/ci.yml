@@ -118,6 +118,25 @@ jobs:
           fi
           echo "default tree: no sumchain-crypto / sumchain-primitives — feature gating intact."
 
+      # Stage 11b.1.b — same gate, but for the halo2 reference
+      # dependencies. Default omni-node MUST NOT pull halo2_proofs
+      # or pasta_curves; only `--features halo2-reference-verify`
+      # is allowed to.
+      - name: Assert `omni-node` default tree has NO halo2 / pasta crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree_out="$(cargo tree -p omni-node)"
+          if echo "$tree_out" | grep -E 'halo2_proofs|pasta_curves'; then
+            {
+              echo "::error::Default \`omni-node\` build pulls halo2_proofs / pasta_curves."
+              echo "The Stage 11b.1.b feature gating must keep those out of the default"
+              echo "graph; only --features halo2-reference-verify should pull them in."
+            } >&2
+            exit 1
+          fi
+          echo "default tree: no halo2_proofs / pasta_curves — Stage 11b.1.b isolation intact."
+
   # ── (3) Submit features: full Stage 7b surface ─────────────────────────────
   #
   # No secrets needed (Stage 9c). The chain crates are public on
@@ -189,6 +208,83 @@ jobs:
             exit 1
           fi
           echo "submit tree: sumchain-crypto + sumchain-primitives present as expected."
+
+  # ── Stage 11b.1.b: halo2-reference-verify build + test ──────────────────────
+  #
+  # Verifier-only: builds `omni-proofs-halo2-reference` with the
+  # `verify` feature and runs the integration test that loads the
+  # committed `fixtures/halo2/params.bin` + `proof_artifact.json`
+  # and verifies the proof. The PROVER feature is intentionally NOT
+  # exercised in CI (heavier deps + the regen tool lives in
+  # `tools/halo2_reference_regen/`, which is workspace-excluded).
+  halo2-reference-verify-build-test:
+    name: --features halo2-reference-verify — verifier-only build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git / target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-halo2verify-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-halo2verify-
+
+      - name: cargo build -p omni-node --features halo2-reference-verify
+        run: cargo build -p omni-node --features halo2-reference-verify
+
+      - name: cargo test -p omni-proofs-halo2-reference --features verify
+        run: |
+          cargo test \
+            -p omni-proofs-halo2-reference \
+            --features verify \
+            --test halo2_proof_verifies
+
+  # ── Stage 11b.1.b: opt-in tree-check ───────────────────────────────────────
+  #
+  # HARD GATE: with `--features halo2-reference-verify`, `omni-node`
+  # MUST pull `halo2_proofs` (otherwise the feature has silently
+  # gone inert).
+  halo2-reference-verify-tree-check:
+    name: halo2-reference-verify tree — must contain halo2_proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-tree-halo2verify-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tree-halo2verify-
+
+      - name: Assert `omni-node --features halo2-reference-verify` tree DOES contain halo2
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo tree -p omni-node --features halo2-reference-verify | grep -Eq 'halo2_proofs'; then
+            {
+              echo "::error::--features halo2-reference-verify no longer pulls halo2_proofs."
+              echo "The Stage 11b.1.b feature has gone inert; re-check the"
+              echo "omni-node feature definition and the dep gating on"
+              echo "omni-proofs-halo2-reference."
+            } >&2
+            exit 1
+          fi
+          echo "halo2-reference-verify tree: halo2_proofs present as expected."
 
   # ── (5) Stage 6 byte-stability ──────────────────────────────────────────────
   stage6-fixture-check:

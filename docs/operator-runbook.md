@@ -407,7 +407,7 @@ directly. **No backend-specific helper logic in operator code** —
 that's the architectural property Stage 11b.0.1 locks in for every
 future backend.
 
-**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a: zero.**
+**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b: zero.**
 The mainnet allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in
 `omni-zkml`) is empty by design. Every proof artifact this command
 verifies will report `mainnet_eligible=false` and carry an explicit
@@ -449,6 +449,45 @@ live under `tools/` (excluded from the workspace) so
 of `check_mainnet_eligible` refuses both `Stage11bOnnxReference`
 AND `Stage11bHalo2Reference` (defense in depth alongside the
 testnet flag + empty allowlist).
+
+**Stage 11b.1.b — halo2 reference verifier (opt-in feature
+`halo2-reference-verify`).** Adds a `Halo2ReferenceVerifier` to
+`omni-proofs-halo2-reference` (gated by the `verify` cargo feature)
+that overrides `omni_zkml::ProofVerifier::verify_artifact`. Default
+`omni-node` builds **do not include** halo2 / pasta_curves / IPA
+dependencies — `cargo tree -p omni-node` is empty of those crates,
+gated by a CI tree-check. Operators who want to verify
+`Stage11bHalo2Reference` artifacts in the field rebuild with
+`cargo build -p omni-node --features halo2-reference-verify` (or
+the equivalent `cargo install` form). The verifier:
+  1. Asserts `proof_system == Stage11bHalo2Reference`,
+     `model_format == Halo2ReferenceMlp`,
+     `model_framework == FrameworkAgnostic`,
+     `testnet_or_dev_only == Some(true)`, and `model_hash` equals
+     the compile-pinned `EXPECTED_SPEC_HASH`.
+  2. Decodes `metadata.public_inputs` JSON (backend-specific
+     field) into `[i16; 4]` input + output, re-encodes LE, and
+     verifies BLAKE3 matches `metadata.input_hash` /
+     `metadata.response_hash`.
+  3. Loads the embedded IPA params + re-derives the verifying key
+     from the circuit (halo2_proofs 0.3.2 does not provide a
+     stable on-disk VK format; re-derivation is deterministic).
+  4. Calls `halo2_proofs::plonk::verify_proof` against the proof
+     bytes from `body.proof_bytes_hex` and the field-lifted
+     instance column built from the i16 input/output values.
+The non-artifact entry point `verify(&[u8], &PublicInputs)` returns
+`ProofVerifierError::RequiresArtifactDispatch` — the three-hash
+`PublicInputs` cannot bind the raw i16 instance values into the
+halo2 proof. Callers must use `verify_artifact(&ProofArtifactBody)`.
+Mainnet refusal layers 1, 3, and 6 still hard-refuse; the feature
+only enables verification of a testnet/dev artifact.
+
+The committed proof fixture lives at
+`crates/omni-proofs-halo2-reference/fixtures/halo2/` and is
+regenerated via the workspace-excluded
+`tools/halo2_reference_regen/` standalone Cargo package — pattern
+identical to `tools/rumus_export/` in Stage 11b.1.a so the
+operator binary's compile graph never reaches the prover.
 
 **Exit code: inspect/report, not strict-validator.** `verify-proof`
 exits `0` on a successful *inspection* run regardless of whether

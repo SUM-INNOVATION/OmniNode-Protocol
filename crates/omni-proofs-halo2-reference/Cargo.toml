@@ -6,27 +6,34 @@ license.workspace    = true
 repository.workspace = true
 rust-version.workspace = true
 
-# Stage 11b.1.a: pure-Rust scaffold. No halo2 / prover dependencies
-# in this stage. The crate ships:
-#   * the canonical bounded-MLP spec (assets/canonical_spec.json)
-#   * the pure-Rust canonical_evaluate() reference implementation
-#   * canonical byte-encoding helpers
-#   * the FrameworkManifest schema + 5 committed fixture manifests
-#     (RUMUS / PyTorch / TensorFlow / Caffe / FrameworkAgnostic)
-#   * the cross-framework equivalence integration test
+# Stage 11b.1.b: feature-gated halo2 reference verifier + prover.
 #
-# Stage 11b.1.b will add `verify` and `prove` cargo features that
-# pull halo2_proofs (MIT-OR-Apache-2.0) and ship the actual circuit
-# implementation + verifier. **No halo2 dependency exists yet.**
+# Default build (`cargo build -p omni-proofs-halo2-reference`) still
+# pulls zero halo2 / heavy deps — preserves the Stage 11b.1.a
+# invariant that the operator binary's compile graph never reaches
+# halo2_proofs.
 #
-# Default `cargo build` pulls zero heavy deps. Everything below is
-# pure-Rust crates.io with explicit compatible licensing.
+#   - default = []           : pure-Rust scaffold from 11b.1.a only
+#                              (spec + evaluator + manifests).
+#   - feature `verify`       : adds the halo2 circuit + verifier;
+#                              pulls halo2_proofs (verifier-side
+#                              code only via cfg-gating at our crate
+#                              boundary — halo2_proofs 0.3.2 does
+#                              not split its own crate features into
+#                              verify-only / prove-only).
+#   - feature `prove`        : adds the developer-host prover
+#                              helper. Superset of `verify`. Pulls
+#                              rand_chacha (deterministic RNG for
+#                              byte-stable proof generation).
+#
+# CI runs the `verify` feature; the `prove` feature only runs in the
+# developer-host regen tool at `tools/halo2_reference_regen/`
+# (workspace-excluded, like `tools/rumus_export/`).
 
 [features]
 default = []
-# Stage 11b.1.b will populate `verify` and `prove`. Placeholders
-# omitted for now — keeping the Cargo.toml minimal so 11b.1.a
-# doesn't leak heavy-dep intent into 11b.1.a's compile graph.
+verify  = ["dep:halo2_proofs"]
+prove   = ["verify", "dep:rand_chacha"]
 
 [dependencies]
 omni-zkml  = { workspace = true }
@@ -34,6 +41,21 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 blake3     = { workspace = true }
 thiserror  = { workspace = true }
+
+# Stage 11b.1.b — halo2 reference verifier/prover. Opt-in via the
+# `verify` / `prove` features above; default-features = false to
+# avoid pulling rand_core/getrandom (the `batch` feature) and
+# maybe-rayon (the `multicore` feature) into the default build.
+# Single-threaded proving + non-batched verification are sufficient
+# for the bounded 4→8→4 circuit at k ≤ 12, and removing those
+# default features keeps the verifier-only dep tree minimal +
+# byte-deterministic.
+halo2_proofs = { version = "0.3.2", default-features = false, optional = true }
+
+# Stage 11b.1.b — deterministic RNG for byte-stable proof regen.
+# Only pulled by the `prove` feature; never reachable from
+# `verify`-only builds.
+rand_chacha = { version = "0.3", default-features = false, optional = true }
 
 [build-dependencies]
 blake3 = { workspace = true }

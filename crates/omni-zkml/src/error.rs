@@ -213,6 +213,21 @@ pub enum ProofVerifierError {
     /// **not** this variant.
     #[error("proof verifier failure: {0}")]
     VerifierInternal(String),
+
+    /// Stage 11b.1.b: the caller invoked [`crate::proof::ProofVerifier::verify`]
+    /// on a backend that needs the full [`crate::proof::ProofArtifactBody`]
+    /// to bind backend-specific public inputs (e.g. raw i16 tensors carried
+    /// in `metadata.public_inputs`). Such backends override `verify_artifact`
+    /// and their `verify` returns this error to make the contract explicit
+    /// — `verify(&[u8], &PublicInputs)` alone is not enough.
+    ///
+    /// Callers should switch to
+    /// [`crate::proof::ProofVerifier::verify_artifact`] (the operator
+    /// dispatch entry point).
+    #[error(
+        "this proof verifier requires the full ProofArtifactBody — call verify_artifact() instead of verify(): {0}"
+    )]
+    RequiresArtifactDispatch(String),
 }
 
 /// Composite failure returned by [`crate::proof::produce_proof_artifact`]
