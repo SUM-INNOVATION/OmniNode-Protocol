@@ -1799,14 +1799,14 @@ The Stage 11a `proof_pipeline_vectors.json` fixture is **byte-identical** under 
 
 | Layer | Refusal reason | Fires when |
 |---|---|---|
-| 1 | `TestnetOrDevOnly` | `testnet_or_dev_only == Some(true)` — producer explicitly disclaimed mainnet |
+| 1 | `TestnetOrDevOnly` | `testnet_or_dev_only != Some(false)` — i.e., either `Some(true)` (producer explicitly disclaimed) OR `None` (no declaration; treated as testnet/dev for safety). Stage 11d.1 tightening: only an explicit `Some(false)` passes. |
 | 2 | `MockBackend` | `proof_system ∈ {Mock, None}` — preserves Stage 11a's `MockBackendRefusedOnMainnet` guarantee |
 | 3 | `BoundedReference` | `proof_system ∈ {Stage11bOnnxReference, Stage11bHalo2Reference}` — bounded reference fixtures never mainnet |
-| 4 | `GgufClaim` | `model_format == Gguf` — no GGUF inference proof backend is approved at any stage through Stage 11b.0 |
+| 4 | `GgufClaim` | `model_format == Gguf` — no GGUF inference proof backend is approved at any stage through Stage 11d.x |
 | 5 | `UnknownModelFormat` | `model_format ∈ {Other(_), None}` (non-mock) — stringly-typed formats and absent formats refused |
-| 6 | `NotInMainnetAllowlist` | proof_system not in `MAINNET_APPROVED_PROOF_SYSTEMS` (the const slice) |
+| 6 | `NotInMainnetAllowlist` | artifact's `(proof_system, circuit_id_hex, model_hash)` triple does not match any entry in `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` (Stage 11d.1 structured allowlist), AND `proof_system` is not in the legacy `MAINNET_APPROVED_PROOF_SYSTEMS` back-compat alias |
 
-**`MAINNET_APPROVED_PROOF_SYSTEMS` is empty by design through end of Stage 11c.** No proof system shipped through Stages 11b or 11c is mainnet-eligible. Mainnet eligibility lands in a future chain-team-reviewed stage (Stage 11d+). The `mainnet_allowlist_is_empty_at_stage_11b0` and `every_proof_system_is_refused_on_mainnet_at_stage_11b0` tests pin this invariant.
+**Both `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` and the legacy `MAINNET_APPROVED_PROOF_SYSTEMS` are empty by design through Stage 11d.1 / 11d.2.** Only a Stage 11d.3 PR with written chain-team sign-off populates the structured list. Stage 11d.1 introduced the structured `AllowlistEntry`-keyed schema (`AllowlistEntry { proof_system, backend_id, circuit_id_hex, model_hash, model_format, verification_key_hash_hex, chain_team_review_ref }`); the legacy `&[ProofSystem]` slice is preserved as an empty back-compat alias. Mainnet eligibility lands when a Stage 11d.3 entry is added — see [docs/mainnet-eligibility-criteria.md](docs/mainnet-eligibility-criteria.md). The `mainnet_allowlist_is_empty_at_stage_11b0`, `mainnet_allowlist_entries_empty_after_stage_11d1`, `legacy_MAINNET_APPROVED_PROOF_SYSTEMS_empty_after_stage_11d1`, and `every_proof_system_is_refused_on_mainnet_at_stage_11b0` tests pin this invariant.
 
 **5. `operator verify-proof` (new read-only subcommand, default build):**
 
