@@ -115,6 +115,23 @@ pub enum ModelFormat {
     /// cross-framework equivalence fixtures. **Testnet/dev only**;
     /// mainnet hard-refused via Stage 11b.0 refusal layers 1 + 3.
     Halo2ReferenceMlp,
+    /// Stage 11d.2 — first production-grade fixed-point MLP model
+    /// class. Distinct from `Halo2ReferenceMlp` (bounded
+    /// testnet/dev-only) and non-Onnx (no exposed ONNX export path;
+    /// the canonical spec at
+    /// `crates/omni-proofs-halo2-production-mlp/assets/canonical_spec.json`
+    /// is the model definition). **Off-chain proof metadata only.**
+    /// Carried on `ProofArtifactBody.metadata` and consumed by the
+    /// off-chain `check_mainnet_eligible` helper and the off-chain
+    /// `Halo2ProductionMlpVerifier`; never serialized into chain
+    /// wire, into `InferenceAttestationDigest`, into any SUM Chain
+    /// RPC, or into any validator-side verification path. Mainnet
+    /// eligibility STILL gated on a Stage 11d.3 allowlist entry
+    /// after written chain-team sign-off; until then, layer 6 of
+    /// `check_mainnet_eligible` hard-refuses any artifact carrying
+    /// this format because `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`
+    /// is empty.
+    ProductionFixedPointMlp,
     /// Stringly-typed escape hatch for future formats. **Always
     /// refused on mainnet** unless and until promoted to a first-class
     /// enum variant with chain-team review.
@@ -239,6 +256,27 @@ pub enum ProofSystem {
     /// Refused on mainnet by layer 6 (allowlist empty); if
     /// `model_format = Gguf`, layer 4 fires first regardless.
     GgufStrategyTbd,
+    /// Stage 11d.2 — first production-grade fixed-point MLP proof
+    /// system. Built on Stage 11c's RHAZ + saturation + ReLU
+    /// gadget chain (copy-pasted into a separate production
+    /// crate per criteria §1.6 distinguishability hard rules),
+    /// scaled to a representative `16 → 32 → 16 → 8` MLP
+    /// classifying deterministic small-model workloads. **Distinct
+    /// from `Stage11bHalo2Reference` per criteria §1.6 H1**;
+    /// distinct `circuit_id_hex` (H2); distinct `model_hash` (H3).
+    /// **Off-chain proof metadata only.** Carried on
+    /// `ProofArtifactBody.metadata` and consumed by the off-chain
+    /// `omni-node operator verify-proof` dispatch under the opt-in
+    /// `stage11d-production-verify` cargo feature; never serialized
+    /// into chain wire, into `InferenceAttestationDigest`, into
+    /// any SUM Chain RPC, or into any validator-side verification
+    /// path. Mainnet eligibility STILL gated on a Stage 11d.3
+    /// allowlist entry after written chain-team sign-off
+    /// (external cryptographer Claim 1.1.S2 + review packet R1–R9);
+    /// until then, layer 6 of `check_mainnet_eligible` hard-refuses
+    /// any artifact carrying this proof_system because
+    /// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty.
+    Stage11dProductionFixedPointMlp,
 }
 
 /// Stage 11b.0 → 11d.1 — the **legacy** mainnet allowlist of proof
@@ -1561,6 +1599,7 @@ mod tests {
             ProofSystem::Stage11bHalo2Reference,
             ProofSystem::Ezkl,
             ProofSystem::GgufStrategyTbd,
+            ProofSystem::Stage11dProductionFixedPointMlp,
         ] {
             let meta = ProofMetadata {
                 backend_id: format!("test-backend-for-{ps:?}"),
@@ -1581,7 +1620,9 @@ mod tests {
             let err = check_mainnet_eligible(&meta).unwrap_err();
             // Concretely: Mock → MockBackend,
             //   Stage11bOnnxReference + Stage11bHalo2Reference → BoundedReference,
-            //   Ezkl + GgufStrategyTbd → NotInMainnetAllowlist (allowlist empty).
+            //   Ezkl + GgufStrategyTbd + Stage11dProductionFixedPointMlp →
+            //     NotInMainnetAllowlist (allowlist empty through Stage 11d.1/11d.2;
+            //     Stage 11d.2 adds the production variant but no allowlist entry).
             match (ps, &err) {
                 (ProofSystem::Mock, MainnetRefusalReason::MockBackend { .. }) => {}
                 (
@@ -1589,7 +1630,9 @@ mod tests {
                     MainnetRefusalReason::BoundedReference { .. },
                 ) => {}
                 (
-                    ProofSystem::Ezkl | ProofSystem::GgufStrategyTbd,
+                    ProofSystem::Ezkl
+                    | ProofSystem::GgufStrategyTbd
+                    | ProofSystem::Stage11dProductionFixedPointMlp,
                     MainnetRefusalReason::NotInMainnetAllowlist { .. },
                 ) => {}
                 _ => panic!("unexpected refusal for {ps:?}: {err:?}"),

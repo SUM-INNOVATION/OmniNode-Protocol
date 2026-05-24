@@ -1852,6 +1852,29 @@ async fn verify_proof_core(proof_artifact_path: PathBuf) -> Result<(), OperatorE
                         ))
                     })?
             }
+            // Stage 11d.2 — production fixed-point MLP dispatch arm.
+            // Orthogonal to `halo2-reference-verify`; either, both,
+            // or neither may be enabled at the operator-binary level.
+            // Mainnet posture is preserved by the always-evaluated
+            // `check_mainnet_eligible` call below, which refuses
+            // this proof_system through layer 6 (empty allowlist).
+            #[cfg(feature = "stage11d-production-verify")]
+            Some(omni_zkml::ProofSystem::Stage11dProductionFixedPointMlp) => {
+                use omni_zkml::ProofVerifier;
+                let verifier = omni_proofs_halo2_production_mlp::Halo2ProductionMlpVerifier::from_embedded_fixtures()
+                    .map_err(|e| {
+                        OperatorError::ProofArtifactParse(format!(
+                            "halo2 production-MLP verifier construction failure: {e}"
+                        ))
+                    })?;
+                verifier
+                    .verify_artifact(&body)
+                    .map_err(|e| {
+                        OperatorError::ProofArtifactParse(format!(
+                            "verifier failure: {e}"
+                        ))
+                    })?
+            }
             Some(other) => {
                 return Err(OperatorError::NoVerifierForProofSystem {
                     proof_system: format!("{other:?}"),

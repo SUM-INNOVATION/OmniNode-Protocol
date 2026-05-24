@@ -137,6 +137,25 @@ jobs:
           fi
           echo "default tree: no halo2_proofs / pasta_curves — Stage 11b.1.b isolation intact."
 
+      # Stage 11d.2 — explicit isolation guard for the production
+      # halo2 verifier crate. Default omni-node MUST NOT pull
+      # `omni-proofs-halo2-production-mlp`; the `stage11d-production-verify`
+      # feature is the only legitimate entry point.
+      - name: Assert `omni-node` default tree has NO production-mlp crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree_out="$(cargo tree -p omni-node)"
+          if echo "$tree_out" | grep -E 'omni-proofs-halo2-production-mlp'; then
+            {
+              echo "::error::Default \`omni-node\` build pulls omni-proofs-halo2-production-mlp."
+              echo "Stage 11d.2 feature gating must keep that crate out of the default"
+              echo "graph; only --features stage11d-production-verify should pull it in."
+            } >&2
+            exit 1
+          fi
+          echo "default tree: no omni-proofs-halo2-production-mlp — Stage 11d.2 isolation intact."
+
   # ── (3) Submit features: full Stage 7b surface ─────────────────────────────
   #
   # No secrets needed (Stage 9c). The chain crates are public on
@@ -288,6 +307,98 @@ jobs:
             exit 1
           fi
           echo "halo2-reference-verify tree: halo2_proofs present as expected."
+
+  # ── Stage 11d.2: stage11d-production-verify build + test ───────────────────
+  #
+  # Verifier-only: builds `omni-proofs-halo2-production-mlp` with the
+  # `verify` feature (no prover surface, no `rand_chacha`) and runs
+  # the verifier-only / corpus integration tests against the
+  # committed fixtures. The full prover surface is exercised
+  # off-CI by `tools/halo2_production_mlp_regen/`, which is
+  # workspace-excluded.
+  #
+  # The Stage 11d.2 production circuit is wider than the bounded
+  # reference (16 → 32 → 16 → 8 vs 4 → 8 → 4); MockProver
+  # invocations stack-overflow at the default 2 MB test stack.
+  # `RUST_MIN_STACK` is raised here so the constraint-system
+  # walker has headroom.
+  stage11d-production-verify-build-test:
+    name: --features stage11d-production-verify — verifier-only build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git / target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-stage11dverify-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stage11dverify-
+
+      - name: cargo build -p omni-node --features stage11d-production-verify
+        run: cargo build -p omni-node --features stage11d-production-verify
+
+      - name: cargo test -p omni-proofs-halo2-production-mlp --features verify
+        env:
+          RUST_MIN_STACK: "67108864"
+        run: |
+          cargo test \
+            -p omni-proofs-halo2-production-mlp \
+            --features verify
+
+  # ── Stage 11d.2: opt-in tree-check ─────────────────────────────────────────
+  #
+  # HARD GATE: with `--features stage11d-production-verify`, `omni-node`
+  # MUST pull `halo2_proofs` AND `omni-proofs-halo2-production-mlp`
+  # (otherwise the feature has silently gone inert).
+  stage11d-production-verify-tree-check:
+    name: stage11d-production-verify tree — must contain halo2_proofs + production-mlp
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-tree-stage11dverify-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tree-stage11dverify-
+
+      - name: Assert `omni-node --features stage11d-production-verify` tree DOES contain halo2 + production-mlp
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree_out="$(cargo tree -p omni-node --features stage11d-production-verify)"
+          if ! echo "$tree_out" | grep -Eq 'halo2_proofs'; then
+            {
+              echo "::error::--features stage11d-production-verify no longer pulls halo2_proofs."
+              echo "The Stage 11d.2 feature has gone inert; re-check the"
+              echo "omni-node feature definition and the dep gating on"
+              echo "omni-proofs-halo2-production-mlp."
+            } >&2
+            exit 1
+          fi
+          if ! echo "$tree_out" | grep -Eq 'omni-proofs-halo2-production-mlp'; then
+            {
+              echo "::error::--features stage11d-production-verify no longer pulls omni-proofs-halo2-production-mlp."
+              echo "The Stage 11d.2 feature gating is broken."
+            } >&2
+            exit 1
+          fi
+          echo "stage11d-production-verify tree: halo2_proofs + production-mlp present as expected."
 
   # ── (5) Stage 6 byte-stability ──────────────────────────────────────────────
   stage6-fixture-check:
