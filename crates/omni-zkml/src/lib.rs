@@ -73,10 +73,11 @@ pub use error::{
     RegistryResult, Result, SignerError,
 };
 pub use proof::{
-    check_mainnet_eligible, produce_proof_artifact, MainnetRefusalReason, MockProofBackend,
-    MockProofVerifier, ModelFormat, ModelFramework, ProofArtifactBody, ProofBackend,
-    ProofMetadata, ProofPipelineInputs, ProofPipelineOutputs, ProofSystem, ProofVerifier,
-    PublicInputs, MAINNET_APPROVED_PROOF_SYSTEMS, MOCK_BACKEND_ID,
+    check_mainnet_eligible, mainnet_vk_hash, produce_proof_artifact, AllowlistEntry,
+    MainnetRefusalReason, MockProofBackend, MockProofVerifier, ModelFormat, ModelFramework,
+    ProofArtifactBody, ProofBackend, ProofMetadata, ProofPipelineInputs, ProofPipelineOutputs,
+    ProofSystem, ProofVerifier, PublicInputs, MAINNET_APPROVED_PROOF_SYSTEMS,
+    MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES, MAINNET_VK_HASH_DOMAIN_SEPARATOR, MOCK_BACKEND_ID,
 };
 pub use registry::{
     compute_attestation_id, query_attestation_workflow, submit_attestation_workflow,

@@ -407,7 +407,7 @@ directly. **No backend-specific helper logic in operator code** —
 that's the architectural property Stage 11b.0.1 locks in for every
 future backend.
 
-**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b / 11c / 11d.0: zero.**
+**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b / 11c / 11d.0 / 11d.1: zero.**
 The mainnet allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in
 `omni-zkml`) is empty by design. Every proof artifact this command
 verifies will report `mainnet_eligible=false` and carry an explicit
@@ -661,7 +661,7 @@ typed taxonomy for sub-conditions like fee/balance vs. transport.
 | `BoundedReferenceProofRefusedOnMainnet` (**Stage 11b.0**) | proof_system ∈ `{Stage11bOnnxReference, Stage11bHalo2Reference}` (refusal layer 3) | yes — typed error | bounded reference fixtures are for architecture validation, not production; use a mainnet-approved producer (none ship through Stage 11c) | backend_id |
 | `GgufProofClaimRefusedOnMainnet` (**Stage 11b.0**) | `model_format == Gguf` (refusal layer 4) | yes — typed error | no GGUF inference proof backend is approved at any stage through Stage 11d.0; wait for a future Stage 11e research-track strategy + chain-team review. **Declaring GGUF prevents silent fake-GGUF claims**, which is the point. | backend_id, model_hash |
 | `UnknownModelFormatRefusedOnMainnet` (**Stage 11b.0**) | `model_format = Other(_)` or absent on a non-mock backend (refusal layer 5) | yes — typed error | promote the format to a first-class enum variant via a chain-team-reviewed PR, or use an approved format | backend_id, model_format value |
-| `ProofSystemNotMainnetApproved` (**Stage 11b.0**) | proof_system not in `MAINNET_APPROVED_PROOF_SYSTEMS` (refusal layer 6) | yes — typed error | **Stages 11b and 11c ship with this allowlist empty by design.** Mainnet eligibility lands in a future chain-team-reviewed stage (Stage 11d+). | backend_id, proof_system |
+| `ProofSystemNotMainnetApproved` (**Stage 11b.0**, schema-extended in **Stage 11d.1**) | artifact's `(proof_system, circuit_id_hex, model_hash)` triple does not match any entry in `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`, AND `proof_system` is not in the legacy `MAINNET_APPROVED_PROOF_SYSTEMS` back-compat alias (refusal layer 6) | yes — typed error | **Both lists ship empty by design through Stage 11d.x.** Stage 11d.1 introduced the structured `AllowlistEntry`-keyed list; the legacy `&[ProofSystem]` slice is preserved as an empty back-compat alias. Mainnet eligibility lands when a Stage 11d.3 entry is added after written chain-team sign-off — see [docs/mainnet-eligibility-criteria.md](mainnet-eligibility-criteria.md). | backend_id, proof_system |
 | `NoVerifierForProofSystem` (**Stage 11b.0**) | `operator verify-proof` was handed an artifact whose `proof_system` has no verifier registered | yes — typed error | Stage 11b.0 ships only `MockProofVerifier`; Stage 11b.1.b/11c add `Halo2ReferenceVerifier` under the opt-in `halo2-reference-verify` feature. Other proof systems are verifier-side stubs awaiting future stages. | proof_system |
 
 > **Known limitation flagged by Stage 10a.** [`ChainClientError`](../crates/omni-zkml/src/error.rs)

@@ -63,7 +63,7 @@ Beyond what Stage 11b.0 already requires, an artifact whose `proof_system` claim
 | `model_framework` | `Some(<one of Rumus / PyTorch / TensorFlow / Caffe / FrameworkAgnostic>)`, recorded per the chain-team-approved framework binding. |
 | `testnet_or_dev_only` | `Some(false)` — explicit. The bare `None` is treated as `testnet_or_dev_only=true` for safety and refuses on mainnet regardless of allowlist match. |
 | `circuit_id_hex` | **REQUIRED** (not optional). 64-char lowercase hex of the verifier's compiled circuit identity. Must match the allowlist entry's `circuit_id_hex` exactly. |
-| `verification_key_hex` | **REQUIRED**. Hex of the verifier's compiled verifying key, hashed under a documented scheme. Cross-checked against the verifier's own embedded VK at `verify_artifact` time. |
+| `verification_key_hex` | **REQUIRED on the artifact side.** Existing schema field — historically ambiguously named (could be raw VK bytes hex, could be a hash). Stage 11d.1 does **not** rename this field on `ProofMetadata`; renaming is a wider schema migration deferred to a future stage. The **allowlist** side uses the unambiguously-named `verification_key_hash_hex` (see §1.7 below). Cross-validation between the artifact's `verification_key_hex` and the allowlisted `verification_key_hash_hex` is per-verifier code that lands in **Stage 11d.2** alongside the first production verifier — Stage 11d.1's layer 6 does NOT perform this cross-check. |
 | `model_hash` | 64-char lowercase hex; must match the allowlist entry's `model_hash` exactly. Pins the specific (model, weights, biases) combination. |
 | `input_hash` | BLAKE3 of the canonical input bytes (Stage 11b.0 contract). |
 | `response_hash` | BLAKE3 of the canonical output bytes. |
@@ -77,7 +77,43 @@ Beyond what Stage 11b.0 already requires, an artifact whose `proof_system` claim
 
 **Hard rule H3**: the production proof system MUST have a `model_hash` distinct from any committed bounded-reference spec's hash (the `EXPECTED_SPEC_HASH` for the halo2 reference, etc.).
 
-**CI gate (Stage 11d.1)**: `stage11b_halo2_reference_never_in_allowlist` — iterates `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` and asserts no entry has `proof_system == Stage11bHalo2Reference` AND no entry has `circuit_id_hex` equal to the committed reference circuit's id AND no entry has `model_hash` equal to `EXPECTED_SPEC_HASH`.
+**Defense in depth (Stage 11d.1)**:
+1. Layer 3 of `check_mainnet_eligible` fires **before** the layer-6 allowlist lookup for `Stage11bOnnxReference` and `Stage11bHalo2Reference`, so a bounded reference artifact is refused regardless of allowlist contents. Pinned by the `bounded_reference_refused_before_allowlist_lookup` test.
+2. The `stage11b_halo2_reference_never_in_allowlist` test iterates **both** `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` and the legacy `MAINNET_APPROVED_PROOF_SYSTEMS` and asserts no entry has `proof_system ∈ {Stage11bOnnxReference, Stage11bHalo2Reference}`. The slice is empty today; the test is a forward-looking guard against future misconfiguration.
+3. The `every_allowlist_entry_has_required_metadata` test additionally rejects bounded-reference `proof_system` values, `Mock`, `ModelFormat::Gguf`, and `ModelFormat::Other(_)` in any allowlist entry (also forward-looking).
+
+### 1.7. VK hash scheme
+
+Stage 11d.1 pins the canonical mainnet-eligibility VK hash as:
+
+```text
+verification_key_hash = BLAKE3(MAINNET_VK_HASH_DOMAIN_SEPARATOR || canonical_vk_bytes)
+```
+
+where:
+
+- `MAINNET_VK_HASH_DOMAIN_SEPARATOR = b"OMNINODE-VK:v1:"` — 15 ASCII bytes, no null terminator, no length prefix. The trailing `v1` allows a future migration to a new scheme without ambiguity over which hash an allowlist entry's `verification_key_hash_hex` was computed under.
+- `canonical_vk_bytes` is the **per-verifier** canonical serialization of its `VerifyingKey`. Each production verifier MUST document its `canonical_vk_bytes` scheme (e.g., halo2's `VerifyingKey::write` byte stream, or a backend-specific canonical encoding) and pin a stable test vector for the resulting hash.
+
+Stage 11d.1 ships the helper `omni_zkml::mainnet_vk_hash(canonical_vk_bytes: &[u8]) -> [u8; 32]` plus the `MAINNET_VK_HASH_DOMAIN_SEPARATOR` constant. The concrete `canonical_vk_bytes` extraction lives in each production verifier (Stage 11d.2+).
+
+**Scope of use in Stage 11d.1**:
+- `AllowlistEntry.verification_key_hash_hex` records the hex of this hash (entry-side, compile-time pinning).
+- The helper is available for per-verifier code to compute and compare.
+- Layer 6 of `check_mainnet_eligible` does **NOT** perform cross-validation of an artifact's `metadata.verification_key_hex` against the allowlist's `verification_key_hash_hex` — that cross-check requires per-verifier knowledge of `canonical_vk_bytes` extraction and lands in Stage 11d.2 with the first production verifier.
+
+The `vk_hash_helper_is_byte_stable` and `vk_hash_helper_uses_documented_domain_separator` tests pin the formula bit-for-bit.
+
+### 1.8. Deterministic fixture byte-stability
+
+**Hard requirement** (carrying forward the Stage 11b.1.b / 11c regen-tool pattern): a candidate proof system is **not eligible** if it cannot reproduce its committed fixture bytes with pinned RNG seed and pinned dependency versions on a fresh dev host.
+
+Specifically:
+- Two consecutive `regen` runs of the proof system's developer-host regen tool must produce byte-identical `params.bin` / `proof.bin` / `proof_artifact.json` files.
+- A `verify-only` mode of the regen tool must succeed against the committed fixtures without re-running the prover.
+- Drift detected by `verify-only` on a fresh dev host is a **hard release blocker**.
+- The Stage 11d.3 review packet R3 (fixture byte-stability proof) records the byte-stability evidence.
+- If a backend's prover is non-deterministic by design (e.g., uses true OS randomness), it is not eligible. The fix is either (a) seed all randomness via a pinned RNG, or (b) propose an alternative proof class that admits deterministic byte-stable proving.
 
 ---
 
@@ -109,18 +145,30 @@ pub struct AllowlistEntry {
     pub circuit_id_hex: &'static str,
     pub model_hash: &'static str,
     pub model_format: ModelFormat,
+    pub verification_key_hash_hex: &'static str,
     pub chain_team_review_ref: &'static str,
 }
 
 pub const MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES: &[AllowlistEntry] = &[];
+// Legacy back-compat alias — also empty by design.
+pub const MAINNET_APPROVED_PROOF_SYSTEMS: &[ProofSystem] = &[];
 ```
 
-**Allowlist key**: `(proof_system, circuit_id_hex, model_hash)`. Layer 6 accepts an artifact only if at least one entry matches all three fields exactly. `backend_id`, `model_format`, and `chain_team_review_ref` are recorded for audit but are not part of the matching key.
+**Allowlist key**: `(proof_system, circuit_id_hex, model_hash)`. Layer 6 accepts an artifact only if at least one entry matches all three fields exactly. `backend_id`, `model_format`, `verification_key_hash_hex`, and `chain_team_review_ref` are recorded for audit but are not part of the matching key.
 
 **Why a triple key**:
 - `proof_system`-alone matching is dangerous: a bounded reference + a future production circuit could share a hypothetical variant and accidentally co-allowlist.
 - `(proof_system, circuit_id_hex)` is better but allows the same circuit to be re-used with different weights.
 - `(proof_system, circuit_id_hex, model_hash)` pins the exact (model + circuit + scheme) combination the chain team audited.
+
+### 3.1. Where chain-team-approved framework bindings live
+
+The "chain-team-approved framework binding" for an allowlist entry is the `(model_framework, model_format)` pair the chain team explicitly reviewed for that specific entry. The binding is recorded in two places:
+
+- **Per-entry review packet** — Stage 11d.3 review-packet §8.1 (mainnet impact statement) lists "Approved framework bindings (chain-team-recorded)" enumerating the `(model_framework, model_format)` combinations covered by the entry. The committed `chain_team_review_ref` document path points at this record.
+- **Per-entry allowlist record** — the `AllowlistEntry.model_format` field pins the format component. The framework component is **not** in the allowlist key (the chain team accepts that two frameworks can produce byte-identical proofs for the same `(proof_system, circuit_id_hex, model_hash)` triple — the four-equal-primaries posture from Stage 11b.1.a/11c carries forward). The framework binding remains a chain-team review concern recorded in the linked document.
+
+There is **no separate `framework_bindings.json` artifact** in Stage 11d.1. If a future stage needs runtime enforcement of framework-binding mismatches (rather than runtime advisory), it requires a separate chain-team plan.
 
 ---
 
@@ -156,6 +204,9 @@ These do not change in Stage 11d:
 - No edits to `canonical_spec.json`, the canonical evaluator, framework manifests, or `EXPECTED_SPEC_HASH` (Stage 11c source-of-truth invariant carries forward).
 - **No promotion of `Stage11bHalo2Reference` to production.** It stays a testnet/dev-only architectural-validation fixture in perpetuity.
 - **No allowlist entry lands in Stage 11d.0, 11d.1, or 11d.2.** Only Stage 11d.3 — and only with written chain-team sign-off — modifies `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` to a non-empty list.
+- **`ModelFormat::Gguf` is invalid as a Stage 11d.3 allowlist entry's `model_format`** unless a separately-reviewed GGUF strategy exists. Pinned by the `every_allowlist_entry_has_required_metadata` test.
+- **`ModelFormat::Other(_)` is invalid as a Stage 11d.3 allowlist entry's `model_format`.** The `Other(_)` escape hatch is for forward compatibility with formats that have not been chain-team-reviewed; if a real format needs to land, promote it to a first-class `ModelFormat` enum variant via a separate plan. Pinned by the same test.
+- **`ProofSystem::Stage11bOnnxReference` and `ProofSystem::Stage11bHalo2Reference` are invalid as Stage 11d.3 allowlist entries' `proof_system`** — bounded references are testnet/dev-only by hard rule H1. Pinned by `stage11b_halo2_reference_never_in_allowlist` and `every_allowlist_entry_has_required_metadata`.
 
 ---
 

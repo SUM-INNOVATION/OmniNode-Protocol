@@ -90,3 +90,25 @@ Operator communication path for a post-merge soundness regression is recorded in
 ### Q11: Is there a way for me as an operator to opt into running the bounded-reference verifier on mainnet?
 
 **No, and there should not be.** The bounded-reference verifier is reachable today only under the opt-in `halo2-reference-verify` feature, and even when reachable it does not change the artifact's `mainnet_eligible` status. An artifact carrying `proof_system: Some(Stage11bHalo2Reference)` is refused on mainnet by layer 3 regardless of whether the verifier is registered. The operator's only effective action is to verify on testnet/dev.
+
+### Q12: What is the VK hash scheme?
+
+`BLAKE3(MAINNET_VK_HASH_DOMAIN_SEPARATOR || canonical_vk_bytes)` where `MAINNET_VK_HASH_DOMAIN_SEPARATOR = b"OMNINODE-VK:v1:"` (15 ASCII bytes, no null terminator, no length prefix). The trailing `v1` allows a future migration to a new scheme without ambiguity over which hash an allowlist entry's `verification_key_hash_hex` was computed under. `canonical_vk_bytes` is the per-verifier canonical serialization of its `VerifyingKey`; each production verifier must document its scheme. See [`docs/mainnet-eligibility-criteria.md` §1.7](mainnet-eligibility-criteria.md) for the full spec. Stage 11d.1 ships the helper `omni_zkml::mainnet_vk_hash(&[u8]) -> [u8; 32]` and the `MAINNET_VK_HASH_DOMAIN_SEPARATOR` constant; cross-validation between an artifact's `metadata.verification_key_hex` and the allowlist's `verification_key_hash_hex` lands in Stage 11d.2 with the first production verifier.
+
+### Q13: Can `Stage11bHalo2Reference` or any other bounded reference ever be allowlisted?
+
+**No.** Hard rule H1 from the criteria document § 1.6: bounded reference proof systems are testnet/dev-only in perpetuity. Three independent guards enforce this:
+
+1. Layer 3 of `check_mainnet_eligible` (`BoundedReference`) refuses the artifact **before** the layer-6 allowlist lookup. Pinned by `bounded_reference_refused_before_allowlist_lookup`.
+2. The `stage11b_halo2_reference_never_in_allowlist` test asserts no entry in `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` (or the legacy `MAINNET_APPROVED_PROOF_SYSTEMS`) has `proof_system ∈ {Stage11bOnnxReference, Stage11bHalo2Reference}`.
+3. The `every_allowlist_entry_has_required_metadata` test additionally rejects bounded-reference `proof_system` values in any entry.
+
+### Q14: What happens if a candidate proof class's fixture isn't byte-deterministic?
+
+**It is not eligible.** Criteria §1.8 makes this a hard requirement. The Stage 11d.2 implementation must include a developer-host regen tool with a `verify-only` mode that fails on drift, and two consecutive `regen` runs must produce byte-identical fixture files (`params.bin`, `proof.bin`, `proof_artifact.json`). If the prover requires true OS randomness, the proof system is not eligible until either (a) all randomness is seeded via a pinned RNG (Stage 11b.1.b precedent: `rand_chacha::ChaCha20Rng::from_seed(PINNED_SEED)`), or (b) an alternative proof class is proposed that admits deterministic byte-stable proving.
+
+### Q15: What's the difference between artifact `verification_key_hex` and allowlist `verification_key_hash_hex`?
+
+The artifact-side field (`ProofMetadata::verification_key_hex`) is the **existing** Stage 11b.0 schema field — its name is historical and ambiguous (it might be a raw VK encoding or already a hash, depending on backend). Stage 11d.1 does NOT rename this field; that's a wider schema migration deferred to a future stage.
+
+The allowlist-side field (`AllowlistEntry::verification_key_hash_hex`, introduced in Stage 11d.1) is unambiguous: it is the hex of `mainnet_vk_hash(canonical_vk_bytes)` per Q12 above. Per-verifier code at Stage 11d.2+ time cross-validates the two by hashing the artifact's `verification_key_hex` (or whatever raw bytes the verifier extracts from it) under the §1.7 scheme and comparing to the allowlisted hex. Stage 11d.1's layer 6 does NOT perform this cross-check — only the structured `(proof_system, circuit_id_hex, model_hash)` triple match.
