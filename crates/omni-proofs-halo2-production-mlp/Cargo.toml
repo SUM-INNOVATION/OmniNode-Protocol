@@ -1,0 +1,79 @@
+[package]
+name             = "omni-proofs-halo2-production-mlp"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Stage 11d.2 — first production-grade fixed-point MLP proof class.
+#
+# Built on Stage 11c's RHAZ + saturation + ReLU gadget chain
+# (copy-pasted into this crate per the Stage 11d.2 plan §5.1 Option A
+# for clean distinguishability from the bounded reference and zero
+# risk to Stage 11c byte-stability). Scaled to a representative
+# 16 → 32 → 16 → 8 MLP: deterministic small-model classification.
+#
+# **Off-chain only.** This crate never appears in chain wire / tx /
+# `InferenceAttestationDigest` / RPC / validator-side verification
+# paths. It is reachable from `omni-node` only via the opt-in
+# `stage11d-production-verify` cargo feature.
+#
+# Default build pulls zero halo2 / heavy deps. The `verify` feature
+# pulls `halo2_proofs`; `prove` (superset) additionally pulls
+# `rand_chacha` for byte-stable proving.
+#
+# **No allowlist entry shipped by this crate.** The frozen production
+# fixture's `ProofArtifactBody` carries `testnet_or_dev_only: Some(false)`
+# (production-shape) but is still hard-refused by `check_mainnet_eligible`
+# layer 6 because `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty.
+# Mainnet eligibility is a Stage 11d.3 deliverable.
+
+[features]
+default = []
+verify  = ["dep:halo2_proofs"]
+prove   = ["verify", "dep:rand_chacha"]
+# Stage 11d.2 — R9 opt-in test feature (chain-team digest/signature
+# roundtrip via the existing Stage 6/7 `InferenceAttestationDigest`
+# primitives). NOT in CI; runnable via
+# `cargo test --features r9-chain-digest-roundtrip`
+# OR `cargo test --test chain_digest_roundtrip -- --ignored`.
+#
+# The feature is a no-op on the dep graph (the scaffold test uses
+# `omni-zkml`'s already-present `canonical_digest_bytes` /
+# `sign_chain_attestation_digest` / `InferenceAttestationDigest`
+# surface plus the `bincode1` + `libp2p-identity` dev-dependencies).
+# It exists purely to gate compilation of `tests/chain_digest_roundtrip.rs`
+# via `#![cfg(feature = "r9-chain-digest-roundtrip")]`; `omni-sumchain`
+# is intentionally **NOT** pulled because the scaffold is local-only
+# and never touches Stage 7b chain wire / RPC / signing keys.
+r9-chain-digest-roundtrip = []
+
+[dependencies]
+omni-zkml  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+blake3     = { workspace = true }
+thiserror  = { workspace = true }
+
+# Stage 11d.2 — opt-in via `verify`/`prove` features. Default features
+# disabled to keep the verifier-only dep tree lean (no rayon, no
+# getrandom). See Stage 11b.1.b precedent.
+halo2_proofs = { version = "0.3.2", default-features = false, optional = true }
+rand_chacha  = { version = "0.3", default-features = false, optional = true }
+
+[build-dependencies]
+blake3 = { workspace = true }
+
+# Stage 11d.2 — dev-dependencies used ONLY by the R9 scaffold test
+# (`tests/chain_digest_roundtrip.rs`, gated on
+# `r9-chain-digest-roundtrip` feature). These are dev-only — they
+# never enter the production crate's runtime dep tree, and the R9
+# scaffold tests are `#[ignore]` so default `cargo test` skips
+# them entirely. The chain primitives (`canonical_digest_bytes`,
+# `sign_chain_attestation_digest`, `InferenceAttestationDigest`) come
+# from `omni-zkml`; these crates provide the bincode1 / Ed25519
+# verify surfaces the test exercises locally.
+[dev-dependencies]
+bincode1        = { package = "bincode", version = "1.3" }
+libp2p-identity = { workspace = true }

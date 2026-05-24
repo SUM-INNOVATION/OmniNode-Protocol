@@ -1,0 +1,37 @@
+[package]
+name = "halo2_production_mlp_regen"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Stage 11d.2 — developer-host fixture regen tool for the production
+# fixed-point MLP proof class.
+#
+# Standalone (NOT a workspace member). The root Cargo.toml declares
+# `exclude = ["tools"]`, mirroring the bounded reference's
+# `halo2_reference_regen` and the `rumus_export` isolation pattern:
+# the operator binary's `cargo build -p omni-node` graph cannot
+# transitively reach halo2_proofs through this tool.
+#
+# Builds via:
+#   cd tools/halo2_production_mlp_regen && cargo run --release [regen|verify-only|generate-corpus]
+#
+# Off-chain only. This tool never touches chain wire / tx /
+# `InferenceAttestationDigest` / RPC / validator-side verification.
+
+[[bin]]
+name = "halo2_production_mlp_regen"
+path = "src/main.rs"
+
+[dependencies]
+# Path to the in-tree halo2-production-mlp crate. We pull the `prove`
+# feature (which transitively pulls `verify`), so we get the full
+# circuit + prover + verifier surface here.
+omni-proofs-halo2-production-mlp = { path = "../../crates/omni-proofs-halo2-production-mlp", features = ["prove"] }
+omni-zkml                        = { path = "../../crates/omni-zkml" }
+
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3     = "1"
+clap       = { version = "4", features = ["derive"] }

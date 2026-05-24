@@ -28,6 +28,15 @@ submit  = ["omni-sumchain/submit"]
 # Default-OFF: the operator binary's compile graph contains zero
 # halo2 / pasta / IPA dependencies unless this feature is set.
 halo2-reference-verify = ["dep:omni-proofs-halo2-reference"]
+# Stage 11d.2 — opt-in feature that pulls the halo2 PRODUCTION
+# fixed-point-MLP verifier into the operator binary's `verify-proof`
+# dispatch. Default-OFF (orthogonal to `halo2-reference-verify`);
+# the operator binary's compile graph contains zero halo2 deps unless
+# at least one halo2 verifier feature is set. Mainnet posture is
+# preserved: every accepted artifact under this feature is still
+# refused by `check_mainnet_eligible` layer 6 because
+# `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty through Stage 11d.2.
+stage11d-production-verify = ["dep:omni-proofs-halo2-production-mlp"]
 
 [dependencies]
 omni-types         = { workspace = true }
@@ -52,6 +61,11 @@ blake3             = { workspace = true }
 # compile graph when `--features halo2-reference-verify` is passed;
 # `cargo build -p omni-node` with default features pulls zero halo2.
 omni-proofs-halo2-reference = { workspace = true, optional = true, features = ["verify"] }
+# Stage 11d.2 — opt-in halo2 production-MLP verifier. Only enters the
+# compile graph when `--features stage11d-production-verify` is passed;
+# `cargo build -p omni-node` with default features (and without
+# `halo2-reference-verify`) pulls zero halo2.
+omni-proofs-halo2-production-mlp = { workspace = true, optional = true, features = ["verify"] }
 
 [dev-dependencies]
 tempfile           = { workspace = true }
