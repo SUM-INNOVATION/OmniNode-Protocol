@@ -83,18 +83,29 @@ pub const MOCK_BACKEND_ID: &str = "mock-v1";
 /// intent but still refused on mainnet by the same logic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelFormat {
-    /// ONNX (Open Neural Network Exchange). The format ezkl and most
-    /// production ML provers operate on. **No backend approved for
-    /// mainnet at end of Stage 11b.0** — Stage 11c targets this slot.
+    /// ONNX (Open Neural Network Exchange). A common format for
+    /// production ML provers. **No backend approved for mainnet at
+    /// end of Stage 11d.x.** The Stage 11b.1 ezkl-discovery spike
+    /// rejected ezkl as a dependency (`v23.0.5` has no `LICENSE`
+    /// file or `Cargo.toml` `license` field); the Stage 11d.2
+    /// production proof class selection remains open. ONNX
+    /// requires a separately-reviewed Rust prover with a clean
+    /// license before any allowlist entry can be proposed.
     Onnx,
     /// GGUF (llama.cpp model format). OmniNode's canonical model
-    /// format today. **No proof backend approved at any stage through
-    /// Stage 11b.0.** Stage 11d will pick from the strategies
-    /// documented in the runbook's "GGUF proofs" section; mainnet
-    /// eligibility is then conditional on chain-team review. Until
-    /// then, declaring `Gguf` makes the refusal explicit instead of
-    /// hidden — the architecture refuses the claim with a clear
-    /// "no GGUF proof backend approved" message.
+    /// format today. **No proof backend approved at any stage
+    /// through Stage 11d.x.** A future Stage 11e research track
+    /// may evaluate the strategies documented in the operator
+    /// runbook's "GGUF proofs" section (shadow verifier circuit,
+    /// partial-inference proof, replay-based attestation); none
+    /// of them prove full transformer inference correctness, and
+    /// none is on the Stage 11d allowlist table. Declaring `Gguf`
+    /// is explicitly invalid for any Stage 11d.3 allowlist entry
+    /// per `docs/mainnet-eligibility-criteria.md` §6. Until a
+    /// separately-reviewed strategy lands, declaring `Gguf` makes
+    /// the refusal explicit instead of hidden — the architecture
+    /// refuses the claim with a clear "no GGUF proof backend
+    /// approved" message at layer 4.
     Gguf,
     /// Stage 11b.1: canonical bounded MLP described by a versioned
     /// JSON spec (architecture + weights + biases + quantization
@@ -209,11 +220,24 @@ pub enum ProofSystem {
     /// for any 11b.1 producer; refusal layers 1 (testnet flag) and
     /// 3 (bounded reference) both fire on mainnet.
     Stage11bHalo2Reference,
-    /// Stage 11c (planned) — production ezkl ONNX prover. Mainnet
-    /// eligibility deferred to Stage 11c's plan + chain-team review.
+    /// Originally planned as a production ezkl ONNX prover variant.
+    /// **The Stage 11b.1 ezkl-discovery spike rejected ezkl as a
+    /// dependency** (`v23.0.5` has no `LICENSE` file or
+    /// `Cargo.toml` `license` field). This variant is kept in the
+    /// enum for back-compat (Stage 11b.0 schema slot) but is not
+    /// targeted by any current stage. A future production ONNX
+    /// prover would need a separately-reviewed Rust prover with a
+    /// clean license. Refused on mainnet by layer 6 (allowlist
+    /// empty); could be revisited as a Stage 11d.2 candidate if
+    /// upstream license posture changes.
     Ezkl,
-    /// Stage 11d (planned) — GGUF-compatible proof strategy chosen at
-    /// Stage 11d planning time. **No proof readiness claim today.**
+    /// Originally planned as a slot for a future GGUF-compatible
+    /// proof strategy. **No GGUF strategy is on the Stage 11d
+    /// table.** A future Stage 11e research track may evaluate the
+    /// strategies documented in the operator runbook's "GGUF
+    /// proofs" section. **No proof readiness claim today.**
+    /// Refused on mainnet by layer 6 (allowlist empty); if
+    /// `model_format = Gguf`, layer 4 fires first regardless.
     GgufStrategyTbd,
 }
 
@@ -707,6 +731,12 @@ impl ProofMetadata {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
+            // Stage 11a vintage artifacts never declared this
+            // field, so `None` is the honest default. Stage 11d.1
+            // layer 1 treats `None` as testnet/dev for safety, so
+            // any artifact produced via this constructor is hard-
+            // refused on mainnet — preserving the Stage 11a
+            // mock-only posture.
             testnet_or_dev_only: None,
             model_framework: None,
         }
@@ -741,14 +771,22 @@ impl ProofMetadata {
 /// `#[from]` it into its own enum cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MainnetRefusalReason {
-    /// Layer 1: artifact carries `testnet_or_dev_only: Some(true)`.
-    /// Fires before any other check so a developer who knows they're
-    /// producing a non-mainnet artifact gets a clear signal.
+    /// Layer 1: artifact's `testnet_or_dev_only` field is **not**
+    /// `Some(false)`. Both `Some(true)` (explicit disclaim) and
+    /// `None` (absent — treated as testnet/dev for safety per
+    /// `docs/mainnet-eligibility-criteria.md` §1.5) fire this
+    /// layer. Only an artifact that **explicitly** declares
+    /// `testnet_or_dev_only: Some(false)` can pass to deeper
+    /// refusal layers (Stage 11d.1 tightening).
     #[error(
-        "proof artifact is marked testnet/dev only (backend_id = {backend_id:?}); \
-         the producer explicitly disclaimed mainnet eligibility"
+        "proof artifact is not declared mainnet-eligible \
+         (testnet_or_dev_only = {testnet_or_dev_only:?}, backend_id = {backend_id:?}); \
+         only Some(false) passes this layer"
     )]
-    TestnetOrDevOnly { backend_id: String },
+    TestnetOrDevOnly {
+        backend_id: String,
+        testnet_or_dev_only: Option<bool>,
+    },
 
     /// Layer 2: proof_system is Mock (or absent — Stage 11a vintage).
     /// Preserves Stage 11a's `MockBackendRefusedOnMainnet` guarantee.
@@ -775,12 +813,17 @@ pub enum MainnetRefusalReason {
     },
 
     /// Layer 4: model_format = Gguf claim. No GGUF inference proof
-    /// backend is approved at any stage through Stage 11b.0;
+    /// backend is approved at any stage through Stage 11d.x;
     /// declaration is honest but the claim is hard-refused.
+    /// `ModelFormat::Gguf` is explicitly invalid for any Stage
+    /// 11d.3 allowlist entry per `docs/mainnet-eligibility-criteria.md`
+    /// §6 — a future Stage 11e research track may evaluate
+    /// strategies, but none is on the current roadmap.
     #[error(
         "proof artifact declares GGUF model_format with proof_system {proof_system:?} \
-         (backend_id = {backend_id:?}); no GGUF inference proof backend is approved — \
-         awaiting Stage 11d strategy + chain-team review"
+         (backend_id = {backend_id:?}); no GGUF inference proof backend is approved \
+         through Stage 11d.x — awaiting a future Stage 11e research-track strategy + \
+         chain-team review"
     )]
     GgufClaim {
         backend_id: String,
@@ -811,9 +854,9 @@ pub enum MainnetRefusalReason {
     #[error(
         "proof system {proof_system:?} (backend_id = {backend_id:?}) is not in the \
          structured mainnet allowlist (MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES); both that \
-         list and the legacy MAINNET_APPROVED_PROOF_SYSTEMS alias ship empty by design \
-         through Stage 11d.x — mainnet eligibility lands when a Stage 11d.3 entry is \
-         added after written chain-team sign-off"
+         list and the legacy MAINNET_APPROVED_PROOF_SYSTEMS alias ship empty through \
+         Stage 11d.1 / 11d.2 by design — mainnet eligibility lands when a Stage 11d.3 \
+         entry is added after written chain-team sign-off"
     )]
     NotInMainnetAllowlist {
         backend_id: String,
@@ -842,10 +885,17 @@ pub enum MainnetRefusalReason {
 pub fn check_mainnet_eligible(
     meta: &ProofMetadata,
 ) -> std::result::Result<(), MainnetRefusalReason> {
-    // Layer 1: explicit testnet/dev flag.
-    if meta.testnet_or_dev_only == Some(true) {
+    // Layer 1 (Stage 11d.1 tightening): only an artifact that
+    // EXPLICITLY declares `testnet_or_dev_only: Some(false)` passes.
+    // Both `Some(true)` (the producer disclaimed mainnet) and `None`
+    // (the producer did not declare either way — treated as
+    // testnet/dev for safety per criteria §1.5) refuse here. Fires
+    // before any other check so a mis-declared artifact gets a
+    // clear signal before the deeper layers run.
+    if meta.testnet_or_dev_only != Some(false) {
         return Err(MainnetRefusalReason::TestnetOrDevOnly {
             backend_id: meta.backend_id.clone(),
+            testnet_or_dev_only: meta.testnet_or_dev_only,
         });
     }
 
@@ -899,9 +949,11 @@ pub fn check_mainnet_eligible(
     // Layer 6 (Stage 11d.1): structured allowlist match on the
     // (proof_system, circuit_id_hex, model_hash) triple, plus the
     // legacy bare-ProofSystem alias for back-compat. Both lists
-    // are empty by design through end of Stage 11d.x; the OR is
-    // a deliberate back-compat bridge — downstream stages can
-    // remove the legacy arm once existing tests are migrated.
+    // are empty through Stage 11d.1 / 11d.2 by design; only a
+    // Stage 11d.3 PR with written chain-team sign-off populates
+    // the structured list. The OR is a deliberate back-compat
+    // bridge — downstream stages can remove the legacy arm once
+    // existing tests are migrated.
     let ps = meta.proof_system.unwrap();
     if !proof_system_passes_layer6(meta, ps) {
         return Err(MainnetRefusalReason::NotInMainnetAllowlist {
@@ -956,12 +1008,13 @@ pub(crate) fn check_mainnet_eligible_with(
     structured_entries: &[AllowlistEntry],
     legacy_entries: &[ProofSystem],
 ) -> std::result::Result<(), MainnetRefusalReason> {
-    // Layers 1–5 are unchanged from `check_mainnet_eligible` and
+    // Layers 1–5 mirror `check_mainnet_eligible` and are
     // independent of allowlist contents. Re-run them inline so the
     // helper is self-contained.
-    if meta.testnet_or_dev_only == Some(true) {
+    if meta.testnet_or_dev_only != Some(false) {
         return Err(MainnetRefusalReason::TestnetOrDevOnly {
             backend_id: meta.backend_id.clone(),
+            testnet_or_dev_only: meta.testnet_or_dev_only,
         });
     }
     match meta.proof_system {
@@ -1519,7 +1572,10 @@ mod tests {
                 circuit_id_hex: None,
                 verification_key_hex: None,
                 public_inputs: None,
-                testnet_or_dev_only: None,
+                // Stage 11d.1 tightening: set Some(false) explicitly
+                // so this test exercises layers 2–6 per variant
+                // (not the new layer-1 absent-flag refusal).
+                testnet_or_dev_only: Some(false),
                 model_framework: None,
             };
             let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1565,6 +1621,28 @@ mod tests {
     #[test]
     fn refusal_layer_2_mock_or_absent_proof_system() {
         // Absent proof_system is treated as Mock (Stage 11a vintage).
+        // Stage 11d.1 tightening: layer 1 now catches the default
+        // `testnet_or_dev_only: None` from `new_stage11a`, so this
+        // test explicitly sets `Some(false)` to exercise layer 2.
+        let mut meta = ProofMetadata::new_stage11a(
+            "stage11a-style".into(),
+            blake3::hash(b"m").to_hex().to_string(),
+            blake3::hash(b"i").to_hex().to_string(),
+            blake3::hash(b"o").to_hex().to_string(),
+        );
+        meta.testnet_or_dev_only = Some(false);
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(matches!(err, MainnetRefusalReason::MockBackend { .. }), "got {err:?}");
+    }
+
+    /// Stage 11d.1 — companion to
+    /// `refusal_layer_2_mock_or_absent_proof_system`: confirms the
+    /// `new_stage11a` default (which leaves `testnet_or_dev_only:
+    /// None`) is refused at layer 1, NOT layer 2. This pins the
+    /// safety contract that absent / `None` flag is treated as
+    /// testnet/dev.
+    #[test]
+    fn stage11a_default_metadata_refused_at_layer_1() {
         let meta = ProofMetadata::new_stage11a(
             "stage11a-style".into(),
             blake3::hash(b"m").to_hex().to_string(),
@@ -1572,7 +1650,17 @@ mod tests {
             blake3::hash(b"o").to_hex().to_string(),
         );
         let err = check_mainnet_eligible(&meta).unwrap_err();
-        assert!(matches!(err, MainnetRefusalReason::MockBackend { .. }), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                MainnetRefusalReason::TestnetOrDevOnly {
+                    testnet_or_dev_only: None,
+                    ..
+                }
+            ),
+            "Stage 11a default metadata (testnet_or_dev_only = None) must \
+             be refused at layer 1 per Stage 11d.1 tightening; got {err:?}"
+        );
     }
 
     #[test]
@@ -1587,7 +1675,7 @@ mod tests {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
-            testnet_or_dev_only: None,
+            testnet_or_dev_only: Some(false),
             model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1606,7 +1694,7 @@ mod tests {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
-            testnet_or_dev_only: None,
+            testnet_or_dev_only: Some(false),
             model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1626,7 +1714,7 @@ mod tests {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
-            testnet_or_dev_only: None,
+            testnet_or_dev_only: Some(false),
             model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1655,7 +1743,7 @@ mod tests {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
-            testnet_or_dev_only: None,
+            testnet_or_dev_only: Some(false),
             model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1856,8 +1944,11 @@ mod tests {
         );
         meta.model_format = Some(ModelFormat::Halo2ReferenceMlp);
         meta.proof_system = Some(ProofSystem::Stage11bHalo2Reference);
-        // Note: testnet_or_dev_only deliberately NOT set, so layer 1
-        // does not pre-empt — we want layer 3 to fire concretely.
+        // Stage 11d.1 tightening: must set Some(false) explicitly
+        // so layer 1 doesn't pre-empt (`new_stage11a`'s default
+        // None now triggers layer 1). We want layer 3 to fire
+        // concretely for this bounded-reference variant test.
+        meta.testnet_or_dev_only = Some(false);
         let err = check_mainnet_eligible(&meta).unwrap_err();
         assert!(
             matches!(err, MainnetRefusalReason::BoundedReference {
@@ -1903,6 +1994,9 @@ mod tests {
         );
         meta.model_format = Some(ModelFormat::Halo2ReferenceMlp);
         meta.proof_system = Some(ProofSystem::Stage11bHalo2Reference);
+        // Stage 11d.1 tightening: set Some(false) so the test
+        // exercises layer 3, not the new layer-1 absent-flag refusal.
+        meta.testnet_or_dev_only = Some(false);
         let err = check_mainnet_eligible(&meta).unwrap_err();
         // Must be layer 3, NOT layer 5.
         assert!(
@@ -2055,8 +2149,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, MainnetRefusalReason::TestnetOrDevOnly { .. }),
-            "expected TestnetOrDevOnly (layer 1) refusal, got {err:?}"
+            matches!(
+                err,
+                MainnetRefusalReason::TestnetOrDevOnly {
+                    testnet_or_dev_only: Some(true),
+                    ..
+                }
+            ),
+            "expected TestnetOrDevOnly(Some(true)) (layer 1) refusal, got {err:?}"
+        );
+    }
+
+    /// Stage 11d.1 tightening: the criteria document
+    /// (mainnet-eligibility-criteria.md §1.5) requires
+    /// `testnet_or_dev_only: Some(false)` EXPLICITLY for mainnet.
+    /// The bare `None` (absent declaration) is treated as
+    /// testnet/dev for safety. This test pins that an otherwise-
+    /// allowlist-matching artifact with `testnet_or_dev_only: None`
+    /// is refused at layer 1 — not sneaking past to layer 6.
+    #[test]
+    fn absent_testnet_or_dev_only_refused_before_allowlist_lookup() {
+        let mut meta = synthetic_production_meta();
+        meta.testnet_or_dev_only = None;
+        let err = check_mainnet_eligible_with(
+            &meta,
+            &[synthetic_production_entry()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MainnetRefusalReason::TestnetOrDevOnly {
+                    testnet_or_dev_only: None,
+                    ..
+                }
+            ),
+            "expected TestnetOrDevOnly(None) (layer 1) refusal for absent flag, got {err:?}"
         );
     }
 
