@@ -118,9 +118,12 @@ operator runbook.
 | **Phase 5 Stage 11b.1.a** — Bounded multi-framework halo2 reference scaffold (no halo2 circuit yet, four equal-status primaries): `ModelFramework` enum (Rumus / PyTorch / TensorFlow / Caffe / FrameworkAgnostic), `ModelFormat::Halo2ReferenceMlp`, `ProofSystem::Stage11bHalo2Reference`, **framework-neutral** canonical MLP spec (4→8→4 with ReLU, i16 fixed-point, **i64 accumulator + round-half-away-from-zero + bias-before-saturation**), pure-Rust canonical evaluator (neutral reference implementation), `FrameworkManifest` schema with `spec_hash` / `input_hash` / `output_hash`, 5 committed framework manifests, cross-framework equivalence + hash-equivalence integration tests. **Four equal-status primary exporters** under `tools/` (excluded from the workspace): `rumus_export` (standalone Cargo pkg, `rumus = "0.4.0"` `fixed::FixedLinear`), `pytorch_export` (Python, `torch.int64` explicit), `tensorflow_export` (Python, `tf.int64` explicit), `caffe_export` (Python, real Caffe or auditable pure-NumPy fallback). **Zero prover deps, zero halo2 deps, zero operator-binary changes, zero framework runtimes in the OmniNode workspace, Stage 11a + Stage 11b.0 fixtures byte-stable.** | `omni-zkml`, `crates/omni-proofs-halo2-reference/` (new), `tools/<framework>_export/` (new, outside workspace) | **Complete** |
 | **Phase 5 Stage 11b.1.b** — Halo2 circuit + `Halo2ReferenceVerifier` overriding `verify_artifact` + `verify()` returning `ProofVerifierError::RequiresArtifactDispatch` + opt-in `omni-node halo2-reference-verify` feature + frozen `params.bin`/`proof.bin`/`proof_artifact.json` fixtures + standalone `tools/halo2_reference_regen/` (workspace-excluded) + verifier-only CI gate. Default `omni-node` build pulls zero halo2 deps (verified by tree-check). All artifacts `testnet_or_dev_only: Some(true)`; `MAINNET_APPROVED_PROOF_SYSTEMS` stays empty. | `omni-zkml`, `omni-proofs-halo2-reference/` (extends), `omni-node`, `tools/halo2_reference_regen/`, `.github/workflows` | **Complete** |
 | **Phase 5 Stage 11c** — Arbitrary-input soundness for the bounded `halo2-mlp-v1 / spec_version: 2` numeric contract: complete round-half-away-from-zero (RHAZ) gadget via signed-magnitude Euclidean division (no tie ambiguity) + three-branch saturation gadget (`b_lo` / `b_in` / `b_hi` with branch-correctness aux witnesses) + range checks at widths 8u/15u/16s/16u/17u/23u + 8-entry committed test corpus (`corpus.json`) exercising tie cases + cross-framework corpus equivalence across rumus/pytorch/tensorflow/caffe/framework_agnostic + gadget-isolated `SatTestCircuit` unit tests for boundary cases (real i16 inputs never saturate under the frozen spec; isolated tests exercise the b_lo/b_hi branches). `HALO2_K` bumped 9 → 10 (preauthorized ≤ 11; halt-and-report at ≥ 12). All four framework exporters extended with `--corpus` modes (developer-host only). Verifier-side `canonical_evaluate` defense in depth preserved. **Still not production zkML; still `testnet_or_dev_only: Some(true)`; `MAINNET_APPROVED_PROOF_SYSTEMS` stays empty.** | `omni-proofs-halo2-reference/` (extends), `tools/halo2_reference_regen/`, `tools/{rumus,pytorch,tensorflow,caffe}_export/`, `.github/workflows` | **Complete** |
-| Phase 5 Stage 11c — Production ezkl ONNX prover for real (small) inference networks; first chain-team-reviewed mainnet allowlist entry | `omni-zkml`, `Cargo.toml`, `contracts/` review | Planned |
-| Phase 5 Stage 11d — GGUF-compatible proof strategy (shadow-verifier / partial-inference / replay-based); none of these prove full transformer correctness | `omni-zkml`, `omni-pipeline` integration | Planned |
-| Phase 5 Stage 8+ — SUM Chain Tokenomics (staking / slashing / disputes / chain-side proof verification) — **gated on Stage 11c + chain-team review** | `contracts/` | Planned |
+| **Phase 5 Stage 11d.0** — Mainnet eligibility criteria + chain-team review packet (docs-only). Authoritative criteria document defining what qualifies a proof system for `MAINNET_APPROVED_PROOF_SYSTEMS`: required proof properties (soundness, completeness, determinism, verifier availability), required `ProofArtifactBody` metadata, distinguishability rules vs bounded reference (`Stage11bHalo2Reference` stays testnet/dev-only in perpetuity), allowlist mechanics design (Stage 11d.1 schema: `(proof_system, circuit_id_hex, model_hash)` triple keys), and the eight required chain-team review packet artifacts (R1–R8). Plus the structured review-packet template and an operator-facing FAQ. **No code, no schema, no allowlist entry.** Stage 11d defines and prepares the eligibility path; a later Stage 11d.3 entry may add the first eligible proof system after written sign-off. | `docs/mainnet-eligibility-criteria.md`, `docs/stage11d-review-packet.md`, `docs/stage11d-mainnet-eligibility-FAQ.md`, `README.md`, `docs/operator-runbook.md` | **Complete** |
+| Phase 5 Stage 11d.1 — Structured allowlist schema (`AllowlistEntry` struct + `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES: &[AllowlistEntry] = &[]`), layer-6 refusal rewired, hardening tests including `stage11b_halo2_reference_never_in_allowlist`. Still **no allowlist entry**. | `crates/omni-zkml/src/proof.rs`, tests | Planned |
+| Phase 5 Stage 11d.2 — First production proof class (chain-team-selected during 11d.0/11d.1 review; recommended candidate is a small fixed-point production MLP built on Stage 11c's gadgets). New `ProofSystem` variant + verifier + regen tool + fixtures, behind an opt-in cargo feature. Still **no allowlist entry**. | `omni-zkml`, new `omni-proofs-...` crate or extension, `omni-node` feature, CI | Planned |
+| Phase 5 Stage 11d.3 — First allowlist entry. **Blocked on** external-cryptographer sign-off (Claim 1.1.S2 in the criteria doc) + completed review packet (R1–R8). Adds exactly one `AllowlistEntry`, commits the `mainnet_allowlist_snapshot.json` byte-stability fixture, references the signed chain-team-review document. | `crates/omni-zkml/src/proof.rs`, `docs/chain-team-review/…` (new), tests, CI | Planned (blocked on sign-off) |
+| Phase 5 Stage 11e — GGUF-compatible proof strategy (shadow-verifier / partial-inference / replay-based); none of these prove full transformer correctness. Refused by `check_mainnet_eligible` layer 4 (`GgufClaim`) through end of Stage 11d.x — no GGUF candidate is on the Stage 11d table. | `omni-zkml`, `omni-pipeline` integration | Research / not yet planned |
+| Phase 5 Stage 8+ — SUM Chain Tokenomics (staking / slashing / disputes / chain-side proof verification) — **gated on Stage 11d.3 sign-off + dedicated chain-team plan** | `contracts/` | Planned |
 
 ---
 
@@ -1851,7 +1854,7 @@ Local proving is the only required path. **No Bonsai, no hosted prover dependenc
 - **No new heavy prover deps anywhere.**
 - **No new CI workflow jobs.** Stage 11b.0's checks are pure-Rust unit tests that run inside the existing `default-build-test` job. No `stage11b0-arch-check` shell job; the same invariants are pinned by `mainnet_allowlist_is_empty_at_stage_11b0`, `every_proof_system_is_refused_on_mainnet_at_stage_11b0`, and `stage11a_compat_metadata_serializes_without_stage11b_fields`.
 - **No "zkML" claim** on the bounded reference circuit (Stage 11b.1 deferred) or anywhere in 11b.0 documentation.
-- **No GGUF inference proof readiness claim.** Stage 11b.0 ships the *refusal* infrastructure for GGUF — declaring `model_format = "gguf"` is honest, mainnet refuses the claim, and the runbook (§11c) documents the open menu of Stage 11d strategies.
+- **No GGUF inference proof readiness claim.** Stage 11b.0 ships the *refusal* infrastructure for GGUF — declaring `model_format = "gguf"` is honest, mainnet refuses the claim, and the runbook (§11c) documents the open menu of future Stage 11e research-track strategies.
 - **No edits to** [`docs/mainnet-smoke-audit.md`](docs/mainnet-smoke-audit.md) **or** [`docs/phase5-rc-audit.md`](docs/phase5-rc-audit.md) (both immutable).
 - **No edits to** `omni-types` / `omni-store` / `omni-net` / `omni-pipeline` / `omni-bridge` / `python/omninode` **source.**
 
@@ -1863,21 +1866,24 @@ Local proving is the only required path. **No Bonsai, no hosted prover dependenc
 
 Cryptographically prove that inference was executed correctly. Tie proofs to a staking/slashing economy on SUM Chain.
 
-| Component | Implementation |
+| Component | Implementation status |
 |---|---|
-| Proof Generation | Dual backend: ezkl (Halo2 SNARK) for small-medium models, RISC Zero (STARK) for general computation |
-| Proof Aggregation | Combine per-stage proofs into a single composite proof before on-chain submission |
-| On-Chain Verification | Smart contract verifies aggregated proof and triggers reward/slash |
-| Staking | Nodes stake SUM tokens to join the network; 7-day unbonding period |
-| Slashing | Provably incorrect inference → stake is partially burned |
-| Financial RLHF | `reward_i = compute_share_i × quality_score × stake_weight_i × block_reward` |
+| Proof Generation | Currently **bounded reference only**: a hand-rolled halo2 circuit for the 4→8→4 `halo2-mlp-v1` toy MLP (Stage 11b.1.b + 11c, testnet/dev-only). Production proof generation is open — Stage 11d.0 captures the mainnet-eligibility criteria; Stage 11d.2 selects the first production proof class. No ezkl dependency (rejected at Stage 11b.1 due to license posture — `v23.0.5` has no `LICENSE` file and no `Cargo.toml` `license` field). RISC Zero remains an unevaluated future option. |
+| Proof Aggregation | Future work, not yet planned. |
+| On-Chain Verification | Future work — not in Stage 11d. The Stage 11d.1 allowlist schema is shaped so a future on-chain verifier is a refactor, not a schema change. See [docs/mainnet-eligibility-criteria.md §5](docs/mainnet-eligibility-criteria.md). |
+| Staking | Future Stage 8+ — gated on Stage 11d.3 sign-off + dedicated chain-team plan. |
+| Slashing | Future Stage 8+ — same gating. |
+| Financial RLHF | Future Stage 8+ — same gating. |
 
-**Dual Prover Strategy:**
+**Reference + future prover landscape (current honest state):**
 
-| Backend | Best For | Proof Type | Trade-off |
-|---|---|---|---|
-| ezkl (Halo2) | Small-medium models, high throughput | SNARK | Faster proving, smaller proofs, model-specific circuit |
-| RISC Zero | Large models, general computation | STARK | Slower proving, larger proofs, proves arbitrary Rust code |
+| Backend | Shipped today | Notes |
+|---|---|---|
+| halo2 (Pasta IPA) reference | **Stage 11b.1.b + 11c** — bounded `halo2-mlp-v1` verifier behind opt-in `halo2-reference-verify` feature; testnet/dev-only; not a production proof | Used for architecture validation, not real inference |
+| halo2 production proof class | Not shipped; **recommended candidate** for Stage 11d.2 selection | Built on Stage 11c gadgets (RHAZ + saturation); scope TBD by chain-team review |
+| ezkl (Halo2 SNARK on ONNX) | Not depended upon; **rejected at Stage 11b.1** due to licensing | Revisitable if upstream license posture changes |
+| RISC Zero (STARK) | Not depended upon; unevaluated | Could become a future Stage 11e+ research track |
+| GGUF/LLM inference | No proof strategy; refused by `check_mainnet_eligible` layer 4 | Future Stage 11e+ research track |
 
 **Smart Contract Architecture:**
 ```
@@ -2276,12 +2282,13 @@ omni-zkml     = { path = "crates/omni-zkml" }
 
 ### Phase 5: zkML & Tokenomics (`omni-zkml`)
 
-| Crate | Version | Purpose |
-|---|---|---|
-| `ezkl` | >=15.0 | zkML proof generation (Halo2 SNARK for ONNX models) |
-| `risc0-zkvm` | 3.0 | General-purpose zkVM (STARK prover) |
-| `risc0-zkvm-platform` | 3.0 | RISC Zero platform support |
-| `alloy` | 0.9 | EVM interaction (ABI encoding, contract calls) |
+| Crate | Version | Purpose | Status |
+|---|---|---|---|
+| `halo2_proofs` | 0.3.2 | Halo2 IPA proving system (Pasta curves) — backs the Stage 11b.1.b / 11c bounded `halo2-mlp-v1` reference verifier | **Shipped** behind the opt-in `halo2-reference-verify` feature on `omni-node`; pulled by the standalone `tools/halo2_reference_regen/` package outside the workspace. Default `omni-node` build pulls zero halo2. |
+| `pasta_curves` | 0.5.x | Pasta curves backing `halo2_proofs` | Transitive of `halo2_proofs` |
+| `ezkl` | n/a | Originally planned as the small/medium ONNX prover | **Rejected at Stage 11b.1.** `v23.0.5` has no `LICENSE` file and no `Cargo.toml` `license` field — unsafe to depend on. Revisitable if upstream license posture changes. |
+| `risc0-zkvm` | n/a | Originally planned as a general-purpose STARK prover for large-model paths | **Not depended upon; unevaluated.** Could become a future research-track candidate (Stage 11e+); not on the Stage 11d table. |
+| `alloy` | n/a | Originally planned for EVM interaction | **Not depended upon.** SUM Chain is not EVM; existing chain integration uses `sumchain-primitives` / `sumchain-crypto` v0.1.0 (Stage 9c). |
 
 **Smart contract tooling (pending SUM Chain specification):**
 
@@ -2328,7 +2335,7 @@ Phase 5: omni-zkml + contracts (Verification & Tokenomics)
 | Hidden state transfer latency dominates inference time | Pipeline parallelism slower than single-node | F16 quantized hidden states (halve transfer size); prioritize LAN peers; tensor compression |
 | GGUF format evolution (llama.cpp breaking changes) | Parser breaks on new models | Version the parser; GGUF v3+ support; format version detection |
 | Apple Silicon unified memory path is MLX-version-dependent | Zero-copy fails on some MLX versions | Fallback to explicit copy path; runtime feature detection |
-| ezkl proof generation too slow for real-time inference | Users wait minutes for proof | Async/background proof generation; RISC Zero for faster (larger) proofs; proof caching |
+| Production proof generation too slow for real-time inference | Users wait minutes/hours per proof | Stage 11d.0 documents this as an explicit non-goal for the first production proof class; async/background proof generation + proof caching are deferred design choices. ezkl is **not** used (rejected at Stage 11b.1 due to licensing). |
 | NAT traversal failure rate | Nodes behind strict NATs can't participate | Deploy relay infrastructure; WebRTC transport as fallback |
 | SUM Chain specification not finalized | Phase 5 contracts may need redesign | Abstract chain interface; defer chain-specific code until spec is confirmed |
 
@@ -2356,10 +2363,13 @@ Phase 5: omni-zkml + contracts (Verification & Tokenomics)
 6. **safetensors** — Safe, zero-copy tensor serialization by Hugging Face.
    [GitHub: huggingface/safetensors](https://github.com/huggingface/safetensors)
 
-7. **ezkl** — zkML engine for proving neural network inference via Halo2.
+7. **halo2** (Zcash) — PLONK-based zero-knowledge proving system. Backs the Stage 11b.1.b / 11c bounded `halo2-mlp-v1` reference verifier.
+   [GitHub: zcash/halo2](https://github.com/zcash/halo2)
+
+8. **ezkl** — zkML engine for proving neural network inference via Halo2. **Not depended upon by OmniNode** — rejected at Stage 11b.1 due to license posture (`v23.0.5` has no `LICENSE` file or `Cargo.toml` `license` field). Listed here as a reference to the broader ecosystem; revisitable if upstream license posture changes.
    [GitHub: zkonduit/ezkl](https://github.com/zkonduit/ezkl)
 
-8. **RISC Zero** — General-purpose zero-knowledge virtual machine.
+9. **RISC Zero** — General-purpose zero-knowledge virtual machine. **Not depended upon by OmniNode**; unevaluated; could become a future research-track candidate.
    [GitHub: risc0/risc0](https://github.com/risc0/risc0) | [Docs](https://dev.risczero.com/)
 
 ### Reference Projects

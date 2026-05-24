@@ -407,13 +407,24 @@ directly. **No backend-specific helper logic in operator code** —
 that's the architectural property Stage 11b.0.1 locks in for every
 future backend.
 
-**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b / 11c: zero.**
+**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b / 11c / 11d.0: zero.**
 The mainnet allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in
 `omni-zkml`) is empty by design. Every proof artifact this command
 verifies will report `mainnet_eligible=false` and carry an explicit
 refusal reason from one of the six refusal layers documented in §11a.
-Mainnet eligibility lands in a future chain-team-reviewed stage
-(Stage 11d+); Stage 11c keeps the allowlist empty by design.
+**Stage 11d defines and prepares the eligibility path; a later
+Stage 11d.3 entry may add the first eligible proof system after
+written chain-team sign-off** — see the Stage 11d.0 authoritative
+docs:
+  - [`docs/mainnet-eligibility-criteria.md`](mainnet-eligibility-criteria.md)
+    — what qualifies a proof system; required `ProofArtifactBody`
+    metadata; allowlist mechanics; chain-team review packet
+    requirements; non-goals (including: `Stage11bHalo2Reference`
+    stays testnet/dev-only in perpetuity).
+  - [`docs/stage11d-review-packet.md`](stage11d-review-packet.md)
+    — the structured template a Stage 11d.3 PR fills in.
+  - [`docs/stage11d-mainnet-eligibility-FAQ.md`](stage11d-mainnet-eligibility-FAQ.md)
+    — operator-facing Q&A.
 
 **Stage 11b.1.a — multi-framework architectural scaffold (four equal primaries).**
 Adds the `ModelFramework` enum (Rumus / PyTorch / TensorFlow / Caffe /
@@ -648,7 +659,7 @@ typed taxonomy for sub-conditions like fee/balance vs. transport.
 | `MockBackendRefusedOnMainnet` (**Stage 11a**) | `OperatorError::MockBackendRefusedOnMainnet { backend_id }` — fires when the smoke `--synthetic` path is taken on `chain_id == 1`, even with `--allow-mainnet-submit` | yes — typed error, **before any submit RPC** | mainnet smoke requires a real attestation JSON (`--attestation-json`) produced off-binary by a real prover; the mock backend (`mock-v1`) is non-cryptographic by design and is hard-refused on mainnet | (no escalation needed; operator-side correction. If a real prover is available, use `--attestation-json` and re-run; if not, wait for Stage 11c's real backend) |
 | `TestnetOnlyProofRefusedOnMainnet` (**Stage 11b.0**) | proof artifact carries `testnet_or_dev_only: Some(true)` (refusal layer 1) | yes — typed error | the artifact's producer explicitly disclaimed mainnet eligibility; use a mainnet-approved producer | backend_id, producer source |
 | `BoundedReferenceProofRefusedOnMainnet` (**Stage 11b.0**) | proof_system ∈ `{Stage11bOnnxReference, Stage11bHalo2Reference}` (refusal layer 3) | yes — typed error | bounded reference fixtures are for architecture validation, not production; use a mainnet-approved producer (none ship through Stage 11c) | backend_id |
-| `GgufProofClaimRefusedOnMainnet` (**Stage 11b.0**) | `model_format == Gguf` (refusal layer 4) | yes — typed error | no GGUF inference proof backend is approved at any stage through Stage 11b.0; wait for Stage 11d strategy + chain-team review. **Declaring GGUF prevents silent fake-GGUF claims**, which is the point. | backend_id, model_hash |
+| `GgufProofClaimRefusedOnMainnet` (**Stage 11b.0**) | `model_format == Gguf` (refusal layer 4) | yes — typed error | no GGUF inference proof backend is approved at any stage through Stage 11d.0; wait for a future Stage 11e research-track strategy + chain-team review. **Declaring GGUF prevents silent fake-GGUF claims**, which is the point. | backend_id, model_hash |
 | `UnknownModelFormatRefusedOnMainnet` (**Stage 11b.0**) | `model_format = Other(_)` or absent on a non-mock backend (refusal layer 5) | yes — typed error | promote the format to a first-class enum variant via a chain-team-reviewed PR, or use an approved format | backend_id, model_format value |
 | `ProofSystemNotMainnetApproved` (**Stage 11b.0**) | proof_system not in `MAINNET_APPROVED_PROOF_SYSTEMS` (refusal layer 6) | yes — typed error | **Stages 11b and 11c ship with this allowlist empty by design.** Mainnet eligibility lands in a future chain-team-reviewed stage (Stage 11d+). | backend_id, proof_system |
 | `NoVerifierForProofSystem` (**Stage 11b.0**) | `operator verify-proof` was handed an artifact whose `proof_system` has no verifier registered | yes — typed error | Stage 11b.0 ships only `MockProofVerifier`; Stage 11b.1.b/11c add `Halo2ReferenceVerifier` under the opt-in `halo2-reference-verify` feature. Other proof systems are verifier-side stubs awaiting future stages. | proof_system |
@@ -661,25 +672,33 @@ typed taxonomy for sub-conditions like fee/balance vs. transport.
 > splitting `ChainClientError` into a typed taxonomy is a candidate for a
 > future stage if operator feedback shows the parsing burden is real.
 
-### 11c. GGUF proofs — what's possible today (Stage 11b.0)
+### 11c. GGUF proofs — what's possible today (Stage 11b.0–11d.0)
 
 OmniNode's canonical model format today is **GGUF** (llama.cpp). Stage
 11b.0 ships the schema slot for declaring `model_format = "gguf"` on
 proof artifacts, but **no GGUF inference proof backend is approved at
-any stage through Stage 11b.0**.
+any stage through Stage 11d.0**.
 
-The honest framing — to be repeated wherever Stage 11b is described:
+The honest framing — to be repeated wherever Stage 11b/c/d is described:
 
 - Full GGUF transformer inference proving is **not feasible** end-to-
   end with any current production-ready proof system. This is an open
   research problem.
-- Stage 11d will pick **one or more** of the following strategies and
-  document what each actually proves. None of them prove full
-  transformer inference correctness:
-  - **Shadow verifier circuit**: a small ONNX *verifier net* (provable
-    via the Stage 11c ezkl path) ingests `(model_hash, input_hash,
-    output_hash, derived features)` and outputs a binding. Proves the
-    verifier-net computation, not the GGUF inference itself.
+- **GGUF is explicitly NOT a Stage 11d candidate.** The Stage 11d.0
+  mainnet-eligibility criteria record GGUF as deferred to Stage 11e
+  research. The same criteria record that any future GGUF strategy
+  would require its own chain-team plan and would not auto-inherit
+  Stage 11d allowlist mechanics.
+- A future Stage 11e research track could evaluate **one or more** of
+  the following strategies. None of them prove full transformer
+  inference correctness:
+  - **Shadow verifier circuit**: a small *verifier net* (provable via
+    whichever production proof class Stage 11d.2 selects, OR via a
+    future ONNX-with-licensed-prover path) ingests `(model_hash,
+    input_hash, output_hash, derived features)` and outputs a binding.
+    Proves the verifier-net computation, not the GGUF inference itself.
+    (Note: the Stage 11b.1 ezkl-discovery spike rejected ezkl due to
+    licensing; this strategy presumes a different licensed prover.)
   - **Partial-inference proof**: a zkVM circuit re-executes a single
     layer of the transformer (e.g., the final softmax) given hashed
     intermediate state. Proves that the final emitted token follows
@@ -688,16 +707,16 @@ The honest framing — to be repeated wherever Stage 11b is described:
     same `(model, input)` and submit attestations; matching
     `output_hash` values are treated as "K-replicated." This is a
     **consensus** mechanism, not a proof system.
-- Until Stage 11d ships an approved strategy, **declaring
+- Until a future stage ships an approved GGUF strategy, **declaring
   `model_format = "gguf"` on a proof artifact and attempting mainnet
-  submission is hard-refused** by Stage 11b.0's refusal layer 4
-  (`GgufProofClaimRefusedOnMainnet`). The refusal is the point — it
-  prevents silent fake-GGUF claims.
+  submission is hard-refused** by `check_mainnet_eligible`'s refusal
+  layer 4 (`GgufProofClaimRefusedOnMainnet`). The refusal is the point
+  — it prevents silent fake-GGUF claims.
 
 This is the **decentralized proof architecture** — not "decentralized
 compute readiness." The criteria for the latter are documented in the
 Stage 11b.0 README section and **explicitly unmet** at end of Stage
-11b.0.
+11d.0.
 
 ### 11b. Escalation packet
 
