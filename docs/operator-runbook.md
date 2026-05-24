@@ -407,13 +407,24 @@ directly. **No backend-specific helper logic in operator code** —
 that's the architectural property Stage 11b.0.1 locks in for every
 future backend.
 
-**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b / 11c: zero.**
+**Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b / 11c / 11d.0: zero.**
 The mainnet allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in
 `omni-zkml`) is empty by design. Every proof artifact this command
 verifies will report `mainnet_eligible=false` and carry an explicit
 refusal reason from one of the six refusal layers documented in §11a.
-Mainnet eligibility lands in a future chain-team-reviewed stage
-(Stage 11d+); Stage 11c keeps the allowlist empty by design.
+**Stage 11d defines and prepares the eligibility path; a later
+Stage 11d.3 entry may add the first eligible proof system after
+written chain-team sign-off** — see the Stage 11d.0 authoritative
+docs:
+  - [`docs/mainnet-eligibility-criteria.md`](mainnet-eligibility-criteria.md)
+    — what qualifies a proof system; required `ProofArtifactBody`
+    metadata; allowlist mechanics; chain-team review packet
+    requirements; non-goals (including: `Stage11bHalo2Reference`
+    stays testnet/dev-only in perpetuity).
+  - [`docs/stage11d-review-packet.md`](stage11d-review-packet.md)
+    — the structured template a Stage 11d.3 PR fills in.
+  - [`docs/stage11d-mainnet-eligibility-FAQ.md`](stage11d-mainnet-eligibility-FAQ.md)
+    — operator-facing Q&A.
 
 **Stage 11b.1.a — multi-framework architectural scaffold (four equal primaries).**
 Adds the `ModelFramework` enum (Rumus / PyTorch / TensorFlow / Caffe /
