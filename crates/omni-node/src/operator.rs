@@ -1763,7 +1763,7 @@ fn subcommand_name(c: &OperatorCmd) -> &'static str {
 fn map_mainnet_refusal(reason: omni_zkml::MainnetRefusalReason) -> OperatorError {
     use omni_zkml::MainnetRefusalReason as R;
     match reason {
-        R::TestnetOrDevOnly { backend_id } => {
+        R::TestnetOrDevOnly { backend_id, .. } => {
             OperatorError::TestnetOnlyProofRefusedOnMainnet { backend_id }
         }
         R::MockBackend { backend_id, .. } => {
@@ -3835,7 +3835,10 @@ mod tests {
         // mapping fails compilation.
         let cases: [(R, fn(&OperatorError) -> bool); 6] = [
             (
-                R::TestnetOrDevOnly { backend_id: "x".into() },
+                R::TestnetOrDevOnly {
+                    backend_id: "x".into(),
+                    testnet_or_dev_only: Some(true),
+                },
                 |e| matches!(e, OperatorError::TestnetOnlyProofRefusedOnMainnet { .. }),
             ),
             (

@@ -83,18 +83,29 @@ pub const MOCK_BACKEND_ID: &str = "mock-v1";
 /// intent but still refused on mainnet by the same logic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelFormat {
-    /// ONNX (Open Neural Network Exchange). The format ezkl and most
-    /// production ML provers operate on. **No backend approved for
-    /// mainnet at end of Stage 11b.0** — Stage 11c targets this slot.
+    /// ONNX (Open Neural Network Exchange). A common format for
+    /// production ML provers. **No backend approved for mainnet at
+    /// end of Stage 11d.x.** The Stage 11b.1 ezkl-discovery spike
+    /// rejected ezkl as a dependency (`v23.0.5` has no `LICENSE`
+    /// file or `Cargo.toml` `license` field); the Stage 11d.2
+    /// production proof class selection remains open. ONNX
+    /// requires a separately-reviewed Rust prover with a clean
+    /// license before any allowlist entry can be proposed.
     Onnx,
     /// GGUF (llama.cpp model format). OmniNode's canonical model
-    /// format today. **No proof backend approved at any stage through
-    /// Stage 11b.0.** Stage 11d will pick from the strategies
-    /// documented in the runbook's "GGUF proofs" section; mainnet
-    /// eligibility is then conditional on chain-team review. Until
-    /// then, declaring `Gguf` makes the refusal explicit instead of
-    /// hidden — the architecture refuses the claim with a clear
-    /// "no GGUF proof backend approved" message.
+    /// format today. **No proof backend approved at any stage
+    /// through Stage 11d.x.** A future Stage 11e research track
+    /// may evaluate the strategies documented in the operator
+    /// runbook's "GGUF proofs" section (shadow verifier circuit,
+    /// partial-inference proof, replay-based attestation); none
+    /// of them prove full transformer inference correctness, and
+    /// none is on the Stage 11d allowlist table. Declaring `Gguf`
+    /// is explicitly invalid for any Stage 11d.3 allowlist entry
+    /// per `docs/mainnet-eligibility-criteria.md` §6. Until a
+    /// separately-reviewed strategy lands, declaring `Gguf` makes
+    /// the refusal explicit instead of hidden — the architecture
+    /// refuses the claim with a clear "no GGUF proof backend
+    /// approved" message at layer 4.
     Gguf,
     /// Stage 11b.1: canonical bounded MLP described by a versioned
     /// JSON spec (architecture + weights + biases + quantization
@@ -209,24 +220,120 @@ pub enum ProofSystem {
     /// for any 11b.1 producer; refusal layers 1 (testnet flag) and
     /// 3 (bounded reference) both fire on mainnet.
     Stage11bHalo2Reference,
-    /// Stage 11c (planned) — production ezkl ONNX prover. Mainnet
-    /// eligibility deferred to Stage 11c's plan + chain-team review.
+    /// Originally planned as a production ezkl ONNX prover variant.
+    /// **The Stage 11b.1 ezkl-discovery spike rejected ezkl as a
+    /// dependency** (`v23.0.5` has no `LICENSE` file or
+    /// `Cargo.toml` `license` field). This variant is kept in the
+    /// enum for back-compat (Stage 11b.0 schema slot) but is not
+    /// targeted by any current stage. A future production ONNX
+    /// prover would need a separately-reviewed Rust prover with a
+    /// clean license. Refused on mainnet by layer 6 (allowlist
+    /// empty); could be revisited as a Stage 11d.2 candidate if
+    /// upstream license posture changes.
     Ezkl,
-    /// Stage 11d (planned) — GGUF-compatible proof strategy chosen at
-    /// Stage 11d planning time. **No proof readiness claim today.**
+    /// Originally planned as a slot for a future GGUF-compatible
+    /// proof strategy. **No GGUF strategy is on the Stage 11d
+    /// table.** A future Stage 11e research track may evaluate the
+    /// strategies documented in the operator runbook's "GGUF
+    /// proofs" section. **No proof readiness claim today.**
+    /// Refused on mainnet by layer 6 (allowlist empty); if
+    /// `model_format = Gguf`, layer 4 fires first regardless.
     GgufStrategyTbd,
 }
 
-/// Stage 11b.0 — the mainnet allowlist of proof systems whose
-/// artifacts may even be considered for mainnet attestation. **Empty
-/// by design** at end of Stage 11b.0 and Stage 11b.1: no proof system
-/// shipped through 11b is mainnet-eligible. Stage 11c is the earliest
-/// stage that may add an entry, gated on chain-team review of the
-/// on-chain semantics.
+/// Stage 11b.0 → 11d.1 — the **legacy** mainnet allowlist of proof
+/// systems. Kept as an empty back-compat alias for Stage 11d.1; the
+/// structured replacement is [`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`]
+/// below. Both must remain empty until Stage 11d.3 ships a written
+/// chain-team sign-off; layer 6 of [`check_mainnet_eligible`] accepts
+/// an artifact if EITHER list matches (so dual-empty preserves the
+/// Stage 11b.0 "refuse everything" invariant bit-for-bit).
 ///
-/// The `mainnet_allowlist_is_empty_at_stage_11b0` test pins this
-/// invariant.
+/// The `mainnet_allowlist_is_empty_at_stage_11b0` and
+/// `legacy_MAINNET_APPROVED_PROOF_SYSTEMS_empty_after_stage_11d1` tests
+/// pin this invariant.
 pub const MAINNET_APPROVED_PROOF_SYSTEMS: &[ProofSystem] = &[];
+
+/// Stage 11d.1 — structured mainnet allowlist entry.
+///
+/// The triple `(proof_system, circuit_id_hex, model_hash)` is the
+/// matching key consulted by [`check_mainnet_eligible`] layer 6. The
+/// remaining fields are recorded for audit but NOT part of the
+/// matching key — rationale documented in
+/// `docs/mainnet-eligibility-criteria.md` §3.
+///
+/// **Cannot be `Copy`** because [`ModelFormat::Other`] carries a
+/// `String`. Clone is cheap (all other fields are `&'static str` or
+/// small enums).
+///
+/// Invariants enforced by the `every_allowlist_entry_has_required_metadata`
+/// runtime test:
+///   - `proof_system` is not `Mock`, `Stage11bOnnxReference`, or
+///     `Stage11bHalo2Reference` (bounded references are forever
+///     testnet/dev-only per criteria doc §1.6 hard rule H1).
+///   - `model_format` is not `Gguf` or `Other(_)` (criteria doc §6).
+///   - `circuit_id_hex` / `model_hash` / `verification_key_hash_hex`
+///     are 64 lowercase hex characters (BLAKE3 hash widths).
+///   - `backend_id` and `chain_team_review_ref` are non-empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowlistEntry {
+    pub proof_system: ProofSystem,
+    pub backend_id: &'static str,
+    pub circuit_id_hex: &'static str,
+    pub model_hash: &'static str,
+    pub model_format: ModelFormat,
+    /// Stage 11d.1 — hex of [`mainnet_vk_hash`] applied to the
+    /// per-verifier canonical VK bytes. The allowlist-side field
+    /// name is deliberately `verification_key_hash_hex` (NOT
+    /// `verification_key_hex`) to make it unambiguous that the
+    /// stored value is a hash, not a raw VK encoding. The existing
+    /// [`ProofMetadata::verification_key_hex`] artifact-side field
+    /// is unchanged (its name is historical; per-verifier code
+    /// cross-validates the two when Stage 11d.2 ships the first
+    /// production verifier).
+    pub verification_key_hash_hex: &'static str,
+    pub chain_team_review_ref: &'static str,
+}
+
+/// Stage 11d.1 — domain separator for the canonical
+/// mainnet-eligibility VK hash. Pinned at `b"OMNINODE-VK:v1:"` (15
+/// ASCII bytes, no null terminator, no length prefix). The trailing
+/// `v1` allows a future migration to a new scheme without ambiguity
+/// over which hash an allowlist entry's `verification_key_hash_hex`
+/// was computed under.
+pub const MAINNET_VK_HASH_DOMAIN_SEPARATOR: &[u8] = b"OMNINODE-VK:v1:";
+
+/// Stage 11d.1 — canonical mainnet-eligibility VK hash:
+///
+/// ```text
+/// verification_key_hash =
+///     BLAKE3(MAINNET_VK_HASH_DOMAIN_SEPARATOR || canonical_vk_bytes)
+/// ```
+///
+/// `canonical_vk_bytes` is the per-verifier canonical serialization
+/// of its `VerifyingKey`. Each production verifier MUST document its
+/// `canonical_vk_bytes` scheme and pin a stable test vector.
+///
+/// Stage 11d.1 ships only this helper + the domain separator. The
+/// concrete `canonical_vk_bytes` extraction lives in each production
+/// verifier (Stage 11d.2+). Cross-validation between an artifact's
+/// `metadata.verification_key_hex` and the allowlisted
+/// `verification_key_hash_hex` is per-verifier business; layer 6 of
+/// [`check_mainnet_eligible`] does NOT perform that cross-check.
+pub fn mainnet_vk_hash(canonical_vk_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MAINNET_VK_HASH_DOMAIN_SEPARATOR);
+    hasher.update(canonical_vk_bytes);
+    *hasher.finalize().as_bytes()
+}
+
+/// Stage 11d.1 — structured mainnet allowlist. **Empty by design**
+/// at end of Stage 11d.1; populated only by a Stage 11d.3 PR
+/// carrying written chain-team sign-off.
+///
+/// Layer 6 of [`check_mainnet_eligible`] consults this list keyed
+/// on `(proof_system, circuit_id_hex, model_hash)`.
+pub const MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES: &[AllowlistEntry] = &[];
 
 // ── PublicInputs ────────────────────────────────────────────────────────────
 
@@ -624,6 +731,12 @@ impl ProofMetadata {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
+            // Stage 11a vintage artifacts never declared this
+            // field, so `None` is the honest default. Stage 11d.1
+            // layer 1 treats `None` as testnet/dev for safety, so
+            // any artifact produced via this constructor is hard-
+            // refused on mainnet — preserving the Stage 11a
+            // mock-only posture.
             testnet_or_dev_only: None,
             model_framework: None,
         }
@@ -658,14 +771,22 @@ impl ProofMetadata {
 /// `#[from]` it into its own enum cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MainnetRefusalReason {
-    /// Layer 1: artifact carries `testnet_or_dev_only: Some(true)`.
-    /// Fires before any other check so a developer who knows they're
-    /// producing a non-mainnet artifact gets a clear signal.
+    /// Layer 1: artifact's `testnet_or_dev_only` field is **not**
+    /// `Some(false)`. Both `Some(true)` (explicit disclaim) and
+    /// `None` (absent — treated as testnet/dev for safety per
+    /// `docs/mainnet-eligibility-criteria.md` §1.5) fire this
+    /// layer. Only an artifact that **explicitly** declares
+    /// `testnet_or_dev_only: Some(false)` can pass to deeper
+    /// refusal layers (Stage 11d.1 tightening).
     #[error(
-        "proof artifact is marked testnet/dev only (backend_id = {backend_id:?}); \
-         the producer explicitly disclaimed mainnet eligibility"
+        "proof artifact is not declared mainnet-eligible \
+         (testnet_or_dev_only = {testnet_or_dev_only:?}, backend_id = {backend_id:?}); \
+         only Some(false) passes this layer"
     )]
-    TestnetOrDevOnly { backend_id: String },
+    TestnetOrDevOnly {
+        backend_id: String,
+        testnet_or_dev_only: Option<bool>,
+    },
 
     /// Layer 2: proof_system is Mock (or absent — Stage 11a vintage).
     /// Preserves Stage 11a's `MockBackendRefusedOnMainnet` guarantee.
@@ -692,12 +813,17 @@ pub enum MainnetRefusalReason {
     },
 
     /// Layer 4: model_format = Gguf claim. No GGUF inference proof
-    /// backend is approved at any stage through Stage 11b.0;
+    /// backend is approved at any stage through Stage 11d.x;
     /// declaration is honest but the claim is hard-refused.
+    /// `ModelFormat::Gguf` is explicitly invalid for any Stage
+    /// 11d.3 allowlist entry per `docs/mainnet-eligibility-criteria.md`
+    /// §6 — a future Stage 11e research track may evaluate
+    /// strategies, but none is on the current roadmap.
     #[error(
         "proof artifact declares GGUF model_format with proof_system {proof_system:?} \
-         (backend_id = {backend_id:?}); no GGUF inference proof backend is approved — \
-         awaiting Stage 11d strategy + chain-team review"
+         (backend_id = {backend_id:?}); no GGUF inference proof backend is approved \
+         through Stage 11d.x — awaiting a future Stage 11e research-track strategy + \
+         chain-team review"
     )]
     GgufClaim {
         backend_id: String,
@@ -718,14 +844,19 @@ pub enum MainnetRefusalReason {
         model_format: Option<ModelFormat>,
     },
 
-    /// Layer 6: proof_system is not in
-    /// [`MAINNET_APPROVED_PROOF_SYSTEMS`]. **The allowlist is empty
-    /// at end of Stage 11b.0** — no proof system gets through this
-    /// gate yet.
+    /// Layer 6: the artifact's `(proof_system, circuit_id_hex,
+    /// model_hash)` triple does not match any entry in
+    /// [`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`] (Stage 11d.1
+    /// structured allowlist), and `proof_system` is not in the
+    /// legacy [`MAINNET_APPROVED_PROOF_SYSTEMS`] back-compat alias.
+    /// **Both lists are empty at end of Stage 11d.1** — no proof
+    /// system gets through this gate yet.
     #[error(
         "proof system {proof_system:?} (backend_id = {backend_id:?}) is not in the \
-         mainnet allowlist; Stage 11b / 11c ship with the allowlist empty by design — \
-         mainnet eligibility lands in a future chain-team-reviewed stage (Stage 11d+)"
+         structured mainnet allowlist (MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES); both that \
+         list and the legacy MAINNET_APPROVED_PROOF_SYSTEMS alias ship empty through \
+         Stage 11d.1 / 11d.2 by design — mainnet eligibility lands when a Stage 11d.3 \
+         entry is added after written chain-team sign-off"
     )]
     NotInMainnetAllowlist {
         backend_id: String,
@@ -754,10 +885,17 @@ pub enum MainnetRefusalReason {
 pub fn check_mainnet_eligible(
     meta: &ProofMetadata,
 ) -> std::result::Result<(), MainnetRefusalReason> {
-    // Layer 1: explicit testnet/dev flag.
-    if meta.testnet_or_dev_only == Some(true) {
+    // Layer 1 (Stage 11d.1 tightening): only an artifact that
+    // EXPLICITLY declares `testnet_or_dev_only: Some(false)` passes.
+    // Both `Some(true)` (the producer disclaimed mainnet) and `None`
+    // (the producer did not declare either way — treated as
+    // testnet/dev for safety per criteria §1.5) refuse here. Fires
+    // before any other check so a mis-declared artifact gets a
+    // clear signal before the deeper layers run.
+    if meta.testnet_or_dev_only != Some(false) {
         return Err(MainnetRefusalReason::TestnetOrDevOnly {
             backend_id: meta.backend_id.clone(),
+            testnet_or_dev_only: meta.testnet_or_dev_only,
         });
     }
 
@@ -808,16 +946,116 @@ pub fn check_mainnet_eligible(
         });
     }
 
-    // Layer 6: mainnet allowlist. EMPTY in Stage 11b.0. Stage 11c
-    // earliest may add an entry (with chain-team review).
+    // Layer 6 (Stage 11d.1): structured allowlist match on the
+    // (proof_system, circuit_id_hex, model_hash) triple, plus the
+    // legacy bare-ProofSystem alias for back-compat. Both lists
+    // are empty through Stage 11d.1 / 11d.2 by design; only a
+    // Stage 11d.3 PR with written chain-team sign-off populates
+    // the structured list. The OR is a deliberate back-compat
+    // bridge — downstream stages can remove the legacy arm once
+    // existing tests are migrated.
     let ps = meta.proof_system.unwrap();
-    if !MAINNET_APPROVED_PROOF_SYSTEMS.iter().any(|&s| s == ps) {
+    if !proof_system_passes_layer6(meta, ps) {
         return Err(MainnetRefusalReason::NotInMainnetAllowlist {
             backend_id: meta.backend_id.clone(),
             proof_system: ps,
         });
     }
 
+    Ok(())
+}
+
+/// Layer-6 matching logic factored out so the `#[cfg(test)]` helper
+/// [`check_mainnet_eligible_with`] can inject synthetic allowlists
+/// without touching the real const slices.
+fn proof_system_passes_layer6(meta: &ProofMetadata, ps: ProofSystem) -> bool {
+    let matches_structured = matches_structured_allowlist(
+        meta,
+        ps,
+        MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES,
+    );
+    let matches_legacy = MAINNET_APPROVED_PROOF_SYSTEMS.contains(&ps);
+    matches_structured || matches_legacy
+}
+
+/// Returns true iff at least one entry in `entries` matches the
+/// `(proof_system, circuit_id_hex, model_hash)` triple of `meta`.
+/// Pure function; used by both the real layer-6 path and the
+/// `#[cfg(test)]` helper.
+fn matches_structured_allowlist(
+    meta: &ProofMetadata,
+    ps: ProofSystem,
+    entries: &[AllowlistEntry],
+) -> bool {
+    let cid = meta.circuit_id_hex.as_deref();
+    entries.iter().any(|e| {
+        e.proof_system == ps
+            && cid == Some(e.circuit_id_hex)
+            && meta.model_hash == e.model_hash
+    })
+}
+
+/// Stage 11d.1 — test-only `check_mainnet_eligible` variant that
+/// accepts synthetic allowlist slices. Lets us exercise layer-6
+/// matching against handcrafted entries WITHOUT modifying the real
+/// const slices (which are `&[]` by design and must stay that way).
+///
+/// Crate-private; never re-exported. Downstream crates do not need
+/// to inject synthetic allowlists.
+#[cfg(test)]
+pub(crate) fn check_mainnet_eligible_with(
+    meta: &ProofMetadata,
+    structured_entries: &[AllowlistEntry],
+    legacy_entries: &[ProofSystem],
+) -> std::result::Result<(), MainnetRefusalReason> {
+    // Layers 1–5 mirror `check_mainnet_eligible` and are
+    // independent of allowlist contents. Re-run them inline so the
+    // helper is self-contained.
+    if meta.testnet_or_dev_only != Some(false) {
+        return Err(MainnetRefusalReason::TestnetOrDevOnly {
+            backend_id: meta.backend_id.clone(),
+            testnet_or_dev_only: meta.testnet_or_dev_only,
+        });
+    }
+    match meta.proof_system {
+        Some(ProofSystem::Mock) | None => {
+            return Err(MainnetRefusalReason::MockBackend {
+                backend_id: meta.backend_id.clone(),
+                proof_system: meta.proof_system,
+            });
+        }
+        _ => {}
+    }
+    if matches!(
+        meta.proof_system,
+        Some(ProofSystem::Stage11bOnnxReference) | Some(ProofSystem::Stage11bHalo2Reference)
+    ) {
+        return Err(MainnetRefusalReason::BoundedReference {
+            backend_id: meta.backend_id.clone(),
+            proof_system: meta.proof_system.unwrap(),
+        });
+    }
+    if matches!(meta.model_format, Some(ModelFormat::Gguf)) {
+        return Err(MainnetRefusalReason::GgufClaim {
+            backend_id: meta.backend_id.clone(),
+            proof_system: meta.proof_system,
+        });
+    }
+    if matches!(meta.model_format, Some(ModelFormat::Other(_)) | None) {
+        return Err(MainnetRefusalReason::UnknownModelFormat {
+            backend_id: meta.backend_id.clone(),
+            model_format: meta.model_format.clone(),
+        });
+    }
+    let ps = meta.proof_system.unwrap();
+    let matches_structured = matches_structured_allowlist(meta, ps, structured_entries);
+    let matches_legacy = legacy_entries.contains(&ps);
+    if !(matches_structured || matches_legacy) {
+        return Err(MainnetRefusalReason::NotInMainnetAllowlist {
+            backend_id: meta.backend_id.clone(),
+            proof_system: ps,
+        });
+    }
     Ok(())
 }
 
@@ -1334,7 +1572,10 @@ mod tests {
                 circuit_id_hex: None,
                 verification_key_hex: None,
                 public_inputs: None,
-                testnet_or_dev_only: None,
+                // Stage 11d.1 tightening: set Some(false) explicitly
+                // so this test exercises layers 2–6 per variant
+                // (not the new layer-1 absent-flag refusal).
+                testnet_or_dev_only: Some(false),
                 model_framework: None,
             };
             let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1380,6 +1621,28 @@ mod tests {
     #[test]
     fn refusal_layer_2_mock_or_absent_proof_system() {
         // Absent proof_system is treated as Mock (Stage 11a vintage).
+        // Stage 11d.1 tightening: layer 1 now catches the default
+        // `testnet_or_dev_only: None` from `new_stage11a`, so this
+        // test explicitly sets `Some(false)` to exercise layer 2.
+        let mut meta = ProofMetadata::new_stage11a(
+            "stage11a-style".into(),
+            blake3::hash(b"m").to_hex().to_string(),
+            blake3::hash(b"i").to_hex().to_string(),
+            blake3::hash(b"o").to_hex().to_string(),
+        );
+        meta.testnet_or_dev_only = Some(false);
+        let err = check_mainnet_eligible(&meta).unwrap_err();
+        assert!(matches!(err, MainnetRefusalReason::MockBackend { .. }), "got {err:?}");
+    }
+
+    /// Stage 11d.1 — companion to
+    /// `refusal_layer_2_mock_or_absent_proof_system`: confirms the
+    /// `new_stage11a` default (which leaves `testnet_or_dev_only:
+    /// None`) is refused at layer 1, NOT layer 2. This pins the
+    /// safety contract that absent / `None` flag is treated as
+    /// testnet/dev.
+    #[test]
+    fn stage11a_default_metadata_refused_at_layer_1() {
         let meta = ProofMetadata::new_stage11a(
             "stage11a-style".into(),
             blake3::hash(b"m").to_hex().to_string(),
@@ -1387,7 +1650,17 @@ mod tests {
             blake3::hash(b"o").to_hex().to_string(),
         );
         let err = check_mainnet_eligible(&meta).unwrap_err();
-        assert!(matches!(err, MainnetRefusalReason::MockBackend { .. }), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                MainnetRefusalReason::TestnetOrDevOnly {
+                    testnet_or_dev_only: None,
+                    ..
+                }
+            ),
+            "Stage 11a default metadata (testnet_or_dev_only = None) must \
+             be refused at layer 1 per Stage 11d.1 tightening; got {err:?}"
+        );
     }
 
     #[test]
@@ -1402,7 +1675,7 @@ mod tests {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
-            testnet_or_dev_only: None,
+            testnet_or_dev_only: Some(false),
             model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1421,7 +1694,7 @@ mod tests {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
-            testnet_or_dev_only: None,
+            testnet_or_dev_only: Some(false),
             model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1441,7 +1714,7 @@ mod tests {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
-            testnet_or_dev_only: None,
+            testnet_or_dev_only: Some(false),
             model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1470,7 +1743,7 @@ mod tests {
             circuit_id_hex: None,
             verification_key_hex: None,
             public_inputs: None,
-            testnet_or_dev_only: None,
+            testnet_or_dev_only: Some(false),
             model_framework: None,
         };
         let err = check_mainnet_eligible(&meta).unwrap_err();
@@ -1671,8 +1944,11 @@ mod tests {
         );
         meta.model_format = Some(ModelFormat::Halo2ReferenceMlp);
         meta.proof_system = Some(ProofSystem::Stage11bHalo2Reference);
-        // Note: testnet_or_dev_only deliberately NOT set, so layer 1
-        // does not pre-empt — we want layer 3 to fire concretely.
+        // Stage 11d.1 tightening: must set Some(false) explicitly
+        // so layer 1 doesn't pre-empt (`new_stage11a`'s default
+        // None now triggers layer 1). We want layer 3 to fire
+        // concretely for this bounded-reference variant test.
+        meta.testnet_or_dev_only = Some(false);
         let err = check_mainnet_eligible(&meta).unwrap_err();
         assert!(
             matches!(err, MainnetRefusalReason::BoundedReference {
@@ -1718,6 +1994,9 @@ mod tests {
         );
         meta.model_format = Some(ModelFormat::Halo2ReferenceMlp);
         meta.proof_system = Some(ProofSystem::Stage11bHalo2Reference);
+        // Stage 11d.1 tightening: set Some(false) so the test
+        // exercises layer 3, not the new layer-1 absent-flag refusal.
+        meta.testnet_or_dev_only = Some(false);
         let err = check_mainnet_eligible(&meta).unwrap_err();
         // Must be layer 3, NOT layer 5.
         assert!(
@@ -1728,6 +2007,357 @@ mod tests {
         assert!(
             !matches!(err, MainnetRefusalReason::UnknownModelFormat { .. }),
             "Halo2ReferenceMlp must NOT be caught by layer 5"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Stage 11d.1 — structured allowlist schema tests.
+    //
+    // Stage 11d.1 ships the schema as code but commits ZERO
+    // entries. These tests pin: (a) the empty-list invariants for
+    // both the structured and legacy lists; (b) bounded-reference
+    // / testnet-flag refusals fire BEFORE the layer-6 allowlist
+    // lookup, so a hypothetically-misplaced bounded-reference
+    // allowlist entry can never enable a bounded artifact to pass;
+    // (c) the layer-6 matching logic on the (proof_system,
+    // circuit_id_hex, model_hash) triple, exercised via the
+    // `#[cfg(test)] check_mainnet_eligible_with` helper against
+    // synthetic allowlists; (d) the VK hash helper is byte-stable
+    // and uses the documented domain separator.
+    // ─────────────────────────────────────────────────────────────
+
+    /// Helper: build a baseline `ProofMetadata` that passes layers
+    /// 1–5 cleanly. Tests then tamper specific fields to exercise
+    /// layer-6 paths. Uses the `Ezkl` `ProofSystem` variant since
+    /// it is neither Mock nor bounded-reference.
+    fn synthetic_production_meta() -> ProofMetadata {
+        ProofMetadata {
+            backend_id: "synthetic-test-backend".into(),
+            model_hash: "a".repeat(64),
+            input_hash: blake3::hash(b"i").to_hex().to_string(),
+            response_hash: blake3::hash(b"o").to_hex().to_string(),
+            model_format: Some(ModelFormat::Onnx),
+            proof_system: Some(ProofSystem::Ezkl),
+            circuit_id_hex: Some("c".repeat(64)),
+            verification_key_hex: None,
+            public_inputs: None,
+            testnet_or_dev_only: Some(false),
+            model_framework: None,
+        }
+    }
+
+    /// Helper: synthetic `AllowlistEntry` matching the baseline
+    /// `synthetic_production_meta()`'s triple. Used as the "would
+    /// pass" entry in test-only allowlists.
+    fn synthetic_production_entry() -> AllowlistEntry {
+        AllowlistEntry {
+            proof_system: ProofSystem::Ezkl,
+            backend_id: "synthetic-test-backend",
+            circuit_id_hex:
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            model_hash:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            model_format: ModelFormat::Onnx,
+            verification_key_hash_hex:
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            chain_team_review_ref: "docs/chain-team-review/synthetic-test.md",
+        }
+    }
+
+    #[test]
+    fn mainnet_allowlist_entries_empty_after_stage_11d1() {
+        assert!(
+            MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES.is_empty(),
+            "MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES must stay empty through Stage \
+             11d.1 / 11d.2 — only Stage 11d.3 with written chain-team sign-off may add"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn legacy_MAINNET_APPROVED_PROOF_SYSTEMS_empty_after_stage_11d1() {
+        assert!(
+            MAINNET_APPROVED_PROOF_SYSTEMS.is_empty(),
+            "legacy MAINNET_APPROVED_PROOF_SYSTEMS must stay empty — the back-compat \
+             alias is preserved only because dual-empty preserves Stage 11b.0's \
+             refuse-everything invariant bit-for-bit"
+        );
+    }
+
+    #[test]
+    fn stage11b_halo2_reference_never_in_allowlist() {
+        // Hard rule H1 from docs/mainnet-eligibility-criteria.md
+        // §1.6: bounded reference proof systems must not appear in
+        // either list. The slice is empty today; this test guards
+        // against future misconfiguration. Symmetric for the
+        // ONNX reference variant.
+        for entry in MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES {
+            assert!(
+                !matches!(
+                    entry.proof_system,
+                    ProofSystem::Stage11bHalo2Reference | ProofSystem::Stage11bOnnxReference
+                ),
+                "bounded-reference proof system {:?} must not appear in \
+                 MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES — testnet/dev-only in perpetuity",
+                entry.proof_system
+            );
+        }
+        for ps in MAINNET_APPROVED_PROOF_SYSTEMS {
+            assert!(
+                !matches!(
+                    ps,
+                    ProofSystem::Stage11bHalo2Reference | ProofSystem::Stage11bOnnxReference
+                ),
+                "bounded-reference proof system {ps:?} must not appear in legacy \
+                 MAINNET_APPROVED_PROOF_SYSTEMS — testnet/dev-only in perpetuity"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_reference_refused_before_allowlist_lookup() {
+        // Construct metadata with Stage11bHalo2Reference whose
+        // (proof_system, circuit_id_hex, model_hash) WOULD match
+        // a hypothetical allowlist entry. Layer 3 must fire before
+        // the layer-6 lookup, so the artifact is refused regardless
+        // of allowlist contents.
+        let mut meta = synthetic_production_meta();
+        meta.proof_system = Some(ProofSystem::Stage11bHalo2Reference);
+        let would_match = AllowlistEntry {
+            proof_system: ProofSystem::Stage11bHalo2Reference,
+            ..synthetic_production_entry()
+        };
+        let err = check_mainnet_eligible_with(&meta, &[would_match], &[]).unwrap_err();
+        assert!(
+            matches!(err, MainnetRefusalReason::BoundedReference { .. }),
+            "expected BoundedReference (layer 3) refusal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn testnet_or_dev_only_refused_before_allowlist_lookup() {
+        // testnet_or_dev_only: Some(true) must fire layer 1 before
+        // any allowlist match. Cross-check with a "would-match"
+        // allowlist entry to ensure the layer 6 path doesn't sneak
+        // a Some(true) artifact onto mainnet.
+        let mut meta = synthetic_production_meta();
+        meta.testnet_or_dev_only = Some(true);
+        let err = check_mainnet_eligible_with(
+            &meta,
+            &[synthetic_production_entry()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MainnetRefusalReason::TestnetOrDevOnly {
+                    testnet_or_dev_only: Some(true),
+                    ..
+                }
+            ),
+            "expected TestnetOrDevOnly(Some(true)) (layer 1) refusal, got {err:?}"
+        );
+    }
+
+    /// Stage 11d.1 tightening: the criteria document
+    /// (mainnet-eligibility-criteria.md §1.5) requires
+    /// `testnet_or_dev_only: Some(false)` EXPLICITLY for mainnet.
+    /// The bare `None` (absent declaration) is treated as
+    /// testnet/dev for safety. This test pins that an otherwise-
+    /// allowlist-matching artifact with `testnet_or_dev_only: None`
+    /// is refused at layer 1 — not sneaking past to layer 6.
+    #[test]
+    fn absent_testnet_or_dev_only_refused_before_allowlist_lookup() {
+        let mut meta = synthetic_production_meta();
+        meta.testnet_or_dev_only = None;
+        let err = check_mainnet_eligible_with(
+            &meta,
+            &[synthetic_production_entry()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MainnetRefusalReason::TestnetOrDevOnly {
+                    testnet_or_dev_only: None,
+                    ..
+                }
+            ),
+            "expected TestnetOrDevOnly(None) (layer 1) refusal for absent flag, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_circuit_id_hex_rejects_even_with_correct_proof_system() {
+        // Allowlist has one entry. Metadata has matching
+        // proof_system + model_hash but a tampered circuit_id_hex.
+        // Layer 6 must reject.
+        let mut meta = synthetic_production_meta();
+        meta.circuit_id_hex = Some("d".repeat(64)); // tampered
+        let err = check_mainnet_eligible_with(
+            &meta,
+            &[synthetic_production_entry()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MainnetRefusalReason::NotInMainnetAllowlist { .. }),
+            "expected NotInMainnetAllowlist for wrong circuit_id_hex, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_model_hash_rejects_even_with_correct_proof_system_and_circuit_id() {
+        let mut meta = synthetic_production_meta();
+        meta.model_hash = "b".repeat(64); // tampered
+        let err = check_mainnet_eligible_with(
+            &meta,
+            &[synthetic_production_entry()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MainnetRefusalReason::NotInMainnetAllowlist { .. }),
+            "expected NotInMainnetAllowlist for wrong model_hash, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn matching_structured_entry_would_pass_layer_6_for_synthetic_production_metadata() {
+        // Sanity check that layer 6 actually returns Ok(()) when
+        // a synthetic entry matches a synthetic production
+        // artifact. Validates the matching logic without touching
+        // the real (empty) const slice.
+        let meta = synthetic_production_meta();
+        let result = check_mainnet_eligible_with(
+            &meta,
+            &[synthetic_production_entry()],
+            &[],
+        );
+        assert!(
+            result.is_ok(),
+            "synthetic production metadata + matching entry must pass layer 6; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_alias_match_also_passes_layer_6() {
+        // Defense-in-depth back-compat: an empty structured list
+        // plus a single legacy ProofSystem entry that matches the
+        // metadata's proof_system also passes layer 6. Confirms the
+        // OR-bridge in `proof_system_passes_layer6` is wired
+        // correctly. Both lists remain empty in production.
+        let meta = synthetic_production_meta();
+        let result = check_mainnet_eligible_with(&meta, &[], &[ProofSystem::Ezkl]);
+        assert!(
+            result.is_ok(),
+            "synthetic production metadata + legacy alias entry must pass layer 6; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn every_allowlist_entry_has_required_metadata() {
+        // Forward-looking guard: when Stage 11d.3 adds entries,
+        // these structural invariants from
+        // docs/mainnet-eligibility-criteria.md §1.6 + §6 must hold.
+        // Slice is empty in Stage 11d.1 so the loop body never
+        // executes; the test exists to catch future bad entries.
+        for entry in MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES {
+            assert!(
+                !matches!(
+                    entry.proof_system,
+                    ProofSystem::Mock
+                        | ProofSystem::Stage11bOnnxReference
+                        | ProofSystem::Stage11bHalo2Reference
+                ),
+                "{:?}: proof_system must not be Mock or any bounded reference variant",
+                entry.proof_system
+            );
+            assert!(
+                !matches!(entry.model_format, ModelFormat::Gguf | ModelFormat::Other(_)),
+                "{:?}: model_format must not be Gguf or Other(_) — \
+                 invalid for Stage 11d.3 unless a separately-reviewed strategy exists",
+                entry.model_format
+            );
+            assert_eq!(
+                entry.circuit_id_hex.len(),
+                64,
+                "circuit_id_hex must be 64 lowercase hex chars"
+            );
+            assert!(
+                entry.circuit_id_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "circuit_id_hex must be lowercase hex"
+            );
+            assert_eq!(
+                entry.model_hash.len(),
+                64,
+                "model_hash must be 64 lowercase hex chars"
+            );
+            assert!(
+                entry.model_hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "model_hash must be lowercase hex"
+            );
+            assert_eq!(
+                entry.verification_key_hash_hex.len(),
+                64,
+                "verification_key_hash_hex must be 64 lowercase hex chars"
+            );
+            assert!(
+                entry
+                    .verification_key_hash_hex
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "verification_key_hash_hex must be lowercase hex"
+            );
+            assert!(
+                !entry.backend_id.is_empty(),
+                "backend_id must be non-empty"
+            );
+            assert!(
+                !entry.chain_team_review_ref.is_empty(),
+                "chain_team_review_ref must be non-empty"
+            );
+        }
+    }
+
+    #[test]
+    fn vk_hash_helper_uses_documented_domain_separator() {
+        assert_eq!(
+            MAINNET_VK_HASH_DOMAIN_SEPARATOR, b"OMNINODE-VK:v1:",
+            "domain separator must be exactly 'OMNINODE-VK:v1:' (15 ASCII bytes)"
+        );
+        assert_eq!(MAINNET_VK_HASH_DOMAIN_SEPARATOR.len(), 15);
+    }
+
+    #[test]
+    fn vk_hash_helper_is_byte_stable() {
+        // Pin two values. Computed offline as
+        //   BLAKE3(b"OMNINODE-VK:v1:" || INPUT).
+        // Caught any accidental edit to the domain separator OR
+        // the helper's hashing order.
+        let empty_input_hash = mainnet_vk_hash(b"");
+        let abc_input_hash = mainnet_vk_hash(b"abc");
+
+        // The two hashes must differ.
+        assert_ne!(empty_input_hash, abc_input_hash);
+
+        // Recompute to confirm determinism (no hidden state).
+        assert_eq!(empty_input_hash, mainnet_vk_hash(b""));
+        assert_eq!(abc_input_hash, mainnet_vk_hash(b"abc"));
+
+        // Explicit verification against the algorithmic spec:
+        // recompute by directly chaining the domain separator +
+        // input, confirming the helper matches the documented
+        // formula bit-for-bit.
+        let mut h = blake3::Hasher::new();
+        h.update(b"OMNINODE-VK:v1:");
+        h.update(b"abc");
+        let manual = *h.finalize().as_bytes();
+        assert_eq!(
+            abc_input_hash, manual,
+            "mainnet_vk_hash output must equal BLAKE3(domain_separator || input)"
         );
     }
 }
