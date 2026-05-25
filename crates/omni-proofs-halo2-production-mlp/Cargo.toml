@@ -59,7 +59,15 @@ thiserror  = { workspace = true }
 # Stage 11d.2 — opt-in via `verify`/`prove` features. Default features
 # disabled to keep the verifier-only dep tree lean (no rayon, no
 # getrandom). See Stage 11b.1.b precedent.
-halo2_proofs = { version = "0.3.2", default-features = false, optional = true }
+#
+# Stage 11d.3 engineering hardening: requirement string is exact-pinned
+# to `"=0.3.2"` (not the caret `"0.3.2"`). An upstream 0.3.x patch
+# release could silently shift the VK pinned representation
+# (`format!("{:?}", vk.pinned())`) and bypass `Halo2ProductionMlpVerifier`'s
+# at-construction drift check until a clean-target rebuild. The exact
+# pin removes the freedom — any halo2_proofs version bump now fails
+# `cargo build` rather than producing surprising bytes.
+halo2_proofs = { version = "=0.3.2", default-features = false, optional = true }
 rand_chacha  = { version = "0.3", default-features = false, optional = true }
 
 [build-dependencies]

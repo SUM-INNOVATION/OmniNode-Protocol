@@ -99,6 +99,77 @@ fn verifier_construction_enforces_vk_identity_drift_detection() {
     v.expect("VK identity must match pinned constants");
 }
 
+// ── Stage 11d.3 engineering hardening: per-artifact metadata
+// rejection tests. Each mutates one metadata field on a copy of the
+// committed artifact and asserts `verify_artifact` returns
+// `ProofVerifierError::VerifierInternal(...)` with a message that
+// names the drifted field. Pairs with the positive case
+// (`committed_artifact_carries_pinned_circuit_id_and_vk_hash`) and
+// the at-construction drift check
+// (`verifier_construction_enforces_vk_identity_drift_detection`).
+
+fn mutated_body(mut_fn: impl FnOnce(&mut ProofArtifactBody)) -> ProofArtifactBody {
+    let mut b = load_committed_artifact();
+    mut_fn(&mut b);
+    b
+}
+
+fn assert_verifier_internal_mentions(err: omni_zkml::ProofVerifierError, needle: &str) {
+    match err {
+        omni_zkml::ProofVerifierError::VerifierInternal(msg) => {
+            assert!(
+                msg.contains(needle),
+                "expected VerifierInternal message to mention {needle:?}, got {msg:?}"
+            );
+        }
+        other => panic!("expected VerifierInternal({needle:?}-mentioning), got {other:?}"),
+    }
+}
+
+#[test]
+fn wrong_backend_id_rejected_by_verifier() {
+    let v = Halo2ProductionMlpVerifier::from_embedded_fixtures()
+        .expect("VK identity must match pinned constants");
+    let body = mutated_body(|b| b.metadata.backend_id = "rogue-backend-v999".into());
+    let err = v
+        .verify_artifact(&body)
+        .expect_err("wrong backend_id must reject");
+    assert_verifier_internal_mentions(err, "backend_id");
+}
+
+#[test]
+fn wrong_circuit_id_hex_rejected_by_verifier() {
+    let v = Halo2ProductionMlpVerifier::from_embedded_fixtures()
+        .expect("VK identity must match pinned constants");
+    let body = mutated_body(|b| b.metadata.circuit_id_hex = Some("0".repeat(64)));
+    let err = v
+        .verify_artifact(&body)
+        .expect_err("wrong circuit_id_hex must reject");
+    assert_verifier_internal_mentions(err, "circuit_id_hex");
+}
+
+#[test]
+fn wrong_verification_key_hex_rejected_by_verifier() {
+    let v = Halo2ProductionMlpVerifier::from_embedded_fixtures()
+        .expect("VK identity must match pinned constants");
+    let body = mutated_body(|b| b.metadata.verification_key_hex = Some("f".repeat(64)));
+    let err = v
+        .verify_artifact(&body)
+        .expect_err("wrong verification_key_hex must reject");
+    assert_verifier_internal_mentions(err, "verification_key_hex");
+}
+
+#[test]
+fn wrong_model_hash_rejected_by_verifier() {
+    let v = Halo2ProductionMlpVerifier::from_embedded_fixtures()
+        .expect("VK identity must match pinned constants");
+    let body = mutated_body(|b| b.metadata.model_hash = "1".repeat(64));
+    let err = v
+        .verify_artifact(&body)
+        .expect_err("wrong model_hash must reject");
+    assert_verifier_internal_mentions(err, "model_hash");
+}
+
 #[test]
 fn committed_artifact_refused_on_mainnet() {
     // Stage 11d.1 invariant: every proof-system value (including this
