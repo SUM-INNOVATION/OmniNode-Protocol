@@ -378,6 +378,98 @@ mod tests {
         assert_eq!(b, c);
     }
 
+    /// Stage 11d.3 engineering hardening — closed-form proof that
+    /// the production weights satisfy every gadget-level arithmetic
+    /// invariant for **any** i16-valued input. Catches a future
+    /// weight tweak (or scale change, or new layer) that would
+    /// silently push the circuit past its range-check / saturation
+    /// preconditions before any prove attempt.
+    ///
+    /// For each dense output `j` the worst-case absolute `with_bias`
+    /// is bounded by `I16_MAX_ABS · Σ_i |W[i][j]| + |B[j]| · SCALE`
+    /// where `I16_MAX_ABS = 32_768` (the larger of `|i16::MIN|` /
+    /// `|i16::MAX|`, used as a sound over-approximation for any
+    /// i16-valued input regardless of sign). Then the worst-case
+    /// `|q_sat_j|` before saturation clamps is
+    /// `⌊(|with_bias_j| + HALF_SCALE) / SCALE⌋`.
+    ///
+    /// The circuit's gadget chain requires:
+    ///   (a) `|with_bias_j| < 2^23`                  — RHAZ `abs_w` rc23u
+    ///   (b) `|q_sat_j|     < 2^15` for L1 + L2     — ReLU magnitude rc15u
+    ///                                                  (also: no saturation
+    ///                                                  branch ever activates)
+    ///   (c) `|q_sat_j|     ≤ i16::MAX` for L3      — public-input lift to Fp
+    ///
+    /// (a) is enforced as a panic by `compute_dense_unit_witnesses`
+    /// at witness-build time; (b) is enforced as a panic by
+    /// `bits_le(_, 15)` on the ReLU magnitude. This test proves both
+    /// ahead of any prove attempt so a violation surfaces here, not
+    /// at proof generation time.
+    #[test]
+    fn arithmetic_invariants_hold_for_any_i16_input() {
+        const I16_MAX_ABS: i64 = 32_768;
+        fn dense_worst_case<const IN: usize, const OUT: usize>(
+            w: &[[i16; OUT]; IN],
+            b: &[i16; OUT],
+            in_abs_bound: i64,
+        ) -> (i64, i64) {
+            let mut max_with_bias: i64 = 0;
+            let mut max_q_pre_clamp: i64 = 0;
+            for j in 0..OUT {
+                let row_abs: i64 = (0..IN)
+                    .map(|i| (w[i][j].unsigned_abs() as i64) * in_abs_bound)
+                    .sum();
+                let with_bias = row_abs + (b[j].unsigned_abs() as i64) * SCALE;
+                let q = (with_bias + HALF_SCALE) / SCALE;
+                max_with_bias = max_with_bias.max(with_bias);
+                max_q_pre_clamp = max_q_pre_clamp.max(q);
+            }
+            (max_with_bias, max_q_pre_clamp)
+        }
+        let (l1_wb, l1_q) = dense_worst_case::<16, 32>(&W1, &B1, I16_MAX_ABS);
+        // Layer 2 inputs are post-ReLU of Layer 1, bounded by l1_q
+        // (non-negative; ReLU(x) ∈ [0, max|q|]).
+        let (l2_wb, l2_q) = dense_worst_case::<32, 16>(&W2, &B2, l1_q);
+        let (l3_wb, l3_q) = dense_worst_case::<16, 8>(&W3, &B3, l2_q);
+
+        // (a) RHAZ abs_w 23-bit invariant — all three layers.
+        assert!(
+            l1_wb < (1 << 23),
+            "L1 worst-case |with_bias| = {l1_wb} ≥ 2^23 = {} — RHAZ rc23u would reject",
+            1 << 23
+        );
+        assert!(
+            l2_wb < (1 << 23),
+            "L2 worst-case |with_bias| = {l2_wb} ≥ 2^23 — RHAZ rc23u would reject"
+        );
+        assert!(
+            l3_wb < (1 << 23),
+            "L3 worst-case |with_bias| = {l3_wb} ≥ 2^23 — RHAZ rc23u would reject"
+        );
+
+        // (b) ReLU magnitude rc15u + no-saturation invariant on L1 + L2.
+        // Strict `<` so |q_sat| = 32768 (the i16::MIN magnitude edge
+        // case) is also rejected — the 15-bit decomposition requires
+        // value < 2^15.
+        assert!(
+            l1_q < (1 << 15),
+            "L1 worst-case |q_sat| = {l1_q} ≥ 2^15 = {} — ReLU rc15u / saturation branch would fire",
+            1 << 15
+        );
+        assert!(
+            l2_q < (1 << 15),
+            "L2 worst-case |q_sat| = {l2_q} ≥ 2^15 — ReLU rc15u / saturation branch would fire"
+        );
+
+        // (c) Layer 3 doesn't feed ReLU; only needs to fit in i16
+        // for the public-instance lift. Strict `≤` is the right
+        // bound here (i16::MAX is reachable, not forbidden).
+        assert!(
+            l3_q <= i16::MAX as i64,
+            "L3 worst-case |q_sat| = {l3_q} > i16::MAX — public-input lift would overflow"
+        );
+    }
+
     #[test]
     fn round_half_away_from_zero_semantics() {
         // Same semantics as Stage 11c (criteria-pinned).
