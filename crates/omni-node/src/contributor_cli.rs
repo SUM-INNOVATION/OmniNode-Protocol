@@ -43,6 +43,21 @@ enum ContributorCmd {
     /// `job_snip_root` field in the result is convenience-only and
     /// NOT implicitly trusted.
     VerifyResult(VerifyResultArgs),
+
+    /// Stage 12.1 — publish a `ContributorJob` JSON to SNIP and write
+    /// a `PostedJob` JSON file that a contributor's `watch-jobs`
+    /// loop will pick up. Dispatcher-side.
+    PostJob(PostJobArgs),
+
+    /// Stage 12.1 — long-running: watch a directory for `PostedJob`
+    /// envelopes, fetch each job from SNIP, apply filters + cost caps,
+    /// run inference, verify the result, write to `--result-out-dir`,
+    /// and optionally publish a `PostedResultLink` to SNIP.
+    WatchJobs(WatchJobsArgs),
+
+    /// Stage 12.1 — publish an existing `ContributorResult` JSON to
+    /// SNIP and emit a signed `PostedResultLink` envelope.
+    PublishResultLink(PublishResultLinkArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -152,6 +167,163 @@ struct VerifyResultArgs {
     snip_seed: Option<PathBuf>,
 }
 
+// ── Stage 12.1: post-job ──────────────────────────────────────────────────
+
+#[derive(Args)]
+struct PostJobArgs {
+    /// Path to the `ContributorJob` JSON to publish.
+    #[arg(long)]
+    job: PathBuf,
+
+    /// Output path for the produced `PostedJob` JSON envelope.
+    #[arg(long)]
+    posted_out: PathBuf,
+
+    /// Optional 32-byte raw seed file for the **poster**. When set,
+    /// `PostedJob.poster_pubkey_hex` + `poster_signature_hex` are
+    /// populated; when absent, both stay None (unsigned posting).
+    #[arg(long)]
+    seed_file: Option<PathBuf>,
+
+    /// Optional RFC 3339 UTC expiry (`Z` suffix). When set,
+    /// `watch-jobs` skips the posting after this instant.
+    #[arg(long)]
+    expires_at_utc: Option<String>,
+
+    /// Optional free-form audit string recorded on the envelope.
+    #[arg(long)]
+    notes: Option<String>,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
+// ── Stage 12.1: watch-jobs ────────────────────────────────────────────────
+
+#[derive(Args)]
+struct WatchJobsArgs {
+    /// Stage 12.1: only `fs` is implemented. SNIP-index polling is
+    /// deferred to Stage 12.2+ because SNIP roots are immutable.
+    #[arg(long, value_enum, default_value_t = WatchSource::Fs)]
+    source: WatchSource,
+
+    /// Directory the dispatcher writes `PostedJob` envelopes into.
+    /// Required when `--source fs`.
+    #[arg(long)]
+    jobs_dir: PathBuf,
+
+    /// Polling interval in seconds.
+    #[arg(long, default_value_t = 30)]
+    poll_interval_secs: u64,
+
+    /// Optional hard cap on jobs picked up before the loop exits 0.
+    #[arg(long)]
+    max_jobs: Option<u64>,
+
+    /// Optional hard cap on poll iterations before the loop exits 0.
+    /// Production typically omits this; useful for smoke runs.
+    #[arg(long)]
+    max_polls: Option<u64>,
+
+    /// Allow-list of `model_hash` values to accept. Repeated. Empty
+    /// = accept any.
+    #[arg(long = "accept-model-hash")]
+    accept_model_hash: Vec<String>,
+
+    /// Allow-list of `tokenizer_hash` values to accept. Repeated.
+    /// Empty = accept any.
+    #[arg(long = "accept-tokenizer-hash")]
+    accept_tokenizer_hash: Vec<String>,
+
+    // Cost caps — REQUIRED. No defaults. An operator must explicitly
+    // decide the workload envelope; a default that fits a dev box is
+    // dangerous for production, and vice-versa.
+    #[arg(long)]
+    max_input_tokens: u64,
+    #[arg(long)]
+    max_output_tokens: u64,
+    #[arg(long)]
+    max_total_base_units: u64,
+
+    /// Inference runner.
+    #[arg(long, value_enum, default_value_t = RunnerChoice::Stub)]
+    runner: RunnerChoice,
+
+    #[arg(long, required_if_eq("runner", "external"))]
+    external_command: Option<PathBuf>,
+
+    #[arg(long = "external-arg")]
+    external_args: Vec<String>,
+
+    #[arg(long = "external-env-allow")]
+    external_env_allow: Vec<String>,
+
+    #[arg(long, required_if_eq("runner", "stub"))]
+    stub_response: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 0)]
+    stub_input_tokens: u64,
+
+    #[arg(long, default_value_t = 0)]
+    stub_output_tokens: u64,
+
+    /// 32-byte raw contributor seed.
+    #[arg(long)]
+    seed_file: PathBuf,
+
+    /// Directory to write accepted `<job_id>.json` + rejected
+    /// `<job_id>.rejected.json` result files into. Created if absent.
+    #[arg(long)]
+    result_out_dir: PathBuf,
+
+    /// If set, publishes a signed `PostedResultLink` to SNIP after
+    /// each accepted result.
+    #[arg(long, default_value_t = false)]
+    publish_result_link: bool,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+enum WatchSource {
+    Fs,
+}
+
+// ── Stage 12.1: publish-result-link ───────────────────────────────────────
+
+#[derive(Args)]
+struct PublishResultLinkArgs {
+    /// Path to the `ContributorResult` JSON to publish.
+    #[arg(long)]
+    result: PathBuf,
+
+    /// Path to the `PostedJob` JSON the result answers. The link's
+    /// `posted_id` is copied from this envelope.
+    #[arg(long)]
+    posted_job: PathBuf,
+
+    /// Output path for the produced `PostedResultLink` JSON.
+    #[arg(long)]
+    link_out: PathBuf,
+
+    /// 32-byte raw contributor seed.
+    #[arg(long)]
+    seed_file: PathBuf,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -159,6 +331,9 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::ValidateJob(a) => run_validate_job(a),
         ContributorCmd::RunJob(a) => run_run_job(a),
         ContributorCmd::VerifyResult(a) => run_verify_result(a),
+        ContributorCmd::PostJob(a) => run_post_job(a),
+        ContributorCmd::WatchJobs(a) => run_watch_jobs(a),
+        ContributorCmd::PublishResultLink(a) => run_publish_result_link(a),
     }
 }
 
@@ -357,5 +532,200 @@ fn run_verify_result(args: VerifyResultArgs) -> Result<()> {
     // here — the type is part of the public re-export the CLI uses
     // transitively via ContributorResult.
     let _ = std::marker::PhantomData::<WorkUnitKind>;
+    Ok(())
+}
+
+// ── Stage 12.1: post-job handler ──────────────────────────────────────────
+
+fn run_post_job(args: PostJobArgs) -> Result<()> {
+    use omni_contributor::canonical::{canonical_posted_job_bytes, hex_lower, posted_id_hex};
+    use omni_contributor::posted::{PostedJob, POSTED_SCHEMA_VERSION};
+    use omni_contributor::signing::DispatcherSigner;
+
+    let job = read_job(&args.job)?;
+    let adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
+
+    // Publish the ContributorJob JSON to SNIP.
+    let job_json = serde_json::to_string_pretty(&job)?;
+    let job_root = omni_contributor::snip::publish_bytes(
+        &adapter,
+        job_json.as_bytes(),
+        "contributor-job",
+    )?;
+    let job_snip_root_hex = format!("0x{}", hex_lower(job_root.as_bytes()));
+
+    // Build the PostedJob envelope (unsigned; sign below if seed given).
+    let posted_at_utc = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let signer = match &args.seed_file {
+        Some(p) => Some(DispatcherSigner::from_seed_file(p)?),
+        None => None,
+    };
+
+    let mut posted = PostedJob {
+        schema_version: POSTED_SCHEMA_VERSION,
+        posted_id: String::new(),
+        job_snip_root: job_snip_root_hex.clone(),
+        job_hash: omni_contributor::canonical::job_hash_hex(&job)?,
+        model_hash: job.model_hash.clone(),
+        posted_at_utc,
+        expires_at_utc: args.expires_at_utc,
+        poster_pubkey_hex: signer.as_ref().map(|s| s.pubkey_hex()),
+        poster_signature_hex: None,
+        notes: args.notes,
+    };
+    posted.posted_id = posted_id_hex(&posted)?;
+    if let Some(ref s) = signer {
+        let signing_input = canonical_posted_job_bytes(&posted)?;
+        posted.poster_signature_hex = Some(s.sign_hex(&signing_input));
+    }
+    posted
+        .validate_schema()
+        .map_err(|e| anyhow!("invalid PostedJob after build: {e}"))?;
+
+    let posted_json = serde_json::to_string_pretty(&posted)?;
+    std::fs::write(&args.posted_out, posted_json)
+        .with_context(|| format!("write posted-job: {}", args.posted_out.display()))?;
+
+    println!("job_snip_root={}", job_snip_root_hex);
+    println!("posted_id={}", posted.posted_id);
+    println!("posted_path={}", args.posted_out.display());
+    Ok(())
+}
+
+// ── Stage 12.1: watch-jobs handler ────────────────────────────────────────
+
+fn run_watch_jobs(args: WatchJobsArgs) -> Result<()> {
+    use omni_contributor::runner::{ExternalCommandRunner, StubRunner};
+    use omni_contributor::{
+        AcceptFilters, ContributorSigner, CostCaps, FilesystemSource, InferenceRunner,
+        StdoutEmitter, WatchOptions,
+    };
+    use std::time::Duration;
+
+    match args.source {
+        WatchSource::Fs => {}
+    }
+
+    let adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let mut source = FilesystemSource::new(args.jobs_dir);
+    let signer = ContributorSigner::from_seed_file(&args.seed_file)
+        .with_context(|| format!("load seed: {}", args.seed_file.display()))?;
+
+    // Build the runner. Same pattern as run-job.
+    enum AnyRunner {
+        Stub(StubRunner),
+        External(ExternalCommandRunner),
+    }
+    impl InferenceRunner for AnyRunner {
+        fn run(
+            &self,
+            manifest_path: &std::path::Path,
+            input_bytes: &[u8],
+        ) -> std::result::Result<
+            omni_contributor::RunOutput,
+            omni_contributor::RunnerError,
+        > {
+            match self {
+                AnyRunner::Stub(r) => r.run(manifest_path, input_bytes),
+                AnyRunner::External(r) => r.run(manifest_path, input_bytes),
+            }
+        }
+    }
+    let runner = match args.runner {
+        RunnerChoice::Stub => {
+            let response_bytes = std::fs::read(
+                args.stub_response
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("--stub-response required"))?,
+            )?;
+            AnyRunner::Stub(StubRunner::new(
+                signer.pubkey_hex(),
+                response_bytes,
+                args.stub_input_tokens,
+                args.stub_output_tokens,
+            ))
+        }
+        RunnerChoice::External => {
+            let mut r = ExternalCommandRunner::new(
+                args.external_command
+                    .ok_or_else(|| anyhow!("--external-command required for --runner external"))?,
+            );
+            r.extra_args = args.external_args;
+            r.env_allowlist = args.external_env_allow;
+            AnyRunner::External(r)
+        }
+    };
+
+    let mut emitter = StdoutEmitter;
+    let opts = WatchOptions {
+        poll_interval: Duration::from_secs(args.poll_interval_secs),
+        max_jobs: args.max_jobs,
+        max_polls: args.max_polls,
+        filters: AcceptFilters {
+            model_hash_allow: args.accept_model_hash,
+            tokenizer_hash_allow: args.accept_tokenizer_hash,
+        },
+        caps: CostCaps {
+            max_input_tokens: args.max_input_tokens,
+            max_output_tokens: args.max_output_tokens,
+            max_total_base_units: args.max_total_base_units,
+        },
+        runner: &runner,
+        signer: &signer,
+        result_out_dir: args.result_out_dir,
+        publish_link: args.publish_result_link,
+        emit: &mut emitter,
+    };
+
+    omni_contributor::run_watch_loop(&adapter, &mut source, opts)
+        .map_err(|e| anyhow!("watch-jobs error: {e}"))?;
+    Ok(())
+}
+
+// ── Stage 12.1: publish-result-link handler ───────────────────────────────
+
+fn run_publish_result_link(args: PublishResultLinkArgs) -> Result<()> {
+    use omni_contributor::canonical::hex_lower;
+    use omni_contributor::posted::PostedJob;
+    use omni_contributor::watch::{publish_result_link_for, StdoutEmitter};
+    use omni_contributor::ContributorSigner;
+
+    let result = read_result(&args.result)?;
+    let posted_bytes = std::fs::read(&args.posted_job)?;
+    let posted: PostedJob = serde_json::from_slice(&posted_bytes)
+        .with_context(|| format!("parse posted-job: {}", args.posted_job.display()))?;
+    posted
+        .validate_schema()
+        .map_err(|e| anyhow!("invalid PostedJob: {e}"))?;
+
+    let adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let signer = ContributorSigner::from_seed_file(&args.seed_file)?;
+    let result_json = serde_json::to_string_pretty(&result)?;
+    let mut emitter = StdoutEmitter;
+
+    let published = publish_result_link_for(
+        &adapter,
+        &posted,
+        &result_json,
+        &result,
+        &signer,
+        &mut emitter,
+    )
+    .map_err(|e| anyhow!("publish result link failed: {e}"))?;
+
+    // Write the EXACT bytes that were published to SNIP. No
+    // re-signing, no fresh timestamp — that would diverge the local
+    // file from the SNIP-published artifact.
+    std::fs::write(&args.link_out, &published.link_json)
+        .with_context(|| format!("write link: {}", args.link_out.display()))?;
+
+    println!("result_snip_root={}", published.link.result_snip_root);
+    println!(
+        "link_snip_root=0x{}",
+        hex_lower(published.link_snip_root.as_bytes())
+    );
+    println!("posted_id={}", published.link.posted_id);
+    println!("link_path={}", args.link_out.display());
     Ok(())
 }

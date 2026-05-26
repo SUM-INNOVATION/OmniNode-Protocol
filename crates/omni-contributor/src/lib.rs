@@ -39,22 +39,27 @@
 //! - [`error`]     — Typed error surface.
 
 pub mod canonical;
+pub mod discover;
 pub mod error;
 pub mod job;
+pub mod posted;
 pub mod result;
 pub mod run;
 pub mod runner;
 pub mod signing;
 pub mod snip;
 pub mod verify;
+pub mod watch;
 
+pub use discover::{DiscoveredEntry, FilesystemSource, JobSource};
 pub use error::{
-    CanonicalError, ContributorError, RunnerError, SchemaError, SigningError, SnipError,
-    VerifyError,
+    CanonicalError, ContributorError, DiscoverError, RunnerError, SchemaError, SigningError,
+    SnipError, VerifyError,
 };
 pub use job::{
     BaseUnitRewardPolicy, ContributorJob, JobAccounting, VerificationRequirement,
 };
+pub use posted::{PostedJob, PostedResultLink, POSTED_SCHEMA_VERSION};
 pub use result::{
     ContributorResult, Evidence, MeasuredAccounting, StageContribution, WorkUnitKind,
 };
@@ -62,3 +67,7 @@ pub use run::{run_job, RunJobOptions};
 pub use runner::{ExternalCommandRunner, InferenceRunner, RunOutput, StubRunner};
 pub use signing::{ContributorSigner, DispatcherSigner};
 pub use verify::{verify_result, VerifyOutcome};
+pub use watch::{
+    publish_result_link_for, run_watch_loop, AcceptFilters, CostCaps, EventEmitter,
+    PublishedResultLink, SkipReason, StdoutEmitter, WatchEvent, WatchOptions,
+};

@@ -41,7 +41,7 @@ pub struct RunJobOptions<'a> {
 }
 
 /// Full pickup-to-result orchestration.
-pub fn run_job<A: SnipV2Adapter, R: InferenceRunner>(
+pub fn run_job<A: SnipV2Adapter, R: InferenceRunner + ?Sized>(
     job: &ContributorJob,
     adapter: &A,
     runner: &R,
