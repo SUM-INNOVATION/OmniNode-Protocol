@@ -26,6 +26,7 @@ use omni_net::{OmniNet, OmniNetEvent, TOPIC_SHARD, TOPIC_TEST};
 use omni_store::{OmniStore, FetchOutcome, decode_announcement};
 use omni_types::config::{NetConfig, StoreConfig};
 
+mod contributor_cli;
 mod operator;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────

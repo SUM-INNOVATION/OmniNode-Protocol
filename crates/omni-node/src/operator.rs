@@ -197,6 +197,15 @@ pub(crate) enum OperatorError {
     )]
     NoVerifierForProofSystem { proof_system: String },
 
+    /// Stage 12.0: catch-all for any error surfaced from the
+    /// off-chain contributor workflow (`operator contributor …`
+    /// subcommands). The contributor crate has its own typed error
+    /// surface (`omni_contributor::ContributorError`); this variant
+    /// flattens it into a string at the operator boundary to avoid
+    /// pulling the entire contributor error enum into this file.
+    #[error("contributor workflow error: {0}")]
+    ContributorWorkflow(String),
+
     /// Stage 11b.0: `operator verify-proof` could not parse the
     /// `--proof-artifact` JSON.
     #[error("failed to parse proof artifact JSON: {0}")]
@@ -671,6 +680,11 @@ enum OperatorCmd {
     /// Stage 10b (as part of release artifact tooling) — not a
     /// behaviour change to make in Stage 11b.0.
     VerifyProof(VerifyProofArgs),
+
+    /// Stage 12.0 — Contributor Inference Node workflow subcommands.
+    /// Off-chain only. Reachable on the default build. AttestationOnly
+    /// evidence mode only in 12.0.
+    Contributor(crate::contributor_cli::ContributorArgs),
 }
 
 #[derive(Args)]
@@ -984,6 +998,15 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
         },
         OperatorCmd::VerifyProof(a) => {
             verify_proof_core(a.proof_artifact).await?;
+        }
+        OperatorCmd::Contributor(a) => {
+            // Stage 12.0 — off-chain contributor workflow. Maps any
+            // crate-level anyhow::Error into OperatorError via a
+            // catch-all variant; the bare-stdout output keys are
+            // emitted directly by the sub-dispatch.
+            crate::contributor_cli::dispatch(a)
+                .await
+                .map_err(|e| OperatorError::ContributorWorkflow(e.to_string()))?;
         }
     }
     Ok(())
@@ -1747,6 +1770,7 @@ fn subcommand_name(c: &OperatorCmd) -> &'static str {
         OperatorCmd::DeriveAddress => "derive-address",
         OperatorCmd::Registry(_) => "registry",
         OperatorCmd::VerifyProof(_) => "verify-proof",
+        OperatorCmd::Contributor(_) => "contributor",
     }
 }
 

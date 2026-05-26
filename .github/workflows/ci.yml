@@ -156,6 +156,42 @@ jobs:
           fi
           echo "default tree: no omni-proofs-halo2-production-mlp — Stage 11d.2 isolation intact."
 
+      # Stage 12.0 — omni-contributor is intentionally INCLUDED in the
+      # default omni-node graph (the `operator contributor …`
+      # subcommand needs it). Assert presence as a hard gate — if the
+      # workspace dep wiring ever breaks, this catches it before
+      # operators discover the missing subcommand at runtime.
+      - name: Assert `omni-node` default tree DOES contain omni-contributor
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo tree -p omni-node | grep -Eq 'omni-contributor'; then
+            {
+              echo "::error::Default \`omni-node\` build no longer pulls omni-contributor."
+              echo "Stage 12.0 wiring is broken; the operator contributor subcommand will"
+              echo "fail to compile or vanish from --help."
+            } >&2
+            exit 1
+          fi
+          echo "default tree: omni-contributor present — Stage 12.0 wiring intact."
+
+      # Stage 12.0 — and despite that, omni-contributor MUST NOT pull
+      # any halo2/prover/framework runtime into the default graph. The
+      # earlier "no halo2_proofs / pasta_curves" check covers this,
+      # but call out the Stage 12.0 invariant explicitly for clarity.
+      - name: Assert `omni-node` default tree (with omni-contributor) still has NO halo2
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo tree -p omni-node | grep -E 'halo2_proofs|pasta_curves'; then
+            {
+              echo "::error::omni-contributor (or its deps) leaked halo2/pasta into the"
+              echo "default omni-node graph. Stage 12.0 isolation broke."
+            } >&2
+            exit 1
+          fi
+          echo "default tree: omni-contributor present, no halo2 — Stage 12.0 isolation intact."
+
   # ── (3) Submit features: full Stage 7b surface ─────────────────────────────
   #
   # No secrets needed (Stage 9c). The chain crates are public on
@@ -399,6 +435,41 @@ jobs:
             exit 1
           fi
           echo "stage11d-production-verify tree: halo2_proofs + production-mlp present as expected."
+
+  # ── Stage 12.0: omni-contributor build + test ──────────────────────────────
+  #
+  # AttestationOnly contributor workflow. Default features only — there
+  # are no other features on the crate in 12.0. No halo2, no prover, no
+  # framework runtime; the `posture_preserved` test additionally guards
+  # against any IPFS-terminology drift in new code.
+  contributor-build-test:
+    name: omni-contributor — default-features build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git / target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-contributor-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-contributor-
+
+      - name: cargo build -p omni-contributor
+        run: cargo build -p omni-contributor
+
+      - name: cargo test -p omni-contributor
+        run: cargo test -p omni-contributor
+
+      - name: cargo build -p omni-node (with omni-contributor in graph)
+        run: cargo build -p omni-node
 
   # ── (5) Stage 6 byte-stability ──────────────────────────────────────────────
   stage6-fixture-check:
