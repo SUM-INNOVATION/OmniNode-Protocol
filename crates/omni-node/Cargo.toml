@@ -66,6 +66,14 @@ omni-proofs-halo2-reference = { workspace = true, optional = true, features = ["
 # `cargo build -p omni-node` with default features (and without
 # `halo2-reference-verify`) pulls zero halo2.
 omni-proofs-halo2-production-mlp = { workspace = true, optional = true, features = ["verify"] }
+# Stage 12.0 — Contributor Inference Node workflow. Default-included.
+# CI's default-tree-check confirms this dep does NOT pull halo2/prover
+# deps even though it ships in the default graph. `omni-store` (already
+# above) provides SnipV2Cli for the subcommand's adapter; the contributor
+# crate handles the rest.
+omni-contributor = { workspace = true }
+# Stage 12.0 — UTC time stamping for produced_at_utc on results.
+chrono     = { workspace = true }
 
 [dev-dependencies]
 tempfile           = { workspace = true }

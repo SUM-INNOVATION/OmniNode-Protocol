@@ -11,6 +11,7 @@ members = [
     "crates/omni-node",
     "crates/omni-proofs-halo2-reference",
     "crates/omni-proofs-halo2-production-mlp",
+    "crates/omni-contributor",
 ]
 # Stage 11b.1.a: `tools/` holds developer-host manual fixture
 # generators (rumus_export, pytorch_export, tensorflow_export,
@@ -148,3 +149,7 @@ omni-proofs-halo2-reference = { path = "crates/omni-proofs-halo2-reference" }
 # opt-in feature. Default `cargo build` (no features) never reaches
 # this dependency. Off-chain only — never in chain wire / tx / digest.
 omni-proofs-halo2-production-mlp = { path = "crates/omni-proofs-halo2-production-mlp" }
+# Stage 12.0 — Contributor Inference Node workflow (AttestationOnly).
+# Off-chain only. Default `omni-node` build includes this crate; CI's
+# default-tree-check confirms no halo2/prover deps are pulled.
+omni-contributor = { path = "crates/omni-contributor" }

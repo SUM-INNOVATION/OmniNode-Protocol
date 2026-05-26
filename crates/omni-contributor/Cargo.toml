@@ -1,0 +1,47 @@
+[package]
+name             = "omni-contributor"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Stage 12.0 — Contributor Inference Node workflow (AttestationOnly).
+#
+# Off-chain only. Implements the numbered contributor/inference flow
+# (chart items 2–6: dispatch + verification requirement → fetch from
+# SNIP → run local inference → produce response + evidence artifact →
+# deliver/publish response). No chain wire / Stage 7b tx / SUM Chain
+# RPC / `InferenceAttestationDigest` / chain-side verification /
+# proof-system allowlist touched.
+#
+# Stage 11d.3 reframe posture preserved: chain remains neutral; proof
+# acceptance is a local verifier policy decision; this crate's
+# verifier is one such local policy gate. `MAINNET_APPROVED_*`
+# remain empty.
+
+[features]
+default = []
+# (No verify-production-proof / halo2 feature in Stage 12.0. Production-
+# proof evidence is a closed-enum extension reserved for a future
+# `schema_version: 2` migration; see docs/stage12-contributor-protocol.md.)
+
+[dependencies]
+# Stage 12.0 — kept deliberately lean. NO `omni-zkml` (chain/proof
+# concerns), NO `omni-pipeline` (single-runner manual flow this stage),
+# NO halo2/pasta/prover deps. Adding any of these is a separate stage.
+omni-types       = { workspace = true }
+omni-store       = { workspace = true }   # for SnipV2Adapter trait + check_lifecycle
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+bincode1         = { package = "bincode", version = "1.3" }
+blake3           = { workspace = true }
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+chrono           = { workspace = true }
+libp2p-identity  = { workspace = true }   # Ed25519 signing — direct dep
+base64           = "0.22"                 # ExternalCommandRunner stdout
+tempfile         = { workspace = true }   # SNIP byte wrappers (Option A)
+
+[dev-dependencies]
+# (None unique to dev; runtime deps cover the tests.)
