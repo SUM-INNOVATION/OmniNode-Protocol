@@ -255,6 +255,125 @@ pub fn contributor_signing_input(
     canonical_result_bytes(result)
 }
 
+// ── Stage 12.1 — posted-envelope canonical bytes ───────────────────────────
+//
+// `PostedJob` and `PostedResultLink` get their own domain separators
+// distinct from Stage 12.0's JOB_DOMAIN / RESULT_DOMAIN and distinct
+// from any chain-wire tag. Bincode 1.3 wire layout; field order frozen
+// for schema_version: 1.
+
+use crate::posted::{PostedJob, PostedResultLink};
+
+/// Domain separator for the canonical PostedJob-body byte sequence
+/// (35 ASCII bytes; no null terminator, no length prefix).
+pub const POSTED_JOB_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-POSTED-JOB:v1:";
+
+/// Domain separator for the canonical PostedResultLink-body byte
+/// sequence (43 ASCII bytes).
+pub const POSTED_RESULT_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-POSTED-RESULT-LINK:v1:";
+
+/// Frozen-layout view of a `PostedJob` for canonical encoding.
+/// Excludes `posted_id` (derived from this hash) and
+/// `poster_signature_hex` (signer can't include its own signature).
+#[derive(Debug, Serialize)]
+struct PostedJobCanonicalBody<'a> {
+    schema_version: u32,
+    job_snip_root: &'a str,
+    job_hash: &'a str,
+    model_hash: &'a str,
+    posted_at_utc: &'a str,
+    expires_at_utc: Option<&'a str>,
+    poster_pubkey_hex: Option<&'a str>,
+    notes: Option<&'a str>,
+}
+
+impl<'a> From<&'a PostedJob> for PostedJobCanonicalBody<'a> {
+    fn from(p: &'a PostedJob) -> Self {
+        Self {
+            schema_version: p.schema_version,
+            job_snip_root: &p.job_snip_root,
+            job_hash: &p.job_hash,
+            model_hash: &p.model_hash,
+            posted_at_utc: &p.posted_at_utc,
+            expires_at_utc: p.expires_at_utc.as_deref(),
+            poster_pubkey_hex: p.poster_pubkey_hex.as_deref(),
+            notes: p.notes.as_deref(),
+        }
+    }
+}
+
+/// `POSTED_JOB_DOMAIN || bincode1::serialize(&canonical_body)`.
+pub fn canonical_posted_job_bytes(p: &PostedJob) -> Result<Vec<u8>, CanonicalError> {
+    let body: PostedJobCanonicalBody = p.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(POSTED_JOB_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(POSTED_JOB_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// 32-byte BLAKE3 of `canonical_posted_job_bytes`.
+pub fn posted_job_hash_bytes(p: &PostedJob) -> Result<[u8; 32], CanonicalError> {
+    let bytes = canonical_posted_job_bytes(p)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// 64-char lowercase hex of `posted_job_hash_bytes`. Value stored in
+/// `PostedJob.posted_id`.
+pub fn posted_id_hex(p: &PostedJob) -> Result<String, CanonicalError> {
+    Ok(hex_lower(&posted_job_hash_bytes(p)?))
+}
+
+/// Bytes the poster signs over (same as `canonical_posted_job_bytes`).
+pub fn poster_signing_input(p: &PostedJob) -> Result<Vec<u8>, CanonicalError> {
+    canonical_posted_job_bytes(p)
+}
+
+/// Frozen-layout view of a `PostedResultLink` for canonical encoding.
+/// Excludes `contributor_signature_hex`.
+#[derive(Debug, Serialize)]
+struct PostedResultLinkCanonicalBody<'a> {
+    schema_version: u32,
+    posted_id: &'a str,
+    result_snip_root: &'a str,
+    result_canonical_hash: &'a str,
+    contributor_pubkey_hex: &'a str,
+    published_at_utc: &'a str,
+}
+
+impl<'a> From<&'a PostedResultLink> for PostedResultLinkCanonicalBody<'a> {
+    fn from(r: &'a PostedResultLink) -> Self {
+        Self {
+            schema_version: r.schema_version,
+            posted_id: &r.posted_id,
+            result_snip_root: &r.result_snip_root,
+            result_canonical_hash: &r.result_canonical_hash,
+            contributor_pubkey_hex: &r.contributor_pubkey_hex,
+            published_at_utc: &r.published_at_utc,
+        }
+    }
+}
+
+/// `POSTED_RESULT_DOMAIN || bincode1::serialize(&canonical_body)`.
+pub fn canonical_posted_result_link_bytes(
+    r: &PostedResultLink,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: PostedResultLinkCanonicalBody = r.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(POSTED_RESULT_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(POSTED_RESULT_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// Bytes the contributor signs over (same as
+/// `canonical_posted_result_link_bytes`).
+pub fn posted_result_link_signing_input(
+    r: &PostedResultLink,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_posted_result_link_bytes(r)
+}
+
 // ── Hex helpers ───────────────────────────────────────────────────────────
 
 /// Lowercase-hex encode raw bytes (no `0x` prefix). Used throughout

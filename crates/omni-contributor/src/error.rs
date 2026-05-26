@@ -25,6 +25,9 @@ pub enum ContributorError {
     #[error("verification error: {0}")]
     Verify(#[from] VerifyError),
 
+    #[error("discovery error: {0}")]
+    Discover(#[from] DiscoverError),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -231,4 +234,62 @@ pub enum VerifyError {
 
     #[error("job expired_at_utc {expires_at} is past now() {now}")]
     JobExpired { expires_at: String, now: String },
+}
+
+/// Stage 12.1 — errors specific to the discovery / watch surface.
+/// Cost-cap refusals are recoverable (the contributor logs and
+/// skips); IO / parse / schema errors during discovery typically
+/// indicate a malformed posted-job file and are also recoverable.
+#[derive(Debug, Error)]
+pub enum DiscoverError {
+    #[error("posted-job file io error at {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse posted-job JSON at {path}: {source}")]
+    Parse {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("posted-job schema error at {path}: {source}")]
+    Schema {
+        path: String,
+        #[source]
+        source: SchemaError,
+    },
+
+    #[error("posted_id mismatch at {path}: posted_id={posted_id}, recomputed={recomputed}")]
+    PostedIdMismatch {
+        path: String,
+        posted_id: String,
+        recomputed: String,
+    },
+
+    #[error("posted-job posted_at_utc {posted_at} is past expires_at_utc {expires_at}")]
+    PostedJobExpired {
+        posted_at: String,
+        expires_at: String,
+    },
+
+    #[error("poster signature did not verify against poster_pubkey_hex (at {path})")]
+    PosterSignatureFailed { path: String },
+
+    #[error(
+        "cost cap exceeded for {field}: job has {value}, contributor cap is {cap}"
+    )]
+    CostCapExceeded {
+        field: &'static str,
+        value: u64,
+        cap: u64,
+    },
+
+    #[error(
+        "filesystem source error: {0}"
+    )]
+    FilesystemSourceOther(String),
 }

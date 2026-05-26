@@ -184,3 +184,152 @@ Each contributor holds a **32-byte raw seed file**, distinct from any chain-atte
 ## Out of scope (Stage 12.0)
 
 Items 1, 7, 8 of the numbered chart flow (prompt/service fee, human feedback, financial RLHF/slashing). The entire lettered (developer/training/federated/aggregate/reward) flow. Network-level job dispatch (gossip topic / posted-jobs board) — Stage 12.0 ships manual-CLI handoff only. Multi-contributor pipeline orchestration runtime (the schema supports B/C/D records; the runtime is Stage 12.2+).
+
+---
+
+# Stage 12.1 — filesystem-based job discovery
+
+**Status**: shipped at Stage 12.1. Off-chain only. Extends Stage 12.0 with two new envelopes, one new `JobSource` impl, a long-running `watch-jobs` subcommand, and required cost guardrails. No chain wire / payment / proof changes.
+
+## Posture (unchanged from 12.0)
+
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` changes. `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty. AttestationOnly only. No GGUF correctness claim. Default `omni-node` build pulls zero halo2/prover/framework runtimes (CI re-asserts).
+
+## Why filesystem-only discovery in 12.1
+
+SNIP V2 roots are **content-addressed and immutable**. A dispatcher cannot "append to the index by re-publishing under the same root" — re-publishing produces a *different* root. A contributor polling one fixed SNIP root would keep fetching the same snapshot forever. Real mutable discovery (libp2p gossip / local head pointer / off-chain registry) is Stage 12.2+ work; Stage 12.1 ships filesystem-watch instead so the contributor-job lifecycle works end-to-end without inventing a new wire surface.
+
+What still uses SNIP in 12.1:
+- The `ContributorJob` JSON itself (dispatcher publishes; contributor fetches by `PostedJob.job_snip_root`).
+- The `ContributorResult` JSON the contributor produces.
+- The `PostedResultLink` envelope (optional, on `--publish-result-link`).
+
+## Schemas
+
+### `PostedJob`
+
+```text
+PostedJob {
+    schema_version: 1                            // pinned
+    posted_id:               hex64               // = lowercase_hex(BLAKE3(POSTED_JOB_DOMAIN || canonical_body))
+    job_snip_root:           0xhex66             // SNIP root of the ContributorJob JSON
+    job_hash:                hex64               // drift guard; verifier recomputes from fetched job
+    model_hash:              hex64               // copy for cheap pre-fetch filtering
+    posted_at_utc:           RFC3339 UTC (Z suffix)
+    expires_at_utc:          Option<RFC3339 UTC>
+    poster_pubkey_hex:       Option<hex64>       // both Some or both None
+    poster_signature_hex:    Option<hex128>      // signs canonical body (excludes posted_id + signature)
+    notes:                   Option<String>      // part of canonical signing input
+}
+```
+
+### `PostedResultLink`
+
+```text
+PostedResultLink {
+    schema_version: 1
+    posted_id:                 hex64             // copy of the PostedJob.posted_id
+    result_snip_root:          0xhex66           // SNIP root of the ContributorResult JSON
+    result_canonical_hash:     hex64             // BLAKE3(canonical_result_bytes(result))
+                                                 // — the signature-domain hash. Distinct
+                                                 // from BLAKE3 of the on-disk JSON.
+    contributor_pubkey_hex:    hex64
+    contributor_signature_hex: hex128            // signs canonical body (excludes signature)
+    published_at_utc:          RFC3339 UTC (Z suffix)
+}
+```
+
+## Canonical bytes (v1, frozen)
+
+Two new domain separators:
+
+```text
+POSTED_JOB_DOMAIN    = b"OMNINODE-CONTRIBUTOR-POSTED-JOB:v1:"        (35 bytes)
+POSTED_RESULT_DOMAIN = b"OMNINODE-CONTRIBUTOR-POSTED-RESULT-LINK:v1:" (43 bytes)
+```
+
+Both distinct from Stage 12.0's `JOB_DOMAIN` / `RESULT_DOMAIN` and from any chain-wire tag. Same bincode 1.3 encoding regime; field declaration order frozen for `schema_version: 1`.
+
+## Discovery — `FilesystemSource`
+
+A `JobSource` impl that walks a directory for `*.json` files, parses each as a `PostedJob`, validates schema, and recomputes `posted_id` from canonical bytes (refusing drift). Stateless: dedup-across-polls happens in the watch loop's in-memory `HashSet<posted_id>`, NOT in the source. No persistent dedup state across restarts; rely on `expires_at_utc` + `--max-jobs` to bound work.
+
+Non-JSON files are silently skipped. Per-file errors (bad JSON, schema, posted_id drift) come back as `Err(...)` items in the source's per-entry result vector so the watch loop can log + skip + continue. Source-level errors (directory unreadable on first poll) propagate as `ContributorError::Discover(...)` and cause the loop to exit.
+
+## `watch-jobs` pipeline
+
+```text
+poll FilesystemSource
+  → for each new PostedJob (not in seen-set):
+      1. Validate schema.
+      2. Verify poster signature (if present).
+      3. Refuse if expired.
+      4. Apply --accept-model-hash / --accept-tokenizer-hash allow-lists.
+      5. Apply cost caps (--max-input-tokens / --max-output-tokens
+         / --max-total-base-units) against the job's declared bounds.
+      6. Fetch ContributorJob from SNIP via PostedJob.job_snip_root.
+      7. Drift guards: recompute job_hash from canonical bytes;
+         verify result.model_hash matches PostedJob.model_hash.
+      8. Invoke 12.0 run_job (which itself validates job consistency
+         + dispatcher signature + then fetches + runs + signs).
+      9. Call verify_result(&job, &result, &adapter). On
+         overall_ok=false, write <result-out-dir>/<job_id>.rejected.json
+         (audit trail) and SKIP the link-publish step.
+     10. Otherwise write <result-out-dir>/<job_id>.json.
+     11. If --publish-result-link: publish the result JSON to SNIP,
+         sign + publish a PostedResultLink.
+```
+
+Per-job failures (bad signature, expired, cost-cap exceeded, drift) emit a `WatchEvent::Skip { reason }` and continue. The loop never short-circuits because one file was bad. Source-level errors (directory disappearing mid-loop) propagate.
+
+## Required cost caps
+
+`watch-jobs` requires three CLI flags with no defaults:
+
+```text
+--max-input-tokens        <u64>    # refuse if job.accounting.input_token_count > this
+--max-output-tokens       <u64>    # refuse if job.accounting.max_output_token_count > this
+--max-total-base-units    <u64>    # refuse if input + max_output > this (overflow-safe)
+```
+
+A conservative default that fits a dev box is dangerous for a production contributor and vice-versa; the operator must make an explicit cap decision before any pickup happens. Caps are applied **after fetching the job from SNIP** but **before invoking the runner** — a runner is never invoked for a job that would exceed any cap.
+
+## Post-run `verify_result`
+
+The watch loop invokes the full Stage 12.0 `verify_result` pipeline on the freshly-built result, against the same SNIP adapter the runner used. A failure writes `<result-out-dir>/<job_id>.rejected.json` (containing the result body + a structured `rejected_reason`) and skips the optional link-publish step. This catches a category of integration bug (orchestrator/runner schema drift, future verifier-side check the orchestrator forgot) before another party's verifier sees the result.
+
+## Stage 12.1 CLI
+
+```text
+omni-node operator contributor post-job \
+    --job <path> --posted-out <path> \
+    [--seed-file <path>] [--expires-at-utc <RFC3339-Z>] [--notes <string>]
+    [--snip-binary <bin>] [--snip-seed <path>]
+
+omni-node operator contributor watch-jobs \
+    --source fs --jobs-dir <path> \
+    --max-input-tokens <N> --max-output-tokens <N> --max-total-base-units <N> \
+    --runner external|stub \
+    [--external-command <bin>] [--external-arg ...] [--external-env-allow ...] \
+    [--stub-response <path>] [--stub-input-tokens N] [--stub-output-tokens N] \
+    --seed-file <path> --result-out-dir <path> \
+    [--accept-model-hash <hex64> ...] [--accept-tokenizer-hash <hex64> ...] \
+    [--max-jobs <N>] [--max-polls <N>] [--poll-interval-secs <N>] \
+    [--publish-result-link] [--snip-binary <bin>] [--snip-seed <path>]
+
+omni-node operator contributor publish-result-link \
+    --result <path> --posted-job <path> --link-out <path> --seed-file <path>
+    [--snip-binary <bin>] [--snip-seed <path>]
+```
+
+`--source` is `fs` only in 12.1. `--max-polls` is primarily for tests + smoke runs; production typically omits it and lets the loop run until `--max-jobs` is reached or the surrounding process supervisor sends SIGTERM.
+
+## Out of scope (Stage 12.1)
+
+- SNIP index polling and `PostedJobsIndex` aggregator. Deferred to Stage 12.2+ when a real mutable discovery surface is designed.
+- Libp2p gossip / pubsub discovery.
+- Lease / claim primitives. Two contributors polling the same directory will both pick the same job and both publish results; dispatchers reading results choose which to trust.
+- Persistent dedup state across `watch-jobs` restarts.
+- Multi-dispatcher reconciliation.
+- Anything in items 1 / 7 / 8 or the lettered A–F flow.
+- Any chain-side interaction.
