@@ -15,7 +15,8 @@ pub mod transport;   // deferred — TCP/Noise fallback transport
 
 pub use events::OmniNetEvent;
 pub use gossip::{
-    TOPIC_CAPABILITY, TOPIC_PIPELINE, TOPIC_PROOF, TOPIC_SHARD, TOPIC_TEST,
+    TOPIC_CAPABILITY, TOPIC_CONTRIBUTOR_JOB, TOPIC_CONTRIBUTOR_RESULT, TOPIC_PIPELINE,
+    TOPIC_PROOF, TOPIC_SHARD, TOPIC_TEST, UnknownTopic,
 };
 pub use codec::{ShardCodec, ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL};
 pub use tensor_codec::{TensorCodec, TensorRequest, TensorResponse, TENSOR_XFER_PROTOCOL};
@@ -179,11 +180,97 @@ impl OmniNet {
         self.event_rx.recv().await
     }
 
+    /// Stage 12.2-pre — non-blocking event drain.
+    ///
+    /// Returns the next event immediately if one is queued, or
+    /// `None` if the queue is currently empty (including the case
+    /// where the swarm task has stopped and the buffer is drained).
+    /// Distinct from `next_event` which awaits.
+    ///
+    /// Provided so synchronous consumers (e.g. the Stage 12.2
+    /// contributor watch loop) can poll the event stream from a
+    /// non-async context without blocking. Does not change the
+    /// behavior of `next_event`.
+    pub fn try_next_event(&mut self) -> Option<OmniNetEvent> {
+        self.event_rx.try_recv().ok()
+    }
+
     /// Signal the swarm loop to shut down gracefully.
     pub async fn shutdown(&self) -> Result<()> {
         self.cmd_tx
             .send(SwarmCommand::Shutdown)
             .await
             .map_err(|_| anyhow::anyhow!("swarm task already stopped"))
+    }
+
+    /// Test-only constructor that builds an `OmniNet` from pre-built
+    /// channels instead of standing up a full libp2p swarm. Used to
+    /// unit-test the synchronous `try_next_event` accessor without
+    /// requiring real networking.
+    #[cfg(test)]
+    pub(crate) fn from_test_channels(
+        cmd_tx: mpsc::Sender<SwarmCommand>,
+        event_rx: mpsc::Receiver<OmniNetEvent>,
+    ) -> Self {
+        Self { cmd_tx, event_rx }
+    }
+}
+
+// ── Stage 12.2-pre — try_next_event unit tests ────────────────────────────
+//
+// These exercise the synchronous accessor in isolation, without
+// standing up a real swarm. The async `next_event` path is unchanged
+// and continues to be exercised by existing integration usage.
+
+#[cfg(test)]
+mod try_next_event_tests {
+    use super::*;
+    use libp2p::PeerId;
+
+    /// Construct an `OmniNet` whose `event_rx` is the receiver-side of
+    /// the returned `event_tx`. These tests never call methods that
+    /// use the cmd channel, so the cmd_rx is allowed to drop —
+    /// `try_next_event` only touches `event_rx`.
+    fn make_pair() -> (mpsc::Sender<OmniNetEvent>, OmniNet) {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SwarmCommand>(CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel::<OmniNetEvent>(CHANNEL_CAPACITY);
+        let net = OmniNet::from_test_channels(cmd_tx, event_rx);
+        // Drop cmd_rx — irrelevant to try_next_event behavior.
+        drop(_cmd_rx);
+        (event_tx, net)
+    }
+
+    #[tokio::test]
+    async fn try_next_event_returns_none_when_empty() {
+        let (_event_tx, mut net) = make_pair();
+        // Channel has zero pending events → try_next_event must be None.
+        assert!(net.try_next_event().is_none());
+    }
+
+    #[tokio::test]
+    async fn try_next_event_returns_some_after_event_pushed() {
+        let (event_tx, mut net) = make_pair();
+        // Inject a synthetic event; try_next_event must return it.
+        let from = PeerId::random();
+        event_tx
+            .send(OmniNetEvent::PeerConnected { peer_id: from })
+            .await
+            .unwrap();
+        let ev = net.try_next_event().expect("event should be available");
+        match ev {
+            OmniNetEvent::PeerConnected { peer_id } => assert_eq!(peer_id, from),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        // Drained — the next call must be None again.
+        assert!(net.try_next_event().is_none());
+    }
+
+    #[tokio::test]
+    async fn try_next_event_returns_none_when_sender_dropped_and_drained() {
+        let (event_tx, mut net) = make_pair();
+        drop(event_tx);
+        // No events were ever pushed; receiver is now closed. Behavior
+        // mirrors next_event's "swarm stopped" None semantics.
+        assert!(net.try_next_event().is_none());
     }
 }
