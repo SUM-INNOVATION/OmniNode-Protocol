@@ -43,7 +43,7 @@ pub fn publish_bytes<A: SnipV2Adapter>(
 
 /// Call `adapter.download_public(root, tempfile_path)` and return the
 /// downloaded bytes. The tempfile is removed on scope exit.
-pub fn fetch_bytes<A: SnipV2Adapter>(
+pub fn fetch_bytes<A: SnipV2Adapter + ?Sized>(
     adapter: &A,
     root: &SnipV2ObjectId,
 ) -> Result<Vec<u8>, SnipError> {

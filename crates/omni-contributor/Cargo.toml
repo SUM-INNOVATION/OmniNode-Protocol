@@ -25,6 +25,13 @@ default = []
 # (No verify-production-proof / halo2 feature in Stage 12.0. Production-
 # proof evidence is a closed-enum extension reserved for a future
 # `schema_version: 2` migration; see docs/stage12-contributor-protocol.md.)
+#
+# Stage 12.2 — opt-in libp2p network relay. Default builds (including
+# every test in this crate) pull zero networking deps; the in-memory
+# relay is sufficient for the full test suite. The `omni-node`
+# operator binary enables this feature to wire `OmniNetRelay` into
+# the announce-* / watch-network-* CLI subcommands.
+network = ["dep:omni-net", "dep:tokio"]
 
 [dependencies]
 # Stage 12.0 — kept deliberately lean. NO `omni-zkml` (chain/proof
@@ -42,6 +49,11 @@ chrono           = { workspace = true }
 libp2p-identity  = { workspace = true }   # Ed25519 signing — direct dep
 base64           = "0.22"                 # ExternalCommandRunner stdout
 tempfile         = { workspace = true }   # SNIP byte wrappers (Option A)
+
+# Stage 12.2 — optional libp2p network relay. Default-off; pulled
+# only when --features network is set (via omni-node's CLI build).
+omni-net         = { workspace = true, optional = true }
+tokio            = { workspace = true, optional = true }
 
 [dev-dependencies]
 # (None unique to dev; runtime deps cover the tests.)

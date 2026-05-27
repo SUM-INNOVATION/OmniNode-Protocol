@@ -128,6 +128,7 @@ fn run_once(
         result_out_dir: out_dir,
         publish_link,
         emit: &mut emitter,
+        result_broadcaster: None,
     };
     run_watch_loop(snip, &mut source, opts).unwrap();
     emitter.events
@@ -241,6 +242,7 @@ fn watch_loop_skips_poster_signature_failure() {
         result_out_dir: tmp_out.path().to_path_buf(),
         publish_link: false,
         emit: &mut emitter,
+        result_broadcaster: None,
     };
     // max_jobs(1) won't be reached because the bad-signature entry
     // is skipped, not picked. Force the loop to exit by also using

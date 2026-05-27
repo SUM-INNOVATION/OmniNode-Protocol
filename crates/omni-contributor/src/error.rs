@@ -28,6 +28,9 @@ pub enum ContributorError {
     #[error("discovery error: {0}")]
     Discover(#[from] DiscoverError),
 
+    #[error("relay error: {0}")]
+    Relay(#[from] RelayError),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -292,4 +295,42 @@ pub enum DiscoverError {
         "filesystem source error: {0}"
     )]
     FilesystemSourceOther(String),
+
+    #[error("network announcement signature did not verify against announcer_pubkey_hex")]
+    AnnouncerSignatureFailed,
+
+    #[error(
+        "drift between network announcement and SNIP-fetched envelope: field={field}, \
+         announcement={announcement}, fetched={fetched}"
+    )]
+    AnnouncementDrift {
+        field: &'static str,
+        announcement: String,
+        fetched: String,
+    },
+
+    #[error("malformed network announcement JSON: {0}")]
+    MalformedAnnouncement(String),
+}
+
+/// Stage 12.2 — errors specific to the network-relay surface.
+/// Distinct from `DiscoverError` so the watch loop can distinguish
+/// "the mesh is broken" (RelayError) from "this one announcement
+/// was bad" (DiscoverError).
+#[derive(Debug, Error)]
+pub enum RelayError {
+    #[error("relay publish failed: {0}")]
+    Publish(String),
+
+    #[error("relay poll failed: {0}")]
+    Poll(String),
+
+    #[error("relay serialization failed: {0}")]
+    Serialization(String),
+}
+
+impl From<serde_json::Error> for RelayError {
+    fn from(e: serde_json::Error) -> Self {
+        RelayError::Serialization(e.to_string())
+    }
 }

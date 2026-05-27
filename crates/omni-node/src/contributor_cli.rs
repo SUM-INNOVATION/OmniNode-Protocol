@@ -58,6 +58,28 @@ enum ContributorCmd {
     /// Stage 12.1 — publish an existing `ContributorResult` JSON to
     /// SNIP and emit a signed `PostedResultLink` envelope.
     PublishResultLink(PublishResultLinkArgs),
+
+    /// Stage 12.2 — broadcast a signed `NetworkPostedJobAnnouncement`
+    /// for a `PostedJob` over the contributor gossip mesh.
+    AnnounceJob(AnnounceJobArgs),
+
+    /// Stage 12.2 — long-running: subscribe to the contributor job
+    /// gossip topic, validate + fetch each announced `PostedJob`
+    /// from SNIP, apply filters + cost caps, run inference, verify
+    /// the result, write output, and optionally publish + broadcast
+    /// a `PostedResultLink`.
+    WatchNetworkJobs(WatchNetworkJobsArgs),
+
+    /// Stage 12.2 — broadcast a signed
+    /// `NetworkPostedResultAnnouncement` for an existing
+    /// `PostedResultLink`.
+    AnnounceResult(AnnounceResultArgs),
+
+    /// Stage 12.2 — long-running: subscribe to the contributor
+    /// result gossip topic, fetch + validate each announced
+    /// `PostedResultLink` from SNIP, optionally filter by
+    /// `posted_id`, write the link envelopes to disk.
+    WatchNetworkResults(WatchNetworkResultsArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -324,6 +346,197 @@ struct PublishResultLinkArgs {
     snip_seed: Option<PathBuf>,
 }
 
+// ── Stage 12.2: announce-job args ─────────────────────────────────────────
+
+#[derive(Args)]
+struct AnnounceJobArgs {
+    /// Path to a `PostedJob` JSON (produced by `post-job`).
+    #[arg(long)]
+    posted_job: PathBuf,
+
+    /// 32-byte raw announcer seed.
+    #[arg(long)]
+    seed_file: PathBuf,
+
+    /// Optional: also fetch the inner `ContributorJob` from SNIP and
+    /// record its `tokenizer_hash` in the announcement (advisory
+    /// field). On any fetch / parse failure, leave the field None
+    /// and emit the announcement without it.
+    #[arg(long, default_value_t = false)]
+    include_tokenizer_hash: bool,
+
+    /// libp2p listen port. Mapped to `NetConfig.listen_port`.
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+
+    /// Bootstrap peer multiaddr (repeatable). Mapped to
+    /// `NetConfig.bootstrap_peers`.
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+
+    /// Brief wait (milliseconds) after publishing before the
+    /// subcommand exits, to give gossipsub a chance to propagate.
+    #[arg(long, default_value_t = 200)]
+    propagation_wait_ms: u64,
+
+    /// Bounded wait (seconds) for the first peer to appear on the
+    /// mesh BEFORE publishing. Mirrors `omni-node send`'s 30s
+    /// default. Set to 0 to skip the wait (only useful in tests
+    /// against an already-connected node).
+    #[arg(long, default_value_t = 30)]
+    peer_wait_secs: u64,
+
+    /// Brief wait (milliseconds) AFTER the first peer is observed
+    /// and BEFORE publishing, so gossipsub has time to form a topic
+    /// mesh. Same heuristic the `omni-node send` path uses.
+    #[arg(long, default_value_t = 500)]
+    mesh_stabilize_ms: u64,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
+// ── Stage 12.2: watch-network-jobs args ───────────────────────────────────
+
+#[derive(Args)]
+struct WatchNetworkJobsArgs {
+    // Cost caps — REQUIRED. Same policy as Stage 12.1's watch-jobs.
+    #[arg(long)]
+    max_input_tokens: u64,
+    #[arg(long)]
+    max_output_tokens: u64,
+    #[arg(long)]
+    max_total_base_units: u64,
+
+    #[arg(long = "accept-model-hash")]
+    accept_model_hash: Vec<String>,
+    #[arg(long = "accept-tokenizer-hash")]
+    accept_tokenizer_hash: Vec<String>,
+
+    #[arg(long, value_enum, default_value_t = RunnerChoice::Stub)]
+    runner: RunnerChoice,
+    #[arg(long, required_if_eq("runner", "external"))]
+    external_command: Option<PathBuf>,
+    #[arg(long = "external-arg")]
+    external_args: Vec<String>,
+    #[arg(long = "external-env-allow")]
+    external_env_allow: Vec<String>,
+    #[arg(long, required_if_eq("runner", "stub"))]
+    stub_response: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    stub_input_tokens: u64,
+    #[arg(long, default_value_t = 0)]
+    stub_output_tokens: u64,
+
+    #[arg(long)]
+    seed_file: PathBuf,
+
+    #[arg(long)]
+    result_out_dir: PathBuf,
+
+    #[arg(long, default_value_t = false)]
+    publish_result_link: bool,
+
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+
+    #[arg(long, default_value_t = 5)]
+    poll_interval_secs: u64,
+
+    #[arg(long)]
+    max_jobs: Option<u64>,
+
+    #[arg(long)]
+    max_polls: Option<u64>,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
+// ── Stage 12.2: announce-result args ──────────────────────────────────────
+
+#[derive(Args)]
+struct AnnounceResultArgs {
+    /// Path to a `PostedResultLink` JSON (produced by `publish-result-link`).
+    #[arg(long)]
+    posted_result_link: PathBuf,
+
+    /// Announcer seed (may be the same key as the contributor that
+    /// signed the link, or a different relayer).
+    #[arg(long)]
+    seed_file: PathBuf,
+
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+
+    #[arg(long, default_value_t = 200)]
+    propagation_wait_ms: u64,
+
+    /// Bounded wait (seconds) for the first peer to appear on the
+    /// mesh BEFORE publishing. Mirrors `omni-node send`'s 30s
+    /// default. Set to 0 to skip.
+    #[arg(long, default_value_t = 30)]
+    peer_wait_secs: u64,
+
+    /// Brief wait (milliseconds) AFTER first peer + BEFORE publish
+    /// so gossipsub forms a topic mesh.
+    #[arg(long, default_value_t = 500)]
+    mesh_stabilize_ms: u64,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
+// ── Stage 12.2: watch-network-results args ────────────────────────────────
+
+#[derive(Args)]
+struct WatchNetworkResultsArgs {
+    /// Optional filter: only fetch links whose `posted_id` matches
+    /// one of these values. Empty = accept any.
+    #[arg(long = "posted-id")]
+    posted_id: Vec<String>,
+
+    /// Directory to write fetched `PostedResultLink` JSON files.
+    #[arg(long)]
+    result_out_dir: PathBuf,
+
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+
+    #[arg(long, default_value_t = 5)]
+    poll_interval_secs: u64,
+
+    #[arg(long)]
+    max_results: Option<u64>,
+
+    #[arg(long)]
+    max_polls: Option<u64>,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -334,6 +547,10 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::PostJob(a) => run_post_job(a),
         ContributorCmd::WatchJobs(a) => run_watch_jobs(a),
         ContributorCmd::PublishResultLink(a) => run_publish_result_link(a),
+        ContributorCmd::AnnounceJob(a) => run_announce_job(a).await,
+        ContributorCmd::WatchNetworkJobs(a) => run_watch_network_jobs(a).await,
+        ContributorCmd::AnnounceResult(a) => run_announce_result(a).await,
+        ContributorCmd::WatchNetworkResults(a) => run_watch_network_results(a).await,
     }
 }
 
@@ -347,6 +564,47 @@ fn build_snip_adapter(
         extra_args: Vec::new(),
         allow_non_active: false,
     })
+}
+
+/// Wait until at least one peer is reachable on the mesh, with a
+/// bounded timeout. Mirrors the `omni-node send` discovery pattern:
+/// a bare `OmniNet::new()` is not yet connected to any peer, so
+/// `publish()` on an empty mesh is a silent drop. Accept either an
+/// mDNS-style `PeerDiscovered` event (LAN) or a `PeerConnected`
+/// event (explicit `--peer` bootstrap multiaddr) — both are
+/// sufficient evidence of a reachable transport.
+///
+/// After the first peer event the function also waits a brief
+/// `mesh_stabilize_ms` so gossipsub has a chance to form a topic
+/// mesh before the caller publishes.
+async fn wait_for_first_peer(
+    net: &mut omni_net::OmniNet,
+    timeout_secs: u64,
+    mesh_stabilize_ms: u64,
+) -> Result<()> {
+    use omni_net::OmniNetEvent;
+    let wait_fut = async {
+        while let Some(event) = net.next_event().await {
+            if matches!(
+                event,
+                OmniNetEvent::PeerDiscovered { .. } | OmniNetEvent::PeerConnected { .. }
+            ) {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+        Err(anyhow!("OmniNet event stream closed before any peer appeared"))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), wait_fut)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "no peer reachable within {timeout_secs}s — check --peer bootstrap and LAN reachability"
+            )
+        })??;
+    if mesh_stabilize_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(mesh_stabilize_ms)).await;
+    }
+    Ok(())
 }
 
 fn read_job(path: &std::path::Path) -> Result<ContributorJob> {
@@ -676,6 +934,7 @@ fn run_watch_jobs(args: WatchJobsArgs) -> Result<()> {
         result_out_dir: args.result_out_dir,
         publish_link: args.publish_result_link,
         emit: &mut emitter,
+        result_broadcaster: None,
     };
 
     omni_contributor::run_watch_loop(&adapter, &mut source, opts)
@@ -728,4 +987,489 @@ fn run_publish_result_link(args: PublishResultLinkArgs) -> Result<()> {
     println!("posted_id={}", published.link.posted_id);
     println!("link_path={}", args.link_out.display());
     Ok(())
+}
+
+// ── Stage 12.2 handlers ───────────────────────────────────────────────────
+
+async fn run_announce_job(args: AnnounceJobArgs) -> Result<()> {
+    use omni_contributor::canonical::{
+        network_job_announcement_signing_input,
+    };
+    use omni_contributor::posted::PostedJob;
+    use omni_contributor::signing::DispatcherSigner;
+    use omni_contributor::{ContributorRelay, NetworkPostedJobAnnouncement, OmniNetRelay, NET_SCHEMA_VERSION};
+    use omni_net::OmniNet;
+    use omni_types::config::NetConfig;
+
+    let posted_bytes = std::fs::read(&args.posted_job)
+        .with_context(|| format!("read posted-job: {}", args.posted_job.display()))?;
+    let posted: PostedJob = serde_json::from_slice(&posted_bytes)
+        .with_context(|| format!("parse posted-job: {}", args.posted_job.display()))?;
+    posted
+        .validate_schema()
+        .map_err(|e| anyhow!("invalid PostedJob: {e}"))?;
+
+    // Optional: fetch the inner ContributorJob to record tokenizer_hash.
+    let tokenizer_hash = if args.include_tokenizer_hash {
+        let snip_adapter = build_snip_adapter(args.snip_binary.clone(), args.snip_seed.clone());
+        let snip_root = omni_types::phase5::SnipV2ObjectId::from_hex(&posted.job_snip_root)
+            .map_err(|e| anyhow!("bad job_snip_root: {e:?}"))?;
+        match omni_contributor::snip::fetch_bytes(&snip_adapter, &snip_root) {
+            Ok(bytes) => serde_json::from_slice::<omni_contributor::ContributorJob>(&bytes)
+                .ok()
+                .map(|j| j.accounting.tokenizer_hash),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let signer = DispatcherSigner::from_seed_file(&args.seed_file)?;
+    let announced_at_utc = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // Publish the PostedJob envelope bytes themselves to SNIP. The
+    // resulting SNIP root is what the network announcement carries
+    // as `posted_job_snip_root`. (The inner job's
+    // `posted.job_snip_root` is a separate SNIP root for the
+    // ContributorJob JSON; do NOT confuse the two — NetworkSource
+    // fetches `posted_job_snip_root` expecting PostedJob bytes.)
+    let snip_adapter_for_publish = build_snip_adapter(
+        args.snip_binary.clone(),
+        args.snip_seed.clone(),
+    );
+    let posted_job_snip_root_obj = omni_contributor::snip::publish_bytes(
+        &snip_adapter_for_publish,
+        &posted_bytes,
+        "announce-job-posted",
+    )
+    .map_err(|e| anyhow!("publish PostedJob to SNIP: {e}"))?;
+    let posted_job_snip_root_hex = format!(
+        "0x{}",
+        omni_contributor::canonical::hex_lower(posted_job_snip_root_obj.as_bytes())
+    );
+
+    let mut ann = NetworkPostedJobAnnouncement {
+        schema_version: NET_SCHEMA_VERSION,
+        posted_job_snip_root: posted_job_snip_root_hex.clone(),
+        posted_id: posted.posted_id.clone(),
+        job_hash: posted.job_hash.clone(),
+        model_hash: posted.model_hash.clone(),
+        tokenizer_hash,
+        announced_at_utc,
+        announcer_pubkey_hex: signer.pubkey_hex(),
+        announcer_signature_hex: String::new(),
+    };
+    let signing_input = network_job_announcement_signing_input(&ann)
+        .map_err(|e| anyhow!("canonical encode: {e}"))?;
+    ann.announcer_signature_hex = signer.sign_hex(&signing_input);
+    ann.validate_schema()
+        .map_err(|e| anyhow!("invalid NetworkPostedJobAnnouncement: {e}"))?;
+
+    // Open OmniNet and publish.
+    let net_config = NetConfig {
+        listen_port: args.listen_port,
+        bootstrap_peers: args.peer,
+        ..NetConfig::default()
+    };
+    let mut net = OmniNet::new(net_config)
+        .await
+        .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
+    // Bounded peer-wait BEFORE publish so the announcement isn't a
+    // silent drop on an empty mesh. Mirrors `omni-node send`'s
+    // PeerDiscovered-wait pattern at main.rs:309.
+    if args.peer_wait_secs > 0 {
+        wait_for_first_peer(&mut net, args.peer_wait_secs, args.mesh_stabilize_ms).await?;
+    }
+    let net = std::sync::Arc::new(tokio::sync::Mutex::new(net));
+    let handle = tokio::runtime::Handle::current();
+    let mut relay = OmniNetRelay::new(net.clone(), handle);
+    relay
+        .publish_job(&ann)
+        .map_err(|e| anyhow!("publish: {e}"))?;
+
+    // Brief propagation wait.
+    tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
+    {
+        let g = net.lock().await;
+        let _ = g.shutdown().await;
+    }
+
+    println!("posted_id={}", ann.posted_id);
+    println!("posted_job_snip_root={}", ann.posted_job_snip_root);
+    println!("announced=true");
+    Ok(())
+}
+
+async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
+    use omni_contributor::canonical::network_result_announcement_signing_input;
+    use omni_contributor::runner::{ExternalCommandRunner, StubRunner};
+    use omni_contributor::{
+        AcceptFilters, ContributorRelay, ContributorSigner, CostCaps, InferenceRunner,
+        NetworkPostedResultAnnouncement, NetworkSource, OmniNetRelay, PublishedResultLink,
+        ResultBroadcaster, StdoutEmitter, WatchOptions, NET_SCHEMA_VERSION,
+    };
+    use omni_net::OmniNet;
+    use omni_types::config::NetConfig;
+
+    let signer = ContributorSigner::from_seed_file(&args.seed_file)?;
+
+    // Construct the runner (same shape as Stage 12.1's watch-jobs).
+    enum AnyRunner {
+        Stub(StubRunner),
+        External(ExternalCommandRunner),
+    }
+    impl InferenceRunner for AnyRunner {
+        fn run(
+            &self,
+            manifest_path: &std::path::Path,
+            input_bytes: &[u8],
+        ) -> std::result::Result<
+            omni_contributor::RunOutput,
+            omni_contributor::RunnerError,
+        > {
+            match self {
+                AnyRunner::Stub(r) => r.run(manifest_path, input_bytes),
+                AnyRunner::External(r) => r.run(manifest_path, input_bytes),
+            }
+        }
+    }
+    let runner = match args.runner {
+        RunnerChoice::Stub => {
+            let bytes = std::fs::read(
+                args.stub_response
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("--stub-response required"))?,
+            )?;
+            AnyRunner::Stub(StubRunner::new(
+                signer.pubkey_hex(),
+                bytes,
+                args.stub_input_tokens,
+                args.stub_output_tokens,
+            ))
+        }
+        RunnerChoice::External => {
+            let mut r = ExternalCommandRunner::new(
+                args.external_command
+                    .ok_or_else(|| anyhow!("--external-command required"))?,
+            );
+            r.extra_args = args.external_args;
+            r.env_allowlist = args.external_env_allow;
+            AnyRunner::External(r)
+        }
+    };
+
+    let snip_adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let net_config = NetConfig {
+        listen_port: args.listen_port,
+        bootstrap_peers: args.peer,
+        ..NetConfig::default()
+    };
+    let net = OmniNet::new(net_config)
+        .await
+        .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
+    let net = std::sync::Arc::new(tokio::sync::Mutex::new(net));
+    let handle = tokio::runtime::Handle::current();
+
+    // Build a result broadcaster that piggybacks on the same
+    // OmniNet via a second `OmniNetRelay` clone. When the watch
+    // loop publishes a result link to SNIP, this broadcaster
+    // builds + signs a `NetworkPostedResultAnnouncement` (the
+    // contributor signer doubles as the announcer) and posts it on
+    // the contributor-result topic, so peers running
+    // `watch-network-results` learn the link's SNIP root.
+    let broadcaster_relay = OmniNetRelay::new(net.clone(), handle.clone());
+    let broadcaster_signer = ContributorSigner::from_seed_file(&args.seed_file)?;
+    let publish_result_link = args.publish_result_link;
+
+    let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut relay = OmniNetRelay::new(net.clone(), handle);
+        let mut source = NetworkSource::new(&mut relay, &snip_adapter);
+        let mut emitter = StdoutEmitter;
+
+        struct NetResultBroadcaster {
+            relay: OmniNetRelay,
+            signer: ContributorSigner,
+        }
+        impl ResultBroadcaster for NetResultBroadcaster {
+            fn broadcast(
+                &mut self,
+                published: &PublishedResultLink,
+            ) -> std::result::Result<(), String> {
+                let announced_at_utc = chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let mut ann = NetworkPostedResultAnnouncement {
+                    schema_version: NET_SCHEMA_VERSION,
+                    posted_id: published.link.posted_id.clone(),
+                    posted_result_link_snip_root: format!(
+                        "0x{}",
+                        omni_contributor::canonical::hex_lower(
+                            published.link_snip_root.as_bytes()
+                        )
+                    ),
+                    result_canonical_hash: published.link.result_canonical_hash.clone(),
+                    contributor_pubkey_hex: published.link.contributor_pubkey_hex.clone(),
+                    announced_at_utc,
+                    announcer_pubkey_hex: self.signer.pubkey_hex(),
+                    announcer_signature_hex: String::new(),
+                };
+                let signing_input = network_result_announcement_signing_input(&ann)
+                    .map_err(|e| format!("canonical: {e}"))?;
+                ann.announcer_signature_hex = self.signer.sign_hex(&signing_input);
+                ann.validate_schema()
+                    .map_err(|e| format!("schema: {e}"))?;
+                self.relay
+                    .publish_result(&ann)
+                    .map_err(|e| format!("publish: {e}"))?;
+                println!(
+                    "event=result_announcement_broadcast posted_id={} link_snip_root={}",
+                    ann.posted_id, ann.posted_result_link_snip_root
+                );
+                Ok(())
+            }
+        }
+        let mut broadcaster = NetResultBroadcaster {
+            relay: broadcaster_relay,
+            signer: broadcaster_signer,
+        };
+
+        let opts = WatchOptions {
+            poll_interval: std::time::Duration::from_secs(args.poll_interval_secs),
+            max_jobs: args.max_jobs,
+            max_polls: args.max_polls,
+            filters: AcceptFilters {
+                model_hash_allow: args.accept_model_hash,
+                tokenizer_hash_allow: args.accept_tokenizer_hash,
+            },
+            caps: CostCaps {
+                max_input_tokens: args.max_input_tokens,
+                max_output_tokens: args.max_output_tokens,
+                max_total_base_units: args.max_total_base_units,
+            },
+            runner: &runner,
+            signer: &signer,
+            result_out_dir: args.result_out_dir,
+            publish_link: publish_result_link,
+            emit: &mut emitter,
+            result_broadcaster: if publish_result_link {
+                Some(&mut broadcaster)
+            } else {
+                None
+            },
+        };
+        omni_contributor::run_watch_loop(&snip_adapter, &mut source, opts)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow!("watch-network-jobs join: {e}"))?;
+    run_result
+}
+
+async fn run_announce_result(args: AnnounceResultArgs) -> Result<()> {
+    use omni_contributor::canonical::network_result_announcement_signing_input;
+    use omni_contributor::posted::PostedResultLink;
+    use omni_contributor::signing::ContributorSigner;
+    use omni_contributor::{ContributorRelay, NetworkPostedResultAnnouncement, OmniNetRelay, NET_SCHEMA_VERSION};
+    use omni_net::OmniNet;
+    use omni_types::config::NetConfig;
+
+    let bytes = std::fs::read(&args.posted_result_link)
+        .with_context(|| format!("read link: {}", args.posted_result_link.display()))?;
+    let link: PostedResultLink = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse link: {}", args.posted_result_link.display()))?;
+    link.validate_schema()
+        .map_err(|e| anyhow!("invalid PostedResultLink: {e}"))?;
+
+    let signer = ContributorSigner::from_seed_file(&args.seed_file)?;
+    let announced_at_utc = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // The link envelope on disk doesn't itself record its own SNIP
+    // root (the standalone publish-result-link CLI prints it, but
+    // the on-disk JSON only carries result_snip_root, not its own
+    // posted_result_link_snip_root). To produce a faithful network
+    // announcement we re-publish the link bytes to SNIP and use
+    // that root.
+    let snip_adapter = build_snip_adapter(
+        args.snip_binary.clone(),
+        args.snip_seed.clone(),
+    );
+    let link_root =
+        omni_contributor::snip::publish_bytes(&snip_adapter, &bytes, "announce-result-link")
+            .map_err(|e| anyhow!("snip publish: {e}"))?;
+    let link_root_hex = format!(
+        "0x{}",
+        omni_contributor::canonical::hex_lower(link_root.as_bytes())
+    );
+
+    let mut ann = NetworkPostedResultAnnouncement {
+        schema_version: NET_SCHEMA_VERSION,
+        posted_id: link.posted_id.clone(),
+        posted_result_link_snip_root: link_root_hex.clone(),
+        result_canonical_hash: link.result_canonical_hash.clone(),
+        contributor_pubkey_hex: link.contributor_pubkey_hex.clone(),
+        announced_at_utc,
+        announcer_pubkey_hex: signer.pubkey_hex(),
+        announcer_signature_hex: String::new(),
+    };
+    let signing_input = network_result_announcement_signing_input(&ann)
+        .map_err(|e| anyhow!("canonical encode: {e}"))?;
+    ann.announcer_signature_hex = signer.sign_hex(&signing_input);
+    ann.validate_schema()
+        .map_err(|e| anyhow!("invalid NetworkPostedResultAnnouncement: {e}"))?;
+
+    let net_config = NetConfig {
+        listen_port: args.listen_port,
+        bootstrap_peers: args.peer,
+        ..NetConfig::default()
+    };
+    let mut net = OmniNet::new(net_config)
+        .await
+        .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
+    // Same bounded peer-wait as announce-job: without it, a
+    // freshly-opened OmniNet has zero peers and `publish` silently
+    // drops the announcement.
+    if args.peer_wait_secs > 0 {
+        wait_for_first_peer(&mut net, args.peer_wait_secs, args.mesh_stabilize_ms).await?;
+    }
+    let net = std::sync::Arc::new(tokio::sync::Mutex::new(net));
+    let handle = tokio::runtime::Handle::current();
+    let mut relay = OmniNetRelay::new(net.clone(), handle);
+    relay
+        .publish_result(&ann)
+        .map_err(|e| anyhow!("publish: {e}"))?;
+    tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
+    {
+        let g = net.lock().await;
+        let _ = g.shutdown().await;
+    }
+
+    println!("posted_id={}", ann.posted_id);
+    println!("posted_result_link_snip_root={}", ann.posted_result_link_snip_root);
+    println!("announced=true");
+    Ok(())
+}
+
+async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> {
+    use omni_contributor::{
+        process_result_announcement, ContributorRelay, OmniNetRelay,
+        ResultAnnouncementOutcome,
+    };
+    use omni_net::OmniNet;
+    use omni_types::config::NetConfig;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    let snip_adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let net_config = NetConfig {
+        listen_port: args.listen_port,
+        bootstrap_peers: args.peer,
+        ..NetConfig::default()
+    };
+    let net = OmniNet::new(net_config)
+        .await
+        .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
+    let net = std::sync::Arc::new(tokio::sync::Mutex::new(net));
+    let handle = tokio::runtime::Handle::current();
+    std::fs::create_dir_all(&args.result_out_dir)?;
+
+    let filter: HashSet<String> = args.posted_id.into_iter().collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut polls_done: u64 = 0;
+    let mut results_written: u64 = 0;
+
+    let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut relay = OmniNetRelay::new(net.clone(), handle);
+        loop {
+            if let Some(max) = args.max_polls {
+                if polls_done >= max {
+                    println!("event=exit reason=max_polls_reached results_written={results_written}");
+                    return Ok(());
+                }
+            }
+            polls_done += 1;
+            let anns = relay
+                .poll_results()
+                .map_err(|e| anyhow!("poll: {e}"))?;
+            for ann in anns {
+                if seen.contains(&ann.posted_result_link_snip_root) {
+                    println!(
+                        "event=skip posted_id={} reason=already_seen",
+                        ann.posted_id
+                    );
+                    continue;
+                }
+                seen.insert(ann.posted_result_link_snip_root.clone());
+
+                let outcome = process_result_announcement(
+                    &ann,
+                    &snip_adapter,
+                    &filter,
+                    &args.result_out_dir,
+                );
+                match outcome {
+                    ResultAnnouncementOutcome::LinkWritten { posted_id, link_path } => {
+                        println!(
+                            "event=link_written posted_id={posted_id} path={}",
+                            link_path.display()
+                        );
+                        results_written += 1;
+                        if let Some(max) = args.max_results {
+                            if results_written >= max {
+                                println!(
+                                    "event=exit reason=max_results_reached results_written={results_written}"
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                    ResultAnnouncementOutcome::AnnouncerSignatureFailed { posted_id } => {
+                        println!(
+                            "event=skip posted_id={posted_id} reason=announcer_signature_fail"
+                        );
+                    }
+                    ResultAnnouncementOutcome::SchemaMalformed { posted_id, message } => {
+                        println!(
+                            "event=skip posted_id={posted_id} reason=schema_malformed:{message}"
+                        );
+                    }
+                    ResultAnnouncementOutcome::FilteredOut { posted_id } => {
+                        println!(
+                            "event=skip posted_id={posted_id} reason=posted_id_not_in_accept_set"
+                        );
+                    }
+                    ResultAnnouncementOutcome::SnipFetchFailed { posted_id, message } => {
+                        println!(
+                            "event=skip posted_id={posted_id} reason=snip_fetch_failed:{message}"
+                        );
+                    }
+                    ResultAnnouncementOutcome::LinkParseFailed { posted_id, message } => {
+                        println!(
+                            "event=skip posted_id={posted_id} reason=link_parse_failed:{message}"
+                        );
+                    }
+                    ResultAnnouncementOutcome::LinkSchemaInvalid { posted_id, message } => {
+                        println!(
+                            "event=skip posted_id={posted_id} reason=link_schema:{message}"
+                        );
+                    }
+                    ResultAnnouncementOutcome::LinkContributorSignatureFailed { posted_id } => {
+                        println!(
+                            "event=skip posted_id={posted_id} reason=link_contributor_signature_fail"
+                        );
+                    }
+                    ResultAnnouncementOutcome::LinkDrift { posted_id, field } => {
+                        println!(
+                            "event=skip posted_id={posted_id} reason=link_drift:{field}"
+                        );
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(args.poll_interval_secs));
+        }
+    })
+    .await
+    .map_err(|e| anyhow!("watch-network-results join: {e}"))?;
+    run_result
 }

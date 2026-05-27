@@ -71,7 +71,12 @@ omni-proofs-halo2-production-mlp = { workspace = true, optional = true, features
 # deps even though it ships in the default graph. `omni-store` (already
 # above) provides SnipV2Cli for the subcommand's adapter; the contributor
 # crate handles the rest.
-omni-contributor = { workspace = true }
+#
+# Stage 12.2 — the `network` feature pulls in the omni-net libp2p
+# relay. omni-net is already a transitive dep of omni-node via omni-store,
+# so this adds no halo2/prover deps to the default graph (CI's
+# default-tree-check re-asserts).
+omni-contributor = { workspace = true, features = ["network"] }
 # Stage 12.0 — UTC time stamping for produced_at_utc on results.
 chrono     = { workspace = true }
 
