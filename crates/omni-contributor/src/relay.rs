@@ -20,7 +20,12 @@
 use std::collections::VecDeque;
 
 use crate::error::RelayError;
-use crate::net::{NetworkPostedJobAnnouncement, NetworkPostedResultAnnouncement};
+use crate::net::{
+    NetworkAggregatedResultAnnouncement, NetworkContributorJoinedAnnouncement,
+    NetworkPartialResultAnnouncement, NetworkPostedJobAnnouncement,
+    NetworkPostedResultAnnouncement, NetworkSessionOpenedAnnouncement,
+    NetworkWorkAssignedAnnouncement,
+};
 
 /// Minimal sync interface a contributor watch / announce loop uses.
 /// Production calls go through `OmniNetRelay`; tests use
@@ -51,6 +56,53 @@ pub trait ContributorRelay {
     fn poll_results(
         &mut self,
     ) -> Result<Vec<NetworkPostedResultAnnouncement>, RelayError>;
+
+    // ── Stage 12.3 — session network surface ────────────────────────
+
+    fn publish_session_opened(
+        &mut self,
+        msg: &NetworkSessionOpenedAnnouncement,
+    ) -> Result<(), RelayError>;
+
+    fn publish_contributor_joined(
+        &mut self,
+        msg: &NetworkContributorJoinedAnnouncement,
+    ) -> Result<(), RelayError>;
+
+    fn publish_work_assigned(
+        &mut self,
+        msg: &NetworkWorkAssignedAnnouncement,
+    ) -> Result<(), RelayError>;
+
+    fn publish_partial_result(
+        &mut self,
+        msg: &NetworkPartialResultAnnouncement,
+    ) -> Result<(), RelayError>;
+
+    fn publish_aggregated_result(
+        &mut self,
+        msg: &NetworkAggregatedResultAnnouncement,
+    ) -> Result<(), RelayError>;
+
+    fn poll_sessions_opened(
+        &mut self,
+    ) -> Result<Vec<NetworkSessionOpenedAnnouncement>, RelayError>;
+
+    fn poll_contributors_joined(
+        &mut self,
+    ) -> Result<Vec<NetworkContributorJoinedAnnouncement>, RelayError>;
+
+    fn poll_work_assigned(
+        &mut self,
+    ) -> Result<Vec<NetworkWorkAssignedAnnouncement>, RelayError>;
+
+    fn poll_partial_results(
+        &mut self,
+    ) -> Result<Vec<NetworkPartialResultAnnouncement>, RelayError>;
+
+    fn poll_aggregated_results(
+        &mut self,
+    ) -> Result<Vec<NetworkAggregatedResultAnnouncement>, RelayError>;
 }
 
 // ── InMemoryRelay ─────────────────────────────────────────────────────────
@@ -64,6 +116,11 @@ pub trait ContributorRelay {
 pub struct InMemoryRelay {
     jobs: VecDeque<NetworkPostedJobAnnouncement>,
     results: VecDeque<NetworkPostedResultAnnouncement>,
+    sessions_opened: VecDeque<NetworkSessionOpenedAnnouncement>,
+    contributors_joined: VecDeque<NetworkContributorJoinedAnnouncement>,
+    work_assigned: VecDeque<NetworkWorkAssignedAnnouncement>,
+    partial_results: VecDeque<NetworkPartialResultAnnouncement>,
+    aggregated_results: VecDeque<NetworkAggregatedResultAnnouncement>,
 }
 
 impl InMemoryRelay {
@@ -71,6 +128,11 @@ impl InMemoryRelay {
         Self {
             jobs: VecDeque::new(),
             results: VecDeque::new(),
+            sessions_opened: VecDeque::new(),
+            contributors_joined: VecDeque::new(),
+            work_assigned: VecDeque::new(),
+            partial_results: VecDeque::new(),
+            aggregated_results: VecDeque::new(),
         }
     }
 
@@ -120,6 +182,76 @@ impl ContributorRelay for InMemoryRelay {
     ) -> Result<Vec<NetworkPostedResultAnnouncement>, RelayError> {
         Ok(self.results.drain(..).collect())
     }
+
+    fn publish_session_opened(
+        &mut self,
+        msg: &NetworkSessionOpenedAnnouncement,
+    ) -> Result<(), RelayError> {
+        self.sessions_opened.push_back(msg.clone());
+        Ok(())
+    }
+
+    fn publish_contributor_joined(
+        &mut self,
+        msg: &NetworkContributorJoinedAnnouncement,
+    ) -> Result<(), RelayError> {
+        self.contributors_joined.push_back(msg.clone());
+        Ok(())
+    }
+
+    fn publish_work_assigned(
+        &mut self,
+        msg: &NetworkWorkAssignedAnnouncement,
+    ) -> Result<(), RelayError> {
+        self.work_assigned.push_back(msg.clone());
+        Ok(())
+    }
+
+    fn publish_partial_result(
+        &mut self,
+        msg: &NetworkPartialResultAnnouncement,
+    ) -> Result<(), RelayError> {
+        self.partial_results.push_back(msg.clone());
+        Ok(())
+    }
+
+    fn publish_aggregated_result(
+        &mut self,
+        msg: &NetworkAggregatedResultAnnouncement,
+    ) -> Result<(), RelayError> {
+        self.aggregated_results.push_back(msg.clone());
+        Ok(())
+    }
+
+    fn poll_sessions_opened(
+        &mut self,
+    ) -> Result<Vec<NetworkSessionOpenedAnnouncement>, RelayError> {
+        Ok(self.sessions_opened.drain(..).collect())
+    }
+
+    fn poll_contributors_joined(
+        &mut self,
+    ) -> Result<Vec<NetworkContributorJoinedAnnouncement>, RelayError> {
+        Ok(self.contributors_joined.drain(..).collect())
+    }
+
+    fn poll_work_assigned(
+        &mut self,
+    ) -> Result<Vec<NetworkWorkAssignedAnnouncement>, RelayError> {
+        Ok(self.work_assigned.drain(..).collect())
+    }
+
+    fn poll_partial_results(
+        &mut self,
+    ) -> Result<Vec<NetworkPartialResultAnnouncement>, RelayError> {
+        Ok(self.partial_results.drain(..).collect())
+    }
+
+    fn poll_aggregated_results(
+        &mut self,
+    ) -> Result<Vec<NetworkAggregatedResultAnnouncement>, RelayError> {
+        Ok(self.aggregated_results.drain(..).collect())
+    }
 }
 
 // ── OmniNetRelay ──────────────────────────────────────────────────────────
@@ -135,6 +267,9 @@ mod omni_net_relay {
 
     use omni_net::{
         OmniNet, OmniNetEvent, TOPIC_CONTRIBUTOR_JOB, TOPIC_CONTRIBUTOR_RESULT,
+        TOPIC_CONTRIBUTOR_SESSION_AGGREGATED, TOPIC_CONTRIBUTOR_SESSION_ASSIGN,
+        TOPIC_CONTRIBUTOR_SESSION_JOIN, TOPIC_CONTRIBUTOR_SESSION_OPEN,
+        TOPIC_CONTRIBUTOR_SESSION_PARTIAL,
     };
     use tokio::runtime::Handle;
     use tokio::sync::Mutex as AsyncMutex;
@@ -165,6 +300,17 @@ mod omni_net_relay {
         handle: Handle,
         pending_jobs: Arc<StdMutex<VecDeque<NetworkPostedJobAnnouncement>>>,
         pending_results: Arc<StdMutex<VecDeque<NetworkPostedResultAnnouncement>>>,
+        // Stage 12.3 session-topic queues.
+        pending_sessions_opened:
+            Arc<StdMutex<VecDeque<NetworkSessionOpenedAnnouncement>>>,
+        pending_contributors_joined:
+            Arc<StdMutex<VecDeque<NetworkContributorJoinedAnnouncement>>>,
+        pending_work_assigned:
+            Arc<StdMutex<VecDeque<NetworkWorkAssignedAnnouncement>>>,
+        pending_partial_results:
+            Arc<StdMutex<VecDeque<NetworkPartialResultAnnouncement>>>,
+        pending_aggregated_results:
+            Arc<StdMutex<VecDeque<NetworkAggregatedResultAnnouncement>>>,
     }
 
     impl OmniNetRelay {
@@ -179,6 +325,11 @@ mod omni_net_relay {
                 handle,
                 pending_jobs: Arc::new(StdMutex::new(VecDeque::new())),
                 pending_results: Arc::new(StdMutex::new(VecDeque::new())),
+                pending_sessions_opened: Arc::new(StdMutex::new(VecDeque::new())),
+                pending_contributors_joined: Arc::new(StdMutex::new(VecDeque::new())),
+                pending_work_assigned: Arc::new(StdMutex::new(VecDeque::new())),
+                pending_partial_results: Arc::new(StdMutex::new(VecDeque::new())),
+                pending_aggregated_results: Arc::new(StdMutex::new(VecDeque::new())),
             }
         }
 
@@ -197,6 +348,26 @@ mod omni_net_relay {
             });
             let mut jobs = self.pending_jobs.lock().expect("pending_jobs poisoned");
             let mut results = self.pending_results.lock().expect("pending_results poisoned");
+            let mut s_open = self
+                .pending_sessions_opened
+                .lock()
+                .expect("pending_sessions_opened poisoned");
+            let mut s_join = self
+                .pending_contributors_joined
+                .lock()
+                .expect("pending_contributors_joined poisoned");
+            let mut s_assign = self
+                .pending_work_assigned
+                .lock()
+                .expect("pending_work_assigned poisoned");
+            let mut s_partial = self
+                .pending_partial_results
+                .lock()
+                .expect("pending_partial_results poisoned");
+            let mut s_agg = self
+                .pending_aggregated_results
+                .lock()
+                .expect("pending_aggregated_results poisoned");
             while let Some(ev) = net.try_next_event() {
                 if let OmniNetEvent::MessageReceived { topic, data, .. } = ev {
                     match topic.as_str() {
@@ -215,6 +386,46 @@ mod omni_net_relay {
                             >(&data)
                             {
                                 results.push_back(msg);
+                            }
+                        }
+                        TOPIC_CONTRIBUTOR_SESSION_OPEN => {
+                            if let Ok(msg) = serde_json::from_slice::<
+                                NetworkSessionOpenedAnnouncement,
+                            >(&data)
+                            {
+                                s_open.push_back(msg);
+                            }
+                        }
+                        TOPIC_CONTRIBUTOR_SESSION_JOIN => {
+                            if let Ok(msg) = serde_json::from_slice::<
+                                NetworkContributorJoinedAnnouncement,
+                            >(&data)
+                            {
+                                s_join.push_back(msg);
+                            }
+                        }
+                        TOPIC_CONTRIBUTOR_SESSION_ASSIGN => {
+                            if let Ok(msg) = serde_json::from_slice::<
+                                NetworkWorkAssignedAnnouncement,
+                            >(&data)
+                            {
+                                s_assign.push_back(msg);
+                            }
+                        }
+                        TOPIC_CONTRIBUTOR_SESSION_PARTIAL => {
+                            if let Ok(msg) = serde_json::from_slice::<
+                                NetworkPartialResultAnnouncement,
+                            >(&data)
+                            {
+                                s_partial.push_back(msg);
+                            }
+                        }
+                        TOPIC_CONTRIBUTOR_SESSION_AGGREGATED => {
+                            if let Ok(msg) = serde_json::from_slice::<
+                                NetworkAggregatedResultAnnouncement,
+                            >(&data)
+                            {
+                                s_agg.push_back(msg);
                             }
                         }
                         _ => {
@@ -274,6 +485,101 @@ mod omni_net_relay {
         ) -> Result<Vec<NetworkPostedResultAnnouncement>, RelayError> {
             self.drain_events();
             let mut q = self.pending_results.lock().expect("pending_results poisoned");
+            Ok(q.drain(..).collect())
+        }
+
+        fn publish_session_opened(
+            &mut self,
+            msg: &NetworkSessionOpenedAnnouncement,
+        ) -> Result<(), RelayError> {
+            let bytes = serde_json::to_vec(msg)?;
+            self.publish_topic(TOPIC_CONTRIBUTOR_SESSION_OPEN, bytes)
+        }
+
+        fn publish_contributor_joined(
+            &mut self,
+            msg: &NetworkContributorJoinedAnnouncement,
+        ) -> Result<(), RelayError> {
+            let bytes = serde_json::to_vec(msg)?;
+            self.publish_topic(TOPIC_CONTRIBUTOR_SESSION_JOIN, bytes)
+        }
+
+        fn publish_work_assigned(
+            &mut self,
+            msg: &NetworkWorkAssignedAnnouncement,
+        ) -> Result<(), RelayError> {
+            let bytes = serde_json::to_vec(msg)?;
+            self.publish_topic(TOPIC_CONTRIBUTOR_SESSION_ASSIGN, bytes)
+        }
+
+        fn publish_partial_result(
+            &mut self,
+            msg: &NetworkPartialResultAnnouncement,
+        ) -> Result<(), RelayError> {
+            let bytes = serde_json::to_vec(msg)?;
+            self.publish_topic(TOPIC_CONTRIBUTOR_SESSION_PARTIAL, bytes)
+        }
+
+        fn publish_aggregated_result(
+            &mut self,
+            msg: &NetworkAggregatedResultAnnouncement,
+        ) -> Result<(), RelayError> {
+            let bytes = serde_json::to_vec(msg)?;
+            self.publish_topic(TOPIC_CONTRIBUTOR_SESSION_AGGREGATED, bytes)
+        }
+
+        fn poll_sessions_opened(
+            &mut self,
+        ) -> Result<Vec<NetworkSessionOpenedAnnouncement>, RelayError> {
+            self.drain_events();
+            let mut q = self
+                .pending_sessions_opened
+                .lock()
+                .expect("pending_sessions_opened poisoned");
+            Ok(q.drain(..).collect())
+        }
+
+        fn poll_contributors_joined(
+            &mut self,
+        ) -> Result<Vec<NetworkContributorJoinedAnnouncement>, RelayError> {
+            self.drain_events();
+            let mut q = self
+                .pending_contributors_joined
+                .lock()
+                .expect("pending_contributors_joined poisoned");
+            Ok(q.drain(..).collect())
+        }
+
+        fn poll_work_assigned(
+            &mut self,
+        ) -> Result<Vec<NetworkWorkAssignedAnnouncement>, RelayError> {
+            self.drain_events();
+            let mut q = self
+                .pending_work_assigned
+                .lock()
+                .expect("pending_work_assigned poisoned");
+            Ok(q.drain(..).collect())
+        }
+
+        fn poll_partial_results(
+            &mut self,
+        ) -> Result<Vec<NetworkPartialResultAnnouncement>, RelayError> {
+            self.drain_events();
+            let mut q = self
+                .pending_partial_results
+                .lock()
+                .expect("pending_partial_results poisoned");
+            Ok(q.drain(..).collect())
+        }
+
+        fn poll_aggregated_results(
+            &mut self,
+        ) -> Result<Vec<NetworkAggregatedResultAnnouncement>, RelayError> {
+            self.drain_events();
+            let mut q = self
+                .pending_aggregated_results
+                .lock()
+                .expect("pending_aggregated_results poisoned");
             Ok(q.drain(..).collect())
         }
     }

@@ -163,3 +163,161 @@ impl NetworkPostedResultAnnouncement {
         Ok(())
     }
 }
+
+// ── Stage 12.3 — session network announcements ───────────────────────────
+//
+// Five pointer-only announcements, one per session event. Each
+// carries drift-guard copies of the inner envelope's identity fields
+// and a required announcer signature. Receivers fetch the inner
+// body from SNIP and run the local verifier (`session_verify`) on
+// what they get.
+
+/// Announcement: a new `ExecutionSession` was published to SNIP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSessionOpenedAnnouncement {
+    pub schema_version: u32,
+    /// SNIP V2 Merkle root of the `ExecutionSession` JSON.
+    pub execution_session_snip_root: String,
+    /// 64-char lowercase hex — copy of `ExecutionSession.session_id`.
+    pub session_id: String,
+    /// 64-char lowercase hex — copy of `ExecutionSession.posted_id`.
+    pub posted_id: String,
+    /// RFC 3339 UTC (`Z` suffix).
+    pub announced_at_utc: String,
+    pub announcer_pubkey_hex: String,
+    pub announcer_signature_hex: String,
+}
+
+impl NetworkSessionOpenedAnnouncement {
+    pub fn validate_schema(&self) -> Result<(), SchemaError> {
+        if self.schema_version != NET_SCHEMA_VERSION {
+            return Err(SchemaError::UnsupportedVersion { got: self.schema_version });
+        }
+        check_snip_root_hex("execution_session_snip_root", &self.execution_session_snip_root)?;
+        check_blake3_hex("session_id", &self.session_id)?;
+        check_blake3_hex("posted_id", &self.posted_id)?;
+        check_iso_8601("announced_at_utc", &self.announced_at_utc)?;
+        check_pubkey_hex("announcer_pubkey_hex", &self.announcer_pubkey_hex)?;
+        check_signature_hex("announcer_signature_hex", &self.announcer_signature_hex)?;
+        Ok(())
+    }
+}
+
+/// Announcement: a `ContributorJoin` was published to SNIP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkContributorJoinedAnnouncement {
+    pub schema_version: u32,
+    /// SNIP V2 Merkle root of the `ContributorJoin` JSON.
+    pub contributor_join_snip_root: String,
+    pub session_id: String,
+    /// Drift-guarded against the inner join.
+    pub contributor_pubkey_hex: String,
+    pub announced_at_utc: String,
+    pub announcer_pubkey_hex: String,
+    pub announcer_signature_hex: String,
+}
+
+impl NetworkContributorJoinedAnnouncement {
+    pub fn validate_schema(&self) -> Result<(), SchemaError> {
+        if self.schema_version != NET_SCHEMA_VERSION {
+            return Err(SchemaError::UnsupportedVersion { got: self.schema_version });
+        }
+        check_snip_root_hex("contributor_join_snip_root", &self.contributor_join_snip_root)?;
+        check_blake3_hex("session_id", &self.session_id)?;
+        check_pubkey_hex("contributor_pubkey_hex", &self.contributor_pubkey_hex)?;
+        check_iso_8601("announced_at_utc", &self.announced_at_utc)?;
+        check_pubkey_hex("announcer_pubkey_hex", &self.announcer_pubkey_hex)?;
+        check_signature_hex("announcer_signature_hex", &self.announcer_signature_hex)?;
+        Ok(())
+    }
+}
+
+/// Announcement: a `WorkAssignment` was published to SNIP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkWorkAssignedAnnouncement {
+    pub schema_version: u32,
+    pub work_assignment_snip_root: String,
+    pub session_id: String,
+    pub assignment_id: String,
+    pub contributor_pubkey_hex: String,
+    pub announced_at_utc: String,
+    pub announcer_pubkey_hex: String,
+    pub announcer_signature_hex: String,
+}
+
+impl NetworkWorkAssignedAnnouncement {
+    pub fn validate_schema(&self) -> Result<(), SchemaError> {
+        if self.schema_version != NET_SCHEMA_VERSION {
+            return Err(SchemaError::UnsupportedVersion { got: self.schema_version });
+        }
+        check_snip_root_hex("work_assignment_snip_root", &self.work_assignment_snip_root)?;
+        check_blake3_hex("session_id", &self.session_id)?;
+        check_blake3_hex("assignment_id", &self.assignment_id)?;
+        check_pubkey_hex("contributor_pubkey_hex", &self.contributor_pubkey_hex)?;
+        check_iso_8601("announced_at_utc", &self.announced_at_utc)?;
+        check_pubkey_hex("announcer_pubkey_hex", &self.announcer_pubkey_hex)?;
+        check_signature_hex("announcer_signature_hex", &self.announcer_signature_hex)?;
+        Ok(())
+    }
+}
+
+/// Announcement: a `PartialContributorResult` was published to SNIP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkPartialResultAnnouncement {
+    pub schema_version: u32,
+    pub partial_result_snip_root: String,
+    pub session_id: String,
+    pub assignment_id: String,
+    pub contributor_pubkey_hex: String,
+    pub announced_at_utc: String,
+    pub announcer_pubkey_hex: String,
+    pub announcer_signature_hex: String,
+}
+
+impl NetworkPartialResultAnnouncement {
+    pub fn validate_schema(&self) -> Result<(), SchemaError> {
+        if self.schema_version != NET_SCHEMA_VERSION {
+            return Err(SchemaError::UnsupportedVersion { got: self.schema_version });
+        }
+        check_snip_root_hex("partial_result_snip_root", &self.partial_result_snip_root)?;
+        check_blake3_hex("session_id", &self.session_id)?;
+        check_blake3_hex("assignment_id", &self.assignment_id)?;
+        check_pubkey_hex("contributor_pubkey_hex", &self.contributor_pubkey_hex)?;
+        check_iso_8601("announced_at_utc", &self.announced_at_utc)?;
+        check_pubkey_hex("announcer_pubkey_hex", &self.announcer_pubkey_hex)?;
+        check_signature_hex("announcer_signature_hex", &self.announcer_signature_hex)?;
+        Ok(())
+    }
+}
+
+/// Announcement: an `AggregatedContributorResult` was published to SNIP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkAggregatedResultAnnouncement {
+    pub schema_version: u32,
+    pub aggregated_result_snip_root: String,
+    pub session_id: String,
+    pub posted_id: String,
+    pub announced_at_utc: String,
+    pub announcer_pubkey_hex: String,
+    pub announcer_signature_hex: String,
+}
+
+impl NetworkAggregatedResultAnnouncement {
+    pub fn validate_schema(&self) -> Result<(), SchemaError> {
+        if self.schema_version != NET_SCHEMA_VERSION {
+            return Err(SchemaError::UnsupportedVersion { got: self.schema_version });
+        }
+        check_snip_root_hex("aggregated_result_snip_root", &self.aggregated_result_snip_root)?;
+        check_blake3_hex("session_id", &self.session_id)?;
+        check_blake3_hex("posted_id", &self.posted_id)?;
+        check_iso_8601("announced_at_utc", &self.announced_at_utc)?;
+        check_pubkey_hex("announcer_pubkey_hex", &self.announcer_pubkey_hex)?;
+        check_signature_hex("announcer_signature_hex", &self.announcer_signature_hex)?;
+        Ok(())
+    }
+}

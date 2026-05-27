@@ -34,6 +34,14 @@ pub struct DispatcherSigner {
     keypair: ed25519::Keypair,
 }
 
+/// Stage 12.3 — coordinator signer. Signs `ExecutionSession`,
+/// `WorkAssignment`, and `AggregatedContributorResult`. Distinct
+/// type so calling `coord_signer.sign(...)` somewhere that wanted a
+/// contributor signature is a compile-time error.
+pub struct CoordinatorSigner {
+    keypair: ed25519::Keypair,
+}
+
 impl ContributorSigner {
     /// Load a 32-byte seed file. Refuses any file whose length is
     /// not exactly 32 bytes.
@@ -69,6 +77,35 @@ impl ContributorSigner {
 }
 
 impl DispatcherSigner {
+    pub fn from_seed_file(path: &Path) -> Result<Self, SigningError> {
+        let bytes = std::fs::read(path)?;
+        let keypair = keypair_from_seed_bytes(&bytes)?;
+        Ok(Self { keypair })
+    }
+
+    pub fn from_seed_bytes(bytes: &[u8]) -> Result<Self, SigningError> {
+        let keypair = keypair_from_seed_bytes(bytes)?;
+        Ok(Self { keypair })
+    }
+
+    pub fn pubkey_bytes(&self) -> [u8; 32] {
+        self.keypair.public().to_bytes()
+    }
+
+    pub fn pubkey_hex(&self) -> String {
+        hex_lower(&self.pubkey_bytes())
+    }
+
+    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        sign_via_keypair(&self.keypair, msg)
+    }
+
+    pub fn sign_hex(&self, msg: &[u8]) -> String {
+        hex_lower(&self.sign(msg))
+    }
+}
+
+impl CoordinatorSigner {
     pub fn from_seed_file(path: &Path) -> Result<Self, SigningError> {
         let bytes = std::fs::read(path)?;
         let keypair = keypair_from_seed_bytes(&bytes)?;

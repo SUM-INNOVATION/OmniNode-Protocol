@@ -489,3 +489,167 @@ omni-node operator contributor watch-network-results \
 - Reputation / abuse-mitigation beyond the required announcer signature.
 - Real-network CI test (would need bootstrap infrastructure).
 - Anything in items 1 / 7 / 8 of the chart; the lettered A–F flow; any chain-side interaction.
+
+
+---
+
+# Stage 12.3 — multi-contributor pooled-memory sessions
+
+**Status**: shipped at Stage 12.3. Extends Stage 12.2's mesh with a signed coordination shell for executing one posted job across multiple contributor devices.
+
+## Posture (verbatim, unchanged)
+
+No chain wire, no Stage 7b tx, no SUM Chain RPC, no `InferenceAttestationDigest`, no payment/reward/staking/slashing, no marketplace/auction/pricing/bid logic, no exclusive claim or lease model, no proof mode, no on-chain verification, no chain proof allowlist, no A–F flow. SNIP only. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes (CI re-asserts).
+
+The coordinator is a **process role**, not a chain authority. Contributors decide locally whether to join; verifiers decide locally whether to trust an aggregate. Assignments are cooperation hints within a session — multiple coordinators can run parallel sessions for the same `posted_id` with overlapping work.
+
+## What 12.3 actually is
+
+**Stage 12.3 is a coordination shell, not live pooled RAM.** It lets multiple machines participate in one inference job, record each participant's contribution under their own signature, and produce one aggregated `ContributorResult`. Inter-stage artifact handoff happens through SNIP — contributor *i+1* fetches contributor *i*'s `partial_artifact_snip_root`. Actual low-latency shared tensor / activation transport between participants is **Stage 12.4**.
+
+This means 12.3 is useful for two shapes today:
+
+1. **1-of-N pipeline through SNIP** — practical for any workload where activation size + SNIP round-trip latency are acceptable. The schemas + verifier are the load-bearing surface; the operator wires real cross-stage I/O.
+2. **1-of-1 signed bookkeeping** — a single contributor running the whole job under a session envelope. Useful as a building block for future N-of-N workloads and as the happy-path integration test.
+
+## Accounting rule (important)
+
+The final `ContributorResult.measured_accounting.total_base_units` is the **job-level** input + output token count, exactly as in 12.0. It is **NOT** a sum of partial totals — that would scale incorrectly with pipeline depth (e.g. 3 contributors cooperating on one 200k-input / 1M-output task would inflate to 3.6M base units, which is wrong; the job is still 1.2M base units total).
+
+Partials carry their own `measured_accounting.stage_contributions` for the contributor's slice of work. Those `work_units` exist to drive a future reward-split policy that divides the job-level base-unit pool — they are NOT summed into the final total. The verifier checks each partial's accounting is structurally valid (exactly one `stage_contribution`, matching pubkey) but does not require numerical equality with the final.
+
+## Roles
+
+- **Coordinator** — signs `ExecutionSession`, `WorkAssignment`s, and `AggregatedContributorResult`. Holds a key distinct from contributor/dispatcher seeds (new `CoordinatorSigner` role wrapper). Does not need to run inference.
+- **Contributor** — signs `ContributorJoin` and `PartialContributorResult`. Can be one of many in a session.
+- **Coordinator-as-contributor** — same person can hold both keys (or use the same seed under different role wrappers); the protocol does not care.
+
+## Inner envelopes (5)
+
+All pinned to `schema_version: 1`. Canonical bytes use bincode 1.3 with per-envelope domain separators. Signer's own signature excluded from the canonical body; `session_id` / `assignment_id` are BLAKE3 of the canonical bytes (mirrors 12.1's `posted_id` derivation).
+
+```text
+ExecutionSession {
+    schema_version, session_id, posted_id, job_hash, model_hash,
+    tokenizer_hash?, coordinator_pubkey_hex,
+    created_at_utc, expires_at_utc,        // required (sessions are bounded)
+    coordinator_signature_hex,
+}
+
+ContributorJoin {
+    schema_version, session_id, contributor_pubkey_hex,
+    available_ram_bytes, max_input_tokens, max_output_tokens,
+    supported_work_unit_kinds: [WorkUnitKind],   // non-empty
+    runner_kind,                                  // non-empty printable ASCII, ≤ 64
+    joined_at_utc,
+    contributor_signature_hex,
+}
+
+WorkAssignment {
+    schema_version, session_id, assignment_id, stage_index,
+    contributor_pubkey_hex,        // must be a joined contributor
+    work_kind: WorkKind,
+    expected_work_units,           // > 0
+    expected_work_unit_kind: WorkUnitKind,
+    assigned_at_utc,
+    coordinator_signature_hex,     // verified against session.coordinator_pubkey_hex
+}
+
+PartialContributorResult {
+    schema_version, session_id, assignment_id, contributor_pubkey_hex,
+    partial_artifact_snip_root, partial_artifact_hash,
+    measured_accounting: MeasuredAccounting,  // exactly one stage_contribution
+    produced_at_utc,
+    contributor_signature_hex,
+}
+
+AggregatedContributorResult {
+    schema_version, session_id, posted_id,
+    final_result_snip_root,         // points at a standalone v1 ContributorResult
+    final_result_canonical_hash,    // BLAKE3 of canonical_result_bytes(final)
+    partial_refs: [AggregatedPartialRef],   // non-empty; one per assignment
+    aggregated_at_utc,
+    coordinator_pubkey_hex,         // must equal session.coordinator_pubkey_hex
+    coordinator_signature_hex,
+}
+```
+
+**`WorkAssignment` deliberately does NOT carry `coordinator_pubkey_hex`** — the coordinator is identified by the session, and assignment signatures are verified against `session.coordinator_pubkey_hex`. This avoids drift between an assignment's coordinator claim and the session's.
+
+## `WorkKind`
+
+```rust
+enum WorkKind {
+    Prefill,
+    Decode,
+    Layers { start: u32, end: u32 },   // half-open; start < end
+    Shard { index: u32 },
+    Custom { label: String },          // non-empty printable ASCII, ≤ 64
+}
+```
+
+`Custom` is intentional: at v1 freezing we cannot enumerate every real-world split strategy. Labels like `Custom("kv-cache-shard")`, `Custom("expert-7")` round-trip through canonical bytes and stay forward-compatible with any future schema_version: 2 promotion to a dedicated variant.
+
+## Network announcements (5)
+
+Each is pointer-only (SNIP root + drift-guard copies + required announcer signature). Subscribers fetch the inner body from SNIP and run the local verifier. Per-event topic lets subscribers filter:
+
+```
+omni/contributor/session/open/v1
+omni/contributor/session/join/v1
+omni/contributor/session/assign/v1
+omni/contributor/session/partial/v1
+omni/contributor/session/aggregated/v1
+```
+
+Topic safety lift (Stage 12.2-pre) means an unknown topic name is a typed `UnknownTopic` error, not a silent misroute.
+
+## What the local verifier checks
+
+Pure helpers, bytes in / typed outcome out:
+
+- `verify_execution_session` — schema, `session_id == BLAKE3(canonical)`, coordinator signature.
+- `verify_contributor_join` — schema, `join.session_id == session.session_id`, contributor signature.
+- `verify_work_assignment` — schema, `assignment.session_id` matches, `assignment_id == BLAKE3(canonical)`, contributor is in the joined set, assignment signature verifies against the **session's** `coordinator_pubkey_hex`.
+- `verify_partial_result` — schema, binding to assignment (session_id + assignment_id + contributor_pubkey_hex), contributor signature.
+- `verify_aggregated_result` — schema, drift guards against session, every assignment has exactly one referenced partial (no `--allow-incomplete` in v1), `partial_canonical_hash` matches each referenced partial, coordinator signature verifies and equals `session.coordinator_pubkey_hex`.
+- `check_not_expired` — `now_utc < expires_at_utc` (RFC 3339 Z lex-compare).
+
+What we do NOT verify:
+- Semantic correctness of any partial's output bytes.
+- That contributors actually have the RAM they advertised.
+- That contributor *i*'s output is the right input for contributor *i+1*'s stage.
+- That `model_hash` names a "good" model.
+
+## CLI surface
+
+```
+omni-node operator contributor open-session       --posted-job <p> --coordinator-seed <p> --expires-at-utc <ISO>
+omni-node operator contributor join-session       --execution-session-snip-root 0x… --contributor-seed <p>
+                                                  --available-ram-bytes <N> --max-input-tokens <N> --max-output-tokens <N>
+                                                  --supported-work-unit-kind tokens|prefill-tokens|… (repeatable)
+                                                  --runner-kind <str>
+omni-node operator contributor assign-work        --execution-session-snip-root 0x… --coordinator-seed <p>
+                                                  --assignments-file <path>
+omni-node operator contributor run-assignment     --assignment-snip-root 0x… --execution-session-snip-root 0x…
+                                                  --contributor-seed <p> --runner stub|external …
+omni-node operator contributor aggregate-session  --execution-session-snip-root 0x… --coordinator-seed <p>
+                                                  --final-result-snip-root 0x…
+                                                  --join-snip-root 0x…       (repeatable, required)
+                                                  --assignment-snip-root 0x… (repeatable, paired)
+                                                  --partial-snip-root 0x…    (repeatable, paired)
+omni-node operator contributor watch-sessions     --out-dir <dir> [--posted-id …] [--session-id …]
+```
+
+`assign-work` reads a small JSON file describing each assignment (`contributor_pubkey_hex`, `stage_index`, `work_kind`, `expected_work_units`, `expected_work_unit_kind`). There is no auto-selection policy at 12.3 — operator scripts implement RAM-greedy / FCFS / whatever they want on top.
+
+Every publish-and-broadcast subcommand (open / join / assign / run / aggregate) takes the same `--peer-wait-secs` (default 30s) + `--mesh-stabilize-ms` (default 500ms) Stage 12.2 added to the announce-* paths, so a fresh `OmniNet` doesn't silently drop publish on an empty mesh.
+
+## Deferred to 12.4+ (call out)
+
+- Live tensor / activation transport between participants via `omni-net`'s Phase-4 `TensorRequest`/`TensorResponse`. Stage 12.3 hands off via SNIP only.
+- Auto-selection policy for joins → assignments (RAM-greedy, capability-match).
+- Filesystem source for sessions (analog of 12.1's `FilesystemSource`).
+- Sybil / anti-spam beyond required signatures.
+- Anything in items 1 / 7 / 8 of the chart; the lettered A–F flow; any chain-side interaction.
+- Reward-split engine that consumes partial `work_units` to divide the job-level base-unit pool.

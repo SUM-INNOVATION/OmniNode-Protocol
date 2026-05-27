@@ -16,6 +16,16 @@ pub const TOPIC_PROOF: &str      = "omni/proof/v1";
 pub const TOPIC_CONTRIBUTOR_JOB:    &str = "omni/contributor/job/v1";
 pub const TOPIC_CONTRIBUTOR_RESULT: &str = "omni/contributor/result/v1";
 
+// Stage 12.3 — first-class topics for the contributor session mesh.
+// Distinct from `omni/contributor/job/v1` / `omni/contributor/result/v1`
+// so subscribers can filter selectively. Each event kind has its own
+// topic; 12.2-pre's `UnknownTopic` typed error protects against typos.
+pub const TOPIC_CONTRIBUTOR_SESSION_OPEN:       &str = "omni/contributor/session/open/v1";
+pub const TOPIC_CONTRIBUTOR_SESSION_JOIN:       &str = "omni/contributor/session/join/v1";
+pub const TOPIC_CONTRIBUTOR_SESSION_ASSIGN:     &str = "omni/contributor/session/assign/v1";
+pub const TOPIC_CONTRIBUTOR_SESSION_PARTIAL:    &str = "omni/contributor/session/partial/v1";
+pub const TOPIC_CONTRIBUTOR_SESSION_AGGREGATED: &str = "omni/contributor/session/aggregated/v1";
+
 /// Typed error for unknown / unsupported topic names. Replaces the
 /// pre-Stage-12.2-pre silent fallback to `TOPIC_TEST`, which silently
 /// misrouted any unknown topic and could not be detected by callers.
@@ -38,6 +48,12 @@ pub struct GossipManager {
     // Stage 12.2-pre — contributor mesh topics.
     topic_contributor_job:    IdentTopic,
     topic_contributor_result: IdentTopic,
+    // Stage 12.3 — contributor session mesh topics.
+    topic_contributor_session_open:       IdentTopic,
+    topic_contributor_session_join:       IdentTopic,
+    topic_contributor_session_assign:     IdentTopic,
+    topic_contributor_session_partial:    IdentTopic,
+    topic_contributor_session_aggregated: IdentTopic,
 }
 
 impl GossipManager {
@@ -50,6 +66,16 @@ impl GossipManager {
             topic_proof:              IdentTopic::new(TOPIC_PROOF),
             topic_contributor_job:    IdentTopic::new(TOPIC_CONTRIBUTOR_JOB),
             topic_contributor_result: IdentTopic::new(TOPIC_CONTRIBUTOR_RESULT),
+            topic_contributor_session_open:
+                IdentTopic::new(TOPIC_CONTRIBUTOR_SESSION_OPEN),
+            topic_contributor_session_join:
+                IdentTopic::new(TOPIC_CONTRIBUTOR_SESSION_JOIN),
+            topic_contributor_session_assign:
+                IdentTopic::new(TOPIC_CONTRIBUTOR_SESSION_ASSIGN),
+            topic_contributor_session_partial:
+                IdentTopic::new(TOPIC_CONTRIBUTOR_SESSION_PARTIAL),
+            topic_contributor_session_aggregated:
+                IdentTopic::new(TOPIC_CONTRIBUTOR_SESSION_AGGREGATED),
         }
     }
 
@@ -84,7 +110,7 @@ impl GossipManager {
         Ok(id)
     }
 
-    fn all_topics(&self) -> [&IdentTopic; 7] {
+    fn all_topics(&self) -> [&IdentTopic; 12] {
         [
             &self.topic_test,
             &self.topic_capability,
@@ -93,6 +119,11 @@ impl GossipManager {
             &self.topic_proof,
             &self.topic_contributor_job,
             &self.topic_contributor_result,
+            &self.topic_contributor_session_open,
+            &self.topic_contributor_session_join,
+            &self.topic_contributor_session_assign,
+            &self.topic_contributor_session_partial,
+            &self.topic_contributor_session_aggregated,
         ]
     }
 
@@ -112,6 +143,16 @@ impl GossipManager {
             TOPIC_PROOF               => Ok(&self.topic_proof),
             TOPIC_CONTRIBUTOR_JOB     => Ok(&self.topic_contributor_job),
             TOPIC_CONTRIBUTOR_RESULT  => Ok(&self.topic_contributor_result),
+            TOPIC_CONTRIBUTOR_SESSION_OPEN
+                => Ok(&self.topic_contributor_session_open),
+            TOPIC_CONTRIBUTOR_SESSION_JOIN
+                => Ok(&self.topic_contributor_session_join),
+            TOPIC_CONTRIBUTOR_SESSION_ASSIGN
+                => Ok(&self.topic_contributor_session_assign),
+            TOPIC_CONTRIBUTOR_SESSION_PARTIAL
+                => Ok(&self.topic_contributor_session_partial),
+            TOPIC_CONTRIBUTOR_SESSION_AGGREGATED
+                => Ok(&self.topic_contributor_session_aggregated),
             other                     => Err(UnknownTopic(other.to_string())),
         }
     }
@@ -151,6 +192,11 @@ mod tests {
             TOPIC_PROOF,
             TOPIC_CONTRIBUTOR_JOB,
             TOPIC_CONTRIBUTOR_RESULT,
+            TOPIC_CONTRIBUTOR_SESSION_OPEN,
+            TOPIC_CONTRIBUTOR_SESSION_JOIN,
+            TOPIC_CONTRIBUTOR_SESSION_ASSIGN,
+            TOPIC_CONTRIBUTOR_SESSION_PARTIAL,
+            TOPIC_CONTRIBUTOR_SESSION_AGGREGATED,
         ] {
             assert!(
                 g.topic_by_name(name).is_ok(),
@@ -161,7 +207,7 @@ mod tests {
         // Defense-in-depth: the count of routed topics matches
         // all_topics. If a new TOPIC_* constant is added without
         // routing, this fails.
-        assert_eq!(g.all_topics().len(), 7);
+        assert_eq!(g.all_topics().len(), 12);
     }
 
     #[test]

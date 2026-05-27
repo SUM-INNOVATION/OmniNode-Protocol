@@ -2608,6 +2608,7 @@ dependencies = [
  "omni-sumchain",
  "omni-types",
  "omni-zkml",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
