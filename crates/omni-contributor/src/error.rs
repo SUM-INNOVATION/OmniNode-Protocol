@@ -87,6 +87,57 @@ pub enum SchemaError {
 
     #[error("job_id must equal lowercase_hex(job_hash); got job_id={job_id:?}, derived={derived:?}")]
     JobIdMismatch { job_id: String, derived: String },
+
+    // Stage 12.3 — session schema errors.
+
+    #[error("WorkKind::Layers range inverted or empty: start={start}, end={end}")]
+    WorkKindLayersInverted { start: u32, end: u32 },
+
+    #[error("WorkKind::Custom label must be non-empty")]
+    WorkKindCustomEmptyLabel,
+
+    #[error("WorkKind::Custom label length {got} exceeds bound {max}")]
+    WorkKindCustomLabelTooLong { got: usize, max: usize },
+
+    #[error("WorkKind::Custom label must be printable ASCII (0x20..=0x7E)")]
+    WorkKindCustomLabelNotPrintableAscii,
+
+    #[error("ContributorJoin.supported_work_unit_kinds must be non-empty")]
+    EmptySupportedWorkUnitKinds,
+
+    #[error("ContributorJoin.runner_kind must be non-empty")]
+    EmptyRunnerKind,
+
+    #[error("ContributorJoin.runner_kind length {got} exceeds bound {max}")]
+    RunnerKindTooLong { got: usize, max: usize },
+
+    #[error("ContributorJoin.runner_kind must be printable ASCII (0x20..=0x7E)")]
+    RunnerKindNotPrintableAscii,
+
+    #[error("WorkAssignment.expected_work_units must be > 0")]
+    AssignmentZeroExpectedWorkUnits,
+
+    #[error(
+        "PartialContributorResult.measured_accounting.stage_contributions must have \
+         exactly one entry; got {got}"
+    )]
+    PartialMustHaveOneStageContribution { got: usize },
+
+    #[error(
+        "PartialContributorResult.measured_accounting.stage_contributions[0].contributor_pubkey_hex \
+         must equal partial.contributor_pubkey_hex"
+    )]
+    PartialStageContributorMismatch,
+
+    #[error("AggregatedContributorResult.partial_refs must be non-empty")]
+    AggregateEmptyPartialRefs,
+
+    #[error("AggregatedContributorResult.partial_refs[{index}] invalid: {inner}")]
+    AggregatePartialRefInvalid {
+        index: usize,
+        #[source]
+        inner: Box<SchemaError>,
+    },
 }
 
 /// Canonical-bytes / hash encoding errors.

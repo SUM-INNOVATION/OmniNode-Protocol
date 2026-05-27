@@ -48,6 +48,8 @@ pub mod relay;
 pub mod result;
 pub mod run;
 pub mod runner;
+pub mod session;
+pub mod session_verify;
 pub mod signing;
 pub mod snip;
 pub mod verify;
@@ -59,7 +61,10 @@ pub use error::{
     SigningError, SnipError, VerifyError,
 };
 pub use net::{
-    NetworkPostedJobAnnouncement, NetworkPostedResultAnnouncement, NET_SCHEMA_VERSION,
+    NetworkAggregatedResultAnnouncement, NetworkContributorJoinedAnnouncement,
+    NetworkPartialResultAnnouncement, NetworkPostedJobAnnouncement,
+    NetworkPostedResultAnnouncement, NetworkSessionOpenedAnnouncement,
+    NetworkWorkAssignedAnnouncement, NET_SCHEMA_VERSION,
 };
 pub use relay::{ContributorRelay, InMemoryRelay};
 #[cfg(feature = "network")]
@@ -73,7 +78,20 @@ pub use result::{
 };
 pub use run::{run_job, RunJobOptions};
 pub use runner::{ExternalCommandRunner, InferenceRunner, RunOutput, StubRunner};
-pub use signing::{ContributorSigner, DispatcherSigner};
+pub use session::{
+    AggregatedContributorResult, AggregatedPartialRef, ContributorJoin, ExecutionSession,
+    PartialContributorResult, WorkAssignment, WorkKind, RUNNER_KIND_MAX,
+    SESSION_SCHEMA_VERSION, WORK_KIND_CUSTOM_LABEL_MAX,
+};
+pub use session_verify::{
+    check_not_expired, process_aggregated_result_announcement,
+    process_contributor_joined_announcement, process_partial_result_announcement,
+    process_session_opened_announcement, process_work_assigned_announcement,
+    verify_aggregated_result, verify_contributor_join, verify_execution_session,
+    verify_partial_result, verify_work_assignment, AnnouncementOutcome,
+    SessionVerifyOutcome,
+};
+pub use signing::{ContributorSigner, CoordinatorSigner, DispatcherSigner};
 pub use verify::{verify_result, VerifyOutcome};
 pub use watch::{
     process_result_announcement, publish_result_link_for, run_watch_loop, AcceptFilters,

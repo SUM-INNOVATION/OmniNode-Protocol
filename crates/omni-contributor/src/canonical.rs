@@ -490,6 +490,552 @@ pub fn network_result_announcement_signing_input(
     canonical_network_result_announcement_bytes(a)
 }
 
+// ── Stage 12.3 — session canonical bytes ──────────────────────────────────
+//
+// Five new domain separators, one per inner envelope. Frozen layout for
+// `schema_version: 1`. Signer's own signature excluded from the
+// canonical body; `session_id` / `assignment_id` self-hash fields also
+// excluded (they're derived from the canonical bytes here).
+
+use crate::session::{
+    AggregatedContributorResult, AggregatedPartialRef, ContributorJoin, ExecutionSession,
+    PartialContributorResult, WorkAssignment, WorkKind,
+};
+
+/// 32 ASCII bytes.
+pub const SESSION_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-SESSION:v1:";
+
+/// 29 ASCII bytes.
+pub const JOIN_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-JOIN:v1:";
+
+/// 35 ASCII bytes.
+pub const ASSIGNMENT_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-ASSIGNMENT:v1:";
+
+/// 32 ASCII bytes.
+pub const PARTIAL_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-PARTIAL:v1:";
+
+/// 35 ASCII bytes.
+pub const AGGREGATED_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-AGGREGATED:v1:";
+
+// --- ExecutionSession ---
+
+#[derive(Debug, Serialize)]
+struct ExecutionSessionCanonicalBody<'a> {
+    schema_version: u32,
+    posted_id: &'a str,
+    job_hash: &'a str,
+    model_hash: &'a str,
+    tokenizer_hash: Option<&'a str>,
+    coordinator_pubkey_hex: &'a str,
+    created_at_utc: &'a str,
+    expires_at_utc: &'a str,
+}
+
+impl<'a> From<&'a ExecutionSession> for ExecutionSessionCanonicalBody<'a> {
+    fn from(s: &'a ExecutionSession) -> Self {
+        Self {
+            schema_version: s.schema_version,
+            posted_id: &s.posted_id,
+            job_hash: &s.job_hash,
+            model_hash: &s.model_hash,
+            tokenizer_hash: s.tokenizer_hash.as_deref(),
+            coordinator_pubkey_hex: &s.coordinator_pubkey_hex,
+            created_at_utc: &s.created_at_utc,
+            expires_at_utc: &s.expires_at_utc,
+        }
+    }
+}
+
+pub fn canonical_execution_session_bytes(
+    s: &ExecutionSession,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: ExecutionSessionCanonicalBody = s.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(SESSION_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(SESSION_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// 32-byte BLAKE3 over `canonical_execution_session_bytes`.
+pub fn execution_session_hash_bytes(
+    s: &ExecutionSession,
+) -> Result<[u8; 32], CanonicalError> {
+    let bytes = canonical_execution_session_bytes(s)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// 64-char lowercase hex. Value stored in `ExecutionSession.session_id`.
+pub fn session_id_hex(s: &ExecutionSession) -> Result<String, CanonicalError> {
+    Ok(hex_lower(&execution_session_hash_bytes(s)?))
+}
+
+pub fn execution_session_signing_input(
+    s: &ExecutionSession,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_execution_session_bytes(s)
+}
+
+// --- ContributorJoin ---
+
+#[derive(Debug, Serialize)]
+struct ContributorJoinCanonicalBody<'a> {
+    schema_version: u32,
+    session_id: &'a str,
+    contributor_pubkey_hex: &'a str,
+    available_ram_bytes: u64,
+    max_input_tokens: u64,
+    max_output_tokens: u64,
+    supported_work_unit_kinds: &'a [crate::result::WorkUnitKind],
+    runner_kind: &'a str,
+    joined_at_utc: &'a str,
+}
+
+impl<'a> From<&'a ContributorJoin> for ContributorJoinCanonicalBody<'a> {
+    fn from(j: &'a ContributorJoin) -> Self {
+        Self {
+            schema_version: j.schema_version,
+            session_id: &j.session_id,
+            contributor_pubkey_hex: &j.contributor_pubkey_hex,
+            available_ram_bytes: j.available_ram_bytes,
+            max_input_tokens: j.max_input_tokens,
+            max_output_tokens: j.max_output_tokens,
+            supported_work_unit_kinds: &j.supported_work_unit_kinds,
+            runner_kind: &j.runner_kind,
+            joined_at_utc: &j.joined_at_utc,
+        }
+    }
+}
+
+pub fn canonical_contributor_join_bytes(
+    j: &ContributorJoin,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: ContributorJoinCanonicalBody = j.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(JOIN_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(JOIN_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn contributor_join_signing_input(
+    j: &ContributorJoin,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_contributor_join_bytes(j)
+}
+
+// --- WorkAssignment ---
+
+#[derive(Debug, Serialize)]
+struct WorkAssignmentCanonicalBody<'a> {
+    schema_version: u32,
+    session_id: &'a str,
+    stage_index: u32,
+    contributor_pubkey_hex: &'a str,
+    work_kind: &'a WorkKind,
+    expected_work_units: u64,
+    expected_work_unit_kind: &'a crate::result::WorkUnitKind,
+    assigned_at_utc: &'a str,
+}
+
+impl<'a> From<&'a WorkAssignment> for WorkAssignmentCanonicalBody<'a> {
+    fn from(a: &'a WorkAssignment) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            session_id: &a.session_id,
+            stage_index: a.stage_index,
+            contributor_pubkey_hex: &a.contributor_pubkey_hex,
+            work_kind: &a.work_kind,
+            expected_work_units: a.expected_work_units,
+            expected_work_unit_kind: &a.expected_work_unit_kind,
+            assigned_at_utc: &a.assigned_at_utc,
+        }
+    }
+}
+
+pub fn canonical_work_assignment_bytes(
+    a: &WorkAssignment,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: WorkAssignmentCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(ASSIGNMENT_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(ASSIGNMENT_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn work_assignment_hash_bytes(
+    a: &WorkAssignment,
+) -> Result<[u8; 32], CanonicalError> {
+    let bytes = canonical_work_assignment_bytes(a)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// 64-char lowercase hex. Value stored in `WorkAssignment.assignment_id`.
+pub fn assignment_id_hex(a: &WorkAssignment) -> Result<String, CanonicalError> {
+    Ok(hex_lower(&work_assignment_hash_bytes(a)?))
+}
+
+pub fn work_assignment_signing_input(
+    a: &WorkAssignment,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_work_assignment_bytes(a)
+}
+
+// --- PartialContributorResult ---
+
+#[derive(Debug, Serialize)]
+struct PartialResultCanonicalBody<'a> {
+    schema_version: u32,
+    session_id: &'a str,
+    assignment_id: &'a str,
+    contributor_pubkey_hex: &'a str,
+    partial_artifact_snip_root: &'a str,
+    partial_artifact_hash: &'a str,
+    measured_accounting: PartialMeasuredAccountingCanonical<'a>,
+    produced_at_utc: &'a str,
+}
+
+/// Partial-domain view of `MeasuredAccounting`. Distinct from the
+/// 12.0 `MeasuredAccountingCanonical` (which lives under RESULT_DOMAIN
+/// and serializes `StageContributionCanonical`) — they're independent
+/// canonical bodies for independent domain separators.
+#[derive(Debug, Serialize)]
+struct PartialMeasuredAccountingCanonical<'a> {
+    tokenizer_hash: &'a str,
+    input_token_count: u64,
+    output_token_count: u64,
+    total_base_units: u64,
+    stage_contributions: &'a [StageContribution],
+}
+
+impl<'a> From<&'a MeasuredAccounting> for PartialMeasuredAccountingCanonical<'a> {
+    fn from(m: &'a MeasuredAccounting) -> Self {
+        Self {
+            tokenizer_hash: &m.tokenizer_hash,
+            input_token_count: m.input_token_count,
+            output_token_count: m.output_token_count,
+            total_base_units: m.total_base_units,
+            stage_contributions: &m.stage_contributions,
+        }
+    }
+}
+
+impl<'a> From<&'a PartialContributorResult> for PartialResultCanonicalBody<'a> {
+    fn from(p: &'a PartialContributorResult) -> Self {
+        Self {
+            schema_version: p.schema_version,
+            session_id: &p.session_id,
+            assignment_id: &p.assignment_id,
+            contributor_pubkey_hex: &p.contributor_pubkey_hex,
+            partial_artifact_snip_root: &p.partial_artifact_snip_root,
+            partial_artifact_hash: &p.partial_artifact_hash,
+            measured_accounting: (&p.measured_accounting).into(),
+            produced_at_utc: &p.produced_at_utc,
+        }
+    }
+}
+
+pub fn canonical_partial_result_bytes(
+    p: &PartialContributorResult,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: PartialResultCanonicalBody = p.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(PARTIAL_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(PARTIAL_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn partial_result_signing_input(
+    p: &PartialContributorResult,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_partial_result_bytes(p)
+}
+
+// --- AggregatedContributorResult ---
+
+#[derive(Debug, Serialize)]
+struct AggregatedCanonicalBody<'a> {
+    schema_version: u32,
+    session_id: &'a str,
+    posted_id: &'a str,
+    final_result_snip_root: &'a str,
+    final_result_canonical_hash: &'a str,
+    partial_refs: &'a [AggregatedPartialRef],
+    aggregated_at_utc: &'a str,
+    coordinator_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a AggregatedContributorResult> for AggregatedCanonicalBody<'a> {
+    fn from(a: &'a AggregatedContributorResult) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            session_id: &a.session_id,
+            posted_id: &a.posted_id,
+            final_result_snip_root: &a.final_result_snip_root,
+            final_result_canonical_hash: &a.final_result_canonical_hash,
+            partial_refs: &a.partial_refs,
+            aggregated_at_utc: &a.aggregated_at_utc,
+            coordinator_pubkey_hex: &a.coordinator_pubkey_hex,
+        }
+    }
+}
+
+pub fn canonical_aggregated_result_bytes(
+    a: &AggregatedContributorResult,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: AggregatedCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(AGGREGATED_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(AGGREGATED_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn aggregated_result_signing_input(
+    a: &AggregatedContributorResult,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_aggregated_result_bytes(a)
+}
+
+// ── Stage 12.3 — session network announcement canonical bytes ────────────
+
+use crate::net::{
+    NetworkAggregatedResultAnnouncement, NetworkContributorJoinedAnnouncement,
+    NetworkPartialResultAnnouncement, NetworkSessionOpenedAnnouncement,
+    NetworkWorkAssignedAnnouncement,
+};
+
+/// 36 ASCII bytes.
+pub const NET_SESSION_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-NET-SESSION:v1:";
+
+/// 33 ASCII bytes.
+pub const NET_JOIN_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-NET-JOIN:v1:";
+
+/// 35 ASCII bytes.
+pub const NET_ASSIGN_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-NET-ASSIGN:v1:";
+
+/// 36 ASCII bytes.
+pub const NET_PARTIAL_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-NET-PARTIAL:v1:";
+
+/// 39 ASCII bytes.
+pub const NET_AGGREGATED_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-NET-AGGREGATED:v1:";
+
+// --- NetworkSessionOpenedAnnouncement ---
+
+#[derive(Debug, Serialize)]
+struct NetSessionOpenedCanonicalBody<'a> {
+    schema_version: u32,
+    execution_session_snip_root: &'a str,
+    session_id: &'a str,
+    posted_id: &'a str,
+    announced_at_utc: &'a str,
+    announcer_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a NetworkSessionOpenedAnnouncement> for NetSessionOpenedCanonicalBody<'a> {
+    fn from(a: &'a NetworkSessionOpenedAnnouncement) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            execution_session_snip_root: &a.execution_session_snip_root,
+            session_id: &a.session_id,
+            posted_id: &a.posted_id,
+            announced_at_utc: &a.announced_at_utc,
+            announcer_pubkey_hex: &a.announcer_pubkey_hex,
+        }
+    }
+}
+
+pub fn canonical_net_session_opened_bytes(
+    a: &NetworkSessionOpenedAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: NetSessionOpenedCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(NET_SESSION_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(NET_SESSION_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn net_session_opened_signing_input(
+    a: &NetworkSessionOpenedAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_net_session_opened_bytes(a)
+}
+
+// --- NetworkContributorJoinedAnnouncement ---
+
+#[derive(Debug, Serialize)]
+struct NetJoinCanonicalBody<'a> {
+    schema_version: u32,
+    contributor_join_snip_root: &'a str,
+    session_id: &'a str,
+    contributor_pubkey_hex: &'a str,
+    announced_at_utc: &'a str,
+    announcer_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a NetworkContributorJoinedAnnouncement> for NetJoinCanonicalBody<'a> {
+    fn from(a: &'a NetworkContributorJoinedAnnouncement) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            contributor_join_snip_root: &a.contributor_join_snip_root,
+            session_id: &a.session_id,
+            contributor_pubkey_hex: &a.contributor_pubkey_hex,
+            announced_at_utc: &a.announced_at_utc,
+            announcer_pubkey_hex: &a.announcer_pubkey_hex,
+        }
+    }
+}
+
+pub fn canonical_net_join_bytes(
+    a: &NetworkContributorJoinedAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: NetJoinCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(NET_JOIN_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(NET_JOIN_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn net_join_signing_input(
+    a: &NetworkContributorJoinedAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_net_join_bytes(a)
+}
+
+// --- NetworkWorkAssignedAnnouncement ---
+
+#[derive(Debug, Serialize)]
+struct NetAssignCanonicalBody<'a> {
+    schema_version: u32,
+    work_assignment_snip_root: &'a str,
+    session_id: &'a str,
+    assignment_id: &'a str,
+    contributor_pubkey_hex: &'a str,
+    announced_at_utc: &'a str,
+    announcer_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a NetworkWorkAssignedAnnouncement> for NetAssignCanonicalBody<'a> {
+    fn from(a: &'a NetworkWorkAssignedAnnouncement) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            work_assignment_snip_root: &a.work_assignment_snip_root,
+            session_id: &a.session_id,
+            assignment_id: &a.assignment_id,
+            contributor_pubkey_hex: &a.contributor_pubkey_hex,
+            announced_at_utc: &a.announced_at_utc,
+            announcer_pubkey_hex: &a.announcer_pubkey_hex,
+        }
+    }
+}
+
+pub fn canonical_net_assign_bytes(
+    a: &NetworkWorkAssignedAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: NetAssignCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(NET_ASSIGN_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(NET_ASSIGN_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn net_assign_signing_input(
+    a: &NetworkWorkAssignedAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_net_assign_bytes(a)
+}
+
+// --- NetworkPartialResultAnnouncement ---
+
+#[derive(Debug, Serialize)]
+struct NetPartialCanonicalBody<'a> {
+    schema_version: u32,
+    partial_result_snip_root: &'a str,
+    session_id: &'a str,
+    assignment_id: &'a str,
+    contributor_pubkey_hex: &'a str,
+    announced_at_utc: &'a str,
+    announcer_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a NetworkPartialResultAnnouncement> for NetPartialCanonicalBody<'a> {
+    fn from(a: &'a NetworkPartialResultAnnouncement) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            partial_result_snip_root: &a.partial_result_snip_root,
+            session_id: &a.session_id,
+            assignment_id: &a.assignment_id,
+            contributor_pubkey_hex: &a.contributor_pubkey_hex,
+            announced_at_utc: &a.announced_at_utc,
+            announcer_pubkey_hex: &a.announcer_pubkey_hex,
+        }
+    }
+}
+
+pub fn canonical_net_partial_bytes(
+    a: &NetworkPartialResultAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: NetPartialCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(NET_PARTIAL_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(NET_PARTIAL_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn net_partial_signing_input(
+    a: &NetworkPartialResultAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_net_partial_bytes(a)
+}
+
+// --- NetworkAggregatedResultAnnouncement ---
+
+#[derive(Debug, Serialize)]
+struct NetAggregatedCanonicalBody<'a> {
+    schema_version: u32,
+    aggregated_result_snip_root: &'a str,
+    session_id: &'a str,
+    posted_id: &'a str,
+    announced_at_utc: &'a str,
+    announcer_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a NetworkAggregatedResultAnnouncement> for NetAggregatedCanonicalBody<'a> {
+    fn from(a: &'a NetworkAggregatedResultAnnouncement) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            aggregated_result_snip_root: &a.aggregated_result_snip_root,
+            session_id: &a.session_id,
+            posted_id: &a.posted_id,
+            announced_at_utc: &a.announced_at_utc,
+            announcer_pubkey_hex: &a.announcer_pubkey_hex,
+        }
+    }
+}
+
+pub fn canonical_net_aggregated_bytes(
+    a: &NetworkAggregatedResultAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: NetAggregatedCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(NET_AGGREGATED_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(NET_AGGREGATED_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn net_aggregated_signing_input(
+    a: &NetworkAggregatedResultAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_net_aggregated_bytes(a)
+}
+
 // ── Hex helpers ───────────────────────────────────────────────────────────
 
 /// Lowercase-hex encode raw bytes (no `0x` prefix). Used throughout
