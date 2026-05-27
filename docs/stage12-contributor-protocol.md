@@ -333,3 +333,159 @@ omni-node operator contributor publish-result-link \
 - Multi-dispatcher reconciliation.
 - Anything in items 1 / 7 / 8 or the lettered A–F flow.
 - Any chain-side interaction.
+
+---
+
+# Stage 12.2 — contributor mesh network relay
+
+**Status**: shipped at Stage 12.2. Extends Stages 12.0 + 12.1 with the first real network surface: signed gossipsub announcements of SNIP-pointed posted envelopes. Filesystem-based discovery (12.1) and network-based discovery (12.2) are parallel paths — operators can run either or both via separate subcommands.
+
+## Posture (unchanged)
+
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. AttestationOnly only. No on-chain verification, no chain proof allowlist. SNIP only. Default `omni-node` build still pulls zero halo2/prover/framework runtimes (CI re-asserts).
+
+## What the mesh carries
+
+**Pointers only.** Announcements are tiny signed envelopes carrying a SNIP V2 root + drift-guard hashes + sender identity. They never carry job bodies, input bytes, model bytes, or result bytes. SNIP remains the content store; the gossip mesh only tells subscribers what's worth fetching.
+
+Two signature layers protect each path:
+1. **Announcer signature** (required) on the network envelope — anti-spam + provenance for who introduced this pointer.
+2. **Inner envelope signatures** — the existing 12.0 / 12.1 validators (`PostedJob.poster_signature_hex` optional; `PostedResultLink.contributor_signature_hex` required) run unchanged after fetching from SNIP.
+
+A receiver discarding the announcer signature is not the same as discarding the inner envelope. Anyone may legitimately relay an announcement they observed; the receiver still validates the inner signed envelope semantically.
+
+## Stage 12.2-pre dependency
+
+This stage builds on `omni-net` topic constants added in [PR #19 / Stage 12.2-pre](#) — `TOPIC_CONTRIBUTOR_JOB = "omni/contributor/job/v1"` and `TOPIC_CONTRIBUTOR_RESULT = "omni/contributor/result/v1"` — plus the non-blocking `OmniNet::try_next_event` accessor and the typed-error refusal of unknown topics. Without the pre-PR, `OmniNet::publish` on a contributor topic would silently route to `TOPIC_TEST`; this stage explicitly depends on that having been fixed.
+
+## Schemas
+
+```text
+NetworkPostedJobAnnouncement {
+    schema_version:           1                        // pinned
+    posted_job_snip_root:     0xhex66                  // SNIP root of PostedJob JSON
+    posted_id:                hex64                    // copy of PostedJob.posted_id
+    job_hash:                 hex64                    // copy of PostedJob.job_hash
+    model_hash:               hex64                    // copy; enables pre-fetch filter
+    tokenizer_hash:           Option<hex64>            // optional; advisory
+    announced_at_utc:         RFC3339 UTC (Z suffix)
+    announcer_pubkey_hex:     hex64                    // REQUIRED
+    announcer_signature_hex:  hex128                   // REQUIRED; over canonical body
+}
+
+NetworkPostedResultAnnouncement {
+    schema_version: 1
+    posted_id:                       hex64
+    posted_result_link_snip_root:    0xhex66
+    result_canonical_hash:           hex64             // copy of PostedResultLink field
+    contributor_pubkey_hex:          hex64             // copy of PostedResultLink field
+    announced_at_utc:                RFC3339 UTC (Z suffix)
+    announcer_pubkey_hex:            hex64             // REQUIRED
+    announcer_signature_hex:         hex128            // REQUIRED
+}
+```
+
+Both have `deny_unknown_fields`. Announcer signature is **required** on both — different from `PostedJob.poster_signature_hex` (which is legitimately optional for local-CLI handoffs in 12.1).
+
+## Canonical bytes (v1, frozen)
+
+Two new domain separators:
+
+```text
+NET_JOB_DOMAIN    = b"OMNINODE-CONTRIBUTOR-NET-JOB:v1:"      (32 bytes)
+NET_RESULT_DOMAIN = b"OMNINODE-CONTRIBUTOR-NET-RESULT:v1:"   (35 bytes)
+```
+
+Both distinct from the 12.0 / 12.1 separators and from any chain-wire tag. Bincode 1.3 encoding; canonical body excludes `announcer_signature_hex` (the signer can't include its own signature) but **includes** `announcer_pubkey_hex` so the signature binds to the claimed pubkey.
+
+## Relay abstraction
+
+`omni_contributor::ContributorRelay` is the sync, transport-agnostic interface the watch and announce paths use:
+
+```text
+publish_job(&NetworkPostedJobAnnouncement)    -> Result<()>
+publish_result(&NetworkPostedResultAnnouncement) -> Result<()>
+poll_jobs()    -> Result<Vec<NetworkPostedJobAnnouncement>>
+poll_results() -> Result<Vec<NetworkPostedResultAnnouncement>>
+```
+
+Two impls:
+
+- **`InMemoryRelay`** — vec-backed in-process queues. Fully sync; no tokio runtime. **All Stage 12.2 tests use this.** The full schema + signature + drift + cost-cap + dedup pipeline is exercised end-to-end without any real networking.
+- **`OmniNetRelay`** — production adapter behind the `network` feature flag on `omni-contributor`. Wraps `omni_net::OmniNet`, drains events via Stage 12.2-pre's `try_next_event`, and bridges sync `publish_*` to async `OmniNet::publish` via `tokio::task::block_in_place(|| handle.block_on(...))`. Per-topic dispatch routes incoming `MessageReceived` events into a job-queue or result-queue based on `topic` string, so `poll_jobs` and `poll_results` don't lose each other's messages.
+
+## NetworkSource
+
+`NetworkSource` is a `JobSource` impl (the same trait `FilesystemSource` implements in 12.1) that drains job announcements from a relay. The validation pipeline per announcement:
+
+1. Schema validate.
+2. Verify announcer signature against canonical body bytes.
+3. Fetch `PostedJob` JSON from SNIP at `posted_job_snip_root`.
+4. Parse + schema-validate the fetched `PostedJob`.
+5. Recompute `posted_id` from canonical bytes; assert three-way agreement (announcement / fetched envelope / recomputed).
+6. Assert `job_hash` and `model_hash` agree between announcement and fetched envelope.
+
+Per-entry failures surface as `Err(DiscoverError::…)` items the watch loop logs + skips; the loop never short-circuits on one bad announcement. The result of step 6 plugs straight into the existing Stage 12.1 `run_watch_loop` — cost caps, poster-signature check, runner invocation, post-run `verify_result`, accepted/rejected write-out, optional `PostedResultLink` publish are all unchanged. Stage 12.2 only swaps the discovery source.
+
+## `watch-network-jobs` pipeline
+
+Same as 12.1 `watch-jobs` with one source-of-discovery change. Required cost caps remain mandatory (`--max-input-tokens` / `--max-output-tokens` / `--max-total-base-units`). If `--publish-result-link` is set, the watch loop additionally builds + signs + broadcasts a `NetworkPostedResultAnnouncement` for each successfully verified result.
+
+## `watch-network-results` pipeline
+
+A separate, simpler loop (no inner job to fetch, no runner, no `verify_result`):
+
+1. Drain result announcements from the relay.
+2. Schema-validate; verify announcer signature.
+3. If `--posted-id` filter is non-empty, apply it.
+4. Fetch `PostedResultLink` from SNIP; parse; schema-validate.
+5. Drift guard: announcement `posted_id` / `result_canonical_hash` / `contributor_pubkey_hex` must agree with fetched link.
+6. Write the link bytes to `<result-out-dir>/<posted_id>.link.json` — **byte-identical to what was on SNIP** (no re-serialization).
+
+This stage **does not settle payment, write results, or invoke any verifier on the result content**. Downstream consumers of result links are out of scope (Stage 12.x+).
+
+## Stage 12.2 CLI
+
+```text
+omni-node operator contributor announce-job \
+    --posted-job <path> --seed-file <path>
+    [--include-tokenizer-hash]                    # fetch inner ContributorJob to populate it
+    [--listen-port <u16>] [--peer <multiaddr> ...]
+    [--propagation-wait-ms <N>]
+    [--snip-binary <bin>] [--snip-seed <path>]
+
+omni-node operator contributor watch-network-jobs \
+    --max-input-tokens <N> --max-output-tokens <N> --max-total-base-units <N>   # REQUIRED
+    --runner external|stub [runner-specific flags]
+    --seed-file <path> --result-out-dir <path>
+    [--accept-model-hash <hex64> ...] [--accept-tokenizer-hash <hex64> ...]
+    [--max-jobs <N>] [--max-polls <N>] [--poll-interval-secs <N>]
+    [--publish-result-link]
+    [--listen-port <u16>] [--peer <multiaddr> ...]
+    [--snip-binary <bin>] [--snip-seed <path>]
+
+omni-node operator contributor announce-result \
+    --posted-result-link <path> --seed-file <path>
+    [--listen-port <u16>] [--peer <multiaddr> ...]
+    [--propagation-wait-ms <N>]
+
+omni-node operator contributor watch-network-results \
+    [--posted-id <hex64> ...]                     # repeat; empty = accept any
+    --result-out-dir <path>
+    [--listen-port <u16>] [--peer <multiaddr> ...]
+    [--max-results <N>] [--max-polls <N>] [--poll-interval-secs <N>]
+    [--snip-binary <bin>] [--snip-seed <path>]
+```
+
+`--listen-port` maps to `NetConfig.listen_port`; arbitrary `--listen <multiaddr>` is Stage 12.3+. `--peer <multiaddr>` repeatable maps to `NetConfig.bootstrap_peers`.
+
+## Out of scope (Stage 12.2)
+
+- Persistent job / result dedup state across restarts.
+- Lease / claim primitives; double-pickup prevention. Multiple watchers will independently pick the same announcement and produce results; dispatchers reading results choose which to trust.
+- Result-content verifier on the receiver side of `watch-network-results` (it only fetches + writes the link envelope; consuming the linked result is a follow-up stage).
+- Arbitrary `--listen <multiaddr>` flexibility.
+- `PostedJobsIndex` aggregator / signed multi-publisher index. Either out of scope or requires a separate design.
+- Reputation / abuse-mitigation beyond the required announcer signature.
+- Real-network CI test (would need bootstrap infrastructure).
+- Anything in items 1 / 7 / 8 of the chart; the lettered A–F flow; any chain-side interaction.

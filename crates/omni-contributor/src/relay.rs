@@ -1,0 +1,280 @@
+//! Stage 12.2 — contributor mesh relay abstraction + implementations.
+//!
+//! The `ContributorRelay` trait is the sync, transport-agnostic
+//! interface the watch loop uses to publish + poll network
+//! announcements. Two concrete impls:
+//!
+//!   - [`InMemoryRelay`] — vec-backed in-process queues for tests.
+//!     Fully synchronous; no tokio runtime required.
+//!
+//!   - [`OmniNetRelay`] — production adapter wrapping
+//!     `omni_net::OmniNet`. Uses Stage 12.2-pre's
+//!     `try_next_event` for non-blocking event drain and
+//!     `block_in_place + Handle::block_on` to bridge the
+//!     async `OmniNet::publish` from the sync watch loop.
+//!
+//! Dedup-by-`posted_id` lives in the watch loop (mirrors 12.1's
+//! filesystem dedup); the relay returns whatever the transport has
+//! accumulated since the last poll.
+
+use std::collections::VecDeque;
+
+use crate::error::RelayError;
+use crate::net::{NetworkPostedJobAnnouncement, NetworkPostedResultAnnouncement};
+
+/// Minimal sync interface a contributor watch / announce loop uses.
+/// Production calls go through `OmniNetRelay`; tests use
+/// `InMemoryRelay`.
+pub trait ContributorRelay {
+    /// Broadcast a job announcement. Returns once the announcement
+    /// has been handed to the transport (does NOT wait for peer
+    /// receipt — gossipsub is best-effort).
+    fn publish_job(
+        &mut self,
+        msg: &NetworkPostedJobAnnouncement,
+    ) -> Result<(), RelayError>;
+
+    /// Broadcast a result announcement.
+    fn publish_result(
+        &mut self,
+        msg: &NetworkPostedResultAnnouncement,
+    ) -> Result<(), RelayError>;
+
+    /// Drain all job announcements accumulated since the last poll.
+    /// Non-blocking; returns empty if nothing is pending.
+    fn poll_jobs(
+        &mut self,
+    ) -> Result<Vec<NetworkPostedJobAnnouncement>, RelayError>;
+
+    /// Drain all result announcements accumulated since the last
+    /// poll. Non-blocking.
+    fn poll_results(
+        &mut self,
+    ) -> Result<Vec<NetworkPostedResultAnnouncement>, RelayError>;
+}
+
+// ── InMemoryRelay ─────────────────────────────────────────────────────────
+
+/// Test-only relay. Two FIFO queues, no transport. `publish_*` push;
+/// `poll_*` drain.
+///
+/// For end-to-end tests where one process plays both publisher and
+/// subscriber, a single `InMemoryRelay` carries the announcements
+/// between them.
+pub struct InMemoryRelay {
+    jobs: VecDeque<NetworkPostedJobAnnouncement>,
+    results: VecDeque<NetworkPostedResultAnnouncement>,
+}
+
+impl InMemoryRelay {
+    pub fn new() -> Self {
+        Self {
+            jobs: VecDeque::new(),
+            results: VecDeque::new(),
+        }
+    }
+
+    /// Number of currently pending job announcements (queue length).
+    /// Used by tests to assert publish/drain semantics.
+    pub fn pending_jobs(&self) -> usize {
+        self.jobs.len()
+    }
+
+    /// Number of currently pending result announcements.
+    pub fn pending_results(&self) -> usize {
+        self.results.len()
+    }
+}
+
+impl Default for InMemoryRelay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContributorRelay for InMemoryRelay {
+    fn publish_job(
+        &mut self,
+        msg: &NetworkPostedJobAnnouncement,
+    ) -> Result<(), RelayError> {
+        self.jobs.push_back(msg.clone());
+        Ok(())
+    }
+
+    fn publish_result(
+        &mut self,
+        msg: &NetworkPostedResultAnnouncement,
+    ) -> Result<(), RelayError> {
+        self.results.push_back(msg.clone());
+        Ok(())
+    }
+
+    fn poll_jobs(
+        &mut self,
+    ) -> Result<Vec<NetworkPostedJobAnnouncement>, RelayError> {
+        Ok(self.jobs.drain(..).collect())
+    }
+
+    fn poll_results(
+        &mut self,
+    ) -> Result<Vec<NetworkPostedResultAnnouncement>, RelayError> {
+        Ok(self.results.drain(..).collect())
+    }
+}
+
+// ── OmniNetRelay ──────────────────────────────────────────────────────────
+
+#[cfg(feature = "network")]
+pub use omni_net_relay::OmniNetRelay;
+
+#[cfg(feature = "network")]
+mod omni_net_relay {
+    use super::*;
+
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use omni_net::{
+        OmniNet, OmniNetEvent, TOPIC_CONTRIBUTOR_JOB, TOPIC_CONTRIBUTOR_RESULT,
+    };
+    use tokio::runtime::Handle;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// Production relay over `omni_net::OmniNet`. Holds an
+    /// `Arc<tokio::sync::Mutex<OmniNet>>` (so multiple consumers —
+    /// e.g. a watch loop's `NetworkSource` AND a result broadcaster
+    /// running off the same loop's events — can share the
+    /// underlying mesh connection, and `OmniNet::shutdown().await`
+    /// can be held across an await from the async CLI handlers) and
+    /// a `tokio::runtime::Handle` to bridge the async
+    /// `OmniNet::publish` from sync callers.
+    ///
+    /// `OmniNetRelay` is `Clone`-able; clones share `pending_jobs` /
+    /// `pending_results` queues (via `Arc<std::sync::Mutex<_>>`) so
+    /// the caller can drain events through one clone while
+    /// publishing through another without dropping messages.
+    ///
+    /// Event-drain strategy: the OmniNet event stream is shared
+    /// across all gossipsub topics (and other event kinds like
+    /// PeerConnected etc.). On every `drain_events()` call we pull
+    /// from `try_next_event` and route to the per-topic pending
+    /// queue. `poll_jobs` and `poll_results` each drain first, so
+    /// callers don't lose results-topic messages when polling jobs.
+    #[derive(Clone)]
+    pub struct OmniNetRelay {
+        net: Arc<AsyncMutex<OmniNet>>,
+        handle: Handle,
+        pending_jobs: Arc<StdMutex<VecDeque<NetworkPostedJobAnnouncement>>>,
+        pending_results: Arc<StdMutex<VecDeque<NetworkPostedResultAnnouncement>>>,
+    }
+
+    impl OmniNetRelay {
+        /// Construct from a shared `OmniNet` handle + the current
+        /// tokio runtime handle. The caller (`omni-node` CLI) wraps
+        /// its `OmniNet::new` instance in
+        /// `Arc<tokio::sync::Mutex<_>>` from its async main and
+        /// passes a clone here.
+        pub fn new(net: Arc<AsyncMutex<OmniNet>>, handle: Handle) -> Self {
+            Self {
+                net,
+                handle,
+                pending_jobs: Arc::new(StdMutex::new(VecDeque::new())),
+                pending_results: Arc::new(StdMutex::new(VecDeque::new())),
+            }
+        }
+
+        /// Drain the OmniNet event stream into per-topic buffers.
+        /// Routes `MessageReceived` events by their topic string and
+        /// silently ignores everything else (peer events, shard
+        /// events, etc.). Malformed JSON on a contributor topic is
+        /// also silently dropped — the higher-level watch loop's
+        /// announcer-signature check is the load-bearing filter.
+        fn drain_events(&self) {
+            // Acquire the OmniNet lock via block_in_place + block_on
+            // so the sync watch loop can call us without blocking
+            // the runtime.
+            let mut net = tokio::task::block_in_place(|| {
+                self.handle.block_on(self.net.lock())
+            });
+            let mut jobs = self.pending_jobs.lock().expect("pending_jobs poisoned");
+            let mut results = self.pending_results.lock().expect("pending_results poisoned");
+            while let Some(ev) = net.try_next_event() {
+                if let OmniNetEvent::MessageReceived { topic, data, .. } = ev {
+                    match topic.as_str() {
+                        TOPIC_CONTRIBUTOR_JOB => {
+                            if let Ok(msg) =
+                                serde_json::from_slice::<NetworkPostedJobAnnouncement>(&data)
+                            {
+                                jobs.push_back(msg);
+                            }
+                            // Malformed JSON on the contributor topic
+                            // is dropped silently — it's spam.
+                        }
+                        TOPIC_CONTRIBUTOR_RESULT => {
+                            if let Ok(msg) = serde_json::from_slice::<
+                                NetworkPostedResultAnnouncement,
+                            >(&data)
+                            {
+                                results.push_back(msg);
+                            }
+                        }
+                        _ => {
+                            // Other topics: not our concern.
+                        }
+                    }
+                }
+            }
+        }
+
+        fn publish_topic(
+            &self,
+            topic: &'static str,
+            bytes: Vec<u8>,
+        ) -> Result<(), RelayError> {
+            // OmniNet::publish takes `&self`; acquire the async lock
+            // and call publish inside a single block_on so we don't
+            // hold the std-side guards across awaits.
+            let result = tokio::task::block_in_place(|| {
+                self.handle.block_on(async {
+                    let g = self.net.lock().await;
+                    g.publish(topic, bytes).await
+                })
+            });
+            result.map_err(|e| RelayError::Publish(e.to_string()))?;
+            Ok(())
+        }
+    }
+
+    impl ContributorRelay for OmniNetRelay {
+        fn publish_job(
+            &mut self,
+            msg: &NetworkPostedJobAnnouncement,
+        ) -> Result<(), RelayError> {
+            let bytes = serde_json::to_vec(msg)?;
+            self.publish_topic(TOPIC_CONTRIBUTOR_JOB, bytes)
+        }
+
+        fn publish_result(
+            &mut self,
+            msg: &NetworkPostedResultAnnouncement,
+        ) -> Result<(), RelayError> {
+            let bytes = serde_json::to_vec(msg)?;
+            self.publish_topic(TOPIC_CONTRIBUTOR_RESULT, bytes)
+        }
+
+        fn poll_jobs(
+            &mut self,
+        ) -> Result<Vec<NetworkPostedJobAnnouncement>, RelayError> {
+            self.drain_events();
+            let mut q = self.pending_jobs.lock().expect("pending_jobs poisoned");
+            Ok(q.drain(..).collect())
+        }
+
+        fn poll_results(
+            &mut self,
+        ) -> Result<Vec<NetworkPostedResultAnnouncement>, RelayError> {
+            self.drain_events();
+            let mut q = self.pending_results.lock().expect("pending_results poisoned");
+            Ok(q.drain(..).collect())
+        }
+    }
+}

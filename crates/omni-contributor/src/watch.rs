@@ -95,6 +95,24 @@ pub struct WatchOptions<'a> {
     /// Caller-supplied event emitter. Watch-loop tests use an
     /// in-memory collector; the CLI passes a stdout emitter.
     pub emit: &'a mut dyn EventEmitter,
+    /// Optional Stage 12.2 hook: after a result link is published to
+    /// SNIP (`publish_link == true`), forward the just-published
+    /// link to a broadcaster so it can build + sign a
+    /// `NetworkPostedResultAnnouncement` and post it to the mesh.
+    /// `None` (the default) means "publish to SNIP only"; this is
+    /// what Stage 12.1's filesystem-only watch path used.
+    pub result_broadcaster: Option<&'a mut dyn ResultBroadcaster>,
+}
+
+/// Stage 12.2 broadcaster hook: receives a `PublishedResultLink` from
+/// the watch loop after a successful SNIP publish and is responsible
+/// for building + signing the `NetworkPostedResultAnnouncement` and
+/// posting it to the mesh.
+///
+/// Failures are reported as `String` and surface to the watch loop
+/// as a `WatchEvent::Error`; the loop continues on the next poll.
+pub trait ResultBroadcaster {
+    fn broadcast(&mut self, published: &PublishedResultLink) -> Result<(), String>;
 }
 
 /// Per-iteration event surface. The CLI's emitter prints
@@ -245,7 +263,7 @@ fn skip_reason_str(r: &SkipReason) -> String {
 pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
     adapter: &A,
     source: &mut S,
-    opts: WatchOptions<'_>,
+    mut opts: WatchOptions<'_>,
 ) -> Result<(), ContributorError> {
     std::fs::create_dir_all(&opts.result_out_dir)?;
 
@@ -615,7 +633,7 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
 
             // 3h. Optionally publish a PostedResultLink.
             if opts.publish_link {
-                if let Err(e) = publish_result_link_for(
+                match publish_result_link_for(
                     adapter,
                     &posted,
                     &result_json,
@@ -623,10 +641,32 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
                     opts.signer,
                     &mut *opts.emit,
                 ) {
-                    opts.emit.emit(WatchEvent::Error {
-                        context: format!("publish_result_link posted_id={}", posted.posted_id),
-                        message: e.to_string(),
-                    });
+                    Ok(published) => {
+                        // 3i. Stage 12.2 — if a network broadcaster
+                        // is wired in, hand it the just-published
+                        // link so it can broadcast a
+                        // NetworkPostedResultAnnouncement on the
+                        // mesh. A SNIP publish without a broadcast
+                        // is still a valid stage 12.1 path; failure
+                        // here doesn't undo the SNIP publish.
+                        if let Some(b) = opts.result_broadcaster.as_mut() {
+                            if let Err(e) = b.broadcast(&published) {
+                                opts.emit.emit(WatchEvent::Error {
+                                    context: format!(
+                                        "broadcast_result_link posted_id={}",
+                                        posted.posted_id
+                                    ),
+                                    message: e,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        opts.emit.emit(WatchEvent::Error {
+                            context: format!("publish_result_link posted_id={}", posted.posted_id),
+                            message: e.to_string(),
+                        });
+                    }
                 }
             }
 
@@ -782,6 +822,179 @@ pub fn publish_result_link_for<A: SnipV2Adapter, E: EventEmitter + ?Sized>(
         result_snip_root: result_root,
         link_snip_root: link_root,
     })
+}
+
+// ── Stage 12.2 — result-announcement processing helper ────────────────────
+//
+// Used by both the omni-node `watch-network-results` CLI handler and
+// the watch_network_results integration test. Validates the
+// announcer signature, fetches the PostedResultLink from SNIP,
+// schema-validates + drift-guards it, applies the posted_id filter,
+// and writes the link bytes to disk. Returns a typed outcome enum
+// so callers can route per-announcement results into bare-stdout
+// events / typed test assertions without duplicating logic.
+
+use crate::net::NetworkPostedResultAnnouncement;
+
+/// Per-announcement outcome from [`process_result_announcement`].
+/// Each variant is one bare-stdout line the CLI emits and one typed
+/// test assertion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultAnnouncementOutcome {
+    /// The announcement passed every check and the link envelope
+    /// was written to disk at `link_path`.
+    LinkWritten {
+        posted_id: String,
+        link_path: std::path::PathBuf,
+    },
+    /// The announcer's signature did not verify.
+    AnnouncerSignatureFailed { posted_id: String },
+    /// The announcement's schema is malformed.
+    SchemaMalformed { posted_id: String, message: String },
+    /// `--posted-id` filter is set and this posted_id is not in it.
+    FilteredOut { posted_id: String },
+    /// SNIP fetch failed (root malformed or transport error).
+    SnipFetchFailed { posted_id: String, message: String },
+    /// The fetched bytes don't parse as PostedResultLink.
+    LinkParseFailed { posted_id: String, message: String },
+    /// The fetched PostedResultLink's schema is invalid.
+    LinkSchemaInvalid { posted_id: String, message: String },
+    /// The fetched PostedResultLink's `contributor_signature_hex`
+    /// did not verify against `contributor_pubkey_hex` over the
+    /// canonical signing input. Distinct from
+    /// `AnnouncerSignatureFailed`: an honest relayer can announce a
+    /// link whose contributor signature is forged, and we must
+    /// reject the link before trusting any of its fields.
+    LinkContributorSignatureFailed { posted_id: String },
+    /// Drift: announcement's claimed posted_id / result_canonical_hash
+    /// / contributor_pubkey_hex disagrees with the fetched link.
+    LinkDrift { posted_id: String, field: &'static str },
+}
+
+/// Process one result announcement. Inert side-effects:
+///   - Writes `<result_out_dir>/<posted_id>.link.json` on success.
+///   - Returns a typed outcome describing what happened.
+pub fn process_result_announcement<A: SnipV2Adapter + ?Sized>(
+    ann: &NetworkPostedResultAnnouncement,
+    adapter: &A,
+    posted_id_filter: &std::collections::HashSet<String>,
+    result_out_dir: &std::path::Path,
+) -> ResultAnnouncementOutcome {
+    let posted_id = ann.posted_id.clone();
+
+    if let Err(e) = ann.validate_schema() {
+        return ResultAnnouncementOutcome::SchemaMalformed {
+            posted_id,
+            message: e.to_string(),
+        };
+    }
+
+    let signing_input =
+        match crate::canonical::network_result_announcement_signing_input(ann) {
+            Ok(b) => b,
+            Err(e) => {
+                return ResultAnnouncementOutcome::SchemaMalformed {
+                    posted_id,
+                    message: e.to_string(),
+                };
+            }
+        };
+    let sig_ok = match crate::signing::verify_signature_hex(
+        &ann.announcer_pubkey_hex,
+        &signing_input,
+        &ann.announcer_signature_hex,
+    ) {
+        Ok(v) => v,
+        Err(_) => false,
+    };
+    if !sig_ok {
+        return ResultAnnouncementOutcome::AnnouncerSignatureFailed { posted_id };
+    }
+
+    if !posted_id_filter.is_empty() && !posted_id_filter.contains(&posted_id) {
+        return ResultAnnouncementOutcome::FilteredOut { posted_id };
+    }
+
+    let snip_root = match SnipV2ObjectId::from_hex(&ann.posted_result_link_snip_root) {
+        Ok(r) => r,
+        Err(e) => {
+            return ResultAnnouncementOutcome::SnipFetchFailed {
+                posted_id,
+                message: format!("bad snip root: {e:?}"),
+            };
+        }
+    };
+    let bytes = match crate::snip::fetch_bytes(adapter, &snip_root) {
+        Ok(b) => b,
+        Err(e) => {
+            return ResultAnnouncementOutcome::SnipFetchFailed {
+                posted_id,
+                message: e.to_string(),
+            };
+        }
+    };
+    let link: PostedResultLink = match serde_json::from_slice(&bytes) {
+        Ok(l) => l,
+        Err(e) => {
+            return ResultAnnouncementOutcome::LinkParseFailed {
+                posted_id,
+                message: e.to_string(),
+            };
+        }
+    };
+    if let Err(e) = link.validate_schema() {
+        return ResultAnnouncementOutcome::LinkSchemaInvalid {
+            posted_id,
+            message: e.to_string(),
+        };
+    }
+    // Verify the contributor signature on the fetched link before
+    // trusting any of its fields. The announcer's signature only
+    // attests to the announcement envelope; the contributor's
+    // signature is the trust root for the link payload.
+    let link_signing_input =
+        match crate::canonical::posted_result_link_signing_input(&link) {
+            Ok(b) => b,
+            Err(e) => {
+                return ResultAnnouncementOutcome::LinkSchemaInvalid {
+                    posted_id,
+                    message: e.to_string(),
+                };
+            }
+        };
+    let link_sig_ok = crate::signing::verify_signature_hex(
+        &link.contributor_pubkey_hex,
+        &link_signing_input,
+        &link.contributor_signature_hex,
+    )
+    .unwrap_or(false);
+    if !link_sig_ok {
+        return ResultAnnouncementOutcome::LinkContributorSignatureFailed { posted_id };
+    }
+    if link.posted_id != ann.posted_id {
+        return ResultAnnouncementOutcome::LinkDrift { posted_id, field: "posted_id" };
+    }
+    if link.result_canonical_hash != ann.result_canonical_hash {
+        return ResultAnnouncementOutcome::LinkDrift {
+            posted_id,
+            field: "result_canonical_hash",
+        };
+    }
+    if link.contributor_pubkey_hex != ann.contributor_pubkey_hex {
+        return ResultAnnouncementOutcome::LinkDrift {
+            posted_id,
+            field: "contributor_pubkey_hex",
+        };
+    }
+
+    let link_path = result_out_dir.join(format!("{}.link.json", ann.posted_id));
+    if let Err(e) = std::fs::write(&link_path, &bytes) {
+        return ResultAnnouncementOutcome::SnipFetchFailed {
+            posted_id,
+            message: format!("write link file: {e}"),
+        };
+    }
+    ResultAnnouncementOutcome::LinkWritten { posted_id, link_path }
 }
 
 // Quiet unused warnings on items the CLI surface consumes:

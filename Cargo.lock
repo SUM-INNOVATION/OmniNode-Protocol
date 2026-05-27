@@ -2564,12 +2564,14 @@ dependencies = [
  "blake3",
  "chrono",
  "libp2p-identity",
+ "omni-net",
  "omni-store",
  "omni-types",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

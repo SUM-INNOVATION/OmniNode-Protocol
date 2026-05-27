@@ -42,7 +42,9 @@ pub mod canonical;
 pub mod discover;
 pub mod error;
 pub mod job;
+pub mod net;
 pub mod posted;
+pub mod relay;
 pub mod result;
 pub mod run;
 pub mod runner;
@@ -51,11 +53,17 @@ pub mod snip;
 pub mod verify;
 pub mod watch;
 
-pub use discover::{DiscoveredEntry, FilesystemSource, JobSource};
+pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
-    CanonicalError, ContributorError, DiscoverError, RunnerError, SchemaError, SigningError,
-    SnipError, VerifyError,
+    CanonicalError, ContributorError, DiscoverError, RelayError, RunnerError, SchemaError,
+    SigningError, SnipError, VerifyError,
 };
+pub use net::{
+    NetworkPostedJobAnnouncement, NetworkPostedResultAnnouncement, NET_SCHEMA_VERSION,
+};
+pub use relay::{ContributorRelay, InMemoryRelay};
+#[cfg(feature = "network")]
+pub use relay::OmniNetRelay;
 pub use job::{
     BaseUnitRewardPolicy, ContributorJob, JobAccounting, VerificationRequirement,
 };
@@ -68,6 +76,7 @@ pub use runner::{ExternalCommandRunner, InferenceRunner, RunOutput, StubRunner};
 pub use signing::{ContributorSigner, DispatcherSigner};
 pub use verify::{verify_result, VerifyOutcome};
 pub use watch::{
-    publish_result_link_for, run_watch_loop, AcceptFilters, CostCaps, EventEmitter,
-    PublishedResultLink, SkipReason, StdoutEmitter, WatchEvent, WatchOptions,
+    process_result_announcement, publish_result_link_for, run_watch_loop, AcceptFilters,
+    CostCaps, EventEmitter, PublishedResultLink, ResultAnnouncementOutcome,
+    ResultBroadcaster, SkipReason, StdoutEmitter, WatchEvent, WatchOptions,
 };

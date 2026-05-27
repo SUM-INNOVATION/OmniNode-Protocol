@@ -374,6 +374,122 @@ pub fn posted_result_link_signing_input(
     canonical_posted_result_link_bytes(r)
 }
 
+// ── Stage 12.2 — network announcement canonical bytes ─────────────────────
+//
+// `NetworkPostedJobAnnouncement` and `NetworkPostedResultAnnouncement`
+// each get their own domain separator, distinct from the 12.0/12.1
+// separators and from any chain-wire tag. Bincode 1.3 wire layout;
+// field order frozen for `schema_version: 1`.
+
+use crate::net::{NetworkPostedJobAnnouncement, NetworkPostedResultAnnouncement};
+
+/// Domain separator for the canonical network-posted-job-announcement
+/// byte sequence (32 ASCII bytes).
+pub const NET_JOB_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-NET-JOB:v1:";
+
+/// Domain separator for the canonical network-posted-result-announcement
+/// byte sequence (35 ASCII bytes).
+pub const NET_RESULT_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-NET-RESULT:v1:";
+
+/// Frozen-layout view of a `NetworkPostedJobAnnouncement` for
+/// canonical encoding. Excludes `announcer_signature_hex` (the
+/// signer can't include its own signature in its signing input);
+/// **includes** `announcer_pubkey_hex` so the signature binds to
+/// the claimed pubkey.
+#[derive(Debug, Serialize)]
+struct NetworkJobCanonicalBody<'a> {
+    schema_version: u32,
+    posted_job_snip_root: &'a str,
+    posted_id: &'a str,
+    job_hash: &'a str,
+    model_hash: &'a str,
+    tokenizer_hash: Option<&'a str>,
+    announced_at_utc: &'a str,
+    announcer_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a NetworkPostedJobAnnouncement> for NetworkJobCanonicalBody<'a> {
+    fn from(a: &'a NetworkPostedJobAnnouncement) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            posted_job_snip_root: &a.posted_job_snip_root,
+            posted_id: &a.posted_id,
+            job_hash: &a.job_hash,
+            model_hash: &a.model_hash,
+            tokenizer_hash: a.tokenizer_hash.as_deref(),
+            announced_at_utc: &a.announced_at_utc,
+            announcer_pubkey_hex: &a.announcer_pubkey_hex,
+        }
+    }
+}
+
+/// `NET_JOB_DOMAIN || bincode1::serialize(&canonical_body)`.
+pub fn canonical_network_job_announcement_bytes(
+    a: &NetworkPostedJobAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: NetworkJobCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(NET_JOB_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(NET_JOB_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// Bytes the announcer signs over (same as
+/// `canonical_network_job_announcement_bytes`).
+pub fn network_job_announcement_signing_input(
+    a: &NetworkPostedJobAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_network_job_announcement_bytes(a)
+}
+
+/// Frozen-layout view of a `NetworkPostedResultAnnouncement` for
+/// canonical encoding. Excludes `announcer_signature_hex`.
+#[derive(Debug, Serialize)]
+struct NetworkResultCanonicalBody<'a> {
+    schema_version: u32,
+    posted_id: &'a str,
+    posted_result_link_snip_root: &'a str,
+    result_canonical_hash: &'a str,
+    contributor_pubkey_hex: &'a str,
+    announced_at_utc: &'a str,
+    announcer_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a NetworkPostedResultAnnouncement> for NetworkResultCanonicalBody<'a> {
+    fn from(a: &'a NetworkPostedResultAnnouncement) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            posted_id: &a.posted_id,
+            posted_result_link_snip_root: &a.posted_result_link_snip_root,
+            result_canonical_hash: &a.result_canonical_hash,
+            contributor_pubkey_hex: &a.contributor_pubkey_hex,
+            announced_at_utc: &a.announced_at_utc,
+            announcer_pubkey_hex: &a.announcer_pubkey_hex,
+        }
+    }
+}
+
+/// `NET_RESULT_DOMAIN || bincode1::serialize(&canonical_body)`.
+pub fn canonical_network_result_announcement_bytes(
+    a: &NetworkPostedResultAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: NetworkResultCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(NET_RESULT_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(NET_RESULT_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// Bytes the announcer signs over (same as
+/// `canonical_network_result_announcement_bytes`).
+pub fn network_result_announcement_signing_input(
+    a: &NetworkPostedResultAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_network_result_announcement_bytes(a)
+}
+
 // ── Hex helpers ───────────────────────────────────────────────────────────
 
 /// Lowercase-hex encode raw bytes (no `0x` prefix). Used throughout
