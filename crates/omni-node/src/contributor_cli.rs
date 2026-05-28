@@ -115,6 +115,13 @@ enum ContributorCmd {
     /// tree (`session.json`, `joins/`, `assignments/`, `partials/`,
     /// `aggregated.json`) under `--out-dir`.
     WatchSessions(WatchSessionsArgs),
+
+    /// Stage 12.4 — diagnostic: send a single `ActivationHandoff`
+    /// envelope from an already-computed activation file. Useful
+    /// for testing live pipelines without invoking a full
+    /// `run-assignment`. Production handoffs flow through
+    /// `run-assignment --activation-out-mode live|both`.
+    SendHandoff(SendHandoffArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -759,10 +766,93 @@ struct RunAssignmentArgs {
     #[arg(long, default_value_t = 500)]
     mesh_stabilize_ms: u64,
 
+    // ── Stage 12.4 — live activation handoff (opt-in) ────────────
+
+    /// Stage 12.4 — SNIP V2 root of an upstream `WorkAssignment`.
+    /// Required when `--activation-in-mode snip` (fetch upstream
+    /// partial from SNIP) or `--activation-in-mode live` (resolve
+    /// the upstream contributor for handoff matching). At most one
+    /// upstream supported at v1 (strict linear pipeline).
+    #[arg(long)]
+    upstream_from_assignment_snip_root: Option<String>,
+
+    /// Stage 12.4 — operator-supplied libp2p PeerId (or full
+    /// `/p2p/...` multiaddr) of the downstream contributor that
+    /// should receive this stage's output activation. When set,
+    /// default `--activation-out-mode` flips to `both`. v1 does NOT
+    /// extend `ContributorJoin` with peer-id; PeerId discovery via
+    /// signed contributor advertisements is Stage 12.5+.
+    #[arg(long)]
+    downstream_to_peer: Option<String>,
+
+    /// Stage 12.4 — SNIP V2 root of the downstream `WorkAssignment`
+    /// (the stage that will receive our output activation). Required
+    /// when `--downstream-to-peer` is set.
+    #[arg(long)]
+    downstream_to_assignment_snip_root: Option<String>,
+
+    /// Stage 12.4 — upstream activation source.
+    /// - `none` (default if no upstream root supplied): first stage.
+    /// - `live`: wait for an `ActivationHandoff` over omni-net.
+    /// - `snip`: fetch upstream partial from SNIP.
+    #[arg(long, value_enum, default_value_t = ActivationInMode::None)]
+    activation_in_mode: ActivationInMode,
+
+    /// Stage 12.4 — output activation routing.
+    /// Default depends on whether downstream peer+assignment are set:
+    ///   downstream present → `both` (live for latency, SNIP for audit)
+    ///   downstream absent  → `snip` (Stage 12.3 behavior, default)
+    /// Set explicitly to override.
+    #[arg(long, value_enum)]
+    activation_out_mode: Option<ActivationOutMode>,
+
+    /// Stage 12.4 — bounded wait for the upstream live handoff
+    /// (seconds).
+    #[arg(long, default_value_t = 60)]
+    upstream_wait_secs: u64,
+
+    /// Stage 12.4 — operator-supplied PeerId/multiaddr of the
+    /// upstream contributor. Used as an advisory hint for what
+    /// to expect on the receive side; not required for verification
+    /// (the signed inner envelope is the trust root).
+    #[arg(long)]
+    upstream_from_peer: Option<String>,
+
+    /// Stage 12.4 — max chunk size (bytes) for outgoing handoffs.
+    /// Must be > 0 (`0` would `div_ceil` to a panic).
+    #[arg(
+        long,
+        default_value_t = 64 * 1024 * 1024,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    handoff_chunk_max_bytes: u64,
+
     #[arg(long, default_value = "sum-node")]
     snip_binary: PathBuf,
     #[arg(long)]
     snip_seed: Option<PathBuf>,
+}
+
+/// Stage 12.4 — upstream activation source for `run-assignment`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ActivationInMode {
+    None,
+    Live,
+    Snip,
+}
+
+/// Stage 12.4 — output activation routing for `run-assignment`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ActivationOutMode {
+    /// 12.3 behavior: publish partial to SNIP; do not send live.
+    Snip,
+    /// Send live via omni-net request_tensor; do not publish to SNIP.
+    Live,
+    /// Send live AND publish to SNIP. Default when downstream peer
+    /// + assignment are supplied.
+    Both,
+    /// Do nothing (last stage, no audit publish).
+    None,
 }
 
 #[derive(Args)]
@@ -815,6 +905,90 @@ struct AggregateSessionArgs {
 }
 
 #[derive(Args)]
+struct SendHandoffArgs {
+    /// SNIP V2 root of the open `ExecutionSession`.
+    #[arg(long)]
+    execution_session_snip_root: String,
+
+    /// SNIP V2 root of the from-side `WorkAssignment` (the stage
+    /// whose output activation is being sent).
+    #[arg(long)]
+    from_assignment_snip_root: String,
+
+    /// SNIP V2 root of the to-side `WorkAssignment` (the receiver).
+    #[arg(long)]
+    to_assignment_snip_root: String,
+
+    /// 32-byte raw contributor seed file. Must correspond to the
+    /// from-assignment's `contributor_pubkey_hex`.
+    #[arg(long)]
+    from_contributor_seed: PathBuf,
+
+    /// Path to the raw activation bytes file (whatever the from-stage
+    /// runner emitted).
+    #[arg(long)]
+    activation_file: PathBuf,
+
+    /// Tensor dtype.
+    #[arg(long, value_enum)]
+    dtype: CliTensorDtype,
+
+    /// Tensor shape, comma-separated (e.g. `--shape 32,4096`).
+    #[arg(long, value_delimiter = ',')]
+    shape: Vec<u64>,
+
+    /// libp2p PeerId or `/p2p/...` multiaddr of the receiver. v1
+    /// operator-supplied (no signed peer advertisement yet —
+    /// Stage 12.5+).
+    #[arg(long)]
+    to_peer: String,
+
+    /// Max bytes per chunk; bigger activations are split.
+    /// Must be > 0 (`0` would `div_ceil` to a panic).
+    #[arg(
+        long,
+        default_value_t = 64 * 1024 * 1024,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    chunk_max_bytes: u64,
+
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+    #[arg(long, default_value_t = 200)]
+    propagation_wait_ms: u64,
+    #[arg(long, default_value_t = 30)]
+    peer_wait_secs: u64,
+    #[arg(long, default_value_t = 500)]
+    mesh_stabilize_ms: u64,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
+/// CLI mirror of `omni_contributor::TensorDtype`. Avoid pulling clap
+/// derives into the contributor crate.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CliTensorDtype {
+    F16,
+    Bf16,
+    F32,
+}
+
+impl From<CliTensorDtype> for omni_contributor::TensorDtype {
+    fn from(d: CliTensorDtype) -> Self {
+        match d {
+            CliTensorDtype::F16 => omni_contributor::TensorDtype::F16,
+            CliTensorDtype::Bf16 => omni_contributor::TensorDtype::Bf16,
+            CliTensorDtype::F32 => omni_contributor::TensorDtype::F32,
+        }
+    }
+}
+
+#[derive(Args)]
 struct WatchSessionsArgs {
     /// Root directory under which per-session subdirectories are
     /// written (`<out-dir>/<session_id>/...`).
@@ -864,6 +1038,7 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::RunAssignment(a) => run_assignment(a).await,
         ContributorCmd::AggregateSession(a) => run_aggregate_session(a).await,
         ContributorCmd::WatchSessions(a) => run_watch_sessions(a).await,
+        ContributorCmd::SendHandoff(a) => run_send_handoff(a).await,
     }
 }
 
@@ -2123,8 +2298,9 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
     use omni_contributor::runner::{ExternalCommandRunner, StubRunner};
     use omni_contributor::{
         ContributorRelay, ContributorSigner, InferenceRunner,
-        NetworkPartialResultAnnouncement, OmniNetRelay, PartialContributorResult,
-        WorkAssignment, NET_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
+        NetworkPartialResultAnnouncement, OmniNetRelay, OmniNetTensorTransport,
+        PartialContributorResult, WorkAssignment, NET_SCHEMA_VERSION,
+        SESSION_SCHEMA_VERSION,
     };
     use omni_contributor::result::{MeasuredAccounting, StageContribution};
     use omni_types::phase5::SnipV2ObjectId;
@@ -2132,7 +2308,7 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
     let snip = build_snip_adapter(args.snip_binary, args.snip_seed);
     let session = fetch_and_verify_session(&snip, &args.execution_session_snip_root)?;
 
-    // Fetch + parse + structurally-validate the assignment.
+    // Fetch + parse + structurally-validate this stage's assignment.
     let asn_root = SnipV2ObjectId::from_hex(&args.assignment_snip_root)
         .map_err(|e| anyhow!("bad assignment snip root: {e:?}"))?;
     let asn_bytes = omni_contributor::snip::fetch_bytes(&snip, &asn_root)
@@ -2155,14 +2331,163 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
         ));
     }
 
-    // Build the runner. The session's job_hash is the manifest's role
-    // for the existing runner trait; Stage 12.3 keeps runner I/O
-    // opaque — the partial artifact is whatever the runner returns.
-    // For 12.3 a runner is invoked with an empty manifest path +
-    // empty input bytes (operators wire real inputs through
-    // `--external-arg`s on the external runner if needed).
+    // Stage 12.4 — resolve the effective out-mode.
+    let downstream_present = args.downstream_to_peer.is_some()
+        && args.downstream_to_assignment_snip_root.is_some();
+    let activation_out_mode = match args.activation_out_mode {
+        Some(m) => m,
+        None => {
+            if downstream_present {
+                // Live handoff with SNIP audit (12.4 default for
+                // pipelined stages).
+                ActivationOutMode::Both
+            } else {
+                // No downstream supplied — preserve 12.3 behavior.
+                ActivationOutMode::Snip
+            }
+        }
+    };
+    if matches!(
+        activation_out_mode,
+        ActivationOutMode::Live | ActivationOutMode::Both
+    ) && !downstream_present
+    {
+        return Err(anyhow!(
+            "activation-out-mode={:?} requires both --downstream-to-peer \
+             and --downstream-to-assignment-snip-root",
+            activation_out_mode
+        ));
+    }
+    if args.activation_in_mode == ActivationInMode::Live
+        && args.upstream_from_assignment_snip_root.is_none()
+    {
+        return Err(anyhow!(
+            "activation-in-mode=live requires --upstream-from-assignment-snip-root"
+        ));
+    }
+    if args.activation_in_mode == ActivationInMode::Snip {
+        return Err(anyhow!(
+            "activation-in-mode=snip not implemented in 12.4 v1; \
+             use `none` (first stage) or `live` (omni-net handoff)"
+        ));
+    }
+
+    // Stage 12.4 — fetch downstream assignment (if needed) once,
+    // up-front. This is the assignment our output activation will
+    // be handed off to.
+    let downstream_assignment: Option<WorkAssignment> =
+        if let Some(root_hex) = args.downstream_to_assignment_snip_root.as_deref() {
+            let root = SnipV2ObjectId::from_hex(root_hex)
+                .map_err(|e| anyhow!("bad downstream assignment snip root: {e:?}"))?;
+            let bytes = omni_contributor::snip::fetch_bytes(&snip, &root)
+                .map_err(|e| anyhow!("snip fetch downstream assignment: {e}"))?;
+            let a: WorkAssignment =
+                serde_json::from_slice(&bytes).map_err(|e| anyhow!("parse: {e}"))?;
+            a.validate_schema()
+                .map_err(|e| anyhow!("invalid downstream WorkAssignment: {e}"))?;
+            if a.session_id != session.session_id {
+                return Err(anyhow!(
+                    "downstream assignment.session_id != session.session_id"
+                ));
+            }
+            // v1 strict linear pipeline.
+            if a.stage_index != assignment.stage_index.wrapping_add(1) {
+                return Err(anyhow!(
+                    "downstream assignment.stage_index ({}) must equal this stage's \
+                     + 1 ({})",
+                    a.stage_index,
+                    assignment.stage_index + 1
+                ));
+            }
+            Some(a)
+        } else {
+            None
+        };
+
+    // Stage 12.4 — fetch upstream assignment (if needed).
+    let upstream_assignment: Option<WorkAssignment> =
+        if let Some(root_hex) = args.upstream_from_assignment_snip_root.as_deref() {
+            let root = SnipV2ObjectId::from_hex(root_hex)
+                .map_err(|e| anyhow!("bad upstream assignment snip root: {e:?}"))?;
+            let bytes = omni_contributor::snip::fetch_bytes(&snip, &root)
+                .map_err(|e| anyhow!("snip fetch upstream assignment: {e}"))?;
+            let a: WorkAssignment =
+                serde_json::from_slice(&bytes).map_err(|e| anyhow!("parse: {e}"))?;
+            a.validate_schema()
+                .map_err(|e| anyhow!("invalid upstream WorkAssignment: {e}"))?;
+            if a.session_id != session.session_id {
+                return Err(anyhow!(
+                    "upstream assignment.session_id != session.session_id"
+                ));
+            }
+            if a.stage_index.wrapping_add(1) != assignment.stage_index {
+                return Err(anyhow!(
+                    "upstream assignment.stage_index ({}) + 1 must equal this stage's ({})",
+                    a.stage_index,
+                    assignment.stage_index
+                ));
+            }
+            Some(a)
+        } else {
+            None
+        };
+
+    let needs_omninet = args.activation_in_mode == ActivationInMode::Live
+        || matches!(
+            activation_out_mode,
+            ActivationOutMode::Live | ActivationOutMode::Both
+        )
+        || matches!(
+            activation_out_mode,
+            ActivationOutMode::Snip | ActivationOutMode::Both
+        );
+
+    // Open OmniNet once if we need it (live transport for handoff,
+    // and/or the 12.3 partial broadcast).
+    let net_and_handle = if needs_omninet {
+        Some(
+            open_omninet_with_peer_wait(
+                args.listen_port,
+                args.peer,
+                args.peer_wait_secs,
+                args.mesh_stabilize_ms,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    // Stage 12.4 — receive upstream activation if requested.
+    let upstream_activation_bytes: Option<Vec<u8>> =
+        if args.activation_in_mode == ActivationInMode::Live {
+            let (net, handle) = net_and_handle.as_ref().expect("opened above");
+            let upstream_asn = upstream_assignment
+                .as_ref()
+                .expect("validated above for activation-in=live");
+            let mut transport =
+                OmniNetTensorTransport::new(net.clone(), handle.clone());
+            let bytes = live_receive_activation(
+                &mut transport,
+                &session,
+                upstream_asn,
+                &assignment,
+                args.upstream_wait_secs,
+            )
+            .await?;
+            println!(
+                "event=upstream_activation_received bytes={} from_assignment_id={}",
+                bytes.len(),
+                upstream_asn.assignment_id
+            );
+            Some(bytes)
+        } else {
+            None
+        };
+
+    // Build the runner.
     let empty_manifest = std::path::PathBuf::from("/dev/null");
-    let runner_output = match args.runner {
+    let runner_output_with_act = match args.runner {
         RunnerChoice::Stub => {
             let bytes = std::fs::read(
                 args.stub_response
@@ -2175,8 +2500,12 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
                 args.stub_input_tokens,
                 args.stub_output_tokens,
             );
-            r.run(&empty_manifest, b"")
-                .map_err(|e| anyhow!("runner: {e}"))?
+            r.run_with_activations(
+                &empty_manifest,
+                b"",
+                upstream_activation_bytes.as_deref(),
+            )
+            .map_err(|e| anyhow!("runner: {e}"))?
         }
         RunnerChoice::External => {
             let mut r = ExternalCommandRunner::new(
@@ -2185,83 +2514,269 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
             );
             r.extra_args = args.external_args;
             r.env_allowlist = args.external_env_allow;
-            r.run(&empty_manifest, b"")
-                .map_err(|e| anyhow!("runner: {e}"))?
+            r.run_with_activations(
+                &empty_manifest,
+                b"",
+                upstream_activation_bytes.as_deref(),
+            )
+            .map_err(|e| anyhow!("runner: {e}"))?
         }
     };
+    let runner_output = runner_output_with_act.run_output;
+    let output_activation = runner_output_with_act.output_activation;
 
-    // Publish the runner's response bytes as the partial artifact.
-    let artifact_root = omni_contributor::snip::publish_bytes(
-        &snip,
-        &runner_output.response_bytes,
-        "partial-artifact",
-    )
-    .map_err(|e| anyhow!("snip publish artifact: {e}"))?;
-    let artifact_root_hex = format!("0x{}", hex_lower(artifact_root.as_bytes()));
-    let artifact_hash =
-        hex_lower(blake3::hash(&runner_output.response_bytes).as_bytes());
+    // Stage 12.4 — publish to SNIP only if the mode requests it.
+    let publish_to_snip = matches!(
+        activation_out_mode,
+        ActivationOutMode::Snip | ActivationOutMode::Both
+    );
 
-    // Stage accounting: structural-only at 12.3. Use the
-    // assignment's pre-declared work-unit kind.
-    let measured = MeasuredAccounting {
-        tokenizer_hash: session
-            .tokenizer_hash
-            .clone()
-            .unwrap_or_else(|| "00".repeat(32)),
-        input_token_count: runner_output.measured_input_tokens,
-        output_token_count: runner_output.measured_output_tokens,
-        total_base_units: runner_output
-            .measured_input_tokens
-            .saturating_add(runner_output.measured_output_tokens),
-        stage_contributions: vec![StageContribution {
+    // SNIP path: publish artifact + sign partial + broadcast
+    // NetworkPartialResultAnnouncement (Stage 12.3 behavior). Skipped
+    // entirely on `live` / `none` modes.
+    let (mut partial_root_hex, mut artifact_root_hex, mut partial_canonical_hash) =
+        (String::new(), String::new(), String::new());
+    if publish_to_snip {
+        let artifact_root = omni_contributor::snip::publish_bytes(
+            &snip,
+            &runner_output.response_bytes,
+            "partial-artifact",
+        )
+        .map_err(|e| anyhow!("snip publish artifact: {e}"))?;
+        artifact_root_hex = format!("0x{}", hex_lower(artifact_root.as_bytes()));
+        let artifact_hash =
+            hex_lower(blake3::hash(&runner_output.response_bytes).as_bytes());
+
+        let measured = MeasuredAccounting {
+            tokenizer_hash: session
+                .tokenizer_hash
+                .clone()
+                .unwrap_or_else(|| "00".repeat(32)),
+            input_token_count: runner_output.measured_input_tokens,
+            output_token_count: runner_output.measured_output_tokens,
+            total_base_units: runner_output
+                .measured_input_tokens
+                .saturating_add(runner_output.measured_output_tokens),
+            stage_contributions: vec![StageContribution {
+                contributor_pubkey_hex: contrib.pubkey_hex(),
+                stage_label: format!("stage-{}", assignment.stage_index),
+                work_unit_kind: assignment.expected_work_unit_kind,
+                work_units: assignment.expected_work_units,
+            }],
+        };
+
+        let mut partial = PartialContributorResult {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: session.session_id.clone(),
+            assignment_id: assignment.assignment_id.clone(),
             contributor_pubkey_hex: contrib.pubkey_hex(),
-            stage_label: format!("stage-{}", assignment.stage_index),
-            work_unit_kind: assignment.expected_work_unit_kind,
-            work_units: assignment.expected_work_units,
-        }],
-    };
+            partial_artifact_snip_root: artifact_root_hex.clone(),
+            partial_artifact_hash: artifact_hash,
+            measured_accounting: measured,
+            produced_at_utc: chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            contributor_signature_hex: String::new(),
+        };
+        let sig_input = partial_result_signing_input(&partial)?;
+        partial.contributor_signature_hex = contrib.sign_hex(&sig_input);
+        partial
+            .validate_schema()
+            .map_err(|e| anyhow!("invalid PartialContributorResult: {e}"))?;
 
-    let mut partial = PartialContributorResult {
-        schema_version: SESSION_SCHEMA_VERSION,
-        session_id: session.session_id.clone(),
-        assignment_id: assignment.assignment_id.clone(),
-        contributor_pubkey_hex: contrib.pubkey_hex(),
-        partial_artifact_snip_root: artifact_root_hex.clone(),
-        partial_artifact_hash: artifact_hash,
-        measured_accounting: measured,
-        produced_at_utc: chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        contributor_signature_hex: String::new(),
+        let partial_json = serde_json::to_vec_pretty(&partial)?;
+        let partial_root =
+            omni_contributor::snip::publish_bytes(&snip, &partial_json, "partial")
+                .map_err(|e| anyhow!("snip publish partial: {e}"))?;
+        partial_root_hex = format!("0x{}", hex_lower(partial_root.as_bytes()));
+        partial_canonical_hash = {
+            let bytes = canonical_partial_result_bytes(&partial)?;
+            hex_lower(blake3::hash(&bytes).as_bytes())
+        };
+
+        let mut ann = NetworkPartialResultAnnouncement {
+            schema_version: NET_SCHEMA_VERSION,
+            partial_result_snip_root: partial_root_hex.clone(),
+            session_id: session.session_id.clone(),
+            assignment_id: assignment.assignment_id.clone(),
+            contributor_pubkey_hex: contrib.pubkey_hex(),
+            announced_at_utc: chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            announcer_pubkey_hex: contrib.pubkey_hex(),
+            announcer_signature_hex: String::new(),
+        };
+        let ann_sig = net_partial_signing_input(&ann)?;
+        ann.announcer_signature_hex = contrib.sign_hex(&ann_sig);
+
+        let (net, handle) = net_and_handle.as_ref().expect("opened above");
+        let mut relay = OmniNetRelay::new(net.clone(), handle.clone());
+        relay
+            .publish_partial_result(&ann)
+            .map_err(|e| anyhow!("publish: {e}"))?;
+    }
+
+    // Stage 12.4 — live send if the mode requests it.
+    let live_handoff_sent = matches!(
+        activation_out_mode,
+        ActivationOutMode::Live | ActivationOutMode::Both
+    );
+    if live_handoff_sent {
+        // Stage 12.4: live handoff requires typed activation
+        // metadata from the runner — dtype + shape + bytes. No
+        // silent F16/1-D fallback (review #1 closed that hole).
+        let activation = match output_activation.as_ref() {
+            Some(a) => a,
+            None => {
+                return Err(anyhow!(
+                    "activation-out-mode=live|both requires the runner to declare \
+                     a typed output activation (dtype + shape + bytes). The stub \
+                     runner does not produce one; wire an external runner that emits \
+                     `output_activation_dtype` + `output_activation_shape` in its \
+                     stdout envelope, or fall back to `--activation-out-mode snip|none`."
+                ));
+            }
+        };
+        let downstream_asn = downstream_assignment
+            .as_ref()
+            .expect("validated above for downstream-present");
+        let to_peer = args
+            .downstream_to_peer
+            .as_deref()
+            .expect("validated above for downstream-present");
+        let (net, handle) = net_and_handle.as_ref().expect("opened above");
+        let mut transport =
+            OmniNetTensorTransport::new(net.clone(), handle.clone());
+        live_send_activation(
+            &mut transport,
+            &session,
+            &assignment,
+            downstream_asn,
+            &contrib,
+            activation,
+            to_peer,
+            args.handoff_chunk_max_bytes,
+        )
+        .await?;
+        println!(
+            "event=output_activation_sent bytes={} dtype={:?} shape={:?} \
+             to_peer={} to_assignment_id={}",
+            activation.bytes.len(),
+            activation.dtype,
+            activation.shape,
+            to_peer,
+            downstream_asn.assignment_id
+        );
+    }
+
+    // Settle + shutdown.
+    if let Some((net, _handle)) = net_and_handle {
+        tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
+        let g = net.lock().await;
+        let _ = g.shutdown().await;
+    }
+
+    println!("assignment_id={}", assignment.assignment_id);
+    if publish_to_snip {
+        println!("partial_result_snip_root={partial_root_hex}");
+        println!("partial_artifact_snip_root={artifact_root_hex}");
+        println!("partial_canonical_hash={partial_canonical_hash}");
+        println!("partial=published");
+    } else {
+        // No SNIP partial was published — output is purely live or
+        // intentionally suppressed (`--activation-out-mode live|none`).
+        println!("partial=not_published");
+    }
+    println!("activation_out_mode={activation_out_mode:?}");
+    println!("activation_in_mode={:?}", args.activation_in_mode);
+    println!("live_handoff_sent={live_handoff_sent}");
+    Ok(())
+}
+
+async fn run_send_handoff(args: SendHandoffArgs) -> Result<()> {
+    use omni_contributor::canonical::{
+        activation_handoff_signing_input, hex_lower,
     };
-    let sig_input = partial_result_signing_input(&partial)?;
-    partial.contributor_signature_hex = contrib.sign_hex(&sig_input);
-    partial
+    use omni_contributor::{
+        ActivationHandoff, ContributorSigner, OmniNetTensorTransport, TensorTransport,
+        WorkAssignment, HANDOFF_SCHEMA_VERSION,
+    };
+    use omni_types::phase5::SnipV2ObjectId;
+
+    let snip = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let session = fetch_and_verify_session(&snip, &args.execution_session_snip_root)?;
+
+    // Fetch + validate both from and to assignments.
+    let from_root = SnipV2ObjectId::from_hex(&args.from_assignment_snip_root)
+        .map_err(|e| anyhow!("bad from-assignment snip root: {e:?}"))?;
+    let from_bytes = omni_contributor::snip::fetch_bytes(&snip, &from_root)
+        .map_err(|e| anyhow!("snip fetch from-assignment: {e}"))?;
+    let from_assignment: WorkAssignment = serde_json::from_slice(&from_bytes)
+        .map_err(|e| anyhow!("parse from-assignment: {e}"))?;
+    from_assignment
         .validate_schema()
-        .map_err(|e| anyhow!("invalid PartialContributorResult: {e}"))?;
+        .map_err(|e| anyhow!("invalid from-WorkAssignment: {e}"))?;
 
-    let partial_json = serde_json::to_vec_pretty(&partial)?;
-    let partial_root =
-        omni_contributor::snip::publish_bytes(&snip, &partial_json, "partial")
-            .map_err(|e| anyhow!("snip publish partial: {e}"))?;
-    let partial_root_hex = format!("0x{}", hex_lower(partial_root.as_bytes()));
-    let partial_canonical_hash = {
-        let bytes = canonical_partial_result_bytes(&partial)?;
-        hex_lower(blake3::hash(&bytes).as_bytes())
-    };
+    let to_root = SnipV2ObjectId::from_hex(&args.to_assignment_snip_root)
+        .map_err(|e| anyhow!("bad to-assignment snip root: {e:?}"))?;
+    let to_bytes = omni_contributor::snip::fetch_bytes(&snip, &to_root)
+        .map_err(|e| anyhow!("snip fetch to-assignment: {e}"))?;
+    let to_assignment: WorkAssignment = serde_json::from_slice(&to_bytes)
+        .map_err(|e| anyhow!("parse to-assignment: {e}"))?;
+    to_assignment
+        .validate_schema()
+        .map_err(|e| anyhow!("invalid to-WorkAssignment: {e}"))?;
 
-    let mut ann = NetworkPartialResultAnnouncement {
-        schema_version: NET_SCHEMA_VERSION,
-        partial_result_snip_root: partial_root_hex.clone(),
-        session_id: session.session_id.clone(),
-        assignment_id: assignment.assignment_id.clone(),
-        contributor_pubkey_hex: contrib.pubkey_hex(),
-        announced_at_utc: chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        announcer_pubkey_hex: contrib.pubkey_hex(),
-        announcer_signature_hex: String::new(),
-    };
-    let ann_sig = net_partial_signing_input(&ann)?;
-    ann.announcer_signature_hex = contrib.sign_hex(&ann_sig);
+    if from_assignment.session_id != session.session_id
+        || to_assignment.session_id != session.session_id
+    {
+        return Err(anyhow!("assignment(s) do not belong to the supplied session"));
+    }
+    if to_assignment.stage_index != from_assignment.stage_index.wrapping_add(1) {
+        return Err(anyhow!(
+            "v1 strict linear pipeline: to.stage_index ({}) must equal from.stage_index ({}) + 1",
+            to_assignment.stage_index,
+            from_assignment.stage_index
+        ));
+    }
+
+    let contrib = ContributorSigner::from_seed_file(&args.from_contributor_seed)?;
+    if contrib.pubkey_hex() != from_assignment.contributor_pubkey_hex {
+        return Err(anyhow!(
+            "from-contributor seed pubkey does not match from-assignment.contributor_pubkey_hex"
+        ));
+    }
+
+    // Build the in-memory chunking + sending logic by hand so we
+    // can honor the operator-supplied dtype + shape (vs the
+    // degenerate 1-D shape from the run-assignment fast path).
+    let activation_bytes = std::fs::read(&args.activation_file)
+        .with_context(|| format!("read activation: {}", args.activation_file.display()))?;
+    if activation_bytes.is_empty() {
+        return Err(anyhow!("activation file is empty"));
+    }
+    let byte_len = activation_bytes.len() as u64;
+    let dtype: omni_contributor::TensorDtype = args.dtype.into();
+    let bytes_per_element = dtype.bytes_per_element();
+    let shape_product: u64 = args
+        .shape
+        .iter()
+        .copied()
+        .try_fold(1u64, |acc, d| acc.checked_mul(d))
+        .ok_or_else(|| anyhow!("--shape: overflow when computing element count"))?;
+    if shape_product == 0 {
+        return Err(anyhow!("--shape: zero element count"));
+    }
+    if shape_product * bytes_per_element != byte_len {
+        return Err(anyhow!(
+            "shape product ({shape_product}) * dtype-bytes ({bytes_per_element}) = {} \
+             != activation_file size {byte_len}",
+            shape_product * bytes_per_element
+        ));
+    }
+    let tensor_hash = hex_lower(blake3::hash(&activation_bytes).as_bytes());
+    let chunk_size = args.chunk_max_bytes.min(byte_len) as usize;
+    let chunk_count = (activation_bytes.len()).div_ceil(chunk_size) as u32;
+    let produced_at_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let (net, handle) = open_omninet_with_peer_wait(
         args.listen_port,
@@ -2270,22 +2785,164 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
         args.mesh_stabilize_ms,
     )
     .await?;
-    let mut relay = OmniNetRelay::new(net.clone(), handle);
-    relay
-        .publish_partial_result(&ann)
-        .map_err(|e| anyhow!("publish: {e}"))?;
+    let mut transport = OmniNetTensorTransport::new(net.clone(), handle);
+
+    for chunk_index in 0..chunk_count {
+        let start = chunk_index as usize * chunk_size;
+        let end = ((chunk_index + 1) as usize * chunk_size).min(activation_bytes.len());
+        let chunk_bytes = activation_bytes[start..end].to_vec();
+        let mut h = ActivationHandoff {
+            schema_version: HANDOFF_SCHEMA_VERSION,
+            session_id: session.session_id.clone(),
+            from_assignment_id: from_assignment.assignment_id.clone(),
+            to_assignment_id: to_assignment.assignment_id.clone(),
+            from_contributor_pubkey_hex: from_assignment.contributor_pubkey_hex.clone(),
+            to_contributor_pubkey_hex: to_assignment.contributor_pubkey_hex.clone(),
+            dtype,
+            shape: args.shape.clone(),
+            byte_len,
+            tensor_hash: tensor_hash.clone(),
+            chunk_index,
+            chunk_count,
+            produced_at_utc: produced_at_utc.clone(),
+            tensor_chunk_bytes: chunk_bytes,
+            sender_signature_hex: String::new(),
+        };
+        let si = activation_handoff_signing_input(&h)?;
+        h.sender_signature_hex = contrib.sign_hex(&si);
+        h.validate_schema()
+            .map_err(|e| anyhow!("invalid handoff envelope: {e}"))?;
+        transport
+            .send_handoff(Some(&args.to_peer), &h)
+            .map_err(|e| anyhow!("transport send: {e}"))?;
+        println!(
+            "event=handoff_chunk_sent chunk_index={chunk_index} chunk_count={chunk_count} \
+             bytes={}",
+            end - start
+        );
+    }
     tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     {
         let g = net.lock().await;
         let _ = g.shutdown().await;
     }
-
-    println!("assignment_id={}", assignment.assignment_id);
-    println!("partial_result_snip_root={}", partial_root_hex);
-    println!("partial_artifact_snip_root={}", artifact_root_hex);
-    println!("partial_canonical_hash={}", partial_canonical_hash);
-    println!("partial=published");
+    println!("tensor_hash={tensor_hash}");
+    println!("byte_len={byte_len}");
+    println!("chunk_count={chunk_count}");
+    println!("handoff=sent");
     Ok(())
+}
+
+/// Stage 12.4 — chunk + sign + send a runner-produced typed
+/// activation across the configured transport. The runner is the
+/// only source of truth for dtype + shape; the CLI never invents
+/// either. (Review #1 closed the prior F16/1-D fallback hole.)
+async fn live_send_activation<T: omni_contributor::TensorTransport>(
+    transport: &mut T,
+    session: &omni_contributor::ExecutionSession,
+    from_assignment: &omni_contributor::WorkAssignment,
+    to_assignment: &omni_contributor::WorkAssignment,
+    sender: &omni_contributor::ContributorSigner,
+    activation: &omni_contributor::RunnerOutputActivation,
+    to_peer_hint: &str,
+    chunk_max_bytes: u64,
+) -> Result<()> {
+    use omni_contributor::canonical::{
+        activation_handoff_signing_input, hex_lower,
+    };
+    use omni_contributor::{ActivationHandoff, HANDOFF_SCHEMA_VERSION};
+
+    let tensor_bytes = &activation.bytes[..];
+    let byte_len = tensor_bytes.len() as u64;
+    if byte_len == 0 {
+        return Err(anyhow!("live_send_activation: empty tensor"));
+    }
+    let tensor_hash = hex_lower(blake3::hash(tensor_bytes).as_bytes());
+    let chunk_size = chunk_max_bytes.min(byte_len) as usize;
+    let chunk_count = (byte_len as usize).div_ceil(chunk_size) as u32;
+    let produced_at_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    for chunk_index in 0..chunk_count {
+        let start = chunk_index as usize * chunk_size;
+        let end = ((chunk_index + 1) as usize * chunk_size).min(tensor_bytes.len());
+        let chunk_bytes = tensor_bytes[start..end].to_vec();
+        let mut h = ActivationHandoff {
+            schema_version: HANDOFF_SCHEMA_VERSION,
+            session_id: session.session_id.clone(),
+            from_assignment_id: from_assignment.assignment_id.clone(),
+            to_assignment_id: to_assignment.assignment_id.clone(),
+            from_contributor_pubkey_hex: from_assignment.contributor_pubkey_hex.clone(),
+            to_contributor_pubkey_hex: to_assignment.contributor_pubkey_hex.clone(),
+            dtype: activation.dtype,
+            shape: activation.shape.clone(),
+            byte_len,
+            tensor_hash: tensor_hash.clone(),
+            chunk_index,
+            chunk_count,
+            produced_at_utc: produced_at_utc.clone(),
+            tensor_chunk_bytes: chunk_bytes,
+            sender_signature_hex: String::new(),
+        };
+        let si = activation_handoff_signing_input(&h)?;
+        h.sender_signature_hex = sender.sign_hex(&si);
+        h.validate_schema()
+            .map_err(|e| anyhow!("invalid handoff envelope: {e}"))?;
+        transport
+            .send_handoff(Some(to_peer_hint), &h)
+            .map_err(|e| anyhow!("transport send: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Stage 12.4 — bounded-wait receive of an upstream activation.
+/// Verifies each envelope against the supplied session +
+/// upstream/this-stage assignments, accumulates chunks, returns the
+/// reassembled tensor bytes.
+async fn live_receive_activation<T: omni_contributor::TensorTransport>(
+    transport: &mut T,
+    session: &omni_contributor::ExecutionSession,
+    upstream_assignment: &omni_contributor::WorkAssignment,
+    this_assignment: &omni_contributor::WorkAssignment,
+    timeout_secs: u64,
+) -> Result<Vec<u8>> {
+    use omni_contributor::{verify_activation_handoff, ChunkOutcome, HandoffReceiver};
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(timeout_secs);
+    let mut receiver = HandoffReceiver::new();
+    loop {
+        let pending = transport
+            .poll_handoffs()
+            .map_err(|e| anyhow!("transport poll: {e}"))?;
+        for h in pending {
+            let v_out = verify_activation_handoff(
+                session,
+                upstream_assignment,
+                this_assignment,
+                &h,
+            );
+            if !v_out.is_ok() {
+                println!("event=skip kind=handoff reason=verify_failed:{v_out:?}");
+                continue;
+            }
+            match receiver.feed(&h) {
+                ChunkOutcome::Complete { tensor_bytes } => return Ok(tensor_bytes),
+                ChunkOutcome::Accepted => {}
+                other => {
+                    println!("event=skip kind=handoff reason=reassemble_failed:{other:?}");
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "live_receive_activation: timed out after {timeout_secs}s waiting for \
+                 upstream handoff from_assignment_id={}",
+                upstream_assignment.assignment_id
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 async fn run_aggregate_session(args: AggregateSessionArgs) -> Result<()> {

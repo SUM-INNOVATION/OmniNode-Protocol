@@ -23,6 +23,11 @@ impl MockSnipStore {
         }
     }
 
+    /// `#[allow(dead_code)]` because some integration test crates
+    /// (e.g. `handoff_integration`) compile the same `common`
+    /// module but don't exercise this helper directly. Other
+    /// test crates do.
+    #[allow(dead_code)]
     pub fn insert_bytes(&self, bytes: &[u8]) -> SnipV2ObjectId {
         let id = *blake3::hash(bytes).as_bytes();
         self.inner.lock().unwrap().insert(id, bytes.to_vec());

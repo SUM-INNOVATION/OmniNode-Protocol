@@ -1036,6 +1036,75 @@ pub fn net_aggregated_signing_input(
     canonical_net_aggregated_bytes(a)
 }
 
+// ── Stage 12.4 — activation handoff canonical bytes ──────────────────────
+//
+// The canonical signing body EXCLUDES `tensor_chunk_bytes` and
+// `sender_signature_hex`. The signature binds `tensor_hash` +
+// `byte_len` + chunk metadata + the from/to assignment / pubkey
+// identifiers. The receiver is required to re-hash reassembled bytes
+// and reject on mismatch (`handoff_verify::process_activation_handoff`).
+
+use crate::handoff::{ActivationHandoff, TensorDtype};
+
+/// 33 ASCII bytes.
+pub const HANDOFF_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-HANDOFF:v1:";
+
+#[derive(Debug, Serialize)]
+struct ActivationHandoffCanonicalBody<'a> {
+    schema_version: u32,
+    session_id: &'a str,
+    from_assignment_id: &'a str,
+    to_assignment_id: &'a str,
+    from_contributor_pubkey_hex: &'a str,
+    to_contributor_pubkey_hex: &'a str,
+    dtype: &'a TensorDtype,
+    shape: &'a [u64],
+    byte_len: u64,
+    tensor_hash: &'a str,
+    chunk_index: u32,
+    chunk_count: u32,
+    produced_at_utc: &'a str,
+}
+
+impl<'a> From<&'a ActivationHandoff> for ActivationHandoffCanonicalBody<'a> {
+    fn from(h: &'a ActivationHandoff) -> Self {
+        Self {
+            schema_version: h.schema_version,
+            session_id: &h.session_id,
+            from_assignment_id: &h.from_assignment_id,
+            to_assignment_id: &h.to_assignment_id,
+            from_contributor_pubkey_hex: &h.from_contributor_pubkey_hex,
+            to_contributor_pubkey_hex: &h.to_contributor_pubkey_hex,
+            dtype: &h.dtype,
+            shape: &h.shape,
+            byte_len: h.byte_len,
+            tensor_hash: &h.tensor_hash,
+            chunk_index: h.chunk_index,
+            chunk_count: h.chunk_count,
+            produced_at_utc: &h.produced_at_utc,
+        }
+    }
+}
+
+pub fn canonical_activation_handoff_bytes(
+    h: &ActivationHandoff,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: ActivationHandoffCanonicalBody = h.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(HANDOFF_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(HANDOFF_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// Bytes the sender signs over. Equal to
+/// `canonical_activation_handoff_bytes`.
+pub fn activation_handoff_signing_input(
+    h: &ActivationHandoff,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_activation_handoff_bytes(h)
+}
+
 // ── Hex helpers ───────────────────────────────────────────────────────────
 
 /// Lowercase-hex encode raw bytes (no `0x` prefix). Used throughout

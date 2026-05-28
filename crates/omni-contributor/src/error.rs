@@ -138,6 +138,53 @@ pub enum SchemaError {
         #[source]
         inner: Box<SchemaError>,
     },
+
+    // Stage 12.4 — activation-handoff schema errors.
+
+    #[error("ActivationHandoff.shape must be non-empty")]
+    HandoffShapeEmpty,
+
+    #[error("ActivationHandoff.shape rank {got} exceeds bound {max}")]
+    HandoffShapeRankTooLarge { got: usize, max: usize },
+
+    #[error("ActivationHandoff.shape contains a zero dimension")]
+    HandoffShapeZeroDim,
+
+    #[error("ActivationHandoff.byte_len must be > 0")]
+    HandoffByteLenZero,
+
+    #[error("ActivationHandoff.byte_len {got} exceeds bound {max}")]
+    HandoffByteLenTooLarge { got: u64, max: u64 },
+
+    #[error(
+        "ActivationHandoff.byte_len {declared} does not equal shape-product * dtype \
+         bytes-per-element {expected_from_shape_and_dtype}"
+    )]
+    HandoffByteLenMismatch {
+        declared: u64,
+        expected_from_shape_and_dtype: u64,
+    },
+
+    #[error("ActivationHandoff.chunk_count must be > 0")]
+    HandoffChunkCountZero,
+
+    #[error("ActivationHandoff.chunk_count {got} exceeds bound {max}")]
+    HandoffChunkCountTooLarge { got: u32, max: u32 },
+
+    #[error("ActivationHandoff.chunk_index {index} out of range for chunk_count {count}")]
+    HandoffChunkIndexOutOfRange { index: u32, count: u32 },
+
+    #[error("ActivationHandoff.tensor_chunk_bytes must be non-empty")]
+    HandoffChunkBytesEmpty,
+
+    #[error("ActivationHandoff.tensor_chunk_bytes len {got} exceeds bound {max}")]
+    HandoffChunkBytesTooLarge { got: u64, max: u64 },
+
+    #[error(
+        "single-chunk ActivationHandoff: tensor_chunk_bytes len {chunk_len} must equal \
+         byte_len {byte_len}"
+    )]
+    HandoffSingleChunkLenMismatch { chunk_len: u64, byte_len: u64 },
 }
 
 /// Canonical-bytes / hash encoding errors.

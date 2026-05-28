@@ -653,3 +653,160 @@ Every publish-and-broadcast subcommand (open / join / assign / run / aggregate) 
 - Sybil / anti-spam beyond required signatures.
 - Anything in items 1 / 7 / 8 of the chart; the lettered A–F flow; any chain-side interaction.
 - Reward-split engine that consumes partial `work_units` to divide the job-level base-unit pool.
+
+---
+
+# Stage 12.4 — live tensor / activation transport
+
+**Status**: shipped at Stage 12.4. Extends Stage 12.3 sessions with direct peer-to-peer activation handoff over `omni-net`'s existing tensor request/response codec. SNIP keeps its role as durable audit + fallback storage.
+
+## Posture (unchanged)
+
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` / payment / marketplace / exclusive claim / proof mode / on-chain verification / A–F flow. SNIP only for durable storage / fallback. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
+
+## What 12.4 is
+
+**A signed handoff layer for sending one stage's output activation directly to the next stage's contributor**, without forcing the bytes through SNIP first. The session/join/assign/partial chain from 12.3 is unchanged; 12.4 adds one new envelope (`ActivationHandoff`) carried inside `omni-net`'s existing `TensorRequest.data`.
+
+**What 12.4 does NOT do**:
+- Define model-specific tensor semantics. Bytes are opaque.
+- Prove ML correctness. AttestationOnly only.
+- Implement generalized distributed scheduling. Topology is **strict linear** at v1 (`to.stage_index == from.stage_index + 1`).
+- Discover peer IDs from `ContributorJoin` schemas (the join envelope does not change). Recipient PeerId is **operator-supplied** at v1; signed peer-advertisement is Stage 12.5+.
+
+## omni-net inspection — no lift required
+
+`omni-net` already ships `TENSOR_XFER_PROTOCOL = "/omni/tensor-xfer/1"` (libp2p request/response), `OmniNet::request_tensor(peer_id, TensorRequest)`, `OmniNet::respond_tensor(channel_id, TensorResponse)`, and `OmniNetEvent::TensorReceived { request, channel_id }`. Single message cap 128 MiB. Async, direct-peer-targeted.
+
+Stage 12.4 treats the outer `TensorRequest` as routing-only and carries a signed `ActivationHandoff` envelope (bincode 1.3) inside `TensorRequest.data`. **The outer fields are advisory; only the signed inner envelope is trusted on the receive side.** Outer `TensorRequest.micro_batch_index` is overloaded to carry `chunk_index` for transport-side routing — documented as Stage 12.4 transport overlay; the verifier never trusts it.
+
+## Inner envelope
+
+```text
+ActivationHandoff {
+    schema_version,                 // = 1
+    session_id, from_assignment_id, to_assignment_id,
+    from_contributor_pubkey_hex, to_contributor_pubkey_hex,
+    dtype: F16 | BF16 | F32,        // closed enum
+    shape: [u64; 1..=8],            // non-empty, every dim > 0
+    byte_len,                       // total reassembled bytes
+    tensor_hash,                    // BLAKE3 of reassembled bytes
+    chunk_index, chunk_count,       // 1..=256 chunks per stream
+    produced_at_utc,
+    tensor_chunk_bytes,             // THIS chunk; ≤ 64 MiB
+    sender_signature_hex,
+}
+```
+
+**Canonical body excludes `tensor_chunk_bytes` and `sender_signature_hex`.** The signature binds `tensor_hash` (BLAKE3 of the full reassembled bytes), `byte_len`, all chunk metadata, and the from/to assignment / contributor identities. Receivers MUST:
+1. Verify the sender signature against `from_contributor_pubkey_hex`.
+2. After reassembling all `chunk_count` chunks in `chunk_index` order, recompute BLAKE3 and reject on mismatch with `tensor_hash`.
+3. Reject if reassembled length ≠ `byte_len`.
+
+This is a two-step content integrity check: signature → hash → bytes.
+
+Bounds enforced in schema validation:
+| Limit | Default | Field |
+|---|---|---|
+| Single chunk bytes | 64 MiB | `tensor_chunk_bytes.len()` |
+| Total bytes | 16 GiB | `byte_len` |
+| Max chunks | 256 | `chunk_count` |
+| Shape rank | 8 | `shape.len()` |
+
+## Stage 12.3 binding (`verify_activation_handoff`)
+
+- `handoff.session_id == session.session_id`.
+- `from_assignment.session_id == session.session_id` and `to_assignment.session_id == session.session_id`.
+- `to.stage_index == from.stage_index + 1` (strict linear, v1).
+- `handoff.from_contributor_pubkey_hex == from_assignment.contributor_pubkey_hex`.
+- `handoff.to_contributor_pubkey_hex == to_assignment.contributor_pubkey_hex`.
+- Sender signature verifies.
+- `produced_at_utc < session.expires_at_utc`.
+
+The reassembler (`HandoffReceiver::feed`) layers on:
+- Drift-check every shared metadata field against the first chunk on the stream (chunk_count, byte_len, tensor_hash, dtype, shape, from/to pubkeys).
+- Duplicate `chunk_index` is idempotent reject (stream stays live).
+- On `Complete`: total length + BLAKE3 must match the signed values, else `TensorHashMismatch` / `ByteLenMismatch`.
+
+## Transport
+
+`TensorTransport` trait with two impls:
+- `InMemoryTensorTransport` — sync VecDeque, no networking. Tests + single-process pipelines.
+- `OmniNetTensorTransport` (feature `network`) — wraps `Arc<tokio::sync::Mutex<OmniNet>>`, packs the inner envelope into `TensorRequest.data`, ACKs every received envelope on the wire (acceptance is "received", not "trusted"), accumulates pending envelopes into a per-instance queue.
+
+PeerId hint parsing accepts either a bare PeerId base58 or a multiaddr whose last component is `/p2p/<peer-id>`.
+
+## Runner integration
+
+```rust
+pub trait InferenceRunner {
+    fn run(&self, manifest_path: &Path, input_bytes: &[u8]) -> Result<RunOutput, RunnerError>;
+
+    // Stage 12.4 — default impl delegates to run() + returns None for the
+    // output activation. Stage 12.0/12.1/12.2/12.3 runners keep working.
+    fn run_with_activations(
+        &self,
+        manifest_path: &Path,
+        input_bytes: &[u8],
+        upstream_activation_bytes: Option<&[u8]>,
+    ) -> Result<RunOutputWithActivation, RunnerError> { ... }
+}
+
+pub struct RunOutputWithActivation {
+    pub run_output: RunOutput,
+    pub output_activation_bytes: Option<Vec<u8>>,
+}
+```
+
+`ExternalCommandRunner` overrides `run_with_activations`: writes the optional upstream activation to a tempfile, always passes `--activation-out <path>` to the subprocess, reads that file back if non-empty. **No model-framework runtime deps in `omni-node`** — the framework lives in the external command.
+
+## CLI surface
+
+```
+omni-node operator contributor run-assignment
+    --assignment-snip-root 0x… --execution-session-snip-root 0x…
+    --contributor-seed <p> --runner stub|external …
+    [--upstream-from-assignment-snip-root 0x…]
+    [--upstream-from-peer <peer-id|multiaddr>]      # advisory hint
+    [--activation-in-mode none|live]                # default: none
+    [--downstream-to-assignment-snip-root 0x…]
+    [--downstream-to-peer <peer-id|multiaddr>]
+    [--activation-out-mode snip|live|both|none]
+    # default: `both` if downstream present, else `snip` (12.3 behavior)
+    [--upstream-wait-secs <n>]                       # default 60
+    [--handoff-chunk-max-bytes <n>]                  # default 64 MiB
+
+omni-node operator contributor send-handoff
+    --execution-session-snip-root 0x…
+    --from-assignment-snip-root 0x… --to-assignment-snip-root 0x…
+    --from-contributor-seed <p>
+    --activation-file <path>
+    --dtype f16|bf16|f32 --shape <comma-separated-u64s>
+    --to-peer <peer-id|multiaddr>
+    [--chunk-max-bytes <n>]                          # default 64 MiB
+```
+
+`run-assignment`'s effective default for `--activation-out-mode`:
+- **Downstream peer + assignment supplied → `both`** (live for latency, SNIP for audit/fallback).
+- No downstream supplied → `snip` (Stage 12.3 behavior).
+
+`watch-handoffs` is intentionally not in v1; the important path is `run-assignment --activation-in-mode live`. Diagnostic sends use `send-handoff`.
+
+## Fallback semantics
+
+| Mode | Live send | SNIP publish |
+|---|---|---|
+| `snip` (default no-downstream) | no | yes (12.3 behavior) |
+| `live` | yes | no |
+| `both` (default with-downstream) | yes | yes |
+| `none` | no | no |
+
+`activation-in-mode snip` (read upstream partial from SNIP) is NOT implemented in v1 — explicit `none` (first stage) or `live` only. Operators wiring SNIP fallback today extract bytes off the upstream partial out-of-band.
+
+## Deferred to 12.5+
+
+- **Signed contributor peer-advertisement** (so the operator does not have to supply `--downstream-to-peer` out-of-band). This is the right shape for `ContributorJoin` schema v2.
+- **Non-linear topologies** (MoE branching, ring attention, many-to-one handoffs).
+- **`activation-in-mode snip`** as a first-class CLI flag.
+- **Receive-side rate limiting + per-session pending-handoff caps** (today: enforced per-envelope by schema bounds; coarser per-session caps are out of scope).
+- **Reward-split engine** that consumes 12.3 partial `work_units` + 12.4 handoff metadata to divide the job-level base-unit pool.

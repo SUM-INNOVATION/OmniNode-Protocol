@@ -2563,6 +2563,7 @@ dependencies = [
  "bincode 1.3.3",
  "blake3",
  "chrono",
+ "libp2p",
  "libp2p-identity",
  "omni-net",
  "omni-store",
