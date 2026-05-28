@@ -321,3 +321,40 @@ impl NetworkAggregatedResultAnnouncement {
         Ok(())
     }
 }
+
+/// Stage 12.5 — pointer-only mesh announcement for a
+/// `ContributorPeerAdvertisement` published to SNIP. The announcer
+/// signature here is anti-spam + provenance; the inner advertisement
+/// is verified separately by the routing-cache processor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkPeerAdvertisementAnnouncement {
+    pub schema_version: u32,
+    /// SNIP V2 Merkle root of the `ContributorPeerAdvertisement` JSON.
+    pub peer_advertisement_snip_root: String,
+    pub advertisement_id: String,
+    pub session_id: String,
+    pub contributor_pubkey_hex: String,
+    pub announced_at_utc: String,
+    pub announcer_pubkey_hex: String,
+    pub announcer_signature_hex: String,
+}
+
+impl NetworkPeerAdvertisementAnnouncement {
+    pub fn validate_schema(&self) -> Result<(), SchemaError> {
+        if self.schema_version != NET_SCHEMA_VERSION {
+            return Err(SchemaError::UnsupportedVersion { got: self.schema_version });
+        }
+        check_snip_root_hex(
+            "peer_advertisement_snip_root",
+            &self.peer_advertisement_snip_root,
+        )?;
+        check_blake3_hex("advertisement_id", &self.advertisement_id)?;
+        check_blake3_hex("session_id", &self.session_id)?;
+        check_pubkey_hex("contributor_pubkey_hex", &self.contributor_pubkey_hex)?;
+        check_iso_8601("announced_at_utc", &self.announced_at_utc)?;
+        check_pubkey_hex("announcer_pubkey_hex", &self.announcer_pubkey_hex)?;
+        check_signature_hex("announcer_signature_hex", &self.announcer_signature_hex)?;
+        Ok(())
+    }
+}

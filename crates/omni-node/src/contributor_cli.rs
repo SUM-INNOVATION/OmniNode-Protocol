@@ -122,6 +122,19 @@ enum ContributorCmd {
     /// `run-assignment`. Production handoffs flow through
     /// `run-assignment --activation-out-mode live|both`.
     SendHandoff(SendHandoffArgs),
+
+    /// Stage 12.5 — publish a signed `ContributorPeerAdvertisement`
+    /// for a specific (session_id, contributor_pubkey_hex). The
+    /// `libp2p_peer_id` is read from the live `OmniNet` instance
+    /// at publish time; operators cannot supply it manually.
+    AdvertisePeer(AdvertisePeerArgs),
+
+    /// Stage 12.5 — long-running passive observer: subscribe to
+    /// the peer-advert topic, verify each announcement + body,
+    /// write verified peer advertisements to disk so a separate
+    /// `run-assignment` can resolve downstream peers without
+    /// requiring `--downstream-to-peer`.
+    WatchPeerAdverts(WatchPeerAdvertsArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -787,9 +800,45 @@ struct RunAssignmentArgs {
 
     /// Stage 12.4 — SNIP V2 root of the downstream `WorkAssignment`
     /// (the stage that will receive our output activation). Required
-    /// when `--downstream-to-peer` is set.
+    /// when `--downstream-to-peer` is set OR
+    /// `--resolve-downstream-peer-from-session` is set.
     #[arg(long)]
     downstream_to_assignment_snip_root: Option<String>,
+
+    /// Stage 12.5 — directory of verified peer advertisements
+    /// (typically populated by `watch-peer-adverts --out-dir`).
+    /// Required when `--resolve-downstream-peer-from-session` is
+    /// set; ignored otherwise.
+    #[arg(long)]
+    peer_advert_dir: Option<PathBuf>,
+
+    /// Stage 12.5 — directory of verified joins (typically the
+    /// `watch-sessions --out-dir`). Required when
+    /// `--resolve-downstream-peer-from-session` is set: peer
+    /// advertisements are rejected unless the contributor's join
+    /// for the session is present AND `verify_contributor_join`
+    /// passes.
+    #[arg(long)]
+    joins_dir: Option<PathBuf>,
+
+    /// Stage 12.5 — resolve the downstream peer from a verified
+    /// `ContributorPeerAdvertisement` instead of requiring a manual
+    /// `--downstream-to-peer`. Requires `--peer-advert-dir` and
+    /// `--downstream-to-assignment-snip-root`. If
+    /// `--downstream-to-peer` is ALSO supplied, the manual value
+    /// takes precedence (operator override).
+    #[arg(long, default_value_t = false)]
+    resolve_downstream_peer_from_session: bool,
+
+    /// Stage 12.5 — dtype to use when resolving the downstream
+    /// peer's advertisement. Has no effect outside
+    /// `--resolve-downstream-peer-from-session`. Defaults to `f16`
+    /// because it's the most common Stage 12.4 activation dtype.
+    /// Operators wiring runners that produce bf16 or f32 should set
+    /// this explicitly so route resolution matches the runner's
+    /// actual output.
+    #[arg(long, value_enum, default_value_t = CliTensorDtype::F16)]
+    downstream_resolve_dtype: CliTensorDtype,
 
     /// Stage 12.4 — upstream activation source.
     /// - `none` (default if no upstream root supplied): first stage.
@@ -1018,6 +1067,112 @@ struct WatchSessionsArgs {
     snip_seed: Option<PathBuf>,
 }
 
+// ── Stage 12.5 args ────────────────────────────────────────────────────────
+
+#[derive(Args)]
+struct AdvertisePeerArgs {
+    /// SNIP V2 root of the open `ExecutionSession`.
+    #[arg(long)]
+    execution_session_snip_root: String,
+
+    /// SNIP V2 root of the contributor's `ContributorJoin` for this
+    /// session — required so the advertisement binds to a verified
+    /// session-side join.
+    #[arg(long)]
+    join_snip_root: String,
+
+    /// 32-byte raw contributor seed file. Must correspond to the
+    /// join's `contributor_pubkey_hex`.
+    #[arg(long)]
+    contributor_seed: PathBuf,
+
+    /// Optional reachable libp2p multiaddrs. May be empty; mDNS +
+    /// Kademlia resolve PeerId → addrs on the mesh.
+    #[arg(long = "listen-multiaddr")]
+    listen_multiaddrs: Vec<String>,
+
+    /// Advertised maximum incoming chunk byte count. Bounded by the
+    /// Stage 12.4 `HANDOFF_CHUNK_MAX_BYTES`; receivers negotiate
+    /// `min(local, advertised)`.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    max_handoff_chunk_bytes: u64,
+
+    /// Supported tensor dtypes. Repeatable; at least one required.
+    #[arg(long = "supported-dtype", value_enum, required = true)]
+    supported_dtypes: Vec<CliTensorDtype>,
+
+    /// Advertisement lifetime in seconds. Hard-capped at 24h
+    /// (86400) by the Stage 12.5 schema.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    expires_in_secs: u64,
+
+    /// If set, broadcast a `NetworkPeerAdvertisementAnnouncement`
+    /// in addition to publishing the body to SNIP.
+    #[arg(long, default_value_t = false)]
+    publish_announcement: bool,
+
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+    #[arg(long, default_value_t = 200)]
+    propagation_wait_ms: u64,
+    #[arg(long, default_value_t = 30)]
+    peer_wait_secs: u64,
+    #[arg(long, default_value_t = 500)]
+    mesh_stabilize_ms: u64,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct WatchPeerAdvertsArgs {
+    /// Root directory under which per-session subdirectories
+    /// `<out-dir>/<session_id>/peer-adverts/<contributor>.json`
+    /// are written.
+    #[arg(long)]
+    out_dir: PathBuf,
+
+    /// Optional session_id filter (repeatable). Empty = accept any.
+    #[arg(long = "session-id")]
+    session_id: Vec<String>,
+
+    /// Optional contributor_pubkey filter (repeatable). Empty = any.
+    #[arg(long = "contributor-pubkey")]
+    contributor_pubkey: Vec<String>,
+
+    /// Path to a directory holding verified joins. The watcher
+    /// loads every `*.json` it finds (one per join) and uses the
+    /// set as the "matching join" check in
+    /// `process_peer_advertisement_announcement`. Empty/missing
+    /// dir = treated as no-joins-available; advertisements get
+    /// rejected with `NoMatchingJoin`. Operators typically use
+    /// `watch-sessions --out-dir <dir>` to populate this.
+    #[arg(long)]
+    joins_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    max_adverts: Option<u64>,
+
+    #[arg(long)]
+    max_polls: Option<u64>,
+
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+    #[arg(long, default_value_t = 5)]
+    poll_interval_secs: u64,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -1039,6 +1194,8 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::AggregateSession(a) => run_aggregate_session(a).await,
         ContributorCmd::WatchSessions(a) => run_watch_sessions(a).await,
         ContributorCmd::SendHandoff(a) => run_send_handoff(a).await,
+        ContributorCmd::AdvertisePeer(a) => run_advertise_peer(a).await,
+        ContributorCmd::WatchPeerAdverts(a) => run_watch_peer_adverts(a).await,
     }
 }
 
@@ -2331,8 +2488,145 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
         ));
     }
 
-    // Stage 12.4 — resolve the effective out-mode.
-    let downstream_present = args.downstream_to_peer.is_some()
+    // Stage 12.5 — optionally resolve the downstream peer from a
+    // verified peer-advert cache instead of requiring
+    // `--downstream-to-peer`. Manual value (if supplied) takes
+    // precedence so an operator can always override.
+    let mut effective_downstream_to_peer = args.downstream_to_peer.clone();
+    let mut effective_downstream_chunk_cap: Option<u64> = None;
+    if args.resolve_downstream_peer_from_session
+        && effective_downstream_to_peer.is_none()
+    {
+        let advert_dir = args.peer_advert_dir.as_deref().ok_or_else(|| {
+            anyhow!(
+                "--resolve-downstream-peer-from-session requires --peer-advert-dir"
+            )
+        })?;
+        let downstream_root = args
+            .downstream_to_assignment_snip_root
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow!(
+                    "--resolve-downstream-peer-from-session requires \
+                     --downstream-to-assignment-snip-root"
+                )
+            })?;
+        // Fetch the downstream assignment so we know the contributor
+        // pubkey to resolve against.
+        let down_root = omni_types::phase5::SnipV2ObjectId::from_hex(downstream_root)
+            .map_err(|e| anyhow!("bad downstream snip root: {e:?}"))?;
+        let down_bytes = omni_contributor::snip::fetch_bytes(&snip, &down_root)
+            .map_err(|e| anyhow!("snip fetch downstream assignment: {e}"))?;
+        let down_assignment: omni_contributor::WorkAssignment =
+            serde_json::from_slice(&down_bytes)
+                .map_err(|e| anyhow!("parse downstream assignment: {e}"))?;
+
+        // Load cryptographically verified joins for this session
+        // from the watch-sessions tree. Required because a forged
+        // local join file would otherwise let a forged advert pass
+        // the matching-join gate (Stage 12.5 review #2). The
+        // workflow is documented as:
+        //   watch-sessions --out-dir A
+        //   watch-peer-adverts --out-dir B --joins-dir A
+        //   run-assignment --peer-advert-dir B --joins-dir A
+        //                  --resolve-downstream-peer-from-session
+        // — both consumers point at A for joins.
+        let joins_dir = args.joins_dir.as_deref().ok_or_else(|| {
+            anyhow!(
+                "--resolve-downstream-peer-from-session requires --joins-dir \
+                 pointing at a watch-sessions output tree"
+            )
+        })?;
+        let joins_for_session: Vec<omni_contributor::ContributorJoin> =
+            load_verified_joins_from_dir(Some(joins_dir))?
+                .into_iter()
+                .filter(|j| j.session_id == session.session_id)
+                .collect();
+        let now_utc =
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut cache = omni_contributor::PeerRoutingCache::new();
+        let session_peer_dir =
+            advert_dir.join(&session.session_id).join("peer-adverts");
+        if session_peer_dir.is_dir() {
+            for entry in std::fs::read_dir(&session_peer_dir)? {
+                let entry = entry?;
+                let p = entry.path();
+                if !p.is_file()
+                    || p.extension().and_then(|s| s.to_str()) != Some("json")
+                {
+                    continue;
+                }
+                let bytes = std::fs::read(&p)?;
+                let advert: omni_contributor::ContributorPeerAdvertisement =
+                    match serde_json::from_slice(&bytes) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            eprintln!(
+                                "event=warn context=load_peer_advert path={} message={e}",
+                                p.display()
+                            );
+                            continue;
+                        }
+                    };
+                // Re-verify before insert: advertisement_id
+                // recompute + contributor signature + matching
+                // join + expiry.
+                let out = omni_contributor::verify_peer_advertisement_body(
+                    &advert,
+                    &joins_for_session,
+                    Some(&now_utc),
+                );
+                match out {
+                    omni_contributor::PeerAdvertisementOutcome::Verified {
+                        body,
+                    } => {
+                        cache.insert_verified(*body);
+                    }
+                    other => {
+                        eprintln!(
+                            "event=warn context=local_peer_advert_rejected \
+                             path={} reason={}",
+                            p.display(),
+                            stringify_peer_advert_outcome(&other)
+                        );
+                    }
+                }
+            }
+        }
+
+        let dtype: omni_contributor::TensorDtype =
+            args.downstream_resolve_dtype.into();
+        match cache.resolve(
+            &session.session_id,
+            &down_assignment.contributor_pubkey_hex,
+            dtype,
+            args.handoff_chunk_max_bytes,
+            &now_utc,
+        ) {
+            omni_contributor::RouteResolution::Found(route) => {
+                effective_downstream_to_peer = Some(route.peer_id.clone());
+                effective_downstream_chunk_cap =
+                    Some(route.max_handoff_chunk_bytes);
+                println!(
+                    "event=peer_advert_resolved session_id={} downstream_contributor={} \
+                     peer_id={} chunk_cap={}",
+                    session.session_id,
+                    down_assignment.contributor_pubkey_hex,
+                    route.peer_id,
+                    route.max_handoff_chunk_bytes
+                );
+            }
+            other => {
+                return Err(anyhow!(
+                    "could not resolve downstream peer from session adverts: {other:?}"
+                ));
+            }
+        }
+    }
+
+    // Stage 12.4 — resolve the effective out-mode using whichever
+    // downstream-to-peer was selected above (manual or resolved).
+    let downstream_present = effective_downstream_to_peer.is_some()
         && args.downstream_to_assignment_snip_root.is_some();
     let activation_out_mode = match args.activation_out_mode {
         Some(m) => m,
@@ -2638,10 +2932,14 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
         let downstream_asn = downstream_assignment
             .as_ref()
             .expect("validated above for downstream-present");
-        let to_peer = args
-            .downstream_to_peer
+        let to_peer = effective_downstream_to_peer
             .as_deref()
             .expect("validated above for downstream-present");
+        // Stage 12.5: when a peer-advert resolution picked a chunk
+        // cap, use it (already `min(local, advertised)`). Otherwise
+        // fall back to the operator's local cap.
+        let chunk_cap = effective_downstream_chunk_cap
+            .unwrap_or(args.handoff_chunk_max_bytes);
         let (net, handle) = net_and_handle.as_ref().expect("opened above");
         let mut transport =
             OmniNetTensorTransport::new(net.clone(), handle.clone());
@@ -2653,7 +2951,7 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
             &contrib,
             activation,
             to_peer,
-            args.handoff_chunk_max_bytes,
+            chunk_cap,
         )
         .await?;
         println!(
@@ -3441,5 +3739,410 @@ fn handle_aggregated<A: omni_store::SnipV2Adapter + ?Sized>(
             p.display()
         ),
         Err(e) => println!("event=error context=write_aggregated message={e}"),
+    }
+}
+
+// ── Stage 12.5 — peer-advert subcommand handlers ──────────────────────────
+
+/// Load **cryptographically verified** `ContributorJoin`s from the
+/// `watch-sessions` output tree:
+///
+/// ```text
+/// <dir>/
+///   <session_id>/
+///     session.json           # ExecutionSession — verified standalone
+///     joins/<pubkey>.json    # ContributorJoin  — verified against session
+/// ```
+///
+/// For each `<session_id>` subdirectory:
+///   1. Reads + parses + `verify_execution_session` on `session.json`.
+///      If missing / malformed / signature fails: skip the whole
+///      subdirectory with a stderr warning.
+///   2. Reads + parses every `joins/*.json`.
+///   3. Calls `verify_contributor_join(&session, &join)` (Stage 12.3
+///      verifier — schema + session binding + contributor signature).
+///      Only entries that return `SessionVerifyOutcome::Ok` are
+///      returned.
+///
+/// Returns an empty `Vec` if `dir` is `None` or the directory does
+/// not exist. Schema-only loading was removed in Stage 12.5 review
+/// #2: a forged local join file would otherwise let a forged peer
+/// advert pass the matching-join gate. The flat-file (one-level)
+/// fallback is also dropped — the canonical source is the
+/// watch-sessions tree.
+fn load_verified_joins_from_dir(
+    dir: Option<&std::path::Path>,
+) -> Result<Vec<omni_contributor::ContributorJoin>> {
+    let dir = match dir {
+        Some(d) => d,
+        None => return Ok(Vec::new()),
+    };
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let session_subdir = entry.path();
+        if !session_subdir.is_dir() {
+            continue;
+        }
+        let session_path = session_subdir.join("session.json");
+        if !session_path.is_file() {
+            eprintln!(
+                "event=warn context=load_joins_no_session_json path={}",
+                session_subdir.display()
+            );
+            continue;
+        }
+        let session_bytes = match std::fs::read(&session_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "event=warn context=load_joins_read_session path={} message={e}",
+                    session_path.display()
+                );
+                continue;
+            }
+        };
+        let session: omni_contributor::ExecutionSession =
+            match serde_json::from_slice(&session_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "event=warn context=load_joins_parse_session path={} message={e}",
+                        session_path.display()
+                    );
+                    continue;
+                }
+            };
+        let session_outcome = omni_contributor::verify_execution_session(&session);
+        if !session_outcome.is_ok() {
+            eprintln!(
+                "event=warn context=load_joins_session_verify_failed \
+                 path={} outcome={session_outcome:?}",
+                session_path.display()
+            );
+            continue;
+        }
+        let joins_subdir = session_subdir.join("joins");
+        if !joins_subdir.is_dir() {
+            continue;
+        }
+        for sub in std::fs::read_dir(&joins_subdir)? {
+            let sub = sub?;
+            let p = sub.path();
+            if !p.is_file()
+                || p.extension().and_then(|s| s.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let bytes = match std::fs::read(&p) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "event=warn context=load_joins_read_join path={} message={e}",
+                        p.display()
+                    );
+                    continue;
+                }
+            };
+            let join: omni_contributor::ContributorJoin =
+                match serde_json::from_slice(&bytes) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        eprintln!(
+                            "event=warn context=load_joins_parse_join path={} message={e}",
+                            p.display()
+                        );
+                        continue;
+                    }
+                };
+            let outcome = omni_contributor::verify_contributor_join(&session, &join);
+            if outcome.is_ok() {
+                out.push(join);
+            } else {
+                eprintln!(
+                    "event=warn context=load_joins_verify_failed \
+                     path={} outcome={outcome:?}",
+                    p.display()
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn run_advertise_peer(args: AdvertisePeerArgs) -> Result<()> {
+    use omni_contributor::canonical::{
+        advertisement_id_hex, hex_lower, net_peer_advert_signing_input,
+        peer_advertisement_signing_input,
+    };
+    use omni_contributor::{
+        ContributorJoin, ContributorPeerAdvertisement, ContributorRelay, ContributorSigner,
+        NetworkPeerAdvertisementAnnouncement, OmniNetRelay, PeerCapabilities, TensorDtype,
+        NET_SCHEMA_VERSION, PEER_ADVERTISEMENT_SCHEMA_VERSION,
+    };
+    use omni_types::phase5::SnipV2ObjectId;
+
+    let snip = build_snip_adapter(args.snip_binary, args.snip_seed);
+
+    // Fetch + verify session.
+    let session = fetch_and_verify_session(&snip, &args.execution_session_snip_root)?;
+
+    // Fetch + verify join + bind to seed pubkey.
+    let join_root = SnipV2ObjectId::from_hex(&args.join_snip_root)
+        .map_err(|e| anyhow!("bad join snip root: {e:?}"))?;
+    let join_bytes = omni_contributor::snip::fetch_bytes(&snip, &join_root)
+        .map_err(|e| anyhow!("snip fetch join: {e}"))?;
+    let join: ContributorJoin = serde_json::from_slice(&join_bytes)
+        .map_err(|e| anyhow!("parse join: {e}"))?;
+    let join_out = omni_contributor::verify_contributor_join(&session, &join);
+    if !join_out.is_ok() {
+        return Err(anyhow!("join verify failed: {join_out:?}"));
+    }
+    let contrib = ContributorSigner::from_seed_file(&args.contributor_seed)?;
+    if contrib.pubkey_hex() != join.contributor_pubkey_hex {
+        return Err(anyhow!(
+            "contributor_seed pubkey does not match join.contributor_pubkey_hex"
+        ));
+    }
+
+    // Open the mesh and capture the live PeerId — the entire
+    // reason Stage 12.5-pre exists.
+    //
+    // Peer-wait only applies when we're actually broadcasting an
+    // announcement. A SNIP-only advertisement (publishing the
+    // body to durable storage without gossip) does not need a
+    // reachable peer at publish time and must not fail just
+    // because the mesh is empty.
+    let (peer_wait_secs, mesh_stabilize_ms) = if args.publish_announcement {
+        (args.peer_wait_secs, args.mesh_stabilize_ms)
+    } else {
+        (0u64, 0u64)
+    };
+    let (net, handle) = open_omninet_with_peer_wait(
+        args.listen_port,
+        args.peer,
+        peer_wait_secs,
+        mesh_stabilize_ms,
+    )
+    .await?;
+    let libp2p_peer_id_b58 = {
+        let g = net.lock().await;
+        g.local_peer_id().to_base58()
+    };
+
+    // Build + sign the advertisement. Capture `now` once so the
+    // `expires_at_utc - advertised_at_utc` window stays exactly
+    // `expires_in_secs` even if the two reads straddle a second
+    // boundary — otherwise `--expires-in-secs 86400` could land
+    // 86401 seconds out and trip the schema's 24h freshness cap.
+    let now = chrono::Utc::now();
+    let advertised_at_utc =
+        now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let expires_at_utc = (now
+        + chrono::Duration::seconds(args.expires_in_secs as i64))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let supported_dtypes: Vec<TensorDtype> =
+        args.supported_dtypes.into_iter().map(Into::into).collect();
+    let mut advert = ContributorPeerAdvertisement {
+        schema_version: PEER_ADVERTISEMENT_SCHEMA_VERSION,
+        advertisement_id: String::new(),
+        session_id: session.session_id.clone(),
+        contributor_pubkey_hex: contrib.pubkey_hex(),
+        libp2p_peer_id: libp2p_peer_id_b58.clone(),
+        listen_multiaddrs: args.listen_multiaddrs,
+        capabilities: PeerCapabilities {
+            supports_live_handoff: true,
+            max_handoff_chunk_bytes: args.max_handoff_chunk_bytes,
+            supported_dtypes,
+        },
+        advertised_at_utc,
+        expires_at_utc,
+        contributor_signature_hex: String::new(),
+    };
+    advert.advertisement_id = advertisement_id_hex(&advert)?;
+    let si = peer_advertisement_signing_input(&advert)?;
+    advert.contributor_signature_hex = contrib.sign_hex(&si);
+    advert
+        .validate_schema()
+        .map_err(|e| anyhow!("invalid ContributorPeerAdvertisement: {e}"))?;
+
+    let advert_json = serde_json::to_vec_pretty(&advert)?;
+    let advert_root = omni_contributor::snip::publish_bytes(
+        &snip,
+        &advert_json,
+        "peer-advert",
+    )
+    .map_err(|e| anyhow!("snip publish advert: {e}"))?;
+    let advert_root_hex = format!("0x{}", hex_lower(advert_root.as_bytes()));
+
+    if args.publish_announcement {
+        let mut ann = NetworkPeerAdvertisementAnnouncement {
+            schema_version: NET_SCHEMA_VERSION,
+            peer_advertisement_snip_root: advert_root_hex.clone(),
+            advertisement_id: advert.advertisement_id.clone(),
+            session_id: session.session_id.clone(),
+            contributor_pubkey_hex: contrib.pubkey_hex(),
+            announced_at_utc: chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            announcer_pubkey_hex: contrib.pubkey_hex(),
+            announcer_signature_hex: String::new(),
+        };
+        let ann_sig = net_peer_advert_signing_input(&ann)?;
+        ann.announcer_signature_hex = contrib.sign_hex(&ann_sig);
+        let mut relay = OmniNetRelay::new(net.clone(), handle);
+        relay
+            .publish_peer_advertisement(&ann)
+            .map_err(|e| anyhow!("publish: {e}"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
+    }
+    {
+        let g = net.lock().await;
+        let _ = g.shutdown().await;
+    }
+
+    println!("advertisement_id={}", advert.advertisement_id);
+    println!("peer_advertisement_snip_root={advert_root_hex}");
+    println!("libp2p_peer_id={libp2p_peer_id_b58}");
+    println!("session_id={}", advert.session_id);
+    println!(
+        "broadcast={}",
+        if args.publish_announcement { "true" } else { "false" }
+    );
+    Ok(())
+}
+
+async fn run_watch_peer_adverts(args: WatchPeerAdvertsArgs) -> Result<()> {
+    use omni_contributor::{
+        process_peer_advertisement_announcement, ContributorRelay, OmniNetRelay,
+        PeerAdvertisementOutcome,
+    };
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    let snip = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let joins = load_verified_joins_from_dir(args.joins_dir.as_deref())?;
+
+    let (net, handle) = open_omninet_with_peer_wait(
+        args.listen_port,
+        args.peer,
+        /* peer_wait_secs = */ 0,
+        /* mesh_stabilize_ms = */ 0,
+    )
+    .await?;
+    std::fs::create_dir_all(&args.out_dir)?;
+
+    let session_id_filter: HashSet<String> = args.session_id.into_iter().collect();
+    let contributor_filter: HashSet<String> = args.contributor_pubkey.into_iter().collect();
+    let mut polls_done: u64 = 0;
+    let mut adverts_written: u64 = 0;
+
+    let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut relay = OmniNetRelay::new(net, handle);
+        loop {
+            if let Some(max) = args.max_polls {
+                if polls_done >= max {
+                    println!(
+                        "event=exit reason=max_polls_reached adverts_written={adverts_written}"
+                    );
+                    return Ok(());
+                }
+            }
+            polls_done += 1;
+
+            for ann in relay
+                .poll_peer_advertisements()
+                .map_err(|e| anyhow!("poll peer-advert: {e}"))?
+            {
+                if !session_id_filter.is_empty()
+                    && !session_id_filter.contains(&ann.session_id)
+                {
+                    continue;
+                }
+                if !contributor_filter.is_empty()
+                    && !contributor_filter.contains(&ann.contributor_pubkey_hex)
+                {
+                    continue;
+                }
+                let now_utc = chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let outcome = process_peer_advertisement_announcement(
+                    &ann,
+                    &snip,
+                    &joins,
+                    Some(&now_utc),
+                );
+                let advert = match outcome {
+                    PeerAdvertisementOutcome::Verified { body } => body,
+                    other => {
+                        println!(
+                            "event=skip kind=peer_advert session_id={} reason={}",
+                            ann.session_id,
+                            stringify_peer_advert_outcome(&other)
+                        );
+                        continue;
+                    }
+                };
+                let dir = args.out_dir.join(&advert.session_id).join("peer-adverts");
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    println!("event=error context=mkdir message={e}");
+                    continue;
+                }
+                let path =
+                    dir.join(format!("{}.json", advert.contributor_pubkey_hex));
+                let bytes = serde_json::to_vec_pretty(&*advert)
+                    .unwrap_or_default();
+                match std::fs::write(&path, &bytes) {
+                    Ok(()) => {
+                        println!(
+                            "event=peer_advert session_id={} contributor_pubkey={} path={}",
+                            advert.session_id,
+                            advert.contributor_pubkey_hex,
+                            path.display()
+                        );
+                        adverts_written += 1;
+                        if let Some(max) = args.max_adverts {
+                            if adverts_written >= max {
+                                println!(
+                                    "event=exit reason=max_adverts_reached \
+                                     adverts_written={adverts_written}"
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("event=error context=write_peer_advert message={e}");
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(args.poll_interval_secs));
+        }
+    })
+    .await
+    .map_err(|e| anyhow!("watch-peer-adverts join: {e}"))?;
+    run_result
+}
+
+fn stringify_peer_advert_outcome(
+    o: &omni_contributor::PeerAdvertisementOutcome,
+) -> String {
+    use omni_contributor::PeerAdvertisementOutcome as O;
+    match o {
+        O::Verified { .. } => "verified".into(),
+        O::AnnouncementSchemaMalformed(s) => format!("announcement_schema_malformed:{s}"),
+        O::AnnouncerSignatureFailed => "announcer_signature_fail".into(),
+        O::SnipFetchFailed(s) => format!("snip_fetch_failed:{s}"),
+        O::BodyParseFailed(s) => format!("body_parse_failed:{s}"),
+        O::BodySchemaInvalid(s) => format!("body_schema_invalid:{s}"),
+        O::AdvertisementIdMismatch { stored, derived } => {
+            format!("advertisement_id_mismatch:stored={stored}:derived={derived}")
+        }
+        O::ContributorSignatureFailed => "contributor_signature_fail".into(),
+        O::DriftMismatch { field } => format!("drift:{field}"),
+        O::NoMatchingJoin => "no_matching_join".into(),
+        O::Expired { expires_at, now } => format!("expired:expires_at={expires_at}:now={now}"),
     }
 }

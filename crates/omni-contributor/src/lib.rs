@@ -45,6 +45,8 @@ pub mod handoff;
 pub mod handoff_verify;
 pub mod job;
 pub mod net;
+pub mod peer_advert;
+pub mod peer_routing;
 pub mod posted;
 pub mod relay;
 pub mod result;
@@ -65,9 +67,17 @@ pub use error::{
 };
 pub use net::{
     NetworkAggregatedResultAnnouncement, NetworkContributorJoinedAnnouncement,
-    NetworkPartialResultAnnouncement, NetworkPostedJobAnnouncement,
-    NetworkPostedResultAnnouncement, NetworkSessionOpenedAnnouncement,
-    NetworkWorkAssignedAnnouncement, NET_SCHEMA_VERSION,
+    NetworkPartialResultAnnouncement, NetworkPeerAdvertisementAnnouncement,
+    NetworkPostedJobAnnouncement, NetworkPostedResultAnnouncement,
+    NetworkSessionOpenedAnnouncement, NetworkWorkAssignedAnnouncement, NET_SCHEMA_VERSION,
+};
+pub use peer_advert::{
+    ContributorPeerAdvertisement, PeerCapabilities, PEER_ADVERTISEMENT_MAX_LIFETIME_SECS,
+    PEER_ADVERTISEMENT_SCHEMA_VERSION,
+};
+pub use peer_routing::{
+    process_peer_advertisement_announcement, verify_peer_advertisement_body,
+    PeerAdvertisementOutcome, PeerRoutingCache, ResolvedPeerRoute, RouteResolution,
 };
 pub use relay::{ContributorRelay, InMemoryRelay};
 #[cfg(feature = "network")]

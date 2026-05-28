@@ -2565,6 +2565,7 @@ dependencies = [
  "chrono",
  "libp2p",
  "libp2p-identity",
+ "multiaddr",
  "omni-net",
  "omni-store",
  "omni-types",

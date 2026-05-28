@@ -1105,6 +1105,147 @@ pub fn activation_handoff_signing_input(
     canonical_activation_handoff_bytes(h)
 }
 
+// ── Stage 12.5 — peer advertisement canonical bytes ──────────────────────
+//
+// The canonical signing body EXCLUDES `advertisement_id` (which IS
+// the BLAKE3 of this body, lower-hex) and `contributor_signature_hex`.
+// Bincode 1.3 wire layout; field order frozen for
+// `schema_version: 1`. Capabilities are serialized as a sub-struct
+// in declaration order.
+
+use crate::peer_advert::{ContributorPeerAdvertisement, PeerCapabilities};
+
+/// 36 ASCII bytes.
+pub const PEER_ADVERT_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-PEER-ADVERT:v1:";
+
+#[derive(Debug, Serialize)]
+struct PeerAdvertCanonicalBody<'a> {
+    schema_version: u32,
+    session_id: &'a str,
+    contributor_pubkey_hex: &'a str,
+    libp2p_peer_id: &'a str,
+    listen_multiaddrs: &'a [String],
+    capabilities: PeerCapabilitiesCanonical<'a>,
+    advertised_at_utc: &'a str,
+    expires_at_utc: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct PeerCapabilitiesCanonical<'a> {
+    supports_live_handoff: bool,
+    max_handoff_chunk_bytes: u64,
+    supported_dtypes: &'a [TensorDtype],
+}
+
+impl<'a> From<&'a PeerCapabilities> for PeerCapabilitiesCanonical<'a> {
+    fn from(c: &'a PeerCapabilities) -> Self {
+        Self {
+            supports_live_handoff: c.supports_live_handoff,
+            max_handoff_chunk_bytes: c.max_handoff_chunk_bytes,
+            supported_dtypes: &c.supported_dtypes,
+        }
+    }
+}
+
+impl<'a> From<&'a ContributorPeerAdvertisement> for PeerAdvertCanonicalBody<'a> {
+    fn from(a: &'a ContributorPeerAdvertisement) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            session_id: &a.session_id,
+            contributor_pubkey_hex: &a.contributor_pubkey_hex,
+            libp2p_peer_id: &a.libp2p_peer_id,
+            listen_multiaddrs: &a.listen_multiaddrs,
+            capabilities: (&a.capabilities).into(),
+            advertised_at_utc: &a.advertised_at_utc,
+            expires_at_utc: &a.expires_at_utc,
+        }
+    }
+}
+
+pub fn canonical_peer_advertisement_bytes(
+    a: &ContributorPeerAdvertisement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: PeerAdvertCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(PEER_ADVERT_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(PEER_ADVERT_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// 32-byte BLAKE3 of `canonical_peer_advertisement_bytes`.
+pub fn peer_advertisement_hash_bytes(
+    a: &ContributorPeerAdvertisement,
+) -> Result<[u8; 32], CanonicalError> {
+    let bytes = canonical_peer_advertisement_bytes(a)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// 64-char lowercase hex. Value stored in
+/// `ContributorPeerAdvertisement.advertisement_id`.
+pub fn advertisement_id_hex(
+    a: &ContributorPeerAdvertisement,
+) -> Result<String, CanonicalError> {
+    Ok(hex_lower(&peer_advertisement_hash_bytes(a)?))
+}
+
+/// Bytes the contributor signs over. Equal to
+/// `canonical_peer_advertisement_bytes`.
+pub fn peer_advertisement_signing_input(
+    a: &ContributorPeerAdvertisement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_peer_advertisement_bytes(a)
+}
+
+// --- NetworkPeerAdvertisementAnnouncement ---
+
+use crate::net::NetworkPeerAdvertisementAnnouncement;
+
+/// 40 ASCII bytes.
+pub const NET_PEER_ADVERT_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-NET-PEER-ADVERT:v1:";
+
+#[derive(Debug, Serialize)]
+struct NetPeerAdvertCanonicalBody<'a> {
+    schema_version: u32,
+    peer_advertisement_snip_root: &'a str,
+    advertisement_id: &'a str,
+    session_id: &'a str,
+    contributor_pubkey_hex: &'a str,
+    announced_at_utc: &'a str,
+    announcer_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a NetworkPeerAdvertisementAnnouncement> for NetPeerAdvertCanonicalBody<'a> {
+    fn from(a: &'a NetworkPeerAdvertisementAnnouncement) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            peer_advertisement_snip_root: &a.peer_advertisement_snip_root,
+            advertisement_id: &a.advertisement_id,
+            session_id: &a.session_id,
+            contributor_pubkey_hex: &a.contributor_pubkey_hex,
+            announced_at_utc: &a.announced_at_utc,
+            announcer_pubkey_hex: &a.announcer_pubkey_hex,
+        }
+    }
+}
+
+pub fn canonical_net_peer_advert_bytes(
+    a: &NetworkPeerAdvertisementAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: NetPeerAdvertCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(NET_PEER_ADVERT_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(NET_PEER_ADVERT_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn net_peer_advert_signing_input(
+    a: &NetworkPeerAdvertisementAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_net_peer_advert_bytes(a)
+}
+
 // ── Hex helpers ───────────────────────────────────────────────────────────
 
 /// Lowercase-hex encode raw bytes (no `0x` prefix). Used throughout
