@@ -65,8 +65,15 @@ const CHANNEL_CAPACITY: usize = 256;
 /// }
 /// ```
 pub struct OmniNet {
-    cmd_tx:   mpsc::Sender<SwarmCommand>,
-    event_rx: mpsc::Receiver<OmniNetEvent>,
+    cmd_tx:        mpsc::Sender<SwarmCommand>,
+    event_rx:      mpsc::Receiver<OmniNetEvent>,
+    /// Stage 12.5-pre — local libp2p `PeerId`. Captured from the
+    /// built swarm BEFORE the run loop is spawned, so callers can
+    /// read it via [`OmniNet::local_peer_id`] without re-entering
+    /// the swarm task. Stable for the lifetime of this `OmniNet`;
+    /// regenerated on every `OmniNet::new` because the swarm uses
+    /// `SwarmBuilder::with_new_identity()`. Restart = new PeerId.
+    local_peer_id: PeerId,
 }
 
 impl OmniNet {
@@ -75,6 +82,11 @@ impl OmniNet {
     pub async fn new(config: NetConfig) -> Result<Self> {
         let mut omni_swarm = OmniSwarm::build(&config)?;
         omni_swarm.subscribe_all_topics()?;
+
+        // Stage 12.5-pre — capture the local PeerId BEFORE moving
+        // `omni_swarm` into the background task. Cheap copy; the
+        // value is immutable for the lifetime of this `OmniNet`.
+        let local_peer_id = omni_swarm.local_peer_id();
 
         let (event_tx, event_rx) = mpsc::channel::<OmniNetEvent>(CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx)     = mpsc::channel::<SwarmCommand>(CHANNEL_CAPACITY);
@@ -85,7 +97,28 @@ impl OmniNet {
             }
         });
 
-        Ok(Self { cmd_tx, event_rx })
+        Ok(Self {
+            cmd_tx,
+            event_rx,
+            local_peer_id,
+        })
+    }
+
+    /// Stage 12.5-pre — local libp2p [`PeerId`] for this node.
+    /// Stable for the lifetime of this `OmniNet` instance.
+    ///
+    /// Used by Stage 12.5's `advertise-peer` subcommand to bind a
+    /// signed `ContributorPeerAdvertisement` to the actual running
+    /// network identity rather than an operator-supplied string.
+    ///
+    /// Note: `OmniNet::new` calls `SwarmBuilder::with_new_identity`,
+    /// so the libp2p identity keypair (and therefore this PeerId)
+    /// is regenerated on every node restart. Stage 12.5 peer
+    /// advertisements are therefore session-scoped, short-lived
+    /// routing hints — not permanent identity records. Persistent
+    /// libp2p identity is a separate, deferred concern.
+    pub fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id
     }
 
     // ── Phase 1: Gossipsub ──────────────────────────────────────────────
@@ -209,13 +242,20 @@ impl OmniNet {
     /// Test-only constructor that builds an `OmniNet` from pre-built
     /// channels instead of standing up a full libp2p swarm. Used to
     /// unit-test the synchronous `try_next_event` accessor without
-    /// requiring real networking.
+    /// requiring real networking. The local peer id is synthesized
+    /// from a fresh random keypair; tests that read `local_peer_id`
+    /// should use [`OmniNet::new`] against a real (port-0) swarm
+    /// instead — see `local_peer_id_tests` below.
     #[cfg(test)]
     pub(crate) fn from_test_channels(
         cmd_tx: mpsc::Sender<SwarmCommand>,
         event_rx: mpsc::Receiver<OmniNetEvent>,
     ) -> Self {
-        Self { cmd_tx, event_rx }
+        Self {
+            cmd_tx,
+            event_rx,
+            local_peer_id: PeerId::random(),
+        }
     }
 }
 
@@ -275,5 +315,51 @@ mod try_next_event_tests {
         // No events were ever pushed; receiver is now closed. Behavior
         // mirrors next_event's "swarm stopped" None semantics.
         assert!(net.try_next_event().is_none());
+    }
+}
+
+// ── Stage 12.5-pre — local_peer_id accessor tests ─────────────────────────
+//
+// Stands up a real (port-0, no bootstrap) OmniNet to exercise the
+// public `local_peer_id` accessor end-to-end. Asserts the value is
+// stable across repeated calls on the same instance — the field is
+// captured BEFORE the run loop is spawned, so no race exists between
+// reads and swarm events.
+
+#[cfg(test)]
+mod local_peer_id_tests {
+    use super::*;
+    use omni_types::config::NetConfig;
+
+    #[tokio::test]
+    async fn local_peer_id_is_stable_across_repeated_calls() {
+        let net = OmniNet::new(NetConfig::default())
+            .await
+            .expect("OmniNet::new with default config");
+        let a = net.local_peer_id();
+        let b = net.local_peer_id();
+        let c = net.local_peer_id();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        // Clean shutdown so the swarm task doesn't outlive the test.
+        let _ = net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn two_omni_net_instances_have_distinct_peer_ids() {
+        // `SwarmBuilder::with_new_identity()` regenerates the
+        // keypair on every `OmniNet::new`. Two independent
+        // instances must therefore see distinct PeerIds — the
+        // documented "restart = new PeerId" property Stage 12.5
+        // peer advertisements rely on.
+        let net_a = OmniNet::new(NetConfig::default())
+            .await
+            .expect("first OmniNet");
+        let net_b = OmniNet::new(NetConfig::default())
+            .await
+            .expect("second OmniNet");
+        assert_ne!(net_a.local_peer_id(), net_b.local_peer_id());
+        let _ = net_a.shutdown().await;
+        let _ = net_b.shutdown().await;
     }
 }

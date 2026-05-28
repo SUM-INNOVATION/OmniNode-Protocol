@@ -218,6 +218,14 @@ impl OmniSwarm {
             .subscribe_all(&mut self.inner.behaviour_mut().gossipsub)
     }
 
+    /// Stage 12.5-pre — return the local libp2p `PeerId`. Cheap copy.
+    /// Internally delegates to `Swarm::local_peer_id`; captured by
+    /// `OmniNet::new` before the run loop is spawned so callers can
+    /// read it without re-entering the swarm task.
+    pub fn local_peer_id(&self) -> PeerId {
+        *self.inner.local_peer_id()
+    }
+
     /// Publish bytes to a named topic from within the event loop.
     pub fn publish(&mut self, topic: &str, data: Vec<u8>) -> Result<()> {
         self.gossip
