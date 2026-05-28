@@ -22,9 +22,9 @@ use std::collections::VecDeque;
 use crate::error::RelayError;
 use crate::net::{
     NetworkAggregatedResultAnnouncement, NetworkContributorJoinedAnnouncement,
-    NetworkPartialResultAnnouncement, NetworkPostedJobAnnouncement,
-    NetworkPostedResultAnnouncement, NetworkSessionOpenedAnnouncement,
-    NetworkWorkAssignedAnnouncement,
+    NetworkPartialResultAnnouncement, NetworkPeerAdvertisementAnnouncement,
+    NetworkPostedJobAnnouncement, NetworkPostedResultAnnouncement,
+    NetworkSessionOpenedAnnouncement, NetworkWorkAssignedAnnouncement,
 };
 
 /// Minimal sync interface a contributor watch / announce loop uses.
@@ -103,6 +103,17 @@ pub trait ContributorRelay {
     fn poll_aggregated_results(
         &mut self,
     ) -> Result<Vec<NetworkAggregatedResultAnnouncement>, RelayError>;
+
+    // ── Stage 12.5 — peer advertisement surface ──────────────────
+
+    fn publish_peer_advertisement(
+        &mut self,
+        msg: &NetworkPeerAdvertisementAnnouncement,
+    ) -> Result<(), RelayError>;
+
+    fn poll_peer_advertisements(
+        &mut self,
+    ) -> Result<Vec<NetworkPeerAdvertisementAnnouncement>, RelayError>;
 }
 
 // ── InMemoryRelay ─────────────────────────────────────────────────────────
@@ -121,6 +132,7 @@ pub struct InMemoryRelay {
     work_assigned: VecDeque<NetworkWorkAssignedAnnouncement>,
     partial_results: VecDeque<NetworkPartialResultAnnouncement>,
     aggregated_results: VecDeque<NetworkAggregatedResultAnnouncement>,
+    peer_adverts: VecDeque<NetworkPeerAdvertisementAnnouncement>,
 }
 
 impl InMemoryRelay {
@@ -133,6 +145,7 @@ impl InMemoryRelay {
             work_assigned: VecDeque::new(),
             partial_results: VecDeque::new(),
             aggregated_results: VecDeque::new(),
+            peer_adverts: VecDeque::new(),
         }
     }
 
@@ -252,6 +265,20 @@ impl ContributorRelay for InMemoryRelay {
     ) -> Result<Vec<NetworkAggregatedResultAnnouncement>, RelayError> {
         Ok(self.aggregated_results.drain(..).collect())
     }
+
+    fn publish_peer_advertisement(
+        &mut self,
+        msg: &NetworkPeerAdvertisementAnnouncement,
+    ) -> Result<(), RelayError> {
+        self.peer_adverts.push_back(msg.clone());
+        Ok(())
+    }
+
+    fn poll_peer_advertisements(
+        &mut self,
+    ) -> Result<Vec<NetworkPeerAdvertisementAnnouncement>, RelayError> {
+        Ok(self.peer_adverts.drain(..).collect())
+    }
 }
 
 // ── OmniNetRelay ──────────────────────────────────────────────────────────
@@ -269,7 +296,7 @@ mod omni_net_relay {
         OmniNet, OmniNetEvent, TOPIC_CONTRIBUTOR_JOB, TOPIC_CONTRIBUTOR_RESULT,
         TOPIC_CONTRIBUTOR_SESSION_AGGREGATED, TOPIC_CONTRIBUTOR_SESSION_ASSIGN,
         TOPIC_CONTRIBUTOR_SESSION_JOIN, TOPIC_CONTRIBUTOR_SESSION_OPEN,
-        TOPIC_CONTRIBUTOR_SESSION_PARTIAL,
+        TOPIC_CONTRIBUTOR_SESSION_PARTIAL, TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT,
     };
     use tokio::runtime::Handle;
     use tokio::sync::Mutex as AsyncMutex;
@@ -311,6 +338,9 @@ mod omni_net_relay {
             Arc<StdMutex<VecDeque<NetworkPartialResultAnnouncement>>>,
         pending_aggregated_results:
             Arc<StdMutex<VecDeque<NetworkAggregatedResultAnnouncement>>>,
+        // Stage 12.5 — peer-advert queue.
+        pending_peer_adverts:
+            Arc<StdMutex<VecDeque<NetworkPeerAdvertisementAnnouncement>>>,
     }
 
     impl OmniNetRelay {
@@ -330,6 +360,7 @@ mod omni_net_relay {
                 pending_work_assigned: Arc::new(StdMutex::new(VecDeque::new())),
                 pending_partial_results: Arc::new(StdMutex::new(VecDeque::new())),
                 pending_aggregated_results: Arc::new(StdMutex::new(VecDeque::new())),
+                pending_peer_adverts: Arc::new(StdMutex::new(VecDeque::new())),
             }
         }
 
@@ -368,6 +399,10 @@ mod omni_net_relay {
                 .pending_aggregated_results
                 .lock()
                 .expect("pending_aggregated_results poisoned");
+            let mut s_peer = self
+                .pending_peer_adverts
+                .lock()
+                .expect("pending_peer_adverts poisoned");
             while let Some(ev) = net.try_next_event() {
                 if let OmniNetEvent::MessageReceived { topic, data, .. } = ev {
                     match topic.as_str() {
@@ -426,6 +461,14 @@ mod omni_net_relay {
                             >(&data)
                             {
                                 s_agg.push_back(msg);
+                            }
+                        }
+                        TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT => {
+                            if let Ok(msg) = serde_json::from_slice::<
+                                NetworkPeerAdvertisementAnnouncement,
+                            >(&data)
+                            {
+                                s_peer.push_back(msg);
                             }
                         }
                         _ => {
@@ -580,6 +623,25 @@ mod omni_net_relay {
                 .pending_aggregated_results
                 .lock()
                 .expect("pending_aggregated_results poisoned");
+            Ok(q.drain(..).collect())
+        }
+
+        fn publish_peer_advertisement(
+            &mut self,
+            msg: &NetworkPeerAdvertisementAnnouncement,
+        ) -> Result<(), RelayError> {
+            let bytes = serde_json::to_vec(msg)?;
+            self.publish_topic(TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT, bytes)
+        }
+
+        fn poll_peer_advertisements(
+            &mut self,
+        ) -> Result<Vec<NetworkPeerAdvertisementAnnouncement>, RelayError> {
+            self.drain_events();
+            let mut q = self
+                .pending_peer_adverts
+                .lock()
+                .expect("pending_peer_adverts poisoned");
             Ok(q.drain(..).collect())
         }
     }

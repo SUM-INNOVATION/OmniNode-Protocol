@@ -47,6 +47,9 @@ thiserror        = { workspace = true }
 tracing          = { workspace = true }
 chrono           = { workspace = true }
 libp2p-identity  = { workspace = true }   # Ed25519 signing — direct dep
+# Stage 12.5 — Multiaddr parsing for ContributorPeerAdvertisement
+# schema validation. Small crate; does NOT pull libp2p transport.
+multiaddr        = { workspace = true }
 base64           = "0.22"                 # ExternalCommandRunner stdout
 tempfile         = { workspace = true }   # SNIP byte wrappers (Option A)
 

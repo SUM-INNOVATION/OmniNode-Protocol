@@ -810,3 +810,139 @@ omni-node operator contributor send-handoff
 - **`activation-in-mode snip`** as a first-class CLI flag.
 - **Receive-side rate limiting + per-session pending-handoff caps** (today: enforced per-envelope by schema bounds; coarser per-session caps are out of scope).
 - **Reward-split engine** that consumes 12.3 partial `work_units` + 12.4 handoff metadata to divide the job-level base-unit pool.
+
+---
+
+# Stage 12.5 — signed contributor peer advertisement / session routing
+
+**Status**: shipped at Stage 12.5. Builds on Stage 12.4 live activation handoff. Removes manual `--downstream-to-peer` from the pooled inference flow by letting contributors publish signed, session-scoped reachability hints.
+
+## Posture (unchanged)
+
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid logic. No proof mode / on-chain verification / chain proof allowlist. SNIP only for durable storage; mesh announcements are pointer-only. Default `omni-node` build still pulls zero halo2/prover/framework runtimes.
+
+## What 12.5 actually is
+
+**Local routing data, not a marketplace, registry, or chain authority.** A contributor publishes a signed `ContributorPeerAdvertisement` that binds:
+
+```
+ExecutionSession.session_id
+  → ContributorJoin.contributor_pubkey_hex
+    → ContributorPeerAdvertisement.libp2p_peer_id (+ multiaddrs, capabilities)
+```
+
+The advertisement is **per-session** and **short-lived** (≤ 24h by schema validation). Receivers verify announcer signature + body signature + drift + matching join + expiry, then cache locally for [Stage 12.4 live handoff](crates/omni-contributor/src/handoff.rs) route resolution. Two coordinators running parallel sessions for the same `posted_id` cache their own advertisements independently. There is no global registry.
+
+## PeerId binding is honest
+
+`advertise-peer` derives `libp2p_peer_id` from `OmniNet::local_peer_id()` (Stage 12.5-pre lift). There is no `--libp2p-peer-id` flag — operators can't lie about what node they're running. Restart-cycle implications:
+
+- `omni-net`'s `SwarmBuilder::with_new_identity()` regenerates the libp2p keypair on every `OmniNet::new`, so **restart = new PeerId**. Any advertisement published before a restart is dead afterwards.
+- That matches the ≤ 24h freshness cap: Stage 12.5 advertisements are short-lived routing hints, not permanent identity records.
+- Persistent libp2p identity (so PeerIds survive restart) is a separate, deferred concern. Not in 12.5.
+
+## New envelopes (2)
+
+```text
+ContributorPeerAdvertisement {
+    schema_version, advertisement_id, session_id, contributor_pubkey_hex,
+    libp2p_peer_id,                  // base58, from OmniNet::local_peer_id()
+    listen_multiaddrs,               // may be empty; /p2p tail must match libp2p_peer_id
+    capabilities: PeerCapabilities {
+        supports_live_handoff,       // must be true for route resolution
+        max_handoff_chunk_bytes,     // 1..=HANDOFF_CHUNK_MAX_BYTES (Stage 12.4 bound)
+        supported_dtypes,            // non-empty
+    },
+    advertised_at_utc,
+    expires_at_utc,                  // > advertised_at, <= advertised_at + 24h
+    contributor_signature_hex,       // over canonical body (excl. advertisement_id + signature)
+}
+
+NetworkPeerAdvertisementAnnouncement {
+    schema_version, peer_advertisement_snip_root, advertisement_id, session_id,
+    contributor_pubkey_hex, announced_at_utc, announcer_pubkey_hex,
+    announcer_signature_hex,         // required; inner contributor sig is the trust root
+}
+```
+
+New domain separators: `OMNINODE-CONTRIBUTOR-PEER-ADVERT:v1:` and `OMNINODE-CONTRIBUTOR-NET-PEER-ADVERT:v1:`.
+
+New mesh topic: `omni/contributor/session/peer-advert/v1` (carried with the existing `UnknownTopic` safety lift).
+
+## Local routing cache
+
+`PeerRoutingCache` keys on `(session_id, contributor_pubkey_hex)`. **Newest non-expired advertisement wins.** `resolve(session_id, contributor_pubkey_hex, dtype, local_chunk_cap, now_utc)` returns:
+
+- `Found(ResolvedPeerRoute { peer_id, multiaddrs, max_handoff_chunk_bytes, negotiated_dtype })` — `max_handoff_chunk_bytes` is `min(local_chunk_cap, advertised.max_handoff_chunk_bytes)`.
+- `NoAdvertisement` — nothing cached for this key.
+- `AllExpired { newest_expires_at }` — advertisement exists but `now_utc >= expires_at_utc`.
+- `LiveHandoffNotSupported` — advertisement's `supports_live_handoff` is false.
+- `DtypeNotSupported { requested, supported }` — requested dtype is not in the advertised list.
+
+## CLI
+
+```bash
+# Publish a peer advertisement. PeerId comes from the live OmniNet.
+omni-node operator contributor advertise-peer \
+  --execution-session-snip-root 0x... \
+  --join-snip-root 0x... \
+  --contributor-seed <p> \
+  [--listen-multiaddr /ip4/.../udp/.../quic-v1 ...] \
+  --max-handoff-chunk-bytes 33554432 \
+  --supported-dtype f16 --supported-dtype bf16 \
+  --expires-in-secs 3600 \
+  [--publish-announcement]
+
+# Long-running passive watcher; writes verified adverts to disk.
+omni-node operator contributor watch-peer-adverts \
+  --out-dir <dir> \
+  --joins-dir <watch-sessions-out-dir>          # source of verified joins
+  [--session-id <hex64> ...] [--contributor-pubkey <hex64> ...] \
+  [--max-adverts <N>] [--max-polls <N>]
+
+# Run-assignment can now resolve its downstream peer from the cache.
+omni-node operator contributor run-assignment \
+  --assignment-snip-root 0x... \
+  --execution-session-snip-root 0x... \
+  --downstream-to-assignment-snip-root 0x... \
+  --peer-advert-dir <watch-peer-adverts-out-dir> \
+  --joins-dir <watch-sessions-out-dir>     # required for join verification
+  --resolve-downstream-peer-from-session \
+  [--downstream-resolve-dtype f16|bf16|f32] \
+  --contributor-seed <p> --runner ...
+  # `--downstream-to-peer` still works and TAKES PRECEDENCE if both are supplied.
+```
+
+The canonical workflow is:
+
+```bash
+omni-node operator contributor watch-sessions       --out-dir A
+omni-node operator contributor watch-peer-adverts   --out-dir B --joins-dir A
+omni-node operator contributor run-assignment       --peer-advert-dir B --joins-dir A \
+                                                    --resolve-downstream-peer-from-session ...
+```
+
+Both `watch-peer-adverts` and `run-assignment` point at the same `watch-sessions --out-dir` for the join source. The loader walks the `<dir>/<session_id>/{session.json, joins/*.json}` layout: every join goes through `verify_execution_session` on the sibling `session.json` followed by `verify_contributor_join(&session, &join)` (Stage 12.3 verifier — schema + session binding + contributor signature). Joins that fail either check are dropped with a stderr warning. A forged local join file cannot make a forged peer advert pass the matching-join gate.
+
+## What the announcement processor verifies
+
+[`process_peer_advertisement_announcement`](crates/omni-contributor/src/peer_routing.rs) follows the Stage 12.3 / 12.4 processor pattern:
+
+1. Announcement schema valid.
+2. Announcer signature verifies against `announcer_pubkey_hex`.
+3. Fetch advertisement from SNIP at `peer_advertisement_snip_root`.
+4. Advertisement body schema valid (including 24h expiry bound + PeerId/Multiaddr parse + `/p2p` matching).
+5. Inner contributor signature verifies against `contributor_pubkey_hex`.
+6. Drift checks: `(advertisement_id, session_id, contributor_pubkey_hex)` agree between announcement and body.
+7. **Matching-join check**: `(session_id, contributor_pubkey_hex)` must match a supplied verified `ContributorJoin`. Operators wire this from `watch-sessions` output.
+8. Expiry: routine watchers reject `now_utc >= expires_at_utc`. Forensic re-runs can pass `now_utc = None` to skip.
+
+Returns a typed `PeerAdvertisementOutcome` whose failure variants map 1:1 to operator-visible bare-stdout events.
+
+## Out of scope for 12.5 (call out)
+
+- Persistent libp2p identity that survives `omni-node` restart.
+- Non-linear / branching pipelines (Stage 12.4's `+1` topology constraint still applies).
+- Advert-driven peer reputation / scoring.
+- Any chain-side interaction, payment, slashing, reward distribution.
+- Anything in items 1 / 7 / 8 of the chart or the lettered A–F flow.

@@ -185,6 +185,52 @@ pub enum SchemaError {
          byte_len {byte_len}"
     )]
     HandoffSingleChunkLenMismatch { chunk_len: u64, byte_len: u64 },
+
+    // Stage 12.5 — peer advertisement schema errors.
+
+    #[error("ContributorPeerAdvertisement.libp2p_peer_id is not a valid base58 libp2p PeerId: {got:?}")]
+    PeerAdvertLibp2pPeerIdMalformed { got: String },
+
+    #[error("ContributorPeerAdvertisement.listen_multiaddrs[{index}] is not a valid multiaddr: {got:?}")]
+    PeerAdvertMultiaddrMalformed { index: usize, got: String },
+
+    #[error(
+        "ContributorPeerAdvertisement.listen_multiaddrs[{index}] /p2p/{multiaddr_peer} does \
+         not match libp2p_peer_id {advertised_peer}"
+    )]
+    PeerAdvertMultiaddrP2pMismatch {
+        index: usize,
+        multiaddr_peer: String,
+        advertised_peer: String,
+    },
+
+    #[error("PeerCapabilities.max_handoff_chunk_bytes must be > 0")]
+    PeerAdvertChunkCapZero,
+
+    #[error("PeerCapabilities.max_handoff_chunk_bytes {got} exceeds HANDOFF_CHUNK_MAX_BYTES {max}")]
+    PeerAdvertChunkCapTooLarge { got: u64, max: u64 },
+
+    #[error("PeerCapabilities.supported_dtypes must be non-empty")]
+    PeerAdvertSupportedDtypesEmpty,
+
+    #[error(
+        "ContributorPeerAdvertisement.expires_at_utc {expires_at} must be strictly after \
+         advertised_at_utc {advertised_at}"
+    )]
+    PeerAdvertExpiryNotAfterAdvertised {
+        advertised_at: String,
+        expires_at: String,
+    },
+
+    #[error(
+        "ContributorPeerAdvertisement.expires_at_utc {expires_at} exceeds \
+         advertised_at_utc {advertised_at} + {max_lifetime_secs} seconds (24h freshness cap)"
+    )]
+    PeerAdvertExpiryTooFar {
+        advertised_at: String,
+        expires_at: String,
+        max_lifetime_secs: i64,
+    },
 }
 
 /// Canonical-bytes / hash encoding errors.
