@@ -41,6 +41,8 @@
 pub mod canonical;
 pub mod discover;
 pub mod error;
+pub mod handoff;
+pub mod handoff_verify;
 pub mod job;
 pub mod net;
 pub mod posted;
@@ -52,6 +54,7 @@ pub mod session;
 pub mod session_verify;
 pub mod signing;
 pub mod snip;
+pub mod tensor_transport;
 pub mod verify;
 pub mod watch;
 
@@ -77,12 +80,28 @@ pub use result::{
     ContributorResult, Evidence, MeasuredAccounting, StageContribution, WorkUnitKind,
 };
 pub use run::{run_job, RunJobOptions};
-pub use runner::{ExternalCommandRunner, InferenceRunner, RunOutput, StubRunner};
+pub use runner::{
+    ExternalCommandRunner, InferenceRunner, RunOutput, RunOutputWithActivation,
+    RunnerOutputActivation, StubRunner,
+};
 pub use session::{
     AggregatedContributorResult, AggregatedPartialRef, ContributorJoin, ExecutionSession,
     PartialContributorResult, WorkAssignment, WorkKind, RUNNER_KIND_MAX,
     SESSION_SCHEMA_VERSION, WORK_KIND_CUSTOM_LABEL_MAX,
 };
+pub use handoff::{
+    ActivationHandoff, TensorDtype, HANDOFF_BYTE_LEN_MAX, HANDOFF_CHUNK_COUNT_MAX,
+    HANDOFF_CHUNK_MAX_BYTES, HANDOFF_SCHEMA_VERSION, HANDOFF_SHAPE_RANK_MAX,
+};
+pub use handoff_verify::{
+    verify_activation_handoff, ChunkOutcome, HandoffReceiver, HandoffStreamKey,
+    HandoffVerifyOutcome,
+};
+pub use tensor_transport::{
+    InMemoryTensorTransport, TensorTransport, TensorTransportError,
+};
+#[cfg(feature = "network")]
+pub use tensor_transport::OmniNetTensorTransport;
 pub use session_verify::{
     check_not_expired, process_aggregated_result_announcement,
     process_contributor_joined_announcement, process_partial_result_announcement,

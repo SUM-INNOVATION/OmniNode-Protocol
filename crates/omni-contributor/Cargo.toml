@@ -31,7 +31,7 @@ default = []
 # relay is sufficient for the full test suite. The `omni-node`
 # operator binary enables this feature to wire `OmniNetRelay` into
 # the announce-* / watch-network-* CLI subcommands.
-network = ["dep:omni-net", "dep:tokio"]
+network = ["dep:omni-net", "dep:tokio", "dep:libp2p"]
 
 [dependencies]
 # Stage 12.0 — kept deliberately lean. NO `omni-zkml` (chain/proof
@@ -54,6 +54,10 @@ tempfile         = { workspace = true }   # SNIP byte wrappers (Option A)
 # only when --features network is set (via omni-node's CLI build).
 omni-net         = { workspace = true, optional = true }
 tokio            = { workspace = true, optional = true }
+# Stage 12.4 — only PeerId / Multiaddr types for the
+# OmniNetTensorTransport peer-hint parser. Tied to the `network`
+# feature; default builds still pull zero networking deps.
+libp2p           = { workspace = true, optional = true }
 
 [dev-dependencies]
 # (None unique to dev; runtime deps cover the tests.)
