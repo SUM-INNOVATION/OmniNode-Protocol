@@ -429,6 +429,14 @@ struct AnnounceJobArgs {
     #[arg(long = "peer")]
     peer: Vec<String>,
 
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
+
     /// Brief wait (milliseconds) after publishing before the
     /// subcommand exits, to give gossipsub a chance to propagate.
     #[arg(long, default_value_t = 200)]
@@ -501,6 +509,14 @@ struct WatchNetworkJobsArgs {
     #[arg(long = "peer")]
     peer: Vec<String>,
 
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
+
     #[arg(long, default_value_t = 5)]
     poll_interval_secs: u64,
 
@@ -535,6 +551,14 @@ struct AnnounceResultArgs {
 
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
 
     #[arg(long, default_value_t = 200)]
     propagation_wait_ms: u64,
@@ -576,6 +600,14 @@ struct WatchNetworkResultsArgs {
     #[arg(long = "peer")]
     peer: Vec<String>,
 
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
+
     #[arg(long, default_value_t = 5)]
     poll_interval_secs: u64,
 
@@ -615,6 +647,14 @@ struct OpenSessionArgs {
     listen_port: u16,
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
     #[arg(long, default_value_t = 200)]
     propagation_wait_ms: u64,
     #[arg(long, default_value_t = 30)]
@@ -662,6 +702,14 @@ struct JoinSessionArgs {
     listen_port: u16,
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
     #[arg(long, default_value_t = 200)]
     propagation_wait_ms: u64,
     #[arg(long, default_value_t = 30)]
@@ -720,6 +768,14 @@ struct AssignWorkArgs {
     listen_port: u16,
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
     #[arg(long, default_value_t = 200)]
     propagation_wait_ms: u64,
     #[arg(long, default_value_t = 30)]
@@ -772,6 +828,14 @@ struct RunAssignmentArgs {
     listen_port: u16,
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
     #[arg(long, default_value_t = 200)]
     propagation_wait_ms: u64,
     #[arg(long, default_value_t = 30)]
@@ -940,6 +1004,14 @@ struct AggregateSessionArgs {
     listen_port: u16,
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
     #[arg(long, default_value_t = 200)]
     propagation_wait_ms: u64,
     #[arg(long, default_value_t = 30)]
@@ -1005,6 +1077,14 @@ struct SendHandoffArgs {
     listen_port: u16,
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
     #[arg(long, default_value_t = 200)]
     propagation_wait_ms: u64,
     #[arg(long, default_value_t = 30)]
@@ -1056,6 +1136,14 @@ struct WatchSessionsArgs {
     listen_port: u16,
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
     #[arg(long, default_value_t = 5)]
     poll_interval_secs: u64,
     #[arg(long)]
@@ -1115,6 +1203,14 @@ struct AdvertisePeerArgs {
     listen_port: u16,
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
     #[arg(long, default_value_t = 200)]
     propagation_wait_ms: u64,
     #[arg(long, default_value_t = 30)]
@@ -1164,6 +1260,14 @@ struct WatchPeerAdvertsArgs {
     listen_port: u16,
     #[arg(long = "peer")]
     peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file
+    /// (auto-created at 0600 on Unix). Stabilizes `local_peer_id`
+    /// across restart so peer advertisements survive their full
+    /// ≤24h freshness window. Omit to preserve pre-12.6 ephemeral
+    /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
     #[arg(long, default_value_t = 5)]
     poll_interval_secs: u64,
 
@@ -1712,9 +1816,11 @@ async fn run_announce_job(args: AnnounceJobArgs) -> Result<()> {
         .map_err(|e| anyhow!("invalid NetworkPostedJobAnnouncement: {e}"))?;
 
     // Open OmniNet and publish.
+    let identity = resolve_net_identity(args.net_identity_file.as_deref())?;
     let net_config = NetConfig {
         listen_port: args.listen_port,
         bootstrap_peers: args.peer,
+        identity,
         ..NetConfig::default()
     };
     let mut net = OmniNet::new(net_config)
@@ -1805,9 +1911,11 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
     };
 
     let snip_adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let identity = resolve_net_identity(args.net_identity_file.as_deref())?;
     let net_config = NetConfig {
         listen_port: args.listen_port,
         bootstrap_peers: args.peer,
+        identity,
         ..NetConfig::default()
     };
     let net = OmniNet::new(net_config)
@@ -1964,9 +2072,11 @@ async fn run_announce_result(args: AnnounceResultArgs) -> Result<()> {
     ann.validate_schema()
         .map_err(|e| anyhow!("invalid NetworkPostedResultAnnouncement: {e}"))?;
 
+    let identity = resolve_net_identity(args.net_identity_file.as_deref())?;
     let net_config = NetConfig {
         listen_port: args.listen_port,
         bootstrap_peers: args.peer,
+        identity,
         ..NetConfig::default()
     };
     let mut net = OmniNet::new(net_config)
@@ -2007,9 +2117,11 @@ async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> 
     use std::time::Duration;
 
     let snip_adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let identity = resolve_net_identity(args.net_identity_file.as_deref())?;
     let net_config = NetConfig {
         listen_port: args.listen_port,
         bootstrap_peers: args.peer,
+        identity,
         ..NetConfig::default()
     };
     let net = OmniNet::new(net_config)
@@ -2124,18 +2236,42 @@ async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> 
 /// Shared helper: open an OmniNet, wait for first peer, return an
 /// Arc-wrapped handle ready for an OmniNetRelay clone. Used by every
 /// 12.3 publish-and-broadcast subcommand below.
+/// Stage 12.6 — resolve the operator's `--net-identity-file` flag
+/// into a `NetIdentity`. `None` preserves pre-12.6 ephemeral
+/// behavior; `Some(path)` calls
+/// `omni_net::load_or_create_keypair_file_bytes` (auto-create at
+/// 0o600 on Unix; refuses malformed existing files; refuses
+/// world-readable files on Unix). Used by every contributor
+/// subcommand that opens `OmniNet`.
+fn resolve_net_identity(
+    net_identity_file: Option<&std::path::Path>,
+) -> Result<omni_types::config::NetIdentity> {
+    use omni_types::config::NetIdentity;
+    match net_identity_file {
+        None => Ok(NetIdentity::Ephemeral),
+        Some(p) => {
+            let bytes = omni_net::load_or_create_keypair_file_bytes(p)
+                .map_err(|e| anyhow!("net-identity-file at {}: {e}", p.display()))?;
+            Ok(NetIdentity::KeypairProtobufBytes(bytes))
+        }
+    }
+}
+
 async fn open_omninet_with_peer_wait(
     listen_port: u16,
     peer: Vec<String>,
     peer_wait_secs: u64,
     mesh_stabilize_ms: u64,
+    net_identity_file: Option<&std::path::Path>,
 ) -> Result<(std::sync::Arc<tokio::sync::Mutex<omni_net::OmniNet>>, tokio::runtime::Handle)>
 {
     use omni_net::OmniNet;
     use omni_types::config::NetConfig;
+    let identity = resolve_net_identity(net_identity_file)?;
     let net_config = NetConfig {
         listen_port,
         bootstrap_peers: peer,
+        identity,
         ..NetConfig::default()
     };
     let mut net = OmniNet::new(net_config)
@@ -2223,6 +2359,7 @@ async fn run_open_session(args: OpenSessionArgs) -> Result<()> {
         args.peer,
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
+        args.net_identity_file.as_deref(),
     )
     .await?;
     let mut relay = OmniNetRelay::new(net.clone(), handle);
@@ -2323,6 +2460,7 @@ async fn run_join_session(args: JoinSessionArgs) -> Result<()> {
         args.peer,
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
+        args.net_identity_file.as_deref(),
     )
     .await?;
     let mut relay = OmniNetRelay::new(net.clone(), handle);
@@ -2385,6 +2523,7 @@ async fn run_assign_work(args: AssignWorkArgs) -> Result<()> {
         args.peer,
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
+        args.net_identity_file.as_deref(),
     )
     .await?;
     let mut relay = OmniNetRelay::new(net.clone(), handle);
@@ -2745,6 +2884,7 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
                 args.peer,
                 args.peer_wait_secs,
                 args.mesh_stabilize_ms,
+                args.net_identity_file.as_deref(),
             )
             .await?,
         )
@@ -3081,6 +3221,7 @@ async fn run_send_handoff(args: SendHandoffArgs) -> Result<()> {
         args.peer,
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
+        args.net_identity_file.as_deref(),
     )
     .await?;
     let mut transport = OmniNetTensorTransport::new(net.clone(), handle);
@@ -3384,6 +3525,7 @@ async fn run_aggregate_session(args: AggregateSessionArgs) -> Result<()> {
         args.peer,
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
+        args.net_identity_file.as_deref(),
     )
     .await?;
     let mut relay = OmniNetRelay::new(net.clone(), handle);
@@ -3413,6 +3555,7 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
         args.peer,
         /* peer_wait_secs = */ 0,
         /* mesh_stabilize_ms = */ 0,
+        args.net_identity_file.as_deref(),
     )
     .await?;
     std::fs::create_dir_all(&args.out_dir)?;
@@ -3926,6 +4069,7 @@ async fn run_advertise_peer(args: AdvertisePeerArgs) -> Result<()> {
         args.peer,
         peer_wait_secs,
         mesh_stabilize_ms,
+        args.net_identity_file.as_deref(),
     )
     .await?;
     let libp2p_peer_id_b58 = {
@@ -4030,6 +4174,7 @@ async fn run_watch_peer_adverts(args: WatchPeerAdvertsArgs) -> Result<()> {
         args.peer,
         /* peer_wait_secs = */ 0,
         /* mesh_stabilize_ms = */ 0,
+        args.net_identity_file.as_deref(),
     )
     .await?;
     std::fs::create_dir_all(&args.out_dir)?;

@@ -6,6 +6,7 @@ pub mod codec;
 pub mod discovery;
 pub mod events;
 pub mod gossip;
+pub mod identity;    // Stage 12.6 — persistent libp2p mesh identity
 pub mod nat;
 pub mod swarm;
 pub mod tensor_codec;
@@ -20,6 +21,9 @@ pub use gossip::{
     TOPIC_CONTRIBUTOR_SESSION_JOIN, TOPIC_CONTRIBUTOR_SESSION_OPEN,
     TOPIC_CONTRIBUTOR_SESSION_PARTIAL, TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT,
     TOPIC_PIPELINE, TOPIC_PROOF, TOPIC_SHARD, TOPIC_TEST, UnknownTopic,
+};
+pub use identity::{
+    decode_keypair_protobuf, load_or_create_keypair_file_bytes, IdentityError,
 };
 pub use codec::{ShardCodec, ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL};
 pub use tensor_codec::{TensorCodec, TensorRequest, TensorResponse, TENSOR_XFER_PROTOCOL};
@@ -70,9 +74,13 @@ pub struct OmniNet {
     /// Stage 12.5-pre — local libp2p `PeerId`. Captured from the
     /// built swarm BEFORE the run loop is spawned, so callers can
     /// read it via [`OmniNet::local_peer_id`] without re-entering
-    /// the swarm task. Stable for the lifetime of this `OmniNet`;
-    /// regenerated on every `OmniNet::new` because the swarm uses
-    /// `SwarmBuilder::with_new_identity()`. Restart = new PeerId.
+    /// the swarm task. Stable for the lifetime of this `OmniNet`.
+    /// Persistence across restart depends on
+    /// [`omni_types::config::NetConfig::identity`]: `Ephemeral`
+    /// (default) regenerates the keypair each `OmniNet::new`, so
+    /// restart = new PeerId; `KeypairProtobufBytes(_)` (Stage 12.6)
+    /// reuses an existing libp2p identity so the PeerId survives
+    /// process restart.
     local_peer_id: PeerId,
 }
 
@@ -111,12 +119,24 @@ impl OmniNet {
     /// signed `ContributorPeerAdvertisement` to the actual running
     /// network identity rather than an operator-supplied string.
     ///
-    /// Note: `OmniNet::new` calls `SwarmBuilder::with_new_identity`,
-    /// so the libp2p identity keypair (and therefore this PeerId)
-    /// is regenerated on every node restart. Stage 12.5 peer
-    /// advertisements are therefore session-scoped, short-lived
-    /// routing hints — not permanent identity records. Persistent
-    /// libp2p identity is a separate, deferred concern.
+    /// Persistence across restart depends on
+    /// [`omni_types::config::NetConfig::identity`]:
+    ///
+    /// - `NetIdentity::Ephemeral` (default, pre-12.6 behavior):
+    ///   `OmniNet::new` generates a fresh keypair via
+    ///   `SwarmBuilder::with_new_identity`, so restart = new
+    ///   PeerId. Stage 12.5 advertisements published before the
+    ///   restart die.
+    /// - `NetIdentity::KeypairProtobufBytes(_)` (Stage 12.6):
+    ///   reuses a persistent libp2p identity. Two `OmniNet::new`
+    ///   calls with the same bytes (e.g. across `omni-node`
+    ///   restarts using the same `--net-identity-file`) yield the
+    ///   same PeerId, so advertisements remain valid for their
+    ///   full ≤24h freshness window.
+    ///
+    /// Stage 12.5 advertisements are still session-scoped and
+    /// short-lived even under 12.6 persistence — this method does
+    /// NOT turn them into permanent identity records.
     pub fn local_peer_id(&self) -> PeerId {
         self.local_peer_id
     }
@@ -351,7 +371,8 @@ mod local_peer_id_tests {
         // keypair on every `OmniNet::new`. Two independent
         // instances must therefore see distinct PeerIds — the
         // documented "restart = new PeerId" property Stage 12.5
-        // peer advertisements rely on.
+        // peer advertisements rely on (for the ephemeral path —
+        // Stage 12.6 introduces a persistent path tested below).
         let net_a = OmniNet::new(NetConfig::default())
             .await
             .expect("first OmniNet");
@@ -361,5 +382,83 @@ mod local_peer_id_tests {
         assert_ne!(net_a.local_peer_id(), net_b.local_peer_id());
         let _ = net_a.shutdown().await;
         let _ = net_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_identity_yields_stable_peer_id_across_instances() {
+        // Stage 12.6 — the load-bearing property: given the same
+        // libp2p keypair protobuf bytes, two `OmniNet::new` calls
+        // produce the same `local_peer_id()`. This is what makes
+        // Stage 12.5 peer advertisements survive `omni-node` restart.
+        use libp2p::identity::Keypair;
+        use omni_types::config::NetIdentity;
+        let kp = Keypair::generate_ed25519();
+        let bytes = kp.to_protobuf_encoding().expect("encode");
+        let config_a = NetConfig {
+            identity: NetIdentity::KeypairProtobufBytes(bytes.clone()),
+            ..NetConfig::default()
+        };
+        let config_b = NetConfig {
+            identity: NetIdentity::KeypairProtobufBytes(bytes),
+            ..NetConfig::default()
+        };
+        let net_a = OmniNet::new(config_a).await.expect("first OmniNet");
+        let net_b = OmniNet::new(config_b).await.expect("second OmniNet");
+        assert_eq!(
+            net_a.local_peer_id(),
+            net_b.local_peer_id(),
+            "same identity bytes must yield the same PeerId"
+        );
+        let _ = net_a.shutdown().await;
+        let _ = net_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_identity_two_different_files_have_different_peer_ids() {
+        use libp2p::identity::Keypair;
+        use omni_types::config::NetIdentity;
+        let bytes_a = Keypair::generate_ed25519().to_protobuf_encoding().unwrap();
+        let bytes_b = Keypair::generate_ed25519().to_protobuf_encoding().unwrap();
+        assert_ne!(bytes_a, bytes_b, "two random keypairs must differ");
+        let net_a = OmniNet::new(NetConfig {
+            identity: NetIdentity::KeypairProtobufBytes(bytes_a),
+            ..NetConfig::default()
+        })
+        .await
+        .expect("first OmniNet");
+        let net_b = OmniNet::new(NetConfig {
+            identity: NetIdentity::KeypairProtobufBytes(bytes_b),
+            ..NetConfig::default()
+        })
+        .await
+        .expect("second OmniNet");
+        assert_ne!(net_a.local_peer_id(), net_b.local_peer_id());
+        let _ = net_a.shutdown().await;
+        let _ = net_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn omninet_new_rejects_malformed_identity_bytes() {
+        // Garbage bytes must fail at `OmniNet::new` time rather
+        // than silently falling back to a fresh identity. (Can't
+        // use `expect_err` because `OmniNet` doesn't derive `Debug`;
+        // match on the Result directly.)
+        use omni_types::config::NetIdentity;
+        let cfg = NetConfig {
+            identity: NetIdentity::KeypairProtobufBytes(
+                b"definitely not a libp2p Keypair protobuf".to_vec(),
+            ),
+            ..NetConfig::default()
+        };
+        match OmniNet::new(cfg).await {
+            Ok(_) => panic!("OmniNet::new must fail on malformed identity bytes"),
+            Err(e) => {
+                let s = format!("{e:?}");
+                assert!(
+                    s.contains("malformed keypair protobuf bytes"),
+                    "expected the swarm-builder branch's typed error, got: {s}"
+                );
+            }
+        }
     }
 }

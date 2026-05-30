@@ -946,3 +946,87 @@ Returns a typed `PeerAdvertisementOutcome` whose failure variants map 1:1 to ope
 - Advert-driven peer reputation / scoring.
 - Any chain-side interaction, payment, slashing, reward distribution.
 - Anything in items 1 / 7 / 8 of the chart or the lettered A–F flow.
+
+---
+
+# Stage 12.6 — persistent libp2p mesh identity
+
+**Status**: shipped at Stage 12.6. Builds on Stage 12.5-pre's `OmniNet::local_peer_id()` accessor + Stage 12.5's signed peer advertisement. Operational reliability hardening — no protocol or schema change.
+
+## Posture (unchanged)
+
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid logic. No proof mode / on-chain verification / chain proof allowlist. SNIP only for contributor artifacts. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes. No Stage 12.0–12.5 schema or canonical-byte changes.
+
+## Problem
+
+Stage 12.5 honestly advertises `OmniNet::local_peer_id()`. But pre-12.6 `OmniNet::new` calls `SwarmBuilder::with_new_identity()`, so the libp2p Ed25519 keypair is regenerated on every process start. Restart `omni-node` → new `PeerId` → every peer advertisement published before the restart dies, no matter how much of its ≤24h freshness window was left.
+
+## Solution
+
+Add a persistent identity policy on `NetConfig` and a `--net-identity-file <path>` CLI flag plumbed through every contributor subcommand that opens `OmniNet`. When the flag is supplied:
+
+- The CLI calls `omni_net::load_or_create_keypair_file_bytes(&path)` which **auto-creates** the file with `0o600` (Unix) on first use and returns the libp2p protobuf-encoded keypair bytes.
+- Those bytes ride into `NetConfig.identity = NetIdentity::KeypairProtobufBytes(_)`.
+- The swarm builder branches: `Ephemeral` keeps pre-12.6 behavior; `KeypairProtobufBytes(_)` decodes the bytes via `libp2p_identity::Keypair::from_protobuf_encoding` and feeds the result to `SwarmBuilder::with_existing_identity`.
+- `OmniNet::local_peer_id()` (Stage 12.5-pre) returns the same value across restarts → Stage 12.5 advertisements stay valid for their full freshness window.
+
+If the flag is omitted, the swarm uses an ephemeral identity — every existing 12.0–12.5 caller stays bit-identical.
+
+## Failure posture (intentional)
+
+- **Missing file** → auto-create at `0o600` on Unix. No separate `init-net-identity` command — matches what every other identity-bearing libp2p binary does.
+- **Existing file with malformed bytes** → typed `IdentityError::Decode`. The loader does NOT silently fall back to a fresh identity or overwrite the file. Operators rotating identity delete the file explicitly.
+- **Existing file with world/group-readable perms on Unix** → typed `IdentityError::PermissionsTooBroad { mode }`. No load — a key that may have leaked is not silently used. The file is not modified.
+- **Non-regular file** (directory, symlink loop, etc.) → typed `IdentityError::NotARegularFile`.
+- On non-Unix targets the permission check is `#[cfg(unix)]`-gated and behavior degrades to "create with default perms" (same posture Stage 12.0's contributor-seed loader takes).
+
+## Roles are disjoint
+
+The libp2p mesh transport identity and the contributor signing identity are **NOT the same role**. Stage 12.0–12.5 uses separate Ed25519 seeds for `ContributorSigner` / `CoordinatorSigner` / `DispatcherSigner` (passed via `--seed-file` / `--contributor-seed` / `--coordinator-seed`). The mesh identity goes through `--net-identity-file`. Do not reuse a contributor seed as a `--net-identity-file` — different role, different blast radius if compromised.
+
+## Operator workflow
+
+```bash
+# First run: creates ./omni-net.key at 0600 with a fresh keypair.
+omni-node operator contributor advertise-peer \
+  --net-identity-file ./omni-net.key \
+  --execution-session-snip-root 0x... \
+  --join-snip-root 0x... \
+  --contributor-seed ./contributor.seed \
+  --max-handoff-chunk-bytes 33554432 \
+  --supported-dtype f16 \
+  --expires-in-secs 3600 \
+  --publish-announcement
+
+# Restart omni-node, re-run with the same --net-identity-file → same PeerId.
+# Previously published peer advertisements remain valid until expires_at_utc.
+```
+
+The flag is available on every contributor subcommand that opens `OmniNet`:
+
+- Stage 12.2: `announce-job`, `watch-network-jobs`, `announce-result`, `watch-network-results`
+- Stage 12.3: `open-session`, `join-session`, `assign-work`, `run-assignment`, `aggregate-session`, `watch-sessions`
+- Stage 12.4: `send-handoff`
+- Stage 12.5: `advertise-peer`, `watch-peer-adverts`
+
+## Rotation
+
+Peer advertisements remain short-lived (≤24h) and session-scoped. Stage 12.6 does NOT make them permanent identity records. To rotate identity:
+
+1. Delete `./omni-net.key` (or move it aside).
+2. Restart `omni-node` with the same `--net-identity-file <path>` → a fresh keypair is auto-created → new `PeerId`.
+3. Re-run `advertise-peer` so peers learn the new route.
+
+Stage 12.5's matching-join check still gates which advertisements receivers will accept; an attacker who steals the identity file but not the contributor seed cannot publish valid advertisements.
+
+## Manual re-publish before expiry
+
+Stage 12.6 stabilizes the PeerId across restart, but advertisements still expire after `expires_at_utc`. Operators wanting continuous routing across the freshness boundary should re-run `advertise-peer` manually before expiry. Auto-refresh (a long-running daemon that re-publishes near expiry) is intentionally deferred — likely Stage 12.7+.
+
+## What 12.6 does NOT do
+
+- Does NOT make peer advertisements long-lived. The ≤24h schema cap stays.
+- Does NOT introduce a centralized identity registry. Rotation is operator-controlled.
+- Does NOT change any 12.0–12.5 schema, canonical bytes, or wire format.
+- Does NOT add a chain-side anything. Mesh identity is local infrastructure.
+- Does NOT pull libp2p transport into the default `omni-node` tree — the new helper uses only `libp2p::identity` (already a transitive dep via `omni-net`).

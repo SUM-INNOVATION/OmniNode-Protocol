@@ -2588,6 +2588,7 @@ dependencies = [
  "libp2p",
  "omni-types",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
