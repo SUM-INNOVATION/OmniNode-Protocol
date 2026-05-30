@@ -119,7 +119,23 @@ impl OmniSwarm {
         // Relay circuits run over TCP-like streams, so they need Noise + Yamux
         // even though our primary transport is QUIC (which has encryption
         // and multiplexing baked in).
-        let mut swarm = SwarmBuilder::with_new_identity()
+        // Stage 12.6 — branch on the operator's identity policy.
+        // `Ephemeral` reproduces pre-12.6 behavior (fresh Ed25519
+        // each `OmniNet::new`); `KeypairProtobufBytes(_)` decodes
+        // an existing libp2p Keypair so `local_peer_id()` is
+        // stable across restarts.
+        use omni_types::config::NetIdentity;
+        let identity_phase = match &config.identity {
+            NetIdentity::Ephemeral => SwarmBuilder::with_new_identity(),
+            NetIdentity::KeypairProtobufBytes(bytes) => {
+                let kp = crate::identity::decode_keypair_protobuf(bytes)
+                    .map_err(|e| anyhow::anyhow!(
+                        "NetConfig.identity: malformed keypair protobuf bytes: {e}"
+                    ))?;
+                SwarmBuilder::with_existing_identity(kp)
+            }
+        };
+        let mut swarm = identity_phase
             .with_tokio()
             .with_quic()
             .with_relay_client(

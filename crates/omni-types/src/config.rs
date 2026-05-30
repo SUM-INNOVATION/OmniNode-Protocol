@@ -17,6 +17,60 @@ pub struct NetConfig {
     /// Whether this node volunteers as a Circuit Relay v2 server.
     /// Enable on nodes with open NATs (VPS, port-forwarded home server).
     pub relay_server: bool,
+
+    /// Stage 12.6 — libp2p mesh identity policy.
+    ///
+    /// `Ephemeral` (default) preserves pre-12.6 behavior: a fresh
+    /// Ed25519 keypair is generated on every `OmniNet::new`, so
+    /// `local_peer_id()` changes across process restart. Stage 12.5
+    /// peer advertisements published before a restart become
+    /// useless.
+    ///
+    /// `KeypairProtobufBytes(_)` carries an existing libp2p
+    /// keypair encoded via `libp2p_identity::Keypair::to_protobuf_encoding`.
+    /// The swarm builder decodes once at construction; subsequent
+    /// `OmniNet::new` calls with the same bytes yield the same
+    /// `local_peer_id()`, so peer advertisements remain valid for
+    /// their full ≤24h freshness window after a restart.
+    ///
+    /// CLI operators don't construct `NetIdentity` directly — they
+    /// pass `--net-identity-file <path>` and the CLI calls the
+    /// `omni-net::identity` helper (auto-creates the file at 0600
+    /// on Unix; refuses to silently fall back to ephemeral when an
+    /// existing file is malformed).
+    pub identity: NetIdentity,
+}
+
+#[derive(Clone)]
+pub enum NetIdentity {
+    /// Pre-12.6 default. Fresh keypair every `OmniNet::new`.
+    Ephemeral,
+    /// libp2p protobuf-encoded keypair bytes. Decoded at
+    /// swarm-build time via `omni_net::identity::decode_keypair_protobuf`.
+    KeypairProtobufBytes(Vec<u8>),
+}
+
+/// Manual `Debug` impl so that printing a `NetConfig` (which
+/// derives `Debug`) cannot leak the libp2p private keypair bytes.
+/// The variant tag + byte length are still surfaced so operators
+/// can confirm the variant in logs.
+impl std::fmt::Debug for NetIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetIdentity::Ephemeral => write!(f, "Ephemeral"),
+            NetIdentity::KeypairProtobufBytes(bytes) => f
+                .debug_struct("KeypairProtobufBytes")
+                .field("bytes", &"<redacted>")
+                .field("len", &bytes.len())
+                .finish(),
+        }
+    }
+}
+
+impl Default for NetIdentity {
+    fn default() -> Self {
+        NetIdentity::Ephemeral
+    }
 }
 
 impl Default for NetConfig {
@@ -25,6 +79,7 @@ impl Default for NetConfig {
             listen_port: 0,
             bootstrap_peers: vec![],
             relay_server: false,
+            identity: NetIdentity::Ephemeral,
         }
     }
 }
