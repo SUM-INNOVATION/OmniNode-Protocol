@@ -47,6 +47,7 @@ pub mod job;
 pub mod net;
 pub mod peer_advert;
 pub mod peer_routing;
+pub mod planner;
 pub mod posted;
 pub mod relay;
 pub mod result;
@@ -63,8 +64,13 @@ pub mod watch;
 
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
-    CanonicalError, ContributorError, DiscoverError, RelayError, RunnerError, SchemaError,
-    SigningError, SnipError, VerifyError,
+    CanonicalError, ContributorError, DiscoverError, PlannerError, RelayError, RunnerError,
+    SchemaError, SigningError, SnipError, VerifyError,
+};
+pub use planner::{
+    plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,
+    PlannedAssignment, PlannerInputs, PlannerStrategy, MODEL_PLAN_SCHEMA_VERSION,
+    PLANNER_SCHEMA_VERSION,
 };
 pub use net::{
     NetworkAggregatedResultAnnouncement, NetworkContributorJoinedAnnouncement,
