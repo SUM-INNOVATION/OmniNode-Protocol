@@ -158,6 +158,25 @@ enum ContributorCmd {
     /// as events/json/pretty. Does not touch SNIP, the mesh, or
     /// any chain.
     SessionStatus(SessionStatusArgs),
+
+    /// Stage 12.10 — read-only: build a Stage 12.9
+    /// `SessionStatusReport` (or load one from `--status-report`)
+    /// and emit a deterministic `SessionRepairPlan` JSON listing
+    /// one `ReannounceAssignment` action per assignment missing a
+    /// valid partial. Does not touch SNIP, the mesh, or any
+    /// chain.
+    PlanSessionRepair(PlanSessionRepairArgs),
+
+    /// Stage 12.10 — read a `SessionRepairPlan`, recompute its
+    /// integrity tag, re-fetch + re-verify the session via
+    /// `--session-snip-root`, recompute the source-status
+    /// projection from current state-dir (typed error on drift),
+    /// re-verify each referenced assignment, then either
+    /// `--dry-run` log the would-be actions OR republish each
+    /// assignment to SNIP (content-addressed → same root) and
+    /// broadcast a fresh `NetworkWorkAssignedAnnouncement` unless
+    /// `--no-publish-announcements`. The state-dir is NOT mutated.
+    ApplySessionRepair(ApplySessionRepairArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -1639,6 +1658,136 @@ struct SessionStatusArgs {
     no_prune_state_on_start: bool,
 }
 
+// ── Stage 12.10 args ─────────────────────────────────────────────────────
+
+/// CLI mirror of `omni_contributor::repair::RepairStrategy`. v1
+/// closed enum with a single variant; `ReassignMissing` is a Stage
+/// 12.11+ migration after a supersession model exists.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CliRepairStrategy {
+    ReannounceMissing,
+}
+
+impl From<CliRepairStrategy> for omni_contributor::RepairStrategy {
+    fn from(v: CliRepairStrategy) -> Self {
+        match v {
+            CliRepairStrategy::ReannounceMissing => {
+                omni_contributor::RepairStrategy::ReannounceMissing
+            }
+        }
+    }
+}
+
+#[derive(Args)]
+struct PlanSessionRepairArgs {
+    /// Stage 12.7 contributor workflow state directory. Required —
+    /// used both for `--build-status` and for the `source_status_hash`
+    /// projection input.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    /// 64-char lowercase hex `session_id` to plan a repair for.
+    #[arg(long)]
+    session_id: String,
+
+    /// Either supply a pre-built `SessionStatusReport` JSON OR pass
+    /// `--build-status` to build one on the fly from the state-dir.
+    /// Exactly one of these two must be supplied.
+    #[arg(long, conflicts_with = "build_status")]
+    status_report: Option<PathBuf>,
+
+    /// Build the Stage 12.9 status report on the fly. Mutually
+    /// exclusive with `--status-report`.
+    #[arg(long, default_value_t = false)]
+    build_status: bool,
+
+    /// v1: only `reannounce-missing`. Future Stage 12.11+ may add
+    /// `reassign-missing` once a supersession envelope exists.
+    #[arg(long, value_enum, default_value_t = CliRepairStrategy::ReannounceMissing)]
+    strategy: CliRepairStrategy,
+
+    /// Optional operator hint copied into the plan for dry-run
+    /// review. Not a trust check — the applier re-verifies the
+    /// coordinator seed against the freshly-fetched session.
+    #[arg(long)]
+    coordinator_pubkey_hex: Option<String>,
+
+    /// Passed through to `build_session_status_report` when
+    /// `--build-status` is set.
+    #[arg(long, default_value_t = false)]
+    include_expired: bool,
+
+    /// Stage 12.7 — disable the auto-prune of expired sessions /
+    /// peer advertisements that runs on `--contributor-state-dir`
+    /// open.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+
+    /// Output path for the produced `SessionRepairPlan` JSON.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Args)]
+struct ApplySessionRepairArgs {
+    /// Path to a `SessionRepairPlan` JSON produced by
+    /// `plan-session-repair`. `repair_plan_hash` is recomputed and
+    /// verified on read.
+    #[arg(long)]
+    repair_plan: PathBuf,
+
+    /// SNIP V2 root of the `ExecutionSession` the plan targets.
+    #[arg(long)]
+    session_snip_root: String,
+
+    /// 32-byte raw coordinator seed file. Pubkey must match
+    /// `session.coordinator_pubkey_hex`.
+    #[arg(long)]
+    coordinator_seed: PathBuf,
+
+    /// Stage 12.7 contributor workflow state directory. Required
+    /// because the apply step re-loads + re-verifies each
+    /// referenced assignment from disk before republishing.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+
+    /// Stage 12.6 — persistent libp2p mesh identity file.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 200)]
+    propagation_wait_ms: u64,
+    #[arg(long, default_value_t = 30)]
+    peer_wait_secs: u64,
+    #[arg(long, default_value_t = 500)]
+    mesh_stabilize_ms: u64,
+
+    /// When set, the mesh `NetworkWorkAssignedAnnouncement`
+    /// broadcast is skipped; only the SNIP republish runs. Default
+    /// behavior matches Stage 12.8 `assign-session-plan`:
+    /// broadcast to the mesh in addition to the SNIP republish.
+    #[arg(long, default_value_t = false)]
+    no_publish_announcements: bool,
+
+    /// Validate the plan + session + assignments and print
+    /// `event=would_reannounce` lines, without touching SNIP or
+    /// the mesh.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -1665,6 +1814,8 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::PlanSessionAssignments(a) => run_plan_session_assignments(a),
         ContributorCmd::AssignSessionPlan(a) => run_assign_session_plan(a).await,
         ContributorCmd::SessionStatus(a) => run_session_status(a),
+        ContributorCmd::PlanSessionRepair(a) => run_plan_session_repair(a),
+        ContributorCmd::ApplySessionRepair(a) => run_apply_session_repair(a).await,
     }
 }
 
@@ -5701,6 +5852,118 @@ mod tests {
             Some(std::path::Path::new("/tmp/status.json"))
         );
     }
+
+    fn parse_plan_session_repair(extra: &[&str]) -> PlanSessionRepairArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "plan-session-repair".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+            "--session-id".into(),
+            "00".repeat(32),
+            "--out".into(),
+            "/tmp/plan.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::PlanSessionRepair(a) => a,
+            _ => panic!("expected PlanSessionRepair"),
+        }
+    }
+
+    fn parse_apply_session_repair(extra: &[&str]) -> ApplySessionRepairArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "apply-session-repair".into(),
+            "--repair-plan".into(),
+            "/tmp/plan.json".into(),
+            "--session-snip-root".into(),
+            "0x00".into(),
+            "--coordinator-seed".into(),
+            "/tmp/coord.seed".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::ApplySessionRepair(a) => a,
+            _ => panic!("expected ApplySessionRepair"),
+        }
+    }
+
+    /// Stage 12.10 — clap regression. Pins the documented
+    /// `--build-status` xor `--status-report` mutual exclusion,
+    /// the inverted `--no-publish-announcements` posture (matches
+    /// Stage 12.8 fix), and the dry-run + include-expired
+    /// togglability.
+    #[test]
+    fn session_repair_flag_parse_smoke() {
+        // plan: defaults reject (must supply exactly one of
+        // --build-status or --status-report at runtime; clap allows
+        // either to be absent so the run-handler validates).
+        let plan_defaults = parse_plan_session_repair(&[]);
+        assert!(!plan_defaults.build_status);
+        assert!(plan_defaults.status_report.is_none());
+        assert!(!plan_defaults.include_expired);
+        assert!(!plan_defaults.no_prune_state_on_start);
+
+        // plan: --build-status flips on, --status-report stays None.
+        let plan_build = parse_plan_session_repair(&["--build-status"]);
+        assert!(plan_build.build_status);
+        assert!(plan_build.status_report.is_none());
+
+        // plan: --status-report fills the path; conflicts with
+        // --build-status at clap level.
+        let plan_with_path =
+            parse_plan_session_repair(&["--status-report", "/tmp/s.json"]);
+        assert!(!plan_with_path.build_status);
+        assert_eq!(
+            plan_with_path.status_report.as_deref(),
+            Some(std::path::Path::new("/tmp/s.json"))
+        );
+
+        // clap-level conflict: both at once must NOT parse.
+        let conflict = TestRoot::try_parse_from(&[
+            "omni-node",
+            "plan-session-repair",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--session-id",
+            &"00".repeat(32),
+            "--out",
+            "/tmp/plan.json",
+            "--build-status",
+            "--status-report",
+            "/tmp/s.json",
+        ]);
+        assert!(
+            conflict.is_err(),
+            "clap must reject --build-status + --status-report combo"
+        );
+
+        // apply: defaults — broadcast in addition to SNIP publish.
+        let apply_defaults = parse_apply_session_repair(&[]);
+        assert!(!apply_defaults.no_publish_announcements);
+        assert!(!apply_defaults.dry_run);
+        assert!(!apply_defaults.no_prune_state_on_start);
+
+        // apply: --no-publish-announcements is reachable AND
+        // toggles independently of --dry-run.
+        let apply_no_mesh =
+            parse_apply_session_repair(&["--no-publish-announcements"]);
+        assert!(apply_no_mesh.no_publish_announcements);
+        assert!(!apply_no_mesh.dry_run);
+
+        let apply_dry = parse_apply_session_repair(&["--dry-run"]);
+        assert!(apply_dry.dry_run);
+        assert!(!apply_dry.no_publish_announcements);
+    }
 }
 
 // ── Stage 12.9 — session-status ──────────────────────────────────────────
@@ -5906,4 +6169,359 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
             println!("  - {n}");
         }
     }
+}
+
+// ── Stage 12.10 — plan-session-repair ───────────────────────────────────
+
+fn run_plan_session_repair(args: PlanSessionRepairArgs) -> Result<()> {
+    use omni_contributor::{
+        build_session_repair_plan, build_session_status_report, ContributorStateStore,
+        SessionStatusReport,
+    };
+
+    if args.status_report.is_some() == args.build_status {
+        return Err(anyhow!(
+            "supply exactly one of --status-report <path> or --build-status"
+        ));
+    }
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // Open the state store. Stage 12.7 auto-prune applies unless
+    // the operator opts out.
+    let (store, prune_report) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        !args.no_prune_state_on_start,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    println!(
+        "event=state_store_opened path={} pruned_sessions={} pruned_peer_adverts={} kept={}",
+        args.contributor_state_dir.display(),
+        prune_report.removed_sessions,
+        prune_report.removed_peer_adverts,
+        prune_report.kept
+    );
+
+    // Acquire the status report — either build it on the fly OR
+    // load it from the operator-supplied file.
+    let status: SessionStatusReport = if args.build_status {
+        build_session_status_report(
+            &store,
+            &args.session_id,
+            &now_utc,
+            args.include_expired,
+        )
+        .map_err(|e| anyhow!("build session status report: {e}"))?
+    } else {
+        let path = args.status_report.as_deref().expect("validated above");
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read status-report: {}", path.display()))?;
+        let report: SessionStatusReport = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse status-report: {}", path.display()))?;
+        if report.session_id != args.session_id {
+            return Err(anyhow!(
+                "status-report.session_id={} but --session-id={}",
+                report.session_id,
+                args.session_id
+            ));
+        }
+        report
+    };
+
+    let plan = build_session_repair_plan(
+        &status,
+        args.strategy.into(),
+        &now_utc,
+        args.coordinator_pubkey_hex.as_deref(),
+    )
+    .map_err(|e| anyhow!("build session repair plan: {e}"))?;
+
+    let json = serde_json::to_vec_pretty(&plan)?;
+    std::fs::write(&args.out, &json)
+        .with_context(|| format!("write repair plan: {}", args.out.display()))?;
+
+    println!(
+        "event=repair_plan_created session_id={} strategy={:?} actions={} \
+         repair_plan_hash={} source_status_hash={} out={}",
+        plan.session_id,
+        plan.strategy,
+        plan.actions.len(),
+        plan.repair_plan_hash,
+        plan.source_status_hash,
+        args.out.display()
+    );
+    Ok(())
+}
+
+// ── Stage 12.10 — apply-session-repair ──────────────────────────────────
+
+async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
+    use omni_contributor::canonical::{hex_lower, net_assign_signing_input};
+    use omni_contributor::{
+        build_session_status_report, repair_plan_hash_hex, source_status_hash_hex,
+        ContributorRelay, ContributorStateStore, CoordinatorSigner,
+        NetworkWorkAssignedAnnouncement, OmniNetRelay, RepairAction, SessionRepairPlan,
+        WorkAssignment, NET_SCHEMA_VERSION,
+    };
+
+    // ── 1. Read + integrity-check the plan ─────────────────────
+    let bytes = std::fs::read(&args.repair_plan)
+        .with_context(|| format!("read repair-plan: {}", args.repair_plan.display()))?;
+    let plan: SessionRepairPlan = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse repair-plan: {}", args.repair_plan.display()))?;
+    if plan.schema_version != omni_contributor::REPAIR_PLAN_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "repair_plan.schema_version {} not supported (expected {})",
+            plan.schema_version,
+            omni_contributor::REPAIR_PLAN_SCHEMA_VERSION
+        ));
+    }
+    let recomputed_plan_hash = repair_plan_hash_hex(&plan);
+    if recomputed_plan_hash != plan.repair_plan_hash {
+        return Err(anyhow!(omni_contributor::RepairError::PlanHashDrift {
+            stored: plan.repair_plan_hash.clone(),
+            recomputed: recomputed_plan_hash,
+        }));
+    }
+    if plan.actions.is_empty() {
+        return Err(anyhow!("repair-plan carries zero actions; nothing to apply"));
+    }
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // ── 2. Open state store + recompute source-status drift ────
+    let (store, prune_report) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        !args.no_prune_state_on_start,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    println!(
+        "event=state_store_opened path={} pruned_sessions={} pruned_peer_adverts={} kept={}",
+        args.contributor_state_dir.display(),
+        prune_report.removed_sessions,
+        prune_report.removed_peer_adverts,
+        prune_report.kept
+    );
+
+    let current_status = build_session_status_report(
+        &store,
+        &plan.session_id,
+        &now_utc,
+        /* include_expired = */ false,
+    )
+    .map_err(|e| anyhow!("rebuild status report for drift check: {e}"))?;
+    let current_projection = source_status_hash_hex(&current_status);
+    if current_projection != plan.source_status_hash {
+        return Err(anyhow!(omni_contributor::RepairError::SourceStatusDrift));
+    }
+    // `source_status_hash` is a projection over only
+    // `(session_id, [(assignment_id, partial_present)])`. Status
+    // shifts that leave that projection identical (e.g.
+    // `ExpiredIncomplete` under `--no-prune-state-on-start`, or
+    // `InvalidState` from an invalid aggregate body that doesn't
+    // touch partial presence) would otherwise slip past the drift
+    // check. Re-check eligibility against the same matrix the
+    // planner uses, returning identical typed errors so a CI gate
+    // sees a consistent surface.
+    omni_contributor::check_repair_eligible(&current_status)
+        .map_err(|e| anyhow!("apply rejected by current status: {e}"))?;
+
+    // ── 3. Fetch + verify session, check coordinator seed ──────
+    let snip = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let session = fetch_and_verify_session(&snip, &args.session_snip_root)?;
+    if session.session_id != plan.session_id {
+        return Err(anyhow!(
+            "repair-plan.session_id={} but --session-snip-root resolves to session_id={}",
+            plan.session_id,
+            session.session_id
+        ));
+    }
+    let coord = CoordinatorSigner::from_seed_file(&args.coordinator_seed)?;
+    if coord.pubkey_hex() != session.coordinator_pubkey_hex {
+        return Err(anyhow!(
+            "coordinator_seed pubkey does not match session.coordinator_pubkey_hex"
+        ));
+    }
+
+    // ── 4. Load joined-pubkey set + dry-run path ───────────────
+    let raw_joins = store.list_verified_joins_for(&plan.session_id)?;
+    let joins: Vec<omni_contributor::ContributorJoin> = raw_joins
+        .into_iter()
+        .filter(|j| omni_contributor::verify_contributor_join(&session, j).is_ok())
+        .collect();
+    let joined_pubkeys: std::collections::HashSet<String> = joins
+        .iter()
+        .map(|j| j.contributor_pubkey_hex.clone())
+        .collect();
+
+    // Re-verify every referenced assignment before any publish so
+    // a dry-run surfaces tampered bytes too.
+    struct VerifiedAction {
+        assignment: WorkAssignment,
+        stage_index: u32,
+        contributor_pubkey_hex: String,
+    }
+    let mut verified: Vec<VerifiedAction> = Vec::with_capacity(plan.actions.len());
+    for action in &plan.actions {
+        let RepairAction::ReannounceAssignment {
+            assignment_id,
+            stage_index,
+            contributor_pubkey_hex,
+        } = action;
+        let asn: WorkAssignment = match store.read_verified_json(
+            omni_contributor::StateObjectKind::Assignment {
+                session_id: plan.session_id.clone(),
+            },
+            assignment_id,
+        )? {
+            Some(a) => a,
+            None => {
+                return Err(anyhow!(
+                    omni_contributor::RepairError::AssignmentNotPresent {
+                        session_id: plan.session_id.clone(),
+                        assignment_id: assignment_id.clone(),
+                    }
+                ));
+            }
+        };
+        let outcome = omni_contributor::verify_work_assignment(
+            &session,
+            &joined_pubkeys,
+            &asn,
+        );
+        if !outcome.is_ok() {
+            return Err(anyhow!(
+                "assignment_id={} in state-dir failed verify_work_assignment: {outcome:?}",
+                assignment_id
+            ));
+        }
+        // Drift check between the plan's snapshot and the on-disk
+        // body. The Stage 12.9 status report fed the plan with
+        // these fields; if a tamper sneaks through here it's
+        // already a separate failure mode worth surfacing.
+        if &asn.stage_index != stage_index
+            || &asn.contributor_pubkey_hex != contributor_pubkey_hex
+        {
+            return Err(anyhow!(
+                "assignment_id={} body drift vs plan: \
+                 plan(stage_index={stage_index}, contributor={contributor_pubkey_hex}) \
+                 disk(stage_index={}, contributor={})",
+                assignment_id,
+                asn.stage_index,
+                asn.contributor_pubkey_hex
+            ));
+        }
+        verified.push(VerifiedAction {
+            assignment: asn,
+            stage_index: *stage_index,
+            contributor_pubkey_hex: contributor_pubkey_hex.clone(),
+        });
+    }
+
+    if args.dry_run {
+        for v in &verified {
+            println!(
+                "event=would_reannounce session_id={} assignment_id={} \
+                 stage_index={} contributor={}",
+                plan.session_id,
+                v.assignment.assignment_id,
+                v.stage_index,
+                v.contributor_pubkey_hex,
+            );
+        }
+        println!(
+            "event=repair_dry_run session_id={} actions={}",
+            plan.session_id,
+            verified.len()
+        );
+        return Ok(());
+    }
+
+    // ── 5. Real publish path ───────────────────────────────────
+    //
+    // Only open the mesh + wait for peers when we'll actually
+    // broadcast. With `--no-publish-announcements`, the apply is a
+    // pure SNIP-republish loop, and forcing a 30s peer-wait on a
+    // SNIP-only run would be a silent latency tax. The relay,
+    // propagation sleep, and shutdown are all gated on the same
+    // `should_publish_announcements` predicate.
+    let should_publish_announcements = !args.no_publish_announcements;
+    let mut mesh: Option<(
+        std::sync::Arc<tokio::sync::Mutex<omni_net::OmniNet>>,
+        OmniNetRelay,
+    )> = if should_publish_announcements {
+        let (net, handle) = open_omninet_with_peer_wait(
+            args.listen_port,
+            args.peer,
+            args.peer_wait_secs,
+            args.mesh_stabilize_ms,
+            args.net_identity_file.as_deref(),
+        )
+        .await?;
+        let relay = OmniNetRelay::new(net.clone(), handle);
+        Some((net, relay))
+    } else {
+        None
+    };
+    let mut reannounced = 0u64;
+    for v in &verified {
+        // Re-publish the same assignment JSON bytes. SNIP is
+        // content-addressed; the returned root equals the original
+        // publish's root (assignment_id, coordinator signature, and
+        // SNIP root are all preserved across reannounce).
+        let json = serde_json::to_vec_pretty(&v.assignment)?;
+        let root = omni_contributor::snip::publish_bytes(
+            &snip,
+            &json,
+            "assignment-reannounce",
+        )
+        .map_err(|e| anyhow!("snip publish reannouncement: {e}"))?;
+        let root_hex = format!("0x{}", hex_lower(root.as_bytes()));
+
+        if let Some((_, ref mut relay)) = mesh.as_mut().map(|(n, r)| (n, r)) {
+            let mut ann = NetworkWorkAssignedAnnouncement {
+                schema_version: NET_SCHEMA_VERSION,
+                work_assignment_snip_root: root_hex.clone(),
+                session_id: plan.session_id.clone(),
+                assignment_id: v.assignment.assignment_id.clone(),
+                contributor_pubkey_hex: v.assignment.contributor_pubkey_hex.clone(),
+                announced_at_utc: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                announcer_pubkey_hex: coord.pubkey_hex(),
+                announcer_signature_hex: String::new(),
+            };
+            let ann_sig = net_assign_signing_input(&ann)?;
+            ann.announcer_signature_hex = coord.sign_hex(&ann_sig);
+            relay
+                .publish_work_assigned(&ann)
+                .map_err(|e| anyhow!("publish: {e}"))?;
+        }
+
+        println!(
+            "event=assignment_reannounced session_id={} stage_index={} \
+             assignment_id={} contributor={} work_assignment_snip_root={}",
+            plan.session_id,
+            v.stage_index,
+            v.assignment.assignment_id,
+            v.contributor_pubkey_hex,
+            root_hex
+        );
+        reannounced += 1;
+    }
+
+    if let Some((net, _relay)) = mesh {
+        tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms))
+            .await;
+        let g = net.lock().await;
+        let _ = g.shutdown().await;
+    }
+    println!(
+        "event=repair_applied session_id={} assignments_reannounced={}",
+        plan.session_id, reannounced
+    );
+    Ok(())
 }

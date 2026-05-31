@@ -1505,3 +1505,198 @@ omni-node operator contributor session-status \
 - Does NOT add a chain-side anything. The reporter is local infrastructure.
 - Does NOT pull halo2/prover/framework runtimes into the default `omni-node` tree.
 - Does NOT mutate any protocol artifact. The only write it performs is the optional `--json-out` mirror.
+
+---
+
+# Stage 12.10 — local pooled-session repair planner
+
+**Status**: shipped at Stage 12.10. Builds on Stage 12.9 status reports + Stage 12.7 state-dir loaders + Stage 12.3 verifier helpers. Local operator hint generation — no protocol or schema change.
+
+## Posture (unchanged)
+
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing / reputation logic. No proof mode / on-chain verification / chain proof allowlist. **No new omni-net gossipsub topic — reuses `TOPIC_SESSION_WORK_ASSIGNED`.** No omni-store wire change. No Stage 12.0–12.9 schema or canonical-byte changes. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes. **No state-dir mutation on apply.**
+
+## Problem
+
+Stage 12.9 tells the operator that a session is `InProgress` with N missing partials, but it doesn't act. An operator looking at "stage 1 has no partial 30 minutes after open-session" has no built-in way to nudge the contributor's libp2p subscription. The old protocol path is to re-run `assign-work` manually with the same spec — error-prone and not auditable.
+
+## Solution
+
+Add a local repair planner that converts a `SessionStatusReport` into a list of operator-reviewed follow-up actions, plus an applier that executes them. The plan is a **local review artifact** — never signed, never SNIP-published, never network-visible. The signed trust artifact remains the Stage 12.3 `WorkAssignment` at apply time, byte-preserved across the reannounce.
+
+### What this is NOT
+
+- **NOT a coordination enforcer.** The plan is an operator-visible suggestion. Contributors can ignore reannouncements just as they could ignore the original assignment.
+- **NOT a cancellation/supersession system.** Replacement assignments are deferred to Stage 12.11+ (see halt-finding subsection below).
+- **NOT a retry daemon.** Operators run `apply-session-repair` explicitly; nothing auto-fires.
+- **NOT a penalty system.** Reannouncement is a libp2p subscription nudge, not a sanction.
+- **NOT a new envelope.** Reuses `WorkAssignment` + `NetworkWorkAssignedAnnouncement` verbatim.
+- **NOT a new gossipsub topic.** Reuses `TOPIC_SESSION_WORK_ASSIGNED`.
+- **NOT a state mutation.** `apply-session-repair` writes nothing to the state-dir.
+- **NOT a chain authority.** Coordinator stays a process role.
+
+### Halt finding — why no `ReassignMissing` in v1
+
+`verify_aggregated_result` requires every assignment in the supplied slice to be referenced exactly once in the aggregate's `partial_refs`. Adding a replacement assignment for a missing partial leaves the old assignment in the state-dir's `verified/sessions/<id>/assignments/` and would trip `AggregateMissingPartialFor` at aggregate time. There is no canonical "this assignment is superseded" envelope in Stage 12.3.
+
+A supersession model would require one of:
+- A new signed envelope declaring `supersedes: Vec<assignment_id>`, OR
+- A new field on `WorkAssignment` itself, OR
+- A new verifier mode that takes a `superseded: HashSet<String>` and skips matching assignments.
+
+All three are `schema_version: 2` migrations to Stage 12.3 envelopes — out of scope for Stage 12.10's "no canonical-byte changes" posture. Stage 12.11+ will design supersession explicitly. The Stage 12.10 test suite includes `aggregate_verifier_rejects_extra_assignment_without_partial` as an explicit fixture pinning the constraint, so a future supersession design discussion has the failure case documented.
+
+### Trust boundary
+
+State-dir loaders are parse-only (Stage 12.7 review, restated). The planner consumes an already-built `SessionStatusReport` (which itself re-runs every Stage 12.3 verifier — Stage 12.9 contract). The applier:
+
+1. Recomputes `repair_plan_hash` and refuses on drift.
+2. Recomputes `source_status_hash` from the **current** state-dir and refuses on drift (a partial may have arrived between plan and apply).
+3. Re-runs `check_repair_eligible` on the current status. The `source_status_hash` projection is intentionally narrow — it covers only `(session_id, sorted [(assignment_id, partial_present)] pairs)` — so a status flip from `InProgress` to `ExpiredIncomplete` (clock advanced past `session.expires_at_utc`) or `InvalidState` (an aggregate body added between plan and apply that failed the verifier) can leave the projection unchanged. The eligibility re-check catches that explicitly, using the same status→error matrix as the planner.
+4. Re-fetches and re-verifies the session via `--session-snip-root` at apply time.
+5. Re-verifies each referenced assignment from the state-dir via `verify_work_assignment` before any SNIP write.
+
+The on-disk plan is treated as a **suggestion**, not a trust anchor.
+
+### `--no-publish-announcements` is SNIP-only
+
+When set, the applier skips the entire omni-net layer: no mesh open, no peer wait, no propagation sleep, no shutdown. The reannouncement is then a pure SNIP-republish loop (no observable latency tax for the 30s peer-wait default). With the flag unset (default), the apply opens the mesh, peer-waits, broadcasts a fresh `NetworkWorkAssignedAnnouncement` per action, sleeps for `--propagation-wait-ms`, and shuts down — matching Stage 12.8 `assign-session-plan`.
+
+### `source_status_hash` projection
+
+BLAKE3 over `(session_id, sorted [(assignment_id, partial_present)] pairs)`. Two status reports with different `generated_at_utc` or different `notes` but the same operator-meaningful shape produce the same projection — so a plan built from a long-running watcher's snapshot stays valid until a partial actually arrives. As soon as a partial lands, the projection changes and the applier refuses with `RepairError::SourceStatusDrift`.
+
+### CLI surface
+
+```text
+plan-session-repair
+  --contributor-state-dir <path>             required
+  --session-id <hex64>                       required
+  --status-report <path>                     EITHER this
+  --build-status                             OR this (clap-enforced mutual exclusion)
+  --strategy reannounce-missing              v1 only
+  --coordinator-pubkey-hex <hex64>           optional operator hint
+  --include-expired                          passed through when --build-status
+  --no-prune-state-on-start                  Stage 12.7 inherited
+  --out <path>                               required
+```
+
+```text
+apply-session-repair
+  --repair-plan <path>                       required
+  --session-snip-root <0x...>                required
+  --coordinator-seed <path>                  required
+  --contributor-state-dir <path>             required (re-verify before publish)
+  --snip-binary, --snip-seed                 SNIP plumbing
+  --listen-port, --peer, --net-identity-file
+  --peer-wait-secs, --mesh-stabilize-ms, --propagation-wait-ms
+  --no-publish-announcements                 default false (matches Stage 12.8)
+  --dry-run                                  optional
+  --no-prune-state-on-start                  Stage 12.7 inherited
+```
+
+### Refused status branches
+
+`plan-session-repair` refuses to emit actions for:
+
+| Status | Error |
+|---|---|
+| `NoSession` | `RepairError::SessionNotPresent` |
+| `NoAssignments` | `RepairError::NothingToRepair` |
+| `CompletePartials` | `RepairError::NothingToRepair` |
+| `Aggregated` | `RepairError::NothingToRepair` |
+| `InvalidState` | `RepairError::InvalidState` (clean tampered artifacts first; no `--allow-invalid-state` flag) |
+| `ExpiredIncomplete` | `RepairError::SessionExpired` (extend the session via `open-session` first if you mean it) |
+
+Only `InProgress` produces a non-empty plan.
+
+### `SessionRepairPlan` shape (local-only, unsigned)
+
+```json
+{
+  "schema_version": 1,
+  "session_id": "<hex64>",
+  "source_status_hash": "<blake3-hex>",
+  "strategy": "ReannounceMissing",
+  "created_at_utc": "2026-06-01T00:30:00Z",
+  "coordinator_pubkey_hex": "<hex64>",
+  "actions": [
+    {
+      "ReannounceAssignment": {
+        "assignment_id": "<hex64>",
+        "stage_index": 1,
+        "contributor_pubkey_hex": "<hex64>"
+      }
+    }
+  ],
+  "repair_plan_hash": "<blake3-hex>"
+}
+```
+
+Actions sorted by `(stage_index ASC, assignment_id ASC)`. `RepairAction` is a closed Rust enum with one variant; `RepairStrategy` is a closed Rust enum with one variant. Both serialize externally-tagged so the introduction of `ReassignMissing` in Stage 12.11+ is observable from `schema_version` alone.
+
+### Byte preservation on reannounce
+
+The applier re-publishes the on-disk assignment JSON bytes verbatim. SNIP is content-addressed, so the returned root equals the original publish's root. The `assignment_id`, the coordinator signature, and the SNIP root are all preserved across reannounce. Only the network announcement is fresh (new `announced_at_utc` and new announcer signature). The aggregate verifier sees exactly one assignment per id — the same one it would have seen if the contributor had never lost the original announcement.
+
+### Operator workflow
+
+```bash
+# 1. Inspect the session.
+omni-node operator contributor session-status \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64>
+# → InProgress, 2 missing partials.
+
+# 2. Plan the repair (no network, no SNIP).
+omni-node operator contributor plan-session-repair \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64> \
+  --build-status \
+  --out ./repair-plan.json
+
+# 3. Review ./repair-plan.json. Optionally dry-run.
+omni-node operator contributor apply-session-repair \
+  --repair-plan ./repair-plan.json \
+  --session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --contributor-state-dir ./contrib-state \
+  --dry-run
+
+# 4. Apply.
+omni-node operator contributor apply-session-repair \
+  --repair-plan ./repair-plan.json \
+  --session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --contributor-state-dir ./contrib-state \
+  --net-identity-file ./omni-net.key
+```
+
+### What 12.10 does NOT do
+
+- Does NOT introduce a new signed envelope. `SessionRepairPlan` is unsigned.
+- Does NOT add a new gossipsub topic, SNIP root format, or canonical-bytes domain separator.
+- Does NOT change any Stage 12.0–12.9 schema or canonical bytes.
+- Does NOT add a chain-side anything. The planner + applier are local infrastructure.
+- Does NOT pull halo2/prover/framework runtimes into the default `omni-node` tree.
+- Does NOT mutate the state-dir on apply.
+- Does NOT include `ReassignMissing` or `AbandonLocal` actions in v1. Both are deferred.
+- Does NOT include an `--allow-invalid-state` flag. Operators must clean tampered artifacts before repair.
+
+### Test coverage map
+
+| What's covered | Where |
+|---|---|
+| Planner refusal matrix (every `SessionOverallStatus`) | `repair_plan.rs` planner-refuses-* |
+| Planner accepted path + deterministic action ordering | `planner_emits_one_reannounce_per_missing_partial`, `planner_deterministic_under_input_shuffle` |
+| `repair_plan_hash` serde round-trip + hash drift | `repair_plan_hash_round_trips_through_json`, `apply_path_detects_plan_hash_drift` |
+| `source_status_hash` projection stability + drift | `source_status_hash_ignores_*`, `source_status_hash_changes_when_partial_present_flips`, `source_status_hash_drifts_when_partial_arrives_after_planning` |
+| Apply-time eligibility re-check (projection-unchanged status flips) | `apply_eligibility_check_catches_expired_*`, `apply_eligibility_check_catches_invalid_state_*` |
+| Apply-time state-dir contract checks (missing + tampered assignments) | `apply_path_detects_missing_assignment_in_state`, `apply_path_detects_tampered_assignment_in_state` |
+| End-to-end state-dir → status → plan | `end_to_end_state_dir_status_then_plan` |
+| Halt-finding rationale (aggregate verifier coverage check) | `aggregate_verifier_rejects_extra_assignment_without_partial` |
+| CLI flag matrix incl. `--build-status` / `--status-report` mutual exclusion | `session_repair_flag_parse_smoke` (omni-node) |
+| Binary smoke: `plan-session-repair` end-to-end through clap + state-store + planner | Manual (`target/debug/omni-node operator contributor plan-session-repair ...`) |
+| Binary smoke: `apply-session-repair --no-publish-announcements` fails fast (no peer-wait) | Manual (verified in PR review) |
+
+**Residual gap (deliberate):** the apply path's final SNIP-republish + mesh-broadcast loop is not exercised in CI — it would require either spawning `sum-node` + a libp2p mesh, or refactoring `run_apply_session_repair` to be generic over `SnipV2Adapter + ContributorRelay` so a `MockSnipStore` + `InMemoryRelay` can be injected. The underlying primitives (`snip::publish_bytes`, `OmniNetRelay::publish_work_assigned`, `NetworkWorkAssignedAnnouncement` signing) are exercised by Stage 12.2 / 12.3 integration tests. Adding mocked end-to-end apply tests is a future refactoring opportunity that would also benefit Stage 12.8 `assign-session-plan`.
