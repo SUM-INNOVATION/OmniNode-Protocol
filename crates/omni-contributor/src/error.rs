@@ -378,6 +378,79 @@ pub enum StatusError {
     UnsupportedSchemaVersion { got: u32, expected: u32 },
 }
 
+/// Stage 12.10 — typed errors from the local pooled-session repair
+/// planner / applier.
+///
+/// `SessionRepairPlan` is a local read-only operator hint — never
+/// signed, never SNIP-published, never network-visible. Errors here
+/// describe why the planner refused to emit actions, or why the
+/// applier refused to publish them.
+#[derive(Debug, thiserror::Error)]
+pub enum RepairError {
+    #[error(
+        "repair planner schema_version {got} not supported (expected {expected})"
+    )]
+    UnsupportedSchemaVersion { got: u32, expected: u32 },
+
+    /// The supplied `SessionStatusReport` describes a session that
+    /// isn't on disk in the state-dir.
+    #[error("no session: session_id={session_id} is not in the state-dir")]
+    SessionNotPresent { session_id: String },
+
+    /// Status is `CompletePartials`, `Aggregated`, or `NoAssignments`
+    /// — the session does not need a reannounce-missing repair.
+    #[error("nothing to repair: session status is {status:?}")]
+    NothingToRepair { status: String },
+
+    /// Status is `InvalidState`. Operators must clean tampered
+    /// artifacts before repair planning. Stage 12.10 does NOT
+    /// surface an `--allow-invalid-state` flag.
+    #[error(
+        "session has InvalidState; clean tampered artifacts before \
+         repair (see Stage 12.9 status report notes)"
+    )]
+    InvalidState,
+
+    /// Status is `ExpiredIncomplete`. Reannouncing past-expiry
+    /// assignments is mostly noise; operators wanting to repair an
+    /// expired session must extend it via `open-session` first.
+    #[error(
+        "session is expired (ExpiredIncomplete); reannouncing past \
+         expiry is rejected"
+    )]
+    SessionExpired,
+
+    /// Apply-time: the on-disk state's assignment-vs-partial shape
+    /// has drifted from the plan's `source_status_hash` projection.
+    /// Operator should re-plan from a fresh status report.
+    #[error(
+        "source status drift: plan was built against a session shape \
+         that no longer matches the state-dir (a partial may have \
+         arrived); re-plan from a fresh status report"
+    )]
+    SourceStatusDrift,
+
+    /// Apply-time: the plan's `repair_plan_hash` does not match the
+    /// recomputed hash of the loaded bytes. The plan was edited
+    /// after creation.
+    #[error(
+        "repair_plan_hash drift: stored={stored} recomputed={recomputed} \
+         — the plan may have been edited after creation"
+    )]
+    PlanHashDrift { stored: String, recomputed: String },
+
+    /// Apply-time: a referenced assignment_id is not on disk in the
+    /// state-dir's `verified/sessions/<id>/assignments/`.
+    #[error(
+        "assignment not in state-dir: session_id={session_id} \
+         assignment_id={assignment_id}"
+    )]
+    AssignmentNotPresent {
+        session_id: String,
+        assignment_id: String,
+    },
+}
+
 /// Canonical-bytes / hash encoding errors.
 #[derive(Debug, Error)]
 pub enum CanonicalError {

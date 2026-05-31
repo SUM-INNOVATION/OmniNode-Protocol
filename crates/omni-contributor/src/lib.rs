@@ -50,6 +50,7 @@ pub mod peer_routing;
 pub mod planner;
 pub mod posted;
 pub mod relay;
+pub mod repair;
 pub mod result;
 pub mod run;
 pub mod runner;
@@ -65,8 +66,13 @@ pub mod watch;
 
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
-    CanonicalError, ContributorError, DiscoverError, PlannerError, RelayError, RunnerError,
-    SchemaError, SigningError, SnipError, StatusError, VerifyError,
+    CanonicalError, ContributorError, DiscoverError, PlannerError, RelayError, RepairError,
+    RunnerError, SchemaError, SigningError, SnipError, StatusError, VerifyError,
+};
+pub use repair::{
+    build_session_repair_plan, check_repair_eligible, repair_plan_hash_hex,
+    source_status_hash_hex, RepairAction, RepairStrategy, SessionRepairPlan,
+    REPAIR_PLAN_SCHEMA_VERSION,
 };
 pub use status::{
     build_session_status_report, AssignmentStatus, SessionOverallStatus,
