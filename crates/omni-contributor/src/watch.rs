@@ -102,6 +102,19 @@ pub struct WatchOptions<'a> {
     /// `None` (the default) means "publish to SNIP only"; this is
     /// what Stage 12.1's filesystem-only watch path used.
     pub result_broadcaster: Option<&'a mut dyn ResultBroadcaster>,
+    /// Stage 12.7 — optional contributor workflow state store. When
+    /// `Some`, the loop:
+    ///
+    ///   * checks `is_seen(PostedJobs, posted_id)` BEFORE the
+    ///     existing in-memory dedup so already-handled jobs survive
+    ///     process restart, and
+    ///   * calls `mark_seen(PostedJobs, posted_id)` whenever a job
+    ///     is picked up so the next restart sees it as already
+    ///     handled.
+    ///
+    /// `None` preserves pre-12.7 behavior exactly (in-memory dedup
+    /// only).
+    pub state_store: Option<&'a crate::state::ContributorStateStore>,
 }
 
 /// Stage 12.2 broadcaster hook: receives a `PublishedResultLink` from
@@ -322,12 +335,46 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
                 });
                 continue;
             }
+            // Stage 12.7 — cross-restart dedup: if a state store is
+            // configured and the posted_id was marked seen by a
+            // previous process, skip immediately (and also pull the
+            // marker into the in-memory set so subsequent polls
+            // short-circuit on the cheap path).
+            if let Some(store) = opts.state_store {
+                match store.is_seen(crate::state::StateNamespace::PostedJobs, &posted.posted_id) {
+                    Ok(true) => {
+                        seen.insert(posted.posted_id.clone());
+                        opts.emit.emit(WatchEvent::Skip {
+                            posted_id: posted.posted_id.clone(),
+                            reason: SkipReason::AlreadySeen,
+                        });
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        opts.emit.emit(WatchEvent::Error {
+                            context: "state_store_is_seen".into(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            }
 
             // Mark as seen up-front so any per-entry failure below
             // still dedupes against re-pickup on the next poll
             // (matches the "dedup by posted_id, no persistent state"
             // approved default).
             seen.insert(posted.posted_id.clone());
+            if let Some(store) = opts.state_store {
+                if let Err(e) =
+                    store.mark_seen(crate::state::StateNamespace::PostedJobs, &posted.posted_id)
+                {
+                    opts.emit.emit(WatchEvent::Error {
+                        context: "state_store_mark_seen".into(),
+                        message: e.to_string(),
+                    });
+                }
+            }
 
             // 3a. Schema is already validated by FilesystemSource.
             //     Recheck defense-in-depth.
@@ -602,6 +649,25 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
             if !outcome.overall_ok {
                 let reason = summarize_verify_failure(&outcome);
                 write_rejected(&opts.result_out_dir, &result, &reason)?;
+                // Stage 12.7 — dual-write the rejected result into
+                // `<state>/results/contributor-results/<job_id>.rejected.json`.
+                // Best-effort: a failure here doesn't undo the
+                // operator-facing write or stop the loop.
+                if let Some(store) = opts.state_store {
+                    if let Err(e) = store.write_verified_json(
+                        crate::state::StateObjectKind::RejectedResult,
+                        &result.job_id,
+                        &serde_json::json!({
+                            "rejected_reason": reason,
+                            "result":          result,
+                        }),
+                    ) {
+                        opts.emit.emit(WatchEvent::Error {
+                            context: "state_store_write_rejected".into(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
                 opts.emit.emit(WatchEvent::VerifyFail {
                     posted_id: posted.posted_id.clone(),
                     job_id: job.job_id.clone(),
@@ -631,6 +697,23 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
             let result_json = serde_json::to_string_pretty(&result)?;
             std::fs::write(&result_path, &result_json)?;
 
+            // Stage 12.7 — dual-write the accepted result into
+            // `<state>/results/contributor-results/<job_id>.json`.
+            // Best-effort: a failure here doesn't undo the
+            // operator-facing write or stop the loop.
+            if let Some(store) = opts.state_store {
+                if let Err(e) = store.write_verified_json(
+                    crate::state::StateObjectKind::ContributorResult,
+                    &result.job_id,
+                    &result,
+                ) {
+                    opts.emit.emit(WatchEvent::Error {
+                        context: "state_store_write_result".into(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+
             // 3h. Optionally publish a PostedResultLink.
             if opts.publish_link {
                 match publish_result_link_for(
@@ -642,6 +725,27 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
                     &mut *opts.emit,
                 ) {
                     Ok(published) => {
+                        // Stage 12.7 — dual-write the
+                        // PostedResultLink envelope into
+                        // `<state>/results/result-links/<posted_id>.link.json`.
+                        // Mirrors the accepted-result dual-write
+                        // above; documented as part of the
+                        // `--contributor-state-dir` contract.
+                        if let Some(store) = opts.state_store {
+                            if let Err(e) = store.write_verified_json(
+                                crate::state::StateObjectKind::PostedResultLink,
+                                &posted.posted_id,
+                                &published.link,
+                            ) {
+                                opts.emit.emit(WatchEvent::Error {
+                                    context: format!(
+                                        "state_store_write_result_link posted_id={}",
+                                        posted.posted_id
+                                    ),
+                                    message: e.to_string(),
+                                });
+                            }
+                        }
                         // 3i. Stage 12.2 — if a network broadcaster
                         // is wired in, hand it the just-published
                         // link so it can broadcast a

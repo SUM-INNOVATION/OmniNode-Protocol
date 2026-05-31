@@ -233,6 +233,42 @@ pub enum SchemaError {
     },
 }
 
+/// Stage 12.7 — typed errors from the contributor state store.
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    #[error("state-dir io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("state-dir json error at {path}: {source}")]
+    Json {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// `meta/state_version.json` carries a version this binary
+    /// does not support. Forward-compat with future migrations.
+    #[error(
+        "state-dir version {got} not supported by this binary (expected {expected})"
+    )]
+    UnsupportedVersion { got: u32, expected: u32 },
+
+    /// Surfaced by the CLI when an operator supplies both
+    /// `--contributor-state-dir` AND the legacy
+    /// `--peer-advert-dir` / `--joins-dir` flags on the same
+    /// `run-assignment --resolve-downstream-peer-from-session`
+    /// invocation. Pick one source of truth.
+    #[error(
+        "ambiguous source of truth: --contributor-state-dir conflicts with \
+         {legacy_flag}; supply one or the other"
+    )]
+    AmbiguousSource { legacy_flag: &'static str },
+}
+
 /// Canonical-bytes / hash encoding errors.
 #[derive(Debug, Error)]
 pub enum CanonicalError {

@@ -129,6 +129,7 @@ fn run_once(
         publish_link,
         emit: &mut emitter,
         result_broadcaster: None,
+        state_store: None,
     };
     run_watch_loop(snip, &mut source, opts).unwrap();
     emitter.events
@@ -243,6 +244,7 @@ fn watch_loop_skips_poster_signature_failure() {
         publish_link: false,
         emit: &mut emitter,
         result_broadcaster: None,
+        state_store: None,
     };
     // max_jobs(1) won't be reached because the bad-signature entry
     // is skipped, not picked. Force the loop to exit by also using
@@ -489,6 +491,161 @@ fn standalone_publish_result_link_writes_exact_published_bytes() {
     let parsed: omni_contributor::PostedResultLink =
         serde_json::from_str(&published.link_json).unwrap();
     assert_eq!(parsed, published.link);
+}
+
+/// Stage 12.7 — when a `ContributorStateStore` is supplied via
+/// `WatchOptions.state_store`, the accepted result JSON must be
+/// dual-written into `<state>/results/contributor-results/<job_id>.json`
+/// AND the `posted-jobs` seen marker must survive a reopen so a
+/// restart-shaped second `run_watch_loop` skips the same envelope
+/// without re-fetching from SNIP.
+#[test]
+fn watch_loop_state_store_dual_writes_accepted_result_and_dedups_across_restart() {
+    use omni_contributor::{ContributorStateStore, StateNamespace, StateObjectKind};
+
+    let tmp_jobs = tempfile::tempdir().unwrap();
+    let tmp_out = tempfile::tempdir().unwrap();
+    let tmp_state = tempfile::tempdir().unwrap();
+    let snip = MockSnipStore::new();
+    let job = build_minimal_job(&snip);
+    let posted = publish_job_and_post(&snip, &job, tmp_jobs.path(), None);
+    let now_utc = "2026-05-30T00:00:00Z";
+
+    // First "process" run: open the state store, run the loop, see
+    // the result dual-written + seen marker laid down.
+    {
+        let (store, _) =
+            ContributorStateStore::open(tmp_state.path(), false, now_utc).unwrap();
+        let signer = ContributorSigner::from_seed_bytes(&CONTRIBUTOR_SEED).unwrap();
+        let runner =
+            StubRunner::new(signer.pubkey_hex(), b"watch-resp".to_vec(), 7, 13);
+        let mut source = FilesystemSource::new(tmp_jobs.path().to_path_buf());
+        let mut emitter = CollectEmitter::new();
+        let opts = WatchOptions {
+            poll_interval: Duration::ZERO,
+            max_jobs: None,
+            max_polls: Some(1),
+            filters: no_filters(),
+            caps: liberal_caps(),
+            runner: &runner,
+            signer: &signer,
+            result_out_dir: tmp_out.path().to_path_buf(),
+            publish_link: false,
+            emit: &mut emitter,
+            result_broadcaster: None,
+            state_store: Some(&store),
+        };
+        run_watch_loop(&snip, &mut source, opts).unwrap();
+        assert!(emitter.events.iter().any(|e| matches!(
+            e,
+            WatchEvent::VerifyOk { job_id, .. } if job_id == &job.job_id
+        )));
+        // Dual-write must have landed.
+        let on_disk: Option<omni_contributor::ContributorResult> = store
+            .read_verified_json(StateObjectKind::ContributorResult, &job.job_id)
+            .unwrap();
+        assert!(
+            on_disk.is_some(),
+            "accepted result must dual-write into the state store"
+        );
+        assert_eq!(on_disk.unwrap().job_id, job.job_id);
+        // Seen marker must be down.
+        assert!(store
+            .is_seen(StateNamespace::PostedJobs, &posted.posted_id)
+            .unwrap());
+    }
+    // Second "process" run: same state-dir, brand-new in-memory
+    // dedup set, but the seen marker on disk must cause the loop
+    // to skip the same posted_id with AlreadySeen.
+    {
+        let (store, _) =
+            ContributorStateStore::open(tmp_state.path(), false, now_utc).unwrap();
+        let signer = ContributorSigner::from_seed_bytes(&CONTRIBUTOR_SEED).unwrap();
+        let runner =
+            StubRunner::new(signer.pubkey_hex(), b"watch-resp".to_vec(), 7, 13);
+        let mut source = FilesystemSource::new(tmp_jobs.path().to_path_buf());
+        let mut emitter = CollectEmitter::new();
+        let opts = WatchOptions {
+            poll_interval: Duration::ZERO,
+            max_jobs: None,
+            max_polls: Some(1),
+            filters: no_filters(),
+            caps: liberal_caps(),
+            runner: &runner,
+            signer: &signer,
+            result_out_dir: tmp_out.path().to_path_buf(),
+            publish_link: false,
+            emit: &mut emitter,
+            result_broadcaster: None,
+            state_store: Some(&store),
+        };
+        run_watch_loop(&snip, &mut source, opts).unwrap();
+        let saw_dedup = emitter.events.iter().any(|e| matches!(
+            e,
+            WatchEvent::Skip { posted_id, reason: SkipReason::AlreadySeen }
+                if posted_id == &posted.posted_id
+        ));
+        let saw_verify = emitter.events.iter().any(|e| matches!(
+            e, WatchEvent::VerifyOk { .. }
+        ));
+        assert!(saw_dedup, "cross-restart skip expected; events={:?}", emitter.events);
+        assert!(!saw_verify, "re-pickup should not happen on restart");
+    }
+}
+
+/// Stage 12.7 — when both `publish_link` and `state_store` are set,
+/// the watch loop must dual-write the `PostedResultLink` into the
+/// state-dir's `results/result-links/<posted_id>.link.json` after
+/// publishing it to SNIP. The CLI flag doc + Stage 12.7 protocol
+/// doc both promise this; this test pins the contract.
+#[test]
+fn watch_loop_state_store_dual_writes_result_link_when_publish_link_enabled() {
+    use omni_contributor::{ContributorStateStore, StateObjectKind};
+
+    let tmp_jobs = tempfile::tempdir().unwrap();
+    let tmp_out = tempfile::tempdir().unwrap();
+    let tmp_state = tempfile::tempdir().unwrap();
+    let snip = MockSnipStore::new();
+    let job = build_minimal_job(&snip);
+    let posted = publish_job_and_post(&snip, &job, tmp_jobs.path(), None);
+    let now_utc = "2026-05-30T00:00:00Z";
+
+    let (store, _) =
+        ContributorStateStore::open(tmp_state.path(), false, now_utc).unwrap();
+    let signer = ContributorSigner::from_seed_bytes(&CONTRIBUTOR_SEED).unwrap();
+    let runner = StubRunner::new(signer.pubkey_hex(), b"watch-resp".to_vec(), 7, 13);
+    let mut source = FilesystemSource::new(tmp_jobs.path().to_path_buf());
+    let mut emitter = CollectEmitter::new();
+    let opts = WatchOptions {
+        poll_interval: Duration::ZERO,
+        max_jobs: None,
+        max_polls: Some(1),
+        filters: no_filters(),
+        caps: liberal_caps(),
+        runner: &runner,
+        signer: &signer,
+        result_out_dir: tmp_out.path().to_path_buf(),
+        publish_link: true,
+        emit: &mut emitter,
+        result_broadcaster: None,
+        state_store: Some(&store),
+    };
+    run_watch_loop(&snip, &mut source, opts).unwrap();
+
+    let saw_publish = emitter
+        .events
+        .iter()
+        .any(|e| matches!(e, WatchEvent::ResultLinkPublished { .. }));
+    assert!(saw_publish, "expected ResultLinkPublished in {:?}", emitter.events);
+
+    let link: Option<omni_contributor::PostedResultLink> = store
+        .read_verified_json(StateObjectKind::PostedResultLink, &posted.posted_id)
+        .unwrap();
+    let link = link.expect(
+        "PostedResultLink must dual-write into <state>/results/result-links/...",
+    );
+    assert_eq!(link.posted_id, posted.posted_id);
+    assert_eq!(link.contributor_pubkey_hex, signer.pubkey_hex());
 }
 
 #[test]

@@ -56,6 +56,7 @@ pub mod session;
 pub mod session_verify;
 pub mod signing;
 pub mod snip;
+pub mod state;
 pub mod tensor_transport;
 pub mod verify;
 pub mod watch;
@@ -121,6 +122,10 @@ pub use session_verify::{
     SessionVerifyOutcome,
 };
 pub use signing::{ContributorSigner, CoordinatorSigner, DispatcherSigner};
+pub use state::{
+    ContributorStateStore, PruneReport, StateNamespace, StateObjectKind,
+    StateVersionMeta, STATE_VERSION,
+};
 pub use verify::{verify_result, VerifyOutcome};
 pub use watch::{
     process_result_announcement, publish_result_link_for, run_watch_loop, AcceptFilters,
