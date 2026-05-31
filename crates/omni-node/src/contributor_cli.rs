@@ -150,6 +150,14 @@ enum ContributorCmd {
     /// `NetworkWorkAssignedAnnouncement`). `--dry-run` validates
     /// without touching SNIP or the mesh.
     AssignSessionPlan(AssignSessionPlanArgs),
+
+    /// Stage 12.9 — read-only: load + re-verify session/joins/
+    /// assignments/partials/peer-adverts/aggregate for a given
+    /// `--session-id` from a Stage 12.7 `--contributor-state-dir`,
+    /// produce a deterministic `SessionStatusReport`, and print it
+    /// as events/json/pretty. Does not touch SNIP, the mesh, or
+    /// any chain.
+    SessionStatus(SessionStatusArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -1571,6 +1579,66 @@ struct AssignSessionPlanArgs {
     no_prune_state_on_start: bool,
 }
 
+// ── Stage 12.9 args ──────────────────────────────────────────────────────
+
+/// Output format for `session-status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SessionStatusFormat {
+    /// One `event=session_status ...` line + one
+    /// `event=assignment_status ...` line per assignment +
+    /// `event=missing_partial ...` per missing partial +
+    /// `event=note ...` per `notes` entry. Default — matches every
+    /// other Stage 12.x watcher.
+    Events,
+    /// Print the full `SessionStatusReport` as pretty-printed JSON.
+    Json,
+    /// Compact terminal-friendly table. No external TUI deps; just
+    /// stdout.
+    Pretty,
+}
+
+#[derive(Args)]
+struct SessionStatusArgs {
+    /// Stage 12.7 contributor workflow state directory. Required —
+    /// the reporter reads every body it inspects from here.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    /// 64-char lowercase hex `session_id` to report on.
+    #[arg(long)]
+    session_id: String,
+
+    /// Output format. Defaults to `events` (matches every other
+    /// Stage 12.x watcher's bare-stdout posture).
+    #[arg(long, value_enum, default_value_t = SessionStatusFormat::Events)]
+    format: SessionStatusFormat,
+
+    /// Optional path to mirror the JSON report. Best-effort
+    /// `std::fs::write`; a failure here logs a stderr warning and
+    /// does not change the exit code (the report is a snapshot,
+    /// not a protocol artifact).
+    #[arg(long)]
+    json_out: Option<PathBuf>,
+
+    /// Exit non-zero when `overall_status` is not in
+    /// `{CompletePartials, Aggregated}`. Default is "exit 0 even
+    /// if incomplete" so dashboard scrapers can run unconditionally.
+    #[arg(long, default_value_t = false)]
+    fail_on_incomplete: bool,
+
+    /// When set, expired peer advertisements are counted in
+    /// `peer_advert_count`. Session expiry is always reported
+    /// regardless of this flag.
+    #[arg(long, default_value_t = false)]
+    include_expired: bool,
+
+    /// Stage 12.7 — disable the auto-prune of expired sessions /
+    /// peer advertisements that runs on `--contributor-state-dir`
+    /// open. Useful for forensic re-runs against an old tree.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -1596,6 +1664,7 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::WatchPeerAdverts(a) => run_watch_peer_adverts(a).await,
         ContributorCmd::PlanSessionAssignments(a) => run_plan_session_assignments(a),
         ContributorCmd::AssignSessionPlan(a) => run_assign_session_plan(a).await,
+        ContributorCmd::SessionStatus(a) => run_session_status(a),
     }
 }
 
@@ -5577,5 +5646,264 @@ mod tests {
         // Explicit — skip the mesh broadcast.
         let args = parse_assign_session_plan(&["--no-publish-announcements"]);
         assert!(args.no_publish_announcements);
+    }
+
+    fn parse_session_status(extra: &[&str]) -> SessionStatusArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "session-status".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+            "--session-id".into(),
+            "00".repeat(32),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::SessionStatus(a) => a,
+            _ => panic!("expected SessionStatus"),
+        }
+    }
+
+    /// Stage 12.9 — flag-set regression. Defaults must match the
+    /// documented "exit 0 unless --fail-on-incomplete, format=events,
+    /// no expired adverts" posture; each toggle must flip
+    /// independently.
+    #[test]
+    fn session_status_flag_parse_smoke() {
+        let defaults = parse_session_status(&[]);
+        assert_eq!(defaults.format, SessionStatusFormat::Events);
+        assert!(!defaults.fail_on_incomplete);
+        assert!(!defaults.include_expired);
+        assert!(!defaults.no_prune_state_on_start);
+        assert!(defaults.json_out.is_none());
+
+        let json = parse_session_status(&["--format", "json"]);
+        assert_eq!(json.format, SessionStatusFormat::Json);
+
+        let pretty = parse_session_status(&["--format", "pretty"]);
+        assert_eq!(pretty.format, SessionStatusFormat::Pretty);
+
+        let with_flags = parse_session_status(&[
+            "--fail-on-incomplete",
+            "--include-expired",
+            "--no-prune-state-on-start",
+            "--json-out",
+            "/tmp/status.json",
+        ]);
+        assert!(with_flags.fail_on_incomplete);
+        assert!(with_flags.include_expired);
+        assert!(with_flags.no_prune_state_on_start);
+        assert_eq!(
+            with_flags.json_out.as_deref(),
+            Some(std::path::Path::new("/tmp/status.json"))
+        );
+    }
+}
+
+// ── Stage 12.9 — session-status ──────────────────────────────────────────
+
+fn run_session_status(args: SessionStatusArgs) -> Result<()> {
+    use omni_contributor::{
+        build_session_status_report, ContributorStateStore, SessionOverallStatus,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // With `--format json`, stdout must be ONLY the report JSON so
+    // scripts can `jq` it without preprocessing. Operational
+    // chatter (state-store open notice, JSON-out write notice,
+    // warnings) all go to stderr in that mode. `events` and
+    // `pretty` keep their prose-style stdout.
+    let json_mode = matches!(args.format, SessionStatusFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    // Open the state store. Stage 12.7 auto-prune applies unless
+    // the operator opts out.
+    let (store, prune_report) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        !args.no_prune_state_on_start,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    log_op(&format!(
+        "event=state_store_opened path={} pruned_sessions={} pruned_peer_adverts={} kept={}",
+        args.contributor_state_dir.display(),
+        prune_report.removed_sessions,
+        prune_report.removed_peer_adverts,
+        prune_report.kept
+    ));
+
+    let report = build_session_status_report(
+        &store,
+        &args.session_id,
+        &now_utc,
+        args.include_expired,
+    )
+    .map_err(|e| anyhow!("build session status report: {e}"))?;
+
+    match args.format {
+        SessionStatusFormat::Events => render_status_events(&report),
+        SessionStatusFormat::Json => render_status_json(&report)?,
+        SessionStatusFormat::Pretty => render_status_pretty(&report),
+    }
+
+    // Optional best-effort JSON mirror. Failure here is a stderr
+    // warning, not a process error — the report is a snapshot, not
+    // a protocol artifact.
+    if let Some(path) = args.json_out.as_deref() {
+        match serde_json::to_vec_pretty(&report) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, &bytes) {
+                    eprintln!(
+                        "event=warn context=session_status_json_out path={} message={e}",
+                        path.display()
+                    );
+                } else {
+                    log_op(&format!(
+                        "event=session_status_json_written path={}",
+                        path.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "event=warn context=session_status_json_serialize message={e}"
+                );
+            }
+        }
+    }
+
+    // Exit code policy. The Result<()> return shape lets us err
+    // out cleanly; clap's bin entry then converts to exit code 1.
+    if args.fail_on_incomplete
+        && !matches!(
+            report.overall_status,
+            SessionOverallStatus::CompletePartials
+                | SessionOverallStatus::Aggregated
+        )
+    {
+        return Err(anyhow!(
+            "session status is {:?}; --fail-on-incomplete tripped",
+            report.overall_status
+        ));
+    }
+    Ok(())
+}
+
+fn render_status_events(report: &omni_contributor::SessionStatusReport) {
+    println!(
+        "event=session_status session_id={} status={:?} \
+         assignments={} partials={} missing={} aggregate={} expired={}",
+        report.session_id,
+        report.overall_status,
+        report.assignment_count,
+        report.partial_count,
+        report.missing_assignment_ids.len(),
+        report.aggregate_valid,
+        report.session_expired,
+    );
+    for a in &report.assignments {
+        println!(
+            "event=assignment_status session_id={} assignment_id={} \
+             stage_index={} contributor={} join={} peer_advert={} \
+             partial={}",
+            report.session_id,
+            a.assignment_id,
+            a.stage_index,
+            a.contributor_pubkey_hex,
+            if a.join_present { "present" } else { "missing" },
+            if a.peer_advert_present { "present" } else { "missing" },
+            if a.partial_present { "present" } else { "missing" },
+        );
+    }
+    for missing in &report.missing_assignment_ids {
+        // Find the corresponding assignment for stage_index and
+        // contributor context. Linear scan is fine — assignment
+        // counts are small (a handful per session).
+        if let Some(a) = report
+            .assignments
+            .iter()
+            .find(|x| &x.assignment_id == missing)
+        {
+            println!(
+                "event=missing_partial session_id={} assignment_id={} \
+                 stage_index={} contributor={}",
+                report.session_id,
+                missing,
+                a.stage_index,
+                a.contributor_pubkey_hex,
+            );
+        } else {
+            println!(
+                "event=missing_partial session_id={} assignment_id={}",
+                report.session_id, missing,
+            );
+        }
+    }
+    for note in &report.notes {
+        println!("event=note context=session_status message={note}");
+    }
+}
+
+fn render_status_json(
+    report: &omni_contributor::SessionStatusReport,
+) -> Result<()> {
+    let json = serde_json::to_string_pretty(report)?;
+    println!("{json}");
+    Ok(())
+}
+
+fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
+    println!("Session   {}", report.session_id);
+    println!("Status    {:?}", report.overall_status);
+    println!(
+        "Counts    joins={} assignments={} partials={} adverts={} aggregate_present={} aggregate_valid={}",
+        report.join_count,
+        report.assignment_count,
+        report.partial_count,
+        report.peer_advert_count,
+        report.aggregate_present,
+        report.aggregate_valid,
+    );
+    if !report.assignments.is_empty() {
+        println!("Assignments:");
+        println!(
+            "  {:<5} {:<10} {:<10} {:<10} {:<10}",
+            "stage", "join", "advert", "partial", "assignment_id (12)"
+        );
+        for a in &report.assignments {
+            let short_id: String = a.assignment_id.chars().take(12).collect();
+            println!(
+                "  {:<5} {:<10} {:<10} {:<10} {}",
+                a.stage_index,
+                if a.join_present { "present" } else { "missing" },
+                if a.peer_advert_present { "present" } else { "missing" },
+                if a.partial_present { "present" } else { "missing" },
+                short_id,
+            );
+        }
+    }
+    if !report.missing_assignment_ids.is_empty() {
+        println!(
+            "Missing partials: {} / {}",
+            report.missing_assignment_ids.len(),
+            report.assignment_count
+        );
+    }
+    if !report.notes.is_empty() {
+        println!("Notes:");
+        for n in &report.notes {
+            println!("  - {n}");
+        }
     }
 }

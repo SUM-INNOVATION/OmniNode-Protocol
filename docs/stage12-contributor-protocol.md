@@ -1366,3 +1366,142 @@ A planner that ranks contributors by available RAM is a scheduler. A planner tha
 - Does NOT add a chain-side anything. The planner is local infrastructure.
 - Does NOT pull halo2/prover/framework runtimes into the default `omni-node` tree.
 - Does NOT replace the Stage 12.3 `assign-work` CLI. `assign-work` keeps working for hand-edited spec files.
+
+---
+
+# Stage 12.9 — local pooled-session progress monitor
+
+**Status**: shipped at Stage 12.9. Builds on Stage 12.7 state-dir loaders + Stage 12.3 verifier helpers. Read-only observability — no protocol or schema change.
+
+## Posture (unchanged)
+
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing logic. No proof mode / on-chain verification / chain proof allowlist. No omni-net change. No omni-store wire change. No Stage 12.0–12.8 schema or canonical-byte changes. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
+
+## Problem
+
+Stage 12.8 can plan and publish assignments, but an operator inspecting a pooled session still has to walk `<state>/verified/sessions/<id>/...` by hand to check whether joins arrived, assignments were issued, partials came back, and the aggregate landed. There is no single command that says "is session X complete?" or "where is it stuck?"
+
+## Solution
+
+Add a read-only `session-status` subcommand that loads everything for a `--session-id` from a Stage 12.7 `--contributor-state-dir`, re-runs every relevant Stage 12.3 verifier, and emits a deterministic `SessionStatusReport`. The report is a **local snapshot** — never signed, never SNIP-published, never network-visible. Two operators on different machines will see different reports for the same session, and that's correct: each report describes *what its local state-dir contains*.
+
+### What this is NOT
+
+- **NOT a coordination enforcer.** The report doesn't fail a session, refuse work, trigger retries, or mutate anything on disk beyond an optional `--json-out` mirror.
+- **NOT a network protocol.** `SessionStatusReport` is local-only and **unsigned**. Schema-versioned so a future Stage 12.10 can bump cleanly.
+- **NOT a chain authority.** No transaction, no signature, no on-chain anchor.
+- **NOT a TUI.** Just stdout events, JSON, or a compact one-screen table.
+- **NOT a peer-advert-driven liveness probe.** Adverts inform `peer_advert_present` per assignment but never drive completion. A session can be `CompletePartials` or `Aggregated` with no advert at all in the state-dir.
+
+### Trust boundary
+
+State-dir loaders are parse-only (Stage 12.7 review). `build_session_status_report` re-runs:
+
+- `verify_execution_session` on `session.json`,
+- `verify_contributor_join` per join,
+- `verify_work_assignment` per assignment (against the verified-joins pubkey set),
+- `verify_partial_result` per partial (matched by `assignment_id`),
+- `verify_peer_advertisement_body` per advert (against the verified joins),
+- `verify_aggregated_result` full-chain when an aggregate is present.
+
+Failing chain links (joins / assignments / partials / aggregate) drop the artifact from valid counts and set `overall_status = InvalidState`. Failing peer adverts surface as notes but never flip `overall_status` — they're routing helpers, not chain links.
+
+A failed `verify_execution_session` is **fail-closed**: the reporter returns a minimal `InvalidState` report immediately, carrying no session-derived fields (`posted_id`, `model_hash`, `session_expires_at_utc` are all `None`) and zero counts. Continuing past a tampered session would feed an untrusted body into the downstream verifiers and let session-derived trust fields leak into the report. The single `notes` entry names `verify_execution_session` so an operator can find the bad file.
+
+### `SessionOverallStatus` decision tree
+
+Computed in priority order (first match wins):
+
+1. `NoSession` — no `session.json` for the requested id, OR an inner-body session_id mismatch with the directory key.
+2. `InvalidState` — any chain-link body failed individual re-verification, OR `verify_aggregated_result` rejected an aggregate that exists.
+3. `Aggregated` — `aggregate_present && aggregate_valid`.
+4. `ExpiredIncomplete` — `now_utc >= session.expires_at_utc` AND not aggregated.
+5. `NoAssignments` — session valid, zero valid assignments.
+6. `CompletePartials` — every valid assignment has exactly one valid partial; no aggregate yet.
+7. `InProgress` — otherwise.
+
+### Counts policy
+
+Counts are **valid-only**. Tampered artifacts surface as `notes` + `InvalidState` overall, not as inflated counts.
+
+### Duplicate partials in v1
+
+The state-dir layout writes `verified/sessions/<id>/partials/<assignment_id>.json`. Partials are keyed by `assignment_id`, so a second write overwrites — **duplicates are filesystem-impossible in v1**. The `duplicate_partial_assignment_ids` field is always empty and is retained for forward compatibility (a future stage that grows a partials sidecar may need it).
+
+### CLI surface
+
+```text
+session-status
+  --contributor-state-dir <path>             required
+  --session-id <hex64>                       required
+  --format events|json|pretty                default events
+  --json-out <path>                          optional (best-effort fs::write)
+  --fail-on-incomplete                       flag (exit non-zero unless CompletePartials or Aggregated)
+  --include-expired                          flag (count expired adverts too)
+  --no-prune-state-on-start                  optional (inherits Stage 12.7)
+```
+
+### Output formats
+
+**`events`** (default — matches every other Stage 12.x watcher):
+
+```
+event=session_status session_id=... status=InProgress assignments=3 partials=1 missing=2 aggregate=false expired=false
+event=assignment_status session_id=... assignment_id=... stage_index=0 contributor=... join=present peer_advert=present partial=present
+event=missing_partial session_id=... assignment_id=... stage_index=1 contributor=...
+event=note context=session_status message=...
+```
+
+**`json`** — `serde_json::to_string_pretty(&report)` is the **only** thing written to stdout in this mode. Operational chatter (`event=state_store_opened`, `event=session_status_json_written`) is rerouted to stderr so `jq` and other parsers can consume stdout directly. The omni-node binary's `tracing` output also goes to stderr (Stage 12.9 lift), so a clean `omni-node operator contributor session-status --format json` invocation produces parseable JSON on stdout with no preprocessing required.
+
+**`pretty`** — minimal terminal-friendly table. No TUI deps.
+
+### `--json-out` posture
+
+Best-effort `std::fs::write`. Failure produces a stderr warning but does not change the exit code. The report is a **dashboard snapshot, not a protocol artifact** — operator dashboards are fine with non-atomic writes. The state-store's atomic-write helper stays private to `state.rs`.
+
+### `--fail-on-incomplete` exit code mapping
+
+| `overall_status` | Exit code |
+|---|---|
+| `Aggregated` | `0` |
+| `CompletePartials` | `0` |
+| `NoSession` | `1` |
+| `NoAssignments` | `1` |
+| `InProgress` | `1` |
+| `ExpiredIncomplete` | `1` |
+| `InvalidState` | `1` |
+
+Without `--fail-on-incomplete`, every status exits `0` so dashboard scrapers can run unconditionally.
+
+### Operator workflow
+
+```bash
+# After running Stage 12.7 watchers + Stage 12.8 plan/assign:
+omni-node operator contributor session-status \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64>
+# → event lines suitable for grep + tail.
+
+# JSON for a dashboard:
+omni-node operator contributor session-status \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64> \
+  --format json \
+  --json-out ./status.json
+
+# In a CI gate:
+omni-node operator contributor session-status \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64> \
+  --fail-on-incomplete
+```
+
+### What 12.9 does NOT do
+
+- Does NOT introduce a new signed envelope. `SessionStatusReport` is unsigned.
+- Does NOT add a gossipsub topic, SNIP root format, or canonical-bytes domain separator.
+- Does NOT change any Stage 12.0–12.8 schema or canonical bytes.
+- Does NOT add a chain-side anything. The reporter is local infrastructure.
+- Does NOT pull halo2/prover/framework runtimes into the default `omni-node` tree.
+- Does NOT mutate any protocol artifact. The only write it performs is the optional `--json-out` mirror.

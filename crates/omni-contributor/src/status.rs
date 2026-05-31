@@ -1,0 +1,508 @@
+//! Stage 12.9 — local pooled-session progress monitor.
+//!
+//! Read-only observability layer over the Stage 12.7
+//! `ContributorStateStore`. Given a `session_id`, load every body
+//! in `verified/sessions/<id>/...`, re-run the relevant Stage 12.3
+//! verifiers, and produce a deterministic [`SessionStatusReport`].
+//!
+//! ## What this module is NOT
+//!
+//! - **NOT a coordination enforcer.** The report doesn't fail a
+//!   session, refuse work, retry, or change anything on disk
+//!   beyond an optional operator-supplied `--json-out`. It
+//!   reports.
+//! - **NOT a network protocol.** `SessionStatusReport` is local-
+//!   only and **unsigned**. It is never SNIP-published, never
+//!   gossiped, never canonical bytes. Two operators looking at the
+//!   same session from different machines may see different
+//!   reports — and that's correct, because the report describes
+//!   *what their local state-dir contains*, not a global truth.
+//! - **NOT a chain authority.** No transaction, no signature, no
+//!   on-chain anchor.
+//! - **NOT a peer-advert-driven liveness probe.** Peer adverts
+//!   inform `peer_advert_present` per assignment but don't drive
+//!   completion. A session can be `CompletePartials` or
+//!   `Aggregated` with no advert in the state-dir at all.
+//!
+//! ## Trust boundary
+//!
+//! State-dir loaders are parse-only (Stage 12.7 review). This
+//! module re-runs:
+//!
+//! - [`verify_execution_session`] on `session.json`,
+//! - [`verify_contributor_join`] per join,
+//! - [`verify_work_assignment`] per assignment (against the
+//!   verified-joins pubkey set),
+//! - [`verify_partial_result`] per partial (matched by
+//!   `assignment_id`),
+//! - [`verify_peer_advertisement_body`] per advert (against the
+//!   verified joins),
+//! - [`verify_aggregated_result`] full-chain when an aggregate is
+//!   present.
+//!
+//! Any failing verifier drops the artifact from the **valid**
+//! counts and surfaces in `notes`. The presence of any invalid
+//! body sets `overall_status = InvalidState` so operators see the
+//! signal at a glance.
+//!
+//! ## Determinism
+//!
+//! The same state-dir + the same `now_utc` yields the same report.
+//! `assignments` are sorted by `(stage_index, assignment_id)` and
+//! `notes` are appended in iteration order.
+
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::StatusError;
+use crate::peer_advert::ContributorPeerAdvertisement;
+use crate::peer_routing::{verify_peer_advertisement_body, PeerAdvertisementOutcome};
+use crate::result::WorkUnitKind;
+use crate::session::{
+    AggregatedContributorResult, ContributorJoin, ExecutionSession, PartialContributorResult,
+    WorkAssignment, WorkKind,
+};
+use crate::session_verify::{
+    check_not_expired, verify_aggregated_result, verify_contributor_join,
+    verify_execution_session, verify_partial_result, verify_work_assignment,
+    SessionVerifyOutcome,
+};
+use crate::state::{ContributorStateStore, StateObjectKind};
+
+/// Pinned v1. A future stage that needs e.g. a chain-anchor field
+/// bumps this and migrates.
+pub const STATUS_SCHEMA_VERSION: u32 = 1;
+
+// ── SessionOverallStatus ────────────────────────────────────────
+
+/// Closed enum describing the operator-visible state of a pooled
+/// session at report time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionOverallStatus {
+    /// No `session.json` for the requested `session_id` in the
+    /// state-dir (or session.json failed its individual verifier
+    /// — without a verified session we have no chain root to
+    /// report against).
+    NoSession,
+    /// Session verified; zero valid assignments on disk.
+    NoAssignments,
+    /// At least one valid assignment lacks a valid partial.
+    InProgress,
+    /// Every valid assignment has exactly one valid partial; no
+    /// aggregate yet.
+    CompletePartials,
+    /// Aggregate present AND `verify_aggregated_result` passed.
+    Aggregated,
+    /// `now_utc >= session.expires_at_utc` AND not aggregated.
+    ExpiredIncomplete,
+    /// Some loaded body failed individual re-verification (e.g.
+    /// tampered signature, drift mismatch). Counts still report
+    /// valid-only artifacts; see `notes` for per-artifact reasons.
+    InvalidState,
+}
+
+// ── AssignmentStatus ────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentStatus {
+    pub assignment_id: String,
+    pub stage_index: u32,
+    pub contributor_pubkey_hex: String,
+    pub work_kind: WorkKind,
+    pub expected_work_units: u64,
+    pub expected_work_unit_kind: WorkUnitKind,
+    /// True when at least one valid `ContributorJoin` exists for
+    /// `contributor_pubkey_hex` (this is implied by the
+    /// assignment having passed `verify_work_assignment`, but we
+    /// surface it so dashboards can spot the case where someone
+    /// dropped the join file but left the assignment).
+    pub join_present: bool,
+    /// True when a non-expired (or any, with `--include-expired`)
+    /// verified peer advert exists for the contributor.
+    pub peer_advert_present: bool,
+    pub partial_present: bool,
+    pub partial_valid: bool,
+    pub partial_snip_root: Option<String>,
+    pub notes: Vec<String>,
+}
+
+// ── SessionStatusReport ─────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStatusReport {
+    pub schema_version: u32,
+    pub session_id: String,
+    /// `None` only when the session is missing entirely.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub posted_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model_hash: Option<String>,
+    pub generated_at_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_expires_at_utc: Option<String>,
+    pub session_expired: bool,
+    /// VALID-ONLY counts. Tampered artifacts surface as `notes`
+    /// + `InvalidState` overall, not as inflated counts.
+    pub join_count: u32,
+    pub peer_advert_count: u32,
+    pub assignment_count: u32,
+    pub partial_count: u32,
+    pub missing_assignment_ids: Vec<String>,
+    /// State layout writes
+    /// `verified/sessions/<id>/partials/<assignment_id>.json`, so
+    /// a duplicate per assignment_id is filesystem-impossible.
+    /// Always empty in v1; retained for forward compatibility.
+    pub duplicate_partial_assignment_ids: Vec<String>,
+    pub aggregate_present: bool,
+    pub aggregate_valid: bool,
+    pub overall_status: SessionOverallStatus,
+    pub assignments: Vec<AssignmentStatus>,
+    /// Free-form per-artifact failure descriptions. Stable order:
+    /// session → joins → assignments → partials → adverts →
+    /// aggregate. Renderers print these as
+    /// `event=note context=... message=...` lines.
+    pub notes: Vec<String>,
+}
+
+// ── public entry point ─────────────────────────────────────────
+
+/// Load + re-verify + report. The CLI's `session-status`
+/// subcommand calls this; tests can also call it against a
+/// `tempdir`-backed `ContributorStateStore` directly.
+///
+/// `now_utc` is RFC 3339 with `Z` suffix. Used for session expiry
+/// and peer-advert expiry checks.
+///
+/// `include_expired` controls peer-advert filtering ONLY. Session
+/// expiry is always evaluated and reported.
+pub fn build_session_status_report(
+    store: &ContributorStateStore,
+    session_id: &str,
+    now_utc: &str,
+    include_expired: bool,
+) -> Result<SessionStatusReport, StatusError> {
+    let mut notes: Vec<String> = Vec::new();
+    // Chain-link failures (session/joins/assignments/partials/
+    // aggregate) flip overall_status to InvalidState. Advert
+    // failures produce notes but do NOT — adverts are routing
+    // helpers, documented as not required for completion. We track
+    // the two separately.
+    let mut any_chain_invalid = false;
+
+    // ── 1. Load session.json ─────────────────────────────────
+    let session: Option<ExecutionSession> =
+        store.read_verified_json(StateObjectKind::Session, session_id)?;
+    let Some(session) = session else {
+        return Ok(empty_no_session_report(session_id, now_utc));
+    };
+    if session.session_id != session_id {
+        notes.push(format!(
+            "session.json carries session_id={} but state-dir directory says {}; \
+             treating as missing",
+            session.session_id, session_id
+        ));
+        return Ok(empty_no_session_report(session_id, now_utc));
+    }
+    // Fail-closed: session signature must verify or we have NO
+    // anchor for the rest of the chain. Continuing here would feed
+    // an untrusted ExecutionSession into `verify_contributor_join`
+    // / `verify_work_assignment` / etc., and the report would
+    // carry session-derived fields (posted_id, model_hash,
+    // expires_at_utc) lifted from a body whose coordinator
+    // signature failed. Instead, return an InvalidState report
+    // carrying NO session-derived fields and a single note
+    // pointing at the failure.
+    if !verify_execution_session(&session).is_ok() {
+        let mut report = empty_no_session_report(session_id, now_utc);
+        report.overall_status = SessionOverallStatus::InvalidState;
+        report.notes.push(format!(
+            "session.json failed verify_execution_session for session_id={}",
+            session_id
+        ));
+        return Ok(report);
+    }
+
+    // ── 2. Load + re-verify joins ──────────────────────────────
+    let raw_joins = store.list_verified_joins_for(session_id)?;
+    let mut joins: Vec<ContributorJoin> = Vec::new();
+    for j in raw_joins {
+        if verify_contributor_join(&session, &j).is_ok() {
+            joins.push(j);
+        } else {
+            notes.push(format!(
+                "join contributor_pubkey={} failed verify_contributor_join",
+                j.contributor_pubkey_hex
+            ));
+            any_chain_invalid = true;
+        }
+    }
+    let joined_pubkeys: HashSet<String> = joins
+        .iter()
+        .map(|j| j.contributor_pubkey_hex.clone())
+        .collect();
+
+    // ── 3. Load + re-verify assignments ────────────────────────
+    let raw_assignments = store.list_verified_assignments_for(session_id)?;
+    let mut assignments: Vec<WorkAssignment> = Vec::new();
+    for a in raw_assignments {
+        match verify_work_assignment(&session, &joined_pubkeys, &a) {
+            SessionVerifyOutcome::Ok => assignments.push(a),
+            other => {
+                notes.push(format!(
+                    "assignment_id={} failed verify_work_assignment: {other:?}",
+                    a.assignment_id
+                ));
+                any_chain_invalid = true;
+            }
+        }
+    }
+    // Deterministic order: stage_index ASC, then assignment_id ASC.
+    assignments.sort_by(|a, b| {
+        a.stage_index
+            .cmp(&b.stage_index)
+            .then_with(|| a.assignment_id.cmp(&b.assignment_id))
+    });
+
+    // ── 4. Load + re-verify partials (matched by assignment) ───
+    let raw_partials = store.list_verified_partials_for(session_id)?;
+    let mut valid_partials_by_assignment: HashMap<String, PartialContributorResult> =
+        HashMap::new();
+    let assignments_by_id: HashMap<String, &WorkAssignment> = assignments
+        .iter()
+        .map(|a| (a.assignment_id.clone(), a))
+        .collect();
+    for p in raw_partials {
+        let Some(asn) = assignments_by_id.get(&p.assignment_id) else {
+            notes.push(format!(
+                "partial assignment_id={} has no matching verified assignment",
+                p.assignment_id
+            ));
+            any_chain_invalid = true;
+            continue;
+        };
+        match verify_partial_result(asn, &p) {
+            SessionVerifyOutcome::Ok => {
+                valid_partials_by_assignment.insert(p.assignment_id.clone(), p);
+            }
+            other => {
+                notes.push(format!(
+                    "partial assignment_id={} failed verify_partial_result: {other:?}",
+                    p.assignment_id
+                ));
+                any_chain_invalid = true;
+            }
+        }
+    }
+
+    // ── 5. Load + re-verify peer adverts ───────────────────────
+    let raw_adverts = store.list_verified_peer_adverts_for(session_id)?;
+    let mut peer_adverts: Vec<ContributorPeerAdvertisement> = Vec::new();
+    for a in raw_adverts {
+        // Adverts re-verify against the verified joins set.
+        // `Some(now_utc)` enforces expiry; `--include-expired`
+        // overrides expiry filtering AFTER verification by adding
+        // adverts that only failed on the expiry leg.
+        let outcome = verify_peer_advertisement_body(&a, &joins, Some(now_utc));
+        match outcome {
+            PeerAdvertisementOutcome::Verified { body } => peer_adverts.push(*body),
+            PeerAdvertisementOutcome::Expired { .. } if include_expired => {
+                peer_adverts.push(a);
+            }
+            other => {
+                notes.push(format!(
+                    "peer advert contributor_pubkey={} failed verify_peer_advertisement_body: {}",
+                    a.contributor_pubkey_hex,
+                    stringify_advert_outcome(&other)
+                ));
+            }
+        }
+    }
+    let peer_advert_pubkeys: HashSet<String> = peer_adverts
+        .iter()
+        .map(|a| a.contributor_pubkey_hex.clone())
+        .collect();
+
+    // ── 6. Aggregate (optional) ────────────────────────────────
+    let raw_aggregate: Option<AggregatedContributorResult> =
+        store.read_verified_aggregate_for(session_id)?;
+    let (aggregate_present, aggregate_valid) = match raw_aggregate.as_ref() {
+        Some(agg) => {
+            // The state-dir keeps every body the full-chain
+            // verifier needs in-memory — no SNIP fetch required.
+            // We pass the VALID joins/assignments/partials we
+            // already verified individually so a single bad sub-
+            // artifact can't poison the full-chain check.
+            let partials_vec: Vec<PartialContributorResult> = valid_partials_by_assignment
+                .values()
+                .cloned()
+                .collect();
+            let outcome = verify_aggregated_result(
+                &session,
+                &joins,
+                &assignments,
+                &partials_vec,
+                agg,
+            );
+            if outcome.is_ok() {
+                (true, true)
+            } else {
+                notes.push(format!(
+                    "aggregated.json failed verify_aggregated_result: {outcome:?}"
+                ));
+                any_chain_invalid = true;
+                (true, false)
+            }
+        }
+        None => (false, false),
+    };
+
+    // ── 7. Compose per-assignment statuses + missing list ──────
+    let mut missing_assignment_ids: Vec<String> = Vec::new();
+    let mut assignment_statuses: Vec<AssignmentStatus> =
+        Vec::with_capacity(assignments.len());
+    for a in &assignments {
+        let join_present = joined_pubkeys.contains(&a.contributor_pubkey_hex);
+        let peer_advert_present =
+            peer_advert_pubkeys.contains(&a.contributor_pubkey_hex);
+        let partial = valid_partials_by_assignment.get(&a.assignment_id);
+        let partial_present = partial.is_some();
+        let partial_valid = partial.is_some();
+        let partial_snip_root = partial
+            .map(|p| p.partial_artifact_snip_root.clone());
+        let mut a_notes = Vec::new();
+        if !partial_present {
+            a_notes.push("missing partial".to_string());
+            missing_assignment_ids.push(a.assignment_id.clone());
+        }
+        assignment_statuses.push(AssignmentStatus {
+            assignment_id: a.assignment_id.clone(),
+            stage_index: a.stage_index,
+            contributor_pubkey_hex: a.contributor_pubkey_hex.clone(),
+            work_kind: a.work_kind.clone(),
+            expected_work_units: a.expected_work_units,
+            expected_work_unit_kind: a.expected_work_unit_kind,
+            join_present,
+            peer_advert_present,
+            partial_present,
+            partial_valid,
+            partial_snip_root,
+            notes: a_notes,
+        });
+    }
+
+    // ── 8. Expiry + overall status ─────────────────────────────
+    let session_expired = matches!(
+        check_not_expired(now_utc, &session.expires_at_utc),
+        SessionVerifyOutcome::ExpiredAtCheck { .. }
+    );
+    let overall_status = decide_overall_status(
+        any_chain_invalid,
+        aggregate_present,
+        aggregate_valid,
+        session_expired,
+        &assignments,
+        &valid_partials_by_assignment,
+    );
+
+    Ok(SessionStatusReport {
+        schema_version: STATUS_SCHEMA_VERSION,
+        session_id: session_id.to_string(),
+        posted_id: Some(session.posted_id.clone()),
+        model_hash: Some(session.model_hash.clone()),
+        generated_at_utc: now_utc.to_string(),
+        session_expires_at_utc: Some(session.expires_at_utc.clone()),
+        session_expired,
+        join_count: joins.len() as u32,
+        peer_advert_count: peer_adverts.len() as u32,
+        assignment_count: assignments.len() as u32,
+        partial_count: valid_partials_by_assignment.len() as u32,
+        missing_assignment_ids,
+        duplicate_partial_assignment_ids: Vec::new(),
+        aggregate_present,
+        aggregate_valid,
+        overall_status,
+        assignments: assignment_statuses,
+        notes,
+    })
+}
+
+// ── decide_overall_status ──────────────────────────────────────
+
+fn decide_overall_status(
+    any_chain_invalid: bool,
+    aggregate_present: bool,
+    aggregate_valid: bool,
+    session_expired: bool,
+    assignments: &[WorkAssignment],
+    valid_partials_by_assignment: &HashMap<String, PartialContributorResult>,
+) -> SessionOverallStatus {
+    // The priority order is documented at module level + Stage
+    // 12.9 doc. Each branch is a documented condition.
+    if any_chain_invalid {
+        return SessionOverallStatus::InvalidState;
+    }
+    if aggregate_present && aggregate_valid {
+        return SessionOverallStatus::Aggregated;
+    }
+    if session_expired && !aggregate_valid {
+        return SessionOverallStatus::ExpiredIncomplete;
+    }
+    if assignments.is_empty() {
+        return SessionOverallStatus::NoAssignments;
+    }
+    let all_have_partials = assignments
+        .iter()
+        .all(|a| valid_partials_by_assignment.contains_key(&a.assignment_id));
+    if all_have_partials {
+        return SessionOverallStatus::CompletePartials;
+    }
+    SessionOverallStatus::InProgress
+}
+
+fn empty_no_session_report(session_id: &str, now_utc: &str) -> SessionStatusReport {
+    SessionStatusReport {
+        schema_version: STATUS_SCHEMA_VERSION,
+        session_id: session_id.to_string(),
+        posted_id: None,
+        model_hash: None,
+        generated_at_utc: now_utc.to_string(),
+        session_expires_at_utc: None,
+        session_expired: false,
+        join_count: 0,
+        peer_advert_count: 0,
+        assignment_count: 0,
+        partial_count: 0,
+        missing_assignment_ids: Vec::new(),
+        duplicate_partial_assignment_ids: Vec::new(),
+        aggregate_present: false,
+        aggregate_valid: false,
+        overall_status: SessionOverallStatus::NoSession,
+        assignments: Vec::new(),
+        notes: Vec::new(),
+    }
+}
+
+fn stringify_advert_outcome(o: &PeerAdvertisementOutcome) -> String {
+    use crate::peer_routing::PeerAdvertisementOutcome as O;
+    match o {
+        O::Verified { .. } => "verified".into(),
+        O::AnnouncementSchemaMalformed(s) => format!("ann_schema_malformed:{s}"),
+        O::AnnouncerSignatureFailed => "announcer_signature_fail".into(),
+        O::SnipFetchFailed(s) => format!("snip_fetch_failed:{s}"),
+        O::BodyParseFailed(s) => format!("body_parse_failed:{s}"),
+        O::BodySchemaInvalid(s) => format!("body_schema_invalid:{s}"),
+        O::AdvertisementIdMismatch { stored, derived } => {
+            format!("advertisement_id_mismatch:stored={stored}:derived={derived}")
+        }
+        O::ContributorSignatureFailed => "contributor_signature_fail".into(),
+        O::DriftMismatch { field } => format!("drift:{field}"),
+        O::NoMatchingJoin => "no_matching_join".into(),
+        O::Expired { expires_at, now } => {
+            format!("expired:expires_at={expires_at}:now={now}")
+        }
+    }
+}

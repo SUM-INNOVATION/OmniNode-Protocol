@@ -73,11 +73,16 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Stage 12.9 — route tracing to stderr so structured stdout
+    // (e.g. `session-status --format json`) is not contaminated.
+    // Stage 12.x event-stream commands all use `println!` rather
+    // than `tracing`, so their stdout output is unaffected.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
