@@ -152,6 +152,7 @@ fn run_once_through_network(
         publish_link: false,
         emit: &mut emitter,
         result_broadcaster: None,
+        state_store: None,
     };
     run_watch_loop(snip, &mut source, opts).unwrap();
     emitter.events
@@ -459,6 +460,7 @@ fn watch_loop_invokes_result_broadcaster_after_verified_result_link() {
         publish_link: true,
         emit: &mut emitter,
         result_broadcaster: Some(&mut broadcaster),
+        state_store: None,
     };
     run_watch_loop(&snip, &mut source, opts).unwrap();
 
@@ -530,6 +532,7 @@ fn watch_loop_does_not_invoke_broadcaster_when_publish_link_disabled() {
         publish_link: false,
         emit: &mut emitter,
         result_broadcaster: Some(&mut broadcaster),
+        state_store: None,
     };
     run_watch_loop(&snip, &mut source, opts).unwrap();
     assert!(

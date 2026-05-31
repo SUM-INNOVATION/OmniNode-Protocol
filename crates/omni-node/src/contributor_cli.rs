@@ -361,6 +361,21 @@ struct WatchJobsArgs {
     #[arg(long, default_value_t = false)]
     publish_result_link: bool,
 
+    /// Stage 12.7 — optional contributor workflow state directory.
+    /// When set, the watcher loads cross-restart seen markers for
+    /// posted-jobs and dual-writes accepted/rejected contributor
+    /// results + posted-result-links into
+    /// `<state-dir>/results/...`. Omit to preserve pre-12.7
+    /// behavior exactly. See `omni_contributor::state`.
+    #[arg(long)]
+    contributor_state_dir: Option<PathBuf>,
+
+    /// Stage 12.7 — disable the auto-prune of expired sessions /
+    /// peer advertisements that runs on `--contributor-state-dir`
+    /// open. Useful for forensic re-runs against an old tree.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+
     #[arg(long, default_value = "sum-node")]
     snip_binary: PathBuf,
 
@@ -517,6 +532,21 @@ struct WatchNetworkJobsArgs {
     #[arg(long)]
     net_identity_file: Option<PathBuf>,
 
+    /// Stage 12.7 — optional contributor workflow state directory.
+    /// When set, the watcher loads cross-restart seen markers for
+    /// posted-jobs / network job announcements and dual-writes
+    /// accepted/rejected contributor results + posted-result-links
+    /// into `<state-dir>/results/...`. Omit to preserve pre-12.7
+    /// behavior exactly. See `omni_contributor::state`.
+    #[arg(long)]
+    contributor_state_dir: Option<PathBuf>,
+
+    /// Stage 12.7 — disable the auto-prune of expired sessions /
+    /// peer advertisements that runs on `--contributor-state-dir`
+    /// open. Useful for forensic re-runs against an old tree.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+
     #[arg(long, default_value_t = 5)]
     poll_interval_secs: u64,
 
@@ -607,6 +637,21 @@ struct WatchNetworkResultsArgs {
     /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
     #[arg(long)]
     net_identity_file: Option<PathBuf>,
+
+    /// Stage 12.7 — optional contributor workflow state directory.
+    /// When set, the watcher loads cross-restart seen markers for
+    /// network result announcements and dual-writes fetched
+    /// posted-result-links into `<state-dir>/results/...`. Omit
+    /// to preserve pre-12.7 behavior exactly. See
+    /// `omni_contributor::state`.
+    #[arg(long)]
+    contributor_state_dir: Option<PathBuf>,
+
+    /// Stage 12.7 — disable the auto-prune of expired sessions /
+    /// peer advertisements that runs on `--contributor-state-dir`
+    /// open. Useful for forensic re-runs against an old tree.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
 
     #[arg(long, default_value_t = 5)]
     poll_interval_secs: u64,
@@ -871,19 +916,44 @@ struct RunAssignmentArgs {
 
     /// Stage 12.5 — directory of verified peer advertisements
     /// (typically populated by `watch-peer-adverts --out-dir`).
+    /// Stage 12.7: prefer `--contributor-state-dir` instead.
     /// Required when `--resolve-downstream-peer-from-session` is
-    /// set; ignored otherwise.
+    /// set AND `--contributor-state-dir` is omitted; ignored
+    /// otherwise. Supplying both this flag and
+    /// `--contributor-state-dir` is rejected with
+    /// `StateError::AmbiguousSource`.
     #[arg(long)]
     peer_advert_dir: Option<PathBuf>,
 
     /// Stage 12.5 — directory of verified joins (typically the
-    /// `watch-sessions --out-dir`). Required when
-    /// `--resolve-downstream-peer-from-session` is set: peer
-    /// advertisements are rejected unless the contributor's join
-    /// for the session is present AND `verify_contributor_join`
-    /// passes.
+    /// `watch-sessions --out-dir`). Stage 12.7: prefer
+    /// `--contributor-state-dir` instead. Required when
+    /// `--resolve-downstream-peer-from-session` is set AND
+    /// `--contributor-state-dir` is omitted: peer advertisements
+    /// are rejected unless the contributor's join for the session
+    /// is present AND `verify_contributor_join` passes.
+    /// Supplying both this flag and `--contributor-state-dir` is
+    /// rejected with `StateError::AmbiguousSource`.
     #[arg(long)]
     joins_dir: Option<PathBuf>,
+
+    /// Stage 12.7 — optional contributor workflow state directory.
+    /// When set with `--resolve-downstream-peer-from-session`, the
+    /// resolver loads verified joins and verified peer
+    /// advertisements from `<state-dir>/verified/sessions/<id>/...`
+    /// instead of requiring separate `--joins-dir` /
+    /// `--peer-advert-dir` flags. Supplying both this and either
+    /// legacy flag is rejected with `StateError::AmbiguousSource`.
+    /// Omit to preserve pre-12.7 behavior exactly. See
+    /// `omni_contributor::state`.
+    #[arg(long)]
+    contributor_state_dir: Option<PathBuf>,
+
+    /// Stage 12.7 — disable the auto-prune of expired sessions /
+    /// peer advertisements that runs on `--contributor-state-dir`
+    /// open. Useful for forensic re-runs against an old tree.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
 
     /// Stage 12.5 — resolve the downstream peer from a verified
     /// `ContributorPeerAdvertisement` instead of requiring a manual
@@ -1144,6 +1214,25 @@ struct WatchSessionsArgs {
     /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
     #[arg(long)]
     net_identity_file: Option<PathBuf>,
+
+    /// Stage 12.7 — optional contributor workflow state directory.
+    /// When set, the watcher loads cross-restart seen markers for
+    /// sessions/joins/assignments/partials/aggregates and
+    /// dual-writes verified bodies into the
+    /// `<state-dir>/verified/sessions/<id>/...` subtree. That
+    /// subtree is bit-identical to `--out-dir`, so operators
+    /// migrating from a pre-12.7 layout can point both flags at
+    /// the same path. Omit to preserve pre-12.7 behavior exactly.
+    /// See `omni_contributor::state`.
+    #[arg(long)]
+    contributor_state_dir: Option<PathBuf>,
+
+    /// Stage 12.7 — disable the auto-prune of expired sessions /
+    /// peer advertisements that runs on `--contributor-state-dir`
+    /// open. Useful for forensic re-runs against an old tree.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+
     #[arg(long, default_value_t = 5)]
     poll_interval_secs: u64,
     #[arg(long)]
@@ -1268,6 +1357,23 @@ struct WatchPeerAdvertsArgs {
     /// behavior. See `omni_net::load_or_create_keypair_file_bytes`.
     #[arg(long)]
     net_identity_file: Option<PathBuf>,
+
+    /// Stage 12.7 — optional contributor workflow state directory.
+    /// When set, the watcher loads cross-restart seen markers for
+    /// peer advertisements and dual-writes verified advert bodies
+    /// into `<state-dir>/verified/sessions/<id>/peer-adverts/`.
+    /// Auto-prunes expired adverts on open by default. Omit to
+    /// preserve pre-12.7 behavior exactly. See
+    /// `omni_contributor::state`.
+    #[arg(long)]
+    contributor_state_dir: Option<PathBuf>,
+
+    /// Stage 12.7 — disable the auto-prune of expired sessions /
+    /// peer advertisements that runs on `--contributor-state-dir`
+    /// open. Useful for forensic re-runs against an old tree.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+
     #[arg(long, default_value_t = 5)]
     poll_interval_secs: u64,
 
@@ -1665,6 +1771,15 @@ fn run_watch_jobs(args: WatchJobsArgs) -> Result<()> {
     };
 
     let mut emitter = StdoutEmitter;
+
+    // Stage 12.7 — optional contributor workflow state store. When
+    // set, the watch loop adds cross-restart `posted-jobs` dedup
+    // and (above-loop) auto-prunes expired sessions / peer-adverts.
+    let state_store = open_optional_state_store(
+        args.contributor_state_dir.as_deref(),
+        args.no_prune_state_on_start,
+    )?;
+
     let opts = WatchOptions {
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         max_jobs: args.max_jobs,
@@ -1684,11 +1799,39 @@ fn run_watch_jobs(args: WatchJobsArgs) -> Result<()> {
         publish_link: args.publish_result_link,
         emit: &mut emitter,
         result_broadcaster: None,
+        state_store: state_store.as_ref(),
     };
 
     omni_contributor::run_watch_loop(&adapter, &mut source, opts)
         .map_err(|e| anyhow!("watch-jobs error: {e}"))?;
     Ok(())
+}
+
+/// Stage 12.7 — open the optional contributor workflow state store.
+/// Returns `Ok(None)` when the caller did NOT supply
+/// `--contributor-state-dir` (preserves pre-12.7 behavior exactly).
+fn open_optional_state_store(
+    state_dir: Option<&std::path::Path>,
+    no_prune_on_start: bool,
+) -> Result<Option<omni_contributor::ContributorStateStore>> {
+    let Some(state_dir) = state_dir else {
+        return Ok(None);
+    };
+    let now_utc = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (store, report) = omni_contributor::ContributorStateStore::open(
+        state_dir,
+        !no_prune_on_start,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    println!(
+        "event=state_store_opened path={} pruned_sessions={} pruned_peer_adverts={} kept={}",
+        state_dir.display(),
+        report.removed_sessions,
+        report.removed_peer_adverts,
+        report.kept
+    );
+    Ok(Some(store))
 }
 
 // ── Stage 12.1: publish-result-link handler ───────────────────────────────
@@ -1935,6 +2078,15 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
     let broadcaster_signer = ContributorSigner::from_seed_file(&args.seed_file)?;
     let publish_result_link = args.publish_result_link;
 
+    // Stage 12.7 — open the state store on the async runtime BEFORE
+    // moving into spawn_blocking so the auto-prune `now_utc` is the
+    // real start-up time, and so any error surfaces synchronously
+    // (rather than swallowed into the spawn_blocking join error).
+    let state_store = open_optional_state_store(
+        args.contributor_state_dir.as_deref(),
+        args.no_prune_state_on_start,
+    )?;
+
     let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut relay = OmniNetRelay::new(net.clone(), handle);
         let mut source = NetworkSource::new(&mut relay, &snip_adapter);
@@ -2009,6 +2161,7 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
             } else {
                 None
             },
+            state_store: state_store.as_ref(),
         };
         omni_contributor::run_watch_loop(&snip_adapter, &mut source, opts)
             .map_err(|e| anyhow!("{e}"))?;
@@ -2136,6 +2289,14 @@ async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> 
     let mut polls_done: u64 = 0;
     let mut results_written: u64 = 0;
 
+    // Stage 12.7 — open the optional state store BEFORE entering the
+    // spawn_blocking so the auto-prune `now_utc` reflects the actual
+    // startup time and so a bad path surfaces synchronously.
+    let state_store = open_optional_state_store(
+        args.contributor_state_dir.as_deref(),
+        args.no_prune_state_on_start,
+    )?;
+
     let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut relay = OmniNetRelay::new(net.clone(), handle);
         loop {
@@ -2157,6 +2318,34 @@ async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> 
                     );
                     continue;
                 }
+                // Stage 12.7 — cross-restart dedup keyed by
+                // `<posted_id>--<snip_root>`. Matches the
+                // `seen/network-result-announcements/...` namespace
+                // documented in `omni_contributor::state`.
+                let cross_restart_key = format!(
+                    "{}--{}", ann.posted_id, ann.posted_result_link_snip_root
+                );
+                if let Some(ref store) = state_store {
+                    match store.is_seen(
+                        omni_contributor::StateNamespace::NetworkResultAnnouncements,
+                        &cross_restart_key,
+                    ) {
+                        Ok(true) => {
+                            seen.insert(ann.posted_result_link_snip_root.clone());
+                            println!(
+                                "event=skip posted_id={} reason=already_seen_state_store",
+                                ann.posted_id
+                            );
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            println!(
+                                "event=warn context=state_store_is_seen message={e}"
+                            );
+                        }
+                    }
+                }
                 seen.insert(ann.posted_result_link_snip_root.clone());
 
                 let outcome = process_result_announcement(
@@ -2171,6 +2360,45 @@ async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> 
                             "event=link_written posted_id={posted_id} path={}",
                             link_path.display()
                         );
+                        // Stage 12.7 — dual-write the link into the
+                        // state-dir's results tree and lay down the
+                        // cross-restart seen marker.
+                        if let Some(ref store) = state_store {
+                            if let Err(e) = store.mark_seen(
+                                omni_contributor::StateNamespace::NetworkResultAnnouncements,
+                                &cross_restart_key,
+                            ) {
+                                println!(
+                                    "event=warn context=state_store_mark_seen message={e}"
+                                );
+                            }
+                            // Read the just-written link bytes and
+                            // mirror them into
+                            // `<state>/results/result-links/<posted_id>.link.json`.
+                            // Best-effort: a failure here doesn't
+                            // abort the watch loop.
+                            match std::fs::read(&link_path).and_then(|b| {
+                                serde_json::from_slice::<omni_contributor::PostedResultLink>(&b)
+                                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                            }) {
+                                Ok(link) => {
+                                    if let Err(e) = store.write_verified_json(
+                                        omni_contributor::StateObjectKind::PostedResultLink,
+                                        &posted_id,
+                                        &link,
+                                    ) {
+                                        println!(
+                                            "event=warn context=state_store_write_link message={e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "event=warn context=state_store_reread_link message={e}"
+                                    );
+                                }
+                            }
+                        }
                         results_written += 1;
                         if let Some(max) = args.max_results {
                             if results_written >= max {
@@ -2627,6 +2855,24 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
         ));
     }
 
+    // Stage 12.7 — `--contributor-state-dir` is the canonical
+    // source of verified joins + peer advertisements for the
+    // downstream resolver. Mixing it with the legacy 12.5 flags
+    // would create an ambiguous source-of-truth, so reject the
+    // combination up-front.
+    if args.contributor_state_dir.is_some() {
+        if args.peer_advert_dir.is_some() {
+            return Err(anyhow!(omni_contributor::error::StateError::AmbiguousSource {
+                legacy_flag: "--peer-advert-dir",
+            }));
+        }
+        if args.joins_dir.is_some() {
+            return Err(anyhow!(omni_contributor::error::StateError::AmbiguousSource {
+                legacy_flag: "--joins-dir",
+            }));
+        }
+    }
+
     // Stage 12.5 — optionally resolve the downstream peer from a
     // verified peer-advert cache instead of requiring
     // `--downstream-to-peer`. Manual value (if supplied) takes
@@ -2636,11 +2882,6 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
     if args.resolve_downstream_peer_from_session
         && effective_downstream_to_peer.is_none()
     {
-        let advert_dir = args.peer_advert_dir.as_deref().ok_or_else(|| {
-            anyhow!(
-                "--resolve-downstream-peer-from-session requires --peer-advert-dir"
-            )
-        })?;
         let downstream_root = args
             .downstream_to_assignment_snip_root
             .as_deref()
@@ -2660,56 +2901,76 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
             serde_json::from_slice(&down_bytes)
                 .map_err(|e| anyhow!("parse downstream assignment: {e}"))?;
 
-        // Load cryptographically verified joins for this session
-        // from the watch-sessions tree. Required because a forged
-        // local join file would otherwise let a forged advert pass
-        // the matching-join gate (Stage 12.5 review #2). The
-        // workflow is documented as:
-        //   watch-sessions --out-dir A
-        //   watch-peer-adverts --out-dir B --joins-dir A
-        //   run-assignment --peer-advert-dir B --joins-dir A
-        //                  --resolve-downstream-peer-from-session
-        // — both consumers point at A for joins.
-        let joins_dir = args.joins_dir.as_deref().ok_or_else(|| {
-            anyhow!(
-                "--resolve-downstream-peer-from-session requires --joins-dir \
-                 pointing at a watch-sessions output tree"
-            )
-        })?;
-        let joins_for_session: Vec<omni_contributor::ContributorJoin> =
-            load_verified_joins_from_dir(Some(joins_dir))?
-                .into_iter()
-                .filter(|j| j.session_id == session.session_id)
-                .collect();
         let now_utc =
             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut cache = omni_contributor::PeerRoutingCache::new();
-        let session_peer_dir =
-            advert_dir.join(&session.session_id).join("peer-adverts");
-        if session_peer_dir.is_dir() {
-            for entry in std::fs::read_dir(&session_peer_dir)? {
-                let entry = entry?;
-                let p = entry.path();
-                if !p.is_file()
-                    || p.extension().and_then(|s| s.to_str()) != Some("json")
-                {
-                    continue;
-                }
-                let bytes = std::fs::read(&p)?;
-                let advert: omni_contributor::ContributorPeerAdvertisement =
-                    match serde_json::from_slice(&bytes) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            eprintln!(
-                                "event=warn context=load_peer_advert path={} message={e}",
-                                p.display()
-                            );
-                            continue;
-                        }
-                    };
-                // Re-verify before insert: advertisement_id
-                // recompute + contributor signature + matching
-                // join + expiry.
+
+        // Stage 12.7 — prefer the unified state-dir tree.
+        if let Some(state_dir) = args.contributor_state_dir.as_deref() {
+            let (store, _) = omni_contributor::ContributorStateStore::open(
+                state_dir,
+                !args.no_prune_state_on_start,
+                &now_utc,
+            )
+            .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+            // Re-verify the session.json on disk before we trust
+            // any of its joins — mirrors what
+            // `load_verified_joins_from_dir` does for the legacy
+            // dir-based path. A tampered local session.json would
+            // otherwise let a tampered local join.json pass the
+            // matching-join gate.
+            let on_disk_session: omni_contributor::ExecutionSession = store
+                .read_verified_json(
+                    omni_contributor::StateObjectKind::Session,
+                    &session.session_id,
+                )
+                .map_err(|e| {
+                    anyhow!("read verified session from state dir: {e}")
+                })?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "--contributor-state-dir is missing verified session \
+                         for session_id={}",
+                        session.session_id
+                    )
+                })?;
+            if !omni_contributor::verify_execution_session(&on_disk_session)
+                .is_ok()
+            {
+                return Err(anyhow!(
+                    "verified session in state dir failed re-verification: \
+                     session_id={}",
+                    session.session_id
+                ));
+            }
+            let raw_joins = store
+                .list_verified_joins_for(&session.session_id)
+                .map_err(|e| anyhow!("list verified joins from state dir: {e}"))?;
+            let joins_for_session: Vec<omni_contributor::ContributorJoin> = raw_joins
+                .into_iter()
+                .filter(|j| {
+                    let ok = omni_contributor::verify_contributor_join(
+                        &on_disk_session,
+                        j,
+                    )
+                    .is_ok();
+                    if !ok {
+                        eprintln!(
+                            "event=warn context=state_store_join_verify_failed \
+                             session_id={} contributor_pubkey={}",
+                            j.session_id, j.contributor_pubkey_hex
+                        );
+                    }
+                    ok
+                })
+                .collect();
+            let adverts = store
+                .list_verified_peer_adverts_for(&session.session_id)
+                .map_err(|e| {
+                    anyhow!("list verified peer adverts from state dir: {e}")
+                })?;
+            for advert in adverts {
+                let advert_id = advert.advertisement_id.clone();
                 let out = omni_contributor::verify_peer_advertisement_body(
                     &advert,
                     &joins_for_session,
@@ -2723,11 +2984,84 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
                     }
                     other => {
                         eprintln!(
-                            "event=warn context=local_peer_advert_rejected \
-                             path={} reason={}",
-                            p.display(),
+                            "event=warn context=state_peer_advert_rejected \
+                             advertisement_id={} reason={}",
+                            advert_id,
                             stringify_peer_advert_outcome(&other)
                         );
+                    }
+                }
+            }
+        } else {
+            // Pre-12.7 path: require both legacy dirs. Workflow:
+            //   watch-sessions --out-dir A
+            //   watch-peer-adverts --out-dir B --joins-dir A
+            //   run-assignment --peer-advert-dir B --joins-dir A
+            //                  --resolve-downstream-peer-from-session
+            // — both consumers point at A for joins.
+            let advert_dir = args.peer_advert_dir.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "--resolve-downstream-peer-from-session requires \
+                     --peer-advert-dir (or --contributor-state-dir at 12.7+)"
+                )
+            })?;
+            let joins_dir = args.joins_dir.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "--resolve-downstream-peer-from-session requires --joins-dir \
+                     pointing at a watch-sessions output tree (or \
+                     --contributor-state-dir at 12.7+)"
+                )
+            })?;
+            let joins_for_session: Vec<omni_contributor::ContributorJoin> =
+                load_verified_joins_from_dir(Some(joins_dir))?
+                    .into_iter()
+                    .filter(|j| j.session_id == session.session_id)
+                    .collect();
+            let session_peer_dir =
+                advert_dir.join(&session.session_id).join("peer-adverts");
+            if session_peer_dir.is_dir() {
+                for entry in std::fs::read_dir(&session_peer_dir)? {
+                    let entry = entry?;
+                    let p = entry.path();
+                    if !p.is_file()
+                        || p.extension().and_then(|s| s.to_str()) != Some("json")
+                    {
+                        continue;
+                    }
+                    let bytes = std::fs::read(&p)?;
+                    let advert: omni_contributor::ContributorPeerAdvertisement =
+                        match serde_json::from_slice(&bytes) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                eprintln!(
+                                    "event=warn context=load_peer_advert path={} message={e}",
+                                    p.display()
+                                );
+                                continue;
+                            }
+                        };
+                    // Re-verify before insert: advertisement_id
+                    // recompute + contributor signature + matching
+                    // join + expiry.
+                    let out = omni_contributor::verify_peer_advertisement_body(
+                        &advert,
+                        &joins_for_session,
+                        Some(&now_utc),
+                    );
+                    match out {
+                        omni_contributor::PeerAdvertisementOutcome::Verified {
+                            body,
+                        } => {
+                            cache.insert_verified(*body);
+                        }
+                        other => {
+                            eprintln!(
+                                "event=warn context=local_peer_advert_rejected \
+                                 path={} reason={}",
+                                p.display(),
+                                stringify_peer_advert_outcome(&other)
+                            );
+                        }
                     }
                 }
             }
@@ -3563,6 +3897,12 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
     let session_id_filter: HashSet<String> = args.session_id.into_iter().collect();
     let mut polls_done: u64 = 0;
 
+    // Stage 12.7 — open the optional contributor state store.
+    let state_store = open_optional_state_store(
+        args.contributor_state_dir.as_deref(),
+        args.no_prune_state_on_start,
+    )?;
+
     let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut relay = OmniNetRelay::new(net, handle);
         // Session cache: needed so the assignment processor can
@@ -3570,6 +3910,43 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
         // the session's coordinator_pubkey_hex (assignments don't
         // carry their own coordinator pubkey).
         let mut sessions: HashMap<String, ExecutionSession> = HashMap::new();
+        // Stage 12.7 — pre-warm the in-memory session cache from
+        // the state-dir BEFORE the loop runs. Without this, after
+        // restart the seen marker on `sessions/<id>` causes
+        // `handle_session_opened` to skip the announcement, so
+        // `sessions` stays empty and `handle_assignment` falls
+        // back to passing `None` into the processor — which silently
+        // drops the assignment's coordinator-signature check. We
+        // re-verify each session.json before insert so a tampered
+        // local file can't poison the cache.
+        if let Some(ref store) = state_store {
+            match store.list_verified_sessions() {
+                Ok(loaded) => {
+                    let mut accepted: u64 = 0;
+                    for (sid, session) in loaded {
+                        if !omni_contributor::verify_execution_session(&session)
+                            .is_ok()
+                        {
+                            println!(
+                                "event=warn context=state_store_session_verify_failed \
+                                 session_id={sid}"
+                            );
+                            continue;
+                        }
+                        sessions.insert(session.session_id.clone(), session);
+                        accepted += 1;
+                    }
+                    println!(
+                        "event=state_store_sessions_loaded count={accepted}"
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "event=warn context=state_store_list_sessions message={e}"
+                    );
+                }
+            }
+        }
         loop {
             if let Some(max) = args.max_polls {
                 if polls_done >= max {
@@ -3589,13 +3966,20 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
                     &session_id_filter,
                     &ann,
                     &mut sessions,
+                    state_store.as_ref(),
                 );
             }
             for ann in relay
                 .poll_contributors_joined()
                 .map_err(|e| anyhow!("poll joined: {e}"))?
             {
-                handle_join(&snip, &args.out_dir, &session_id_filter, &ann);
+                handle_join(
+                    &snip,
+                    &args.out_dir,
+                    &session_id_filter,
+                    &ann,
+                    state_store.as_ref(),
+                );
             }
             for ann in relay
                 .poll_work_assigned()
@@ -3607,13 +3991,20 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
                     &session_id_filter,
                     &ann,
                     &sessions,
+                    state_store.as_ref(),
                 );
             }
             for ann in relay
                 .poll_partial_results()
                 .map_err(|e| anyhow!("poll partial: {e}"))?
             {
-                handle_partial(&snip, &args.out_dir, &session_id_filter, &ann);
+                handle_partial(
+                    &snip,
+                    &args.out_dir,
+                    &session_id_filter,
+                    &ann,
+                    state_store.as_ref(),
+                );
             }
             for ann in relay
                 .poll_aggregated_results()
@@ -3625,6 +4016,7 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
                     &posted_id_filter,
                     &session_id_filter,
                     &ann,
+                    state_store.as_ref(),
                 );
             }
             std::thread::sleep(Duration::from_secs(args.poll_interval_secs));
@@ -3723,12 +4115,25 @@ fn handle_session_opened<A: omni_store::SnipV2Adapter + ?Sized>(
     session_id_filter: &std::collections::HashSet<String>,
     ann: &omni_contributor::NetworkSessionOpenedAnnouncement,
     sessions: &mut std::collections::HashMap<String, omni_contributor::ExecutionSession>,
+    state_store: Option<&omni_contributor::ContributorStateStore>,
 ) {
     if !posted_id_filter.is_empty() && !posted_id_filter.contains(&ann.posted_id) {
         return;
     }
     if !session_id_filter.is_empty() && !session_id_filter.contains(&ann.session_id) {
         return;
+    }
+    // Stage 12.7 — cross-restart dedup before any SNIP fetch.
+    if let Some(store) = state_store {
+        if matches!(
+            store.is_seen(
+                omni_contributor::StateNamespace::Sessions,
+                &ann.session_id,
+            ),
+            Ok(true)
+        ) {
+            return;
+        }
     }
     let outcome = omni_contributor::process_session_opened_announcement(ann, snip);
     if !log_announcement_failure("session_opened", &ann.session_id, &outcome) {
@@ -3746,6 +4151,24 @@ fn handle_session_opened<A: omni_store::SnipV2Adapter + ?Sized>(
                 session.session_id,
                 p.display()
             );
+            // Stage 12.7 — dual-write into the state-dir's
+            // verified/sessions/<id>/session.json (same shape) and
+            // record the seen marker.
+            if let Some(store) = state_store {
+                if let Err(e) = store.write_verified_json(
+                    omni_contributor::StateObjectKind::Session,
+                    &session.session_id,
+                    &session,
+                ) {
+                    println!("event=warn context=state_store_write_session message={e}");
+                }
+                if let Err(e) = store.mark_seen(
+                    omni_contributor::StateNamespace::Sessions,
+                    &session.session_id,
+                ) {
+                    println!("event=warn context=state_store_mark_seen_session message={e}");
+                }
+            }
             sessions.insert(session.session_id.clone(), session);
         }
         Err(e) => println!("event=error context=write_session message={e}"),
@@ -3757,9 +4180,22 @@ fn handle_join<A: omni_store::SnipV2Adapter + ?Sized>(
     out_dir: &std::path::Path,
     session_id_filter: &std::collections::HashSet<String>,
     ann: &omni_contributor::NetworkContributorJoinedAnnouncement,
+    state_store: Option<&omni_contributor::ContributorStateStore>,
 ) {
     if !session_id_filter.is_empty() && !session_id_filter.contains(&ann.session_id) {
         return;
+    }
+    // Stage 12.7 — cross-restart dedup. Key: <session_id>--<pubkey>.
+    let cross_restart_key = format!(
+        "{}--{}", ann.session_id, ann.contributor_pubkey_hex
+    );
+    if let Some(store) = state_store {
+        if matches!(
+            store.is_seen(omni_contributor::StateNamespace::Joins, &cross_restart_key),
+            Ok(true)
+        ) {
+            return;
+        }
     }
     let outcome = omni_contributor::process_contributor_joined_announcement(ann, snip);
     if !log_announcement_failure("join", &ann.session_id, &outcome) {
@@ -3772,12 +4208,31 @@ fn handle_join<A: omni_store::SnipV2Adapter + ?Sized>(
     let bytes = serde_json::to_vec_pretty(&join).unwrap_or_default();
     let filename = format!("{}.json", join.contributor_pubkey_hex);
     match write_session_artifact(out_dir, &join.session_id, Some("joins"), &filename, &bytes) {
-        Ok(p) => println!(
-            "event=join session_id={} contributor_pubkey={} path={}",
-            join.session_id,
-            join.contributor_pubkey_hex,
-            p.display()
-        ),
+        Ok(p) => {
+            println!(
+                "event=join session_id={} contributor_pubkey={} path={}",
+                join.session_id,
+                join.contributor_pubkey_hex,
+                p.display()
+            );
+            if let Some(store) = state_store {
+                if let Err(e) = store.write_verified_json(
+                    omni_contributor::StateObjectKind::Join {
+                        session_id: join.session_id.clone(),
+                    },
+                    &join.contributor_pubkey_hex,
+                    &join,
+                ) {
+                    println!("event=warn context=state_store_write_join message={e}");
+                }
+                if let Err(e) = store.mark_seen(
+                    omni_contributor::StateNamespace::Joins,
+                    &cross_restart_key,
+                ) {
+                    println!("event=warn context=state_store_mark_seen_join message={e}");
+                }
+            }
+        }
         Err(e) => println!("event=error context=write_join message={e}"),
     }
 }
@@ -3788,9 +4243,22 @@ fn handle_assignment<A: omni_store::SnipV2Adapter + ?Sized>(
     session_id_filter: &std::collections::HashSet<String>,
     ann: &omni_contributor::NetworkWorkAssignedAnnouncement,
     sessions: &std::collections::HashMap<String, omni_contributor::ExecutionSession>,
+    state_store: Option<&omni_contributor::ContributorStateStore>,
 ) {
     if !session_id_filter.is_empty() && !session_id_filter.contains(&ann.session_id) {
         return;
+    }
+    let cross_restart_key = format!("{}--{}", ann.session_id, ann.assignment_id);
+    if let Some(store) = state_store {
+        if matches!(
+            store.is_seen(
+                omni_contributor::StateNamespace::Assignments,
+                &cross_restart_key,
+            ),
+            Ok(true)
+        ) {
+            return;
+        }
     }
     // If we've seen the session, pass its coord pubkey so the
     // processor verifies the assignment's coord signature. Else
@@ -3812,13 +4280,32 @@ fn handle_assignment<A: omni_store::SnipV2Adapter + ?Sized>(
     let filename = format!("{}.json", asn.assignment_id);
     match write_session_artifact(out_dir, &asn.session_id, Some("assignments"), &filename, &bytes)
     {
-        Ok(p) => println!(
-            "event=assignment session_id={} assignment_id={} coord_sig_verified={} path={}",
-            asn.session_id,
-            asn.assignment_id,
-            session_coord.is_some(),
-            p.display()
-        ),
+        Ok(p) => {
+            println!(
+                "event=assignment session_id={} assignment_id={} coord_sig_verified={} path={}",
+                asn.session_id,
+                asn.assignment_id,
+                session_coord.is_some(),
+                p.display()
+            );
+            if let Some(store) = state_store {
+                if let Err(e) = store.write_verified_json(
+                    omni_contributor::StateObjectKind::Assignment {
+                        session_id: asn.session_id.clone(),
+                    },
+                    &asn.assignment_id,
+                    &asn,
+                ) {
+                    println!("event=warn context=state_store_write_assignment message={e}");
+                }
+                if let Err(e) = store.mark_seen(
+                    omni_contributor::StateNamespace::Assignments,
+                    &cross_restart_key,
+                ) {
+                    println!("event=warn context=state_store_mark_seen_assignment message={e}");
+                }
+            }
+        }
         Err(e) => println!("event=error context=write_assignment message={e}"),
     }
 }
@@ -3828,9 +4315,22 @@ fn handle_partial<A: omni_store::SnipV2Adapter + ?Sized>(
     out_dir: &std::path::Path,
     session_id_filter: &std::collections::HashSet<String>,
     ann: &omni_contributor::NetworkPartialResultAnnouncement,
+    state_store: Option<&omni_contributor::ContributorStateStore>,
 ) {
     if !session_id_filter.is_empty() && !session_id_filter.contains(&ann.session_id) {
         return;
+    }
+    let cross_restart_key = format!("{}--{}", ann.session_id, ann.assignment_id);
+    if let Some(store) = state_store {
+        if matches!(
+            store.is_seen(
+                omni_contributor::StateNamespace::Partials,
+                &cross_restart_key,
+            ),
+            Ok(true)
+        ) {
+            return;
+        }
     }
     let outcome = omni_contributor::process_partial_result_announcement(ann, snip);
     if !log_announcement_failure("partial", &ann.session_id, &outcome) {
@@ -3843,12 +4343,31 @@ fn handle_partial<A: omni_store::SnipV2Adapter + ?Sized>(
     let bytes = serde_json::to_vec_pretty(&par).unwrap_or_default();
     let filename = format!("{}.json", par.assignment_id);
     match write_session_artifact(out_dir, &par.session_id, Some("partials"), &filename, &bytes) {
-        Ok(p) => println!(
-            "event=partial session_id={} assignment_id={} path={}",
-            par.session_id,
-            par.assignment_id,
-            p.display()
-        ),
+        Ok(p) => {
+            println!(
+                "event=partial session_id={} assignment_id={} path={}",
+                par.session_id,
+                par.assignment_id,
+                p.display()
+            );
+            if let Some(store) = state_store {
+                if let Err(e) = store.write_verified_json(
+                    omni_contributor::StateObjectKind::Partial {
+                        session_id: par.session_id.clone(),
+                    },
+                    &par.assignment_id,
+                    &par,
+                ) {
+                    println!("event=warn context=state_store_write_partial message={e}");
+                }
+                if let Err(e) = store.mark_seen(
+                    omni_contributor::StateNamespace::Partials,
+                    &cross_restart_key,
+                ) {
+                    println!("event=warn context=state_store_mark_seen_partial message={e}");
+                }
+            }
+        }
         Err(e) => println!("event=error context=write_partial message={e}"),
     }
 }
@@ -3859,12 +4378,24 @@ fn handle_aggregated<A: omni_store::SnipV2Adapter + ?Sized>(
     posted_id_filter: &std::collections::HashSet<String>,
     session_id_filter: &std::collections::HashSet<String>,
     ann: &omni_contributor::NetworkAggregatedResultAnnouncement,
+    state_store: Option<&omni_contributor::ContributorStateStore>,
 ) {
     if !posted_id_filter.is_empty() && !posted_id_filter.contains(&ann.posted_id) {
         return;
     }
     if !session_id_filter.is_empty() && !session_id_filter.contains(&ann.session_id) {
         return;
+    }
+    if let Some(store) = state_store {
+        if matches!(
+            store.is_seen(
+                omni_contributor::StateNamespace::Aggregates,
+                &ann.session_id,
+            ),
+            Ok(true)
+        ) {
+            return;
+        }
     }
     let outcome = omni_contributor::process_aggregated_result_announcement(ann, snip);
     if !log_announcement_failure("aggregated", &ann.session_id, &outcome) {
@@ -3876,11 +4407,28 @@ fn handle_aggregated<A: omni_store::SnipV2Adapter + ?Sized>(
     };
     let bytes = serde_json::to_vec_pretty(&agg).unwrap_or_default();
     match write_session_artifact(out_dir, &agg.session_id, None, "aggregated.json", &bytes) {
-        Ok(p) => println!(
-            "event=aggregated session_id={} path={}",
-            agg.session_id,
-            p.display()
-        ),
+        Ok(p) => {
+            println!(
+                "event=aggregated session_id={} path={}",
+                agg.session_id,
+                p.display()
+            );
+            if let Some(store) = state_store {
+                if let Err(e) = store.write_verified_json(
+                    omni_contributor::StateObjectKind::Aggregate,
+                    &agg.session_id,
+                    &agg,
+                ) {
+                    println!("event=warn context=state_store_write_aggregate message={e}");
+                }
+                if let Err(e) = store.mark_seen(
+                    omni_contributor::StateNamespace::Aggregates,
+                    &agg.session_id,
+                ) {
+                    println!("event=warn context=state_store_mark_seen_aggregate message={e}");
+                }
+            }
+        }
         Err(e) => println!("event=error context=write_aggregated message={e}"),
     }
 }
@@ -4167,7 +4715,52 @@ async fn run_watch_peer_adverts(args: WatchPeerAdvertsArgs) -> Result<()> {
     use std::time::Duration;
 
     let snip = build_snip_adapter(args.snip_binary, args.snip_seed);
-    let joins = load_verified_joins_from_dir(args.joins_dir.as_deref())?;
+    // Stage 12.7 — when `--contributor-state-dir` is supplied,
+    // verified joins are loaded from the state-dir's
+    // `verified/sessions/<id>/joins/...` tree instead of the
+    // legacy `--joins-dir` flag. The state-dir's joins subtree is
+    // shape-compatible with `watch-sessions --out-dir`, so a single
+    // directory can serve both roles during a gradual migration.
+    let state_store = open_optional_state_store(
+        args.contributor_state_dir.as_deref(),
+        args.no_prune_state_on_start,
+    )?;
+    let joins: Vec<omni_contributor::ContributorJoin> = match state_store.as_ref() {
+        Some(store) => {
+            let mut all = Vec::new();
+            // Mirror the legacy `load_verified_joins_from_dir`
+            // posture: re-verify session.json AND every join.json
+            // before exposing them as the matching-join trust
+            // source. A tampered local file would otherwise let a
+            // forged peer advert pass the matching-join gate.
+            for (sid, session) in store.list_verified_sessions()? {
+                if !omni_contributor::verify_execution_session(&session)
+                    .is_ok()
+                {
+                    eprintln!(
+                        "event=warn context=state_store_session_verify_failed \
+                         session_id={sid}"
+                    );
+                    continue;
+                }
+                for join in store.list_verified_joins_for(&sid)? {
+                    if omni_contributor::verify_contributor_join(&session, &join)
+                        .is_ok()
+                    {
+                        all.push(join);
+                    } else {
+                        eprintln!(
+                            "event=warn context=state_store_join_verify_failed \
+                             session_id={} contributor_pubkey={}",
+                            join.session_id, join.contributor_pubkey_hex
+                        );
+                    }
+                }
+            }
+            all
+        }
+        None => load_verified_joins_from_dir(args.joins_dir.as_deref())?,
+    };
 
     let (net, handle) = open_omninet_with_peer_wait(
         args.listen_port,
@@ -4211,6 +4804,23 @@ async fn run_watch_peer_adverts(args: WatchPeerAdvertsArgs) -> Result<()> {
                 {
                     continue;
                 }
+                // Stage 12.7 — cross-restart dedup keyed by
+                // `<session_id>--<contributor_pubkey>`. Matches the
+                // `seen/peer-adverts/` namespace.
+                let cross_restart_key = format!(
+                    "{}--{}", ann.session_id, ann.contributor_pubkey_hex
+                );
+                if let Some(ref store) = state_store {
+                    if matches!(
+                        store.is_seen(
+                            omni_contributor::StateNamespace::PeerAdverts,
+                            &cross_restart_key,
+                        ),
+                        Ok(true)
+                    ) {
+                        continue;
+                    }
+                }
                 let now_utc = chrono::Utc::now()
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                 let outcome = process_peer_advertisement_announcement(
@@ -4247,6 +4857,29 @@ async fn run_watch_peer_adverts(args: WatchPeerAdvertsArgs) -> Result<()> {
                             advert.contributor_pubkey_hex,
                             path.display()
                         );
+                        // Stage 12.7 — dual-write into the
+                        // state-dir's verified/sessions/<id>/peer-adverts/...
+                        if let Some(ref store) = state_store {
+                            if let Err(e) = store.write_verified_json(
+                                omni_contributor::StateObjectKind::PeerAdvert {
+                                    session_id: advert.session_id.clone(),
+                                },
+                                &advert.contributor_pubkey_hex,
+                                &*advert,
+                            ) {
+                                println!(
+                                    "event=warn context=state_store_write_peer_advert message={e}"
+                                );
+                            }
+                            if let Err(e) = store.mark_seen(
+                                omni_contributor::StateNamespace::PeerAdverts,
+                                &cross_restart_key,
+                            ) {
+                                println!(
+                                    "event=warn context=state_store_mark_seen_peer_advert message={e}"
+                                );
+                            }
+                        }
                         adverts_written += 1;
                         if let Some(max) = args.max_adverts {
                             if adverts_written >= max {

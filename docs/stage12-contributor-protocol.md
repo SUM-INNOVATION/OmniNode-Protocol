@@ -1030,3 +1030,147 @@ Stage 12.6 stabilizes the PeerId across restart, but advertisements still expire
 - Does NOT change any 12.0–12.5 schema, canonical bytes, or wire format.
 - Does NOT add a chain-side anything. Mesh identity is local infrastructure.
 - Does NOT pull libp2p transport into the default `omni-node` tree — the new helper uses only `libp2p::identity` (already a transitive dep via `omni-net`).
+
+---
+
+# Stage 12.7 — local contributor workflow state persistence
+
+**Status**: shipped at Stage 12.7. Pairs with Stage 12.6 persistent mesh identity. Operational reliability hardening — no protocol or schema change.
+
+## Posture (unchanged)
+
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid logic. No proof mode / on-chain verification / chain proof allowlist. SNIP only for contributor artifacts. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes. No Stage 12.0–12.6 schema or canonical-byte changes. No omni-net changes.
+
+## Problem
+
+Stage 12.6 keeps the libp2p `PeerId` stable across restart so peer advertisements survive their ≤24h freshness window. But the rest of the contributor workflow state — already-seen announcements, verified sessions/joins/assignments/partials/aggregates, verified peer advertisements, just-fetched posted-result-links — still lives in either the in-memory dedup `HashSet` of `run_watch_loop` or in operator-facing per-command output directories that were never designed as a "resume" source of truth.
+
+Concretely, restart `omni-node` mid-run today and:
+
+- `watch-jobs` / `watch-network-jobs` will re-pick up every posted job whose announcement is still cached at SNIP — the in-memory `seen` set is gone.
+- `watch-sessions` re-fetches sessions/joins/assignments/partials/aggregates from SNIP for every announcement, even ones already verified to disk.
+- `watch-peer-adverts` re-verifies every advertisement from scratch.
+- `run-assignment --resolve-downstream-peer-from-session` needs two separate flags (`--peer-advert-dir`, `--joins-dir`) to find what it needs, and there is no single canonical "this is the resume state" location.
+
+## Solution
+
+Add a local `ContributorStateStore` (in `crates/omni-contributor/src/state.rs`) backed by a versioned, atomic-write JSON tree, and plumb a `--contributor-state-dir <path>` + `--no-prune-state-on-start` flag onto every restart-sensitive contributor subcommand.
+
+### Layout
+
+```text
+<state-dir>/
+  meta/state_version.json
+  seen/posted-jobs/<posted_id>
+  seen/network-job-announcements/<posted_id>
+  seen/network-result-announcements/<posted_id>--<snip_root>
+  seen/sessions/<session_id>
+  seen/joins/<session_id>--<contributor_pubkey>
+  seen/assignments/<session_id>--<assignment_id>
+  seen/partials/<session_id>--<assignment_id>
+  seen/aggregates/<session_id>
+  seen/peer-adverts/<session_id>--<contributor_pubkey>
+  verified/sessions/<session_id>/session.json
+  verified/sessions/<session_id>/joins/<pubkey>.json
+  verified/sessions/<session_id>/assignments/<id>.json
+  verified/sessions/<session_id>/partials/<id>.json
+  verified/sessions/<session_id>/aggregated.json
+  verified/sessions/<session_id>/peer-adverts/<pubkey>.json
+  results/contributor-results/<job_id>.json
+  results/contributor-results/<job_id>.rejected.json
+  results/result-links/<posted_id>.link.json
+```
+
+The `verified/sessions/<id>/...` subtree is **bit-identical** to the Stage 12.3 `watch-sessions --out-dir` layout and the Stage 12.5 `watch-peer-adverts --out-dir` layout. The `results/contributor-results/...` subtree mirrors `watch-jobs --result-out-dir`. See the gradual-migration note below.
+
+### Versioning + atomic writes
+
+- `meta/state_version.json` carries `state_version: 1`, written on first `open`. Future binaries that bump `STATE_VERSION` will refuse mismatched directories with `StateError::UnsupportedVersion`. A 12.8+ migration is therefore clean.
+- Every write goes through tempfile-in-same-directory + `fs::rename`, so a torn write never appears at the final path.
+- `mark_seen` is idempotent (zero-byte marker via `OpenOptions::create_new`; pre-existing marker is treated as success).
+
+### Auto-prune
+
+`ContributorStateStore::open` auto-prunes by default: any verified session whose `expires_at_utc` has passed `now_utc` is removed (with cascade through its joins/assignments/partials/aggregate/peer-adverts + every matching `seen/` marker). Same for individual peer advertisements that are individually expired but inside a still-fresh session. Pass `--no-prune-state-on-start` to disable for forensic re-runs.
+
+### CLI surface
+
+```text
+--contributor-state-dir <path>     # opt-in; absent = pre-12.7 behavior
+--no-prune-state-on-start          # disable auto-prune on open
+```
+
+Wired on every restart-sensitive subcommand:
+
+- `watch-jobs`
+- `watch-network-jobs`
+- `watch-network-results`
+- `watch-sessions`
+- `watch-peer-adverts`
+- `run-assignment` (replaces `--peer-advert-dir` + `--joins-dir` when `--resolve-downstream-peer-from-session` is set)
+
+When supplied, each watcher additionally:
+
+- Loads cross-restart seen markers via `is_seen(StateNamespace::*, ...)` BEFORE the existing in-memory dedup, so already-handled posted-jobs / sessions / joins / assignments / partials / aggregates / peer-adverts are skipped without a SNIP refetch.
+- Dual-writes verified bodies into the state-dir's tree (in addition to the existing operator-facing `--out-dir` / `--result-out-dir` paths).
+- Marks `seen/` after each verified write so the next restart sees the entry as handled.
+
+### Conflict policy (run-assignment)
+
+When `--resolve-downstream-peer-from-session` is set:
+
+- Supplying `--contributor-state-dir <path>` alone uses the state-dir's `verified/sessions/<id>/{joins,peer-adverts}/...` subtree as the canonical source.
+- Supplying the legacy `--peer-advert-dir` + `--joins-dir` flags alone preserves pre-12.7 behavior bit-for-bit.
+- Supplying `--contributor-state-dir` together with either legacy flag is rejected with `StateError::AmbiguousSource { legacy_flag }`. The point of the state-dir is to *be* the single source of truth; mixing it with the per-stage trees would re-introduce the layered-sources problem 12.7 exists to remove.
+
+### Operator workflow
+
+```bash
+# Stage 12.7 — one state directory drives the whole restart-resumable
+# watch + assignment flow.
+omni-node operator contributor watch-sessions \
+  --net-identity-file ./omni-net.key \
+  --contributor-state-dir ./contrib-state \
+  --out-dir ./contrib-state/verified/sessions \
+  ...
+
+omni-node operator contributor watch-peer-adverts \
+  --net-identity-file ./omni-net.key \
+  --contributor-state-dir ./contrib-state \
+  --out-dir ./contrib-state/verified/sessions \
+  ...
+
+omni-node operator contributor run-assignment \
+  --net-identity-file ./omni-net.key \
+  --contributor-state-dir ./contrib-state \
+  --resolve-downstream-peer-from-session \
+  ...
+```
+
+Restart any of the three at any time; the state directory carries the dedup + verified caches forward. The `--out-dir` flags above point INTO the state-dir's verified subtree on purpose — a single directory serves both the operator-facing "I want to inspect verified envelopes" use case and the state-store's restart-resume use case.
+
+### Gradual migration from pre-12.7 layouts
+
+The `verified/sessions/<id>/...` subtree **under** the state-dir is the same per-session shape as the pre-12.7 `watch-sessions --out-dir <X>` tree. But the state-dir's reader (`list_verified_sessions`) only walks `<state-dir>/verified/sessions/...`; it does NOT auto-discover a flat `<X>/<id>/...` tree at the top level. So pointing `--contributor-state-dir <X>` at an existing `watch-sessions --out-dir <X>` does not migrate it.
+
+Two supported migration paths:
+
+1. **Start fresh** (recommended). Pick a new path, e.g. `./contrib-state`. Run the watchers with `--contributor-state-dir ./contrib-state` AND `--out-dir ./contrib-state/verified/sessions`. The pre-12.7 `--out-dir <X>` directories keep working in parallel; new envelopes populate the state-dir as they're announced. Once enough have re-fetched, drop the legacy `--peer-advert-dir` + `--joins-dir` flags from `run-assignment`. Cost: re-fetches that the old tree had cached. Benefit: zero manual file moves.
+2. **In-place move**. `mkdir -p <X>/verified/sessions && mv <X>/<id> <X>/verified/sessions/<id>` for each pre-12.7 per-session subdirectory, then point 12.7 commands at `--contributor-state-dir <X>`. Cost: one-time file-move. Benefit: keeps the already-validated envelopes.
+
+Either way, the state-dir is purely local. Delete it to force a clean re-fetch; the protocol itself does not know it exists.
+
+### Safety properties
+
+- **No private key material**. The contributor signing seed lives in `--contributor-seed` (Stage 12.0), the libp2p mesh keypair lives in `--net-identity-file` (Stage 12.6). The state-dir only stores envelopes that are already public on SNIP plus marker files.
+- **Schema-versioned, not chain-anchored**. The state-dir is a local cache; nothing trusts it as evidence. Verification of restored bodies still re-runs the Stage 12.3 / 12.4 / 12.5 verifiers before any action.
+- **Inspectable**. Everything is pretty-printed JSON. Operators can `cat` and `jq` freely.
+- **Concurrent-safe (single-host)**. Tempfile + `rename` lets two processes pointing at the same directory write without tearing each other's files. Two processes both running `auto_prune` may race on `remove_dir_all`; that race is harmless (best-effort cleanup) but operators who care should not run two `omni-node` processes against the same state-dir.
+
+### What 12.7 does NOT do
+
+- Does NOT make the state-dir a remote sync target. It is local-only; cross-host replication would need a separate stage.
+- Does NOT change any 12.0–12.6 schema, canonical bytes, or wire format. The on-disk JSON inside `verified/sessions/<id>/...` is the same JSON the existing watchers wrote.
+- Does NOT replace the operator-facing `--out-dir` / `--result-out-dir` flags. Both still work; the state-dir is additional.
+- Does NOT add a chain-side anything. The state-dir is local infrastructure.
+- Does NOT pull halo2/prover/framework runtimes into the default `omni-node` tree.
