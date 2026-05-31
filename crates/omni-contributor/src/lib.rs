@@ -58,6 +58,7 @@ pub mod session_verify;
 pub mod signing;
 pub mod snip;
 pub mod state;
+pub mod status;
 pub mod tensor_transport;
 pub mod verify;
 pub mod watch;
@@ -65,7 +66,11 @@ pub mod watch;
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
     CanonicalError, ContributorError, DiscoverError, PlannerError, RelayError, RunnerError,
-    SchemaError, SigningError, SnipError, VerifyError,
+    SchemaError, SigningError, SnipError, StatusError, VerifyError,
+};
+pub use status::{
+    build_session_status_report, AssignmentStatus, SessionOverallStatus,
+    SessionStatusReport, STATUS_SCHEMA_VERSION,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,

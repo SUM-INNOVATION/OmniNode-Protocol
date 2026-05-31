@@ -358,6 +358,26 @@ pub enum PlannerError {
     },
 }
 
+/// Stage 12.9 — typed errors from the local session-status reporter.
+///
+/// `SessionStatusReport` is a local read-only snapshot — it never
+/// leaves the operator's machine, is never signed, and is never
+/// SNIP-published. Errors here describe why the reporter could not
+/// load + re-verify enough state to produce the report at all. Bad
+/// individual artifacts (forged joins, tampered partials) do NOT
+/// produce errors — they produce report `notes` + `InvalidState`
+/// overall status.
+#[derive(Debug, thiserror::Error)]
+pub enum StatusError {
+    #[error("state-dir error: {0}")]
+    State(#[from] StateError),
+
+    #[error(
+        "status reporter schema_version {got} not supported (expected {expected})"
+    )]
+    UnsupportedSchemaVersion { got: u32, expected: u32 },
+}
+
 /// Canonical-bytes / hash encoding errors.
 #[derive(Debug, Error)]
 pub enum CanonicalError {
