@@ -1174,3 +1174,195 @@ Either way, the state-dir is purely local. Delete it to force a clean re-fetch; 
 - Does NOT replace the operator-facing `--out-dir` / `--result-out-dir` flags. Both still work; the state-dir is additional.
 - Does NOT add a chain-side anything. The state-dir is local infrastructure.
 - Does NOT pull halo2/prover/framework runtimes into the default `omni-node` tree.
+
+---
+
+# Stage 12.8 — local pooled-session assignment planner
+
+**Status**: shipped at Stage 12.8. Builds on Stage 12.7 state-dir loaders + Stage 12.3 `WorkAssignment` publish path. Coordination ergonomics, not protocol change.
+
+## Posture (unchanged)
+
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing logic. No proof mode / on-chain verification / chain proof allowlist. No omni-net change. No omni-store wire change. No Stage 12.0–12.7 schema or canonical-byte changes. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
+
+## Problem
+
+Stage 12.3 ships `assign-work`, which takes a hand-edited `assignments.json` and publishes one `WorkAssignment` per entry. That's correct, but it forces a coordinator to spell out the contributor → stage mapping by hand for every session. Stage 12.7 stores verified joins and peer adverts in a state-dir; nothing reads those to propose an assignment shape. Operators end up either copy-pasting pubkeys out of `verified/sessions/<id>/joins/*.json` or writing one-off shell scripts.
+
+## Solution
+
+Add a local coordinator-side **assignment planner**. Given a Stage 12.7 state-dir, a session id, and a strategy, produce an `AssignmentPlan` JSON that names contributors for each stage. The plan is a **local review artifact** — not signed, not SNIP-published, not network-visible. A second subcommand reads the plan and publishes each entry as a normal Stage 12.3 `WorkAssignment` (signed by the coordinator, optionally broadcast on the mesh).
+
+### What the planner is NOT
+
+- **NOT a marketplace.** No bids, prices, scores, rewards, reputation, or winner-picking.
+- **NOT a scheduler.** No RAM-weighted ranking, no historical-performance scoring, no global state.
+- **NOT a network protocol.** `AssignmentPlan` is local-only and **unsigned** in v1. The signed trust artifact remains the Stage 12.3 `WorkAssignment` at publish time. Adding a plan signature is a `schema_version: 2` migration.
+- **NOT a chain authority.** Coordinator stays a process role.
+
+### Determinism
+
+After eligibility filtering, contributors are sorted by `contributor_pubkey_hex` (lexicographic ASCII order on the lowercase hex string). All strategies consume that sorted list in order. Re-running the planner with the same inputs (and the same `now_utc` if any advert sits on the eligibility boundary) yields byte-identical output, including `plan_hash`.
+
+### Eligibility filter
+
+A `ContributorJoin` is eligible if:
+
+1. `available_ram_bytes >= --min-available-ram-bytes` (operator floor, default 0). **Pass/fail** — the floor is "is this contributor able to participate at all," not a quality signal. Two contributors that both clear the floor are interchangeable to the planner.
+2. If `--require-live-routing` is set: a non-expired `ContributorPeerAdvertisement` exists for the same `(session_id, contributor_pubkey_hex)` AND its `capabilities.supports_live_handoff == true` AND its `capabilities.supported_dtypes` contains `--required-dtype`.
+
+No ranking. No RAM weighting. Filtering only.
+
+### Strategies (v1, closed enum)
+
+- `single-contributor`: one contributor handles the entire work envelope.
+- `sequential-layers`:
+  - With `--model-plan <path>`: one stage per model-plan entry, assigned round-robin across the sorted eligible set.
+  - Without `--model-plan`, requires `--layer-count N`: equal split with the remainder absorbed by the LAST stage so total = N exactly.
+- `round-robin`:
+  - With `--model-plan <path>`: stage_index N → eligible[N mod eligible.len()].
+  - Without `--model-plan`, requires `--layer-count N`: emits N single-layer stages cycling through the eligible set.
+
+Adding a strategy is a `schema_version: 2` migration.
+
+### CLI surface
+
+```text
+plan-session-assignments
+  --contributor-state-dir <path>             required
+  --session-id <hex64>                       required
+  --strategy sequential-layers|single-contributor|round-robin   default sequential-layers
+  --required-dtype f16|bf16|f32              default f16
+  --min-available-ram-bytes <u64>            default 0 (no floor)
+  --max-assignments <u32>                    optional
+  --model-plan <path>                        optional
+  --layer-count <u32>                        optional (required when no model-plan and strategy needs it)
+  --require-live-routing                     flag; loads + filters peer adverts
+  --out <path>                               required
+  --no-prune-state-on-start                  optional (Stage 12.7 semantics)
+```
+
+```text
+assign-session-plan
+  --plan <path>                              required
+  --session-snip-root <0x...>                required
+  --coordinator-seed <path>                  required
+  --snip-binary, --snip-seed                 SNIP plumbing
+  --listen-port, --peer, --net-identity-file
+  --peer-wait-secs, --mesh-stabilize-ms, --propagation-wait-ms
+  --no-publish-announcements                 default false (broadcast in addition to SNIP publish)
+  --dry-run                                  optional
+  --contributor-state-dir <path>             optional; mirrors published assignments
+  --no-prune-state-on-start                  optional
+```
+
+### `AssignmentPlan` shape (local-only, unsigned)
+
+```json
+{
+  "schema_version": 1,
+  "session_id": "<hex64>",
+  "planner_version": "omni-contributor v0.1.0",
+  "strategy": "SequentialLayers",
+  "required_dtype": "f16",
+  "created_at_utc": "2026-05-31T00:30:00Z",
+  "coordinator_pubkey_hex": "<hex64>",
+  "assignments": [
+    {
+      "stage_index": 0,
+      "contributor_pubkey_hex": "<hex64>",
+      "work_kind": {"layers": {"start": 0, "end": 16}},
+      "expected_work_units": 16,
+      "expected_work_unit_kind": "layers"
+    }
+  ],
+  "plan_hash": "<blake3-hex>"
+}
+```
+
+`plan_hash` is BLAKE3 over the canonical JSON body with `plan_hash` itself cleared. `assign-session-plan` recomputes it on read and refuses any plan whose hash drifts — guard against accidental edits between dry-run and publish.
+
+### `ModelPlan` shape (operator-supplied, local-only)
+
+```json
+{
+  "schema_version": 1,
+  "stages": [
+    {"stage_index": 0, "work_kind": {"layers": {"start": 0, "end": 16}}, "expected_work_units": 16, "expected_work_unit_kind": "layers"},
+    {"stage_index": 1, "work_kind": {"layers": {"start": 16, "end": 32}}, "expected_work_units": 16, "expected_work_unit_kind": "layers"}
+  ]
+}
+```
+
+`stage_index` values must equal their position in the `stages` array (no gaps, no duplicates). `WorkKind::Layers { start, end }` requires `start < end`. `expected_work_units > 0`.
+
+### Operator workflow
+
+```bash
+# 1. Open the session (12.3) + receive joins + accept peer adverts.
+omni-node operator contributor open-session ...
+omni-node operator contributor watch-sessions \
+  --net-identity-file ./omni-net.key \
+  --contributor-state-dir ./contrib-state \
+  --out-dir ./contrib-state/verified/sessions \
+  ...
+
+# 2. Plan the assignments locally (no network, no SNIP).
+omni-node operator contributor plan-session-assignments \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64> \
+  --strategy sequential-layers \
+  --layer-count 32 \
+  --out ./plan.json
+
+# 3. Review ./plan.json. Optionally dry-run.
+omni-node operator contributor assign-session-plan \
+  --plan ./plan.json \
+  --session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --dry-run
+
+# 4. Publish.
+omni-node operator contributor assign-session-plan \
+  --plan ./plan.json \
+  --session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --contributor-state-dir ./contrib-state \
+  --net-identity-file ./omni-net.key
+```
+
+### Trust boundary
+
+State-dir loaders are parse-only (Stage 12.7 review). `plan-session-assignments` re-runs `verify_execution_session`, `verify_contributor_join`, and `verify_peer_advertisement_body` on every artifact loaded from the state-dir before feeding it to the planner. The planner library entry also re-verifies internally (defense in depth) so an alternate caller cannot accidentally skip the check. `assign-session-plan` re-fetches and re-verifies the session from SNIP at publish time, then re-derives every signature — the on-disk plan is treated as a *suggestion*, not a trust anchor.
+
+### Session expiry
+
+Both `plan-session-assignments` (via the planner's internal `check_not_expired`) and `assign-session-plan` (via an explicit `check_not_expired` on the fetched session) refuse to operate when `now_utc >= session.expires_at_utc`. This matches the publish-time posture of every other Stage 12.x command and means `--no-prune-state-on-start` cannot reach a signed `WorkAssignment` against a stale session.
+
+### `--max-assignments` semantics
+
+The cap means different things to different strategies and is **never** silently truncating:
+
+- `sequential-layers` WITHOUT `--model-plan`: cap is a **contributor cap** ("use at most N contributors"). The strategy splits the requested layer envelope across `min(eligible.len(), N)` contributors. Layer ranges still cover `0..layer_count` exactly.
+- `sequential-layers` WITH `--model-plan`: cap is checked against `model_plan.stages.len()`. If the cap is smaller, the planner refuses with `PlannerError::MaxAssignmentsTooSmall` — dropping stages would leave the work envelope incomplete.
+- `single-contributor`: cap is checked against `model_plan.stages.len()` (or 1 if no model-plan). Refused if too small.
+- `round-robin`: cap is checked against `model_plan.stages.len()` (or `--layer-count` if no model-plan). Refused if too small.
+
+Rationale: silently dropping the tail produces a plan whose `plan_hash` is valid but whose work coverage is incomplete. Refuse loudly instead.
+
+### Dry-run validation
+
+`assign-session-plan --dry-run` does not just print the plan — it builds, signs (locally; no SNIP, no mesh), and runs `WorkAssignment::validate_schema` on every planned entry. A hand-edited plan with `expected_work_units = 0` or an inverted `WorkKind::Layers` survives `plan_hash` recompute (the operator can re-stamp the hash after editing) but fails schema validation. Dry-run catches it before the real publish path.
+
+### Why no RAM-weighting
+
+A planner that ranks contributors by available RAM is a scheduler. A planner that signs winner declarations is a marketplace. Both directions are deliberately outside Stage 12.8's posture. The eligibility floor (`--min-available-ram-bytes`) exists so operators can refuse contributors that obviously can't run a workload — that's a feasibility check, not a quality signal.
+
+### What 12.8 does NOT do
+
+- Does NOT introduce a new signed envelope. `AssignmentPlan` is unsigned.
+- Does NOT add a new gossipsub topic, SNIP root format, or canonical-bytes domain separator.
+- Does NOT change any Stage 12.0–12.7 schema or canonical bytes.
+- Does NOT add a chain-side anything. The planner is local infrastructure.
+- Does NOT pull halo2/prover/framework runtimes into the default `omni-node` tree.
+- Does NOT replace the Stage 12.3 `assign-work` CLI. `assign-work` keeps working for hand-edited spec files.

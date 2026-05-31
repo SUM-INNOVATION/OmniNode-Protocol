@@ -135,6 +135,21 @@ enum ContributorCmd {
     /// `run-assignment` can resolve downstream peers without
     /// requiring `--downstream-to-peer`.
     WatchPeerAdverts(WatchPeerAdvertsArgs),
+
+    /// Stage 12.8 — read-only: load verified session + joins (+
+    /// optional verified peer advertisements) from a Stage 12.7
+    /// `--contributor-state-dir`, run a deterministic local planner,
+    /// and emit an unsigned `AssignmentPlan` JSON. Does not touch
+    /// SNIP, the mesh, or any chain.
+    PlanSessionAssignments(PlanSessionAssignmentsArgs),
+
+    /// Stage 12.8 — read an `AssignmentPlan` JSON, re-verify the
+    /// referenced session via its SNIP root, and publish each
+    /// planned entry as a normal Stage 12.3 `WorkAssignment` (signed
+    /// by the coordinator, optionally broadcast as a
+    /// `NetworkWorkAssignedAnnouncement`). `--dry-run` validates
+    /// without touching SNIP or the mesh.
+    AssignSessionPlan(AssignSessionPlanArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -1383,6 +1398,179 @@ struct WatchPeerAdvertsArgs {
     snip_seed: Option<PathBuf>,
 }
 
+// ── Stage 12.8 args ──────────────────────────────────────────────────────
+
+/// CLI mirror of `omni_contributor::handoff::TensorDtype`. Kept here
+/// (rather than re-exporting with clap derives) so the contributor
+/// crate stays clap-free.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CliTensorDtypePlanner {
+    F16,
+    Bf16,
+    F32,
+}
+
+impl From<CliTensorDtypePlanner> for omni_contributor::TensorDtype {
+    fn from(v: CliTensorDtypePlanner) -> Self {
+        match v {
+            CliTensorDtypePlanner::F16 => omni_contributor::TensorDtype::F16,
+            CliTensorDtypePlanner::Bf16 => omni_contributor::TensorDtype::Bf16,
+            CliTensorDtypePlanner::F32 => omni_contributor::TensorDtype::F32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CliPlannerStrategy {
+    SequentialLayers,
+    SingleContributor,
+    RoundRobin,
+}
+
+impl From<CliPlannerStrategy> for omni_contributor::PlannerStrategy {
+    fn from(v: CliPlannerStrategy) -> Self {
+        match v {
+            CliPlannerStrategy::SequentialLayers => {
+                omni_contributor::PlannerStrategy::SequentialLayers
+            }
+            CliPlannerStrategy::SingleContributor => {
+                omni_contributor::PlannerStrategy::SingleContributor
+            }
+            CliPlannerStrategy::RoundRobin => omni_contributor::PlannerStrategy::RoundRobin,
+        }
+    }
+}
+
+#[derive(Args)]
+struct PlanSessionAssignmentsArgs {
+    /// Stage 12.7 contributor workflow state directory. Required —
+    /// the planner reads its inputs (verified session, joins,
+    /// optional peer advertisements) from here. Auto-prune on open
+    /// is inherited from Stage 12.7 (`--no-prune-state-on-start`
+    /// disables).
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+
+    /// 64-char lowercase hex `session_id` to plan against. Must
+    /// match a `verified/sessions/<session_id>/session.json` in
+    /// the state dir.
+    #[arg(long)]
+    session_id: String,
+
+    #[arg(long, value_enum, default_value_t = CliPlannerStrategy::SequentialLayers)]
+    strategy: CliPlannerStrategy,
+
+    #[arg(long, value_enum, default_value_t = CliTensorDtypePlanner::F16)]
+    required_dtype: CliTensorDtypePlanner,
+
+    /// Eligibility floor on `ContributorJoin.available_ram_bytes`.
+    /// Pass/fail filter; the planner does not rank by RAM.
+    #[arg(long, default_value_t = 0)]
+    min_available_ram_bytes: u64,
+
+    /// Cap on the total number of assignments emitted after strategy
+    /// dispatch.
+    #[arg(long)]
+    max_assignments: Option<u32>,
+
+    /// Optional operator-supplied `ModelPlan` JSON. When supplied,
+    /// strategy-specific work-kind / expected_work_units come from
+    /// here. When omitted, the planner falls back to `--layer-count`
+    /// where applicable. Never SNIP-published or signed.
+    #[arg(long)]
+    model_plan: Option<PathBuf>,
+
+    /// Fallback when `--model-plan` is omitted. Required for
+    /// `sequential-layers` (equal-split) and `round-robin`
+    /// (single-layer-per-stage) and `single-contributor`
+    /// (one `Layers { 0, N }` assignment) when no model-plan is
+    /// supplied.
+    #[arg(long)]
+    layer_count: Option<u32>,
+
+    /// When set, the planner loads verified peer advertisements
+    /// from the state-dir and filters contributors to those with a
+    /// non-expired advert whose
+    /// `capabilities.supports_live_handoff == true` and whose
+    /// `supported_dtypes` contains `--required-dtype`. Off by
+    /// default — pre-12.8 sessions that don't need live handoff
+    /// don't need adverts.
+    #[arg(long, default_value_t = false)]
+    require_live_routing: bool,
+
+    /// Output path for the produced `AssignmentPlan` JSON.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Args)]
+struct AssignSessionPlanArgs {
+    /// Path to an `AssignmentPlan` JSON produced by
+    /// `plan-session-assignments`. The plan's `plan_hash` is
+    /// re-verified on read.
+    #[arg(long)]
+    plan: PathBuf,
+
+    /// SNIP V2 root of the `ExecutionSession` the plan targets.
+    /// Required because the Stage 12.7 state-dir does not carry
+    /// SNIP roots — only inner bodies. The fetched session's
+    /// `session_id` must match `plan.session_id`.
+    #[arg(long)]
+    session_snip_root: String,
+
+    /// 32-byte raw coordinator seed file. Pubkey must match
+    /// `session.coordinator_pubkey_hex`.
+    #[arg(long)]
+    coordinator_seed: PathBuf,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+
+    /// Stage 12.6 — optional persistent libp2p mesh identity file.
+    /// Same semantics as every other Stage 12.x subcommand.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 200)]
+    propagation_wait_ms: u64,
+    #[arg(long, default_value_t = 30)]
+    peer_wait_secs: u64,
+    #[arg(long, default_value_t = 500)]
+    mesh_stabilize_ms: u64,
+
+    /// When set, the mesh `NetworkWorkAssignedAnnouncement`
+    /// broadcast is skipped; only the SNIP publish step runs.
+    /// Default behavior matches `assign-work` posture (broadcast
+    /// to the mesh in addition to the SNIP publish).
+    #[arg(long, default_value_t = false)]
+    no_publish_announcements: bool,
+
+    /// Validate the plan + session and print what would be
+    /// published, without touching SNIP or the mesh. Exit 0 on
+    /// success.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    /// Stage 12.7 — when supplied, each published WorkAssignment is
+    /// also dual-written into
+    /// `<state>/verified/sessions/<id>/assignments/<assignment_id>.json`
+    /// and a `seen/assignments/<session>--<assignment>` marker is
+    /// laid down. Omit to preserve pre-12.7 behavior.
+    #[arg(long)]
+    contributor_state_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -1406,6 +1594,8 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::SendHandoff(a) => run_send_handoff(a).await,
         ContributorCmd::AdvertisePeer(a) => run_advertise_peer(a).await,
         ContributorCmd::WatchPeerAdverts(a) => run_watch_peer_adverts(a).await,
+        ContributorCmd::PlanSessionAssignments(a) => run_plan_session_assignments(a),
+        ContributorCmd::AssignSessionPlan(a) => run_assign_session_plan(a).await,
     }
 }
 
@@ -2719,14 +2909,82 @@ struct AssignmentSpec {
     assigned_at_utc: Option<String>,
 }
 
-async fn run_assign_work(args: AssignWorkArgs) -> Result<()> {
+/// Stage 12.8 — extracted reusable helper. Builds + signs +
+/// SNIP-publishes a single `WorkAssignment` from an `AssignmentSpec`,
+/// and (when `publish_announcement` is true) also builds + signs +
+/// gossips the matching `NetworkWorkAssignedAnnouncement`. Returns
+/// the signed envelope and its SNIP root hex.
+///
+/// Used by `assign-work` (Stage 12.3) and `assign-session-plan`
+/// (Stage 12.8). Behavior of `assign-work` is preserved bit-for-bit:
+/// always publishes the announcement, always uses `now()` for the
+/// `assigned_at_utc` fallback.
+async fn publish_one_signed_assignment(
+    snip: &impl omni_store::SnipV2Adapter,
+    relay: Option<&mut omni_contributor::OmniNetRelay>,
+    coord: &omni_contributor::CoordinatorSigner,
+    session: &omni_contributor::ExecutionSession,
+    spec: AssignmentSpec,
+    now_utc: &str,
+) -> Result<(omni_contributor::WorkAssignment, String /* snip_root_hex */)> {
     use omni_contributor::canonical::{
-        assignment_id_hex, hex_lower, net_assign_signing_input, work_assignment_signing_input,
+        assignment_id_hex, hex_lower, net_assign_signing_input,
+        work_assignment_signing_input,
     };
     use omni_contributor::{
-        ContributorRelay, CoordinatorSigner, NetworkWorkAssignedAnnouncement, OmniNetRelay,
-        WorkAssignment, NET_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
+        ContributorRelay, NetworkWorkAssignedAnnouncement, WorkAssignment,
+        NET_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
     };
+
+    let mut a = WorkAssignment {
+        schema_version: SESSION_SCHEMA_VERSION,
+        session_id: session.session_id.clone(),
+        assignment_id: String::new(),
+        stage_index: spec.stage_index,
+        contributor_pubkey_hex: spec.contributor_pubkey_hex,
+        work_kind: spec.work_kind,
+        expected_work_units: spec.expected_work_units,
+        expected_work_unit_kind: spec.expected_work_unit_kind,
+        assigned_at_utc: spec
+            .assigned_at_utc
+            .unwrap_or_else(|| now_utc.to_string()),
+        coordinator_signature_hex: String::new(),
+    };
+    a.assignment_id = assignment_id_hex(&a)?;
+    let sig_input = work_assignment_signing_input(&a)?;
+    a.coordinator_signature_hex = coord.sign_hex(&sig_input);
+    a.validate_schema()
+        .map_err(|e| anyhow!("invalid WorkAssignment: {e}"))?;
+
+    let json = serde_json::to_vec_pretty(&a)?;
+    let root = omni_contributor::snip::publish_bytes(snip, &json, "assignment")
+        .map_err(|e| anyhow!("snip publish assignment: {e}"))?;
+    let root_hex = format!("0x{}", hex_lower(root.as_bytes()));
+
+    if let Some(relay) = relay {
+        let mut ann = NetworkWorkAssignedAnnouncement {
+            schema_version: NET_SCHEMA_VERSION,
+            work_assignment_snip_root: root_hex.clone(),
+            session_id: session.session_id.clone(),
+            assignment_id: a.assignment_id.clone(),
+            contributor_pubkey_hex: a.contributor_pubkey_hex.clone(),
+            announced_at_utc: chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            announcer_pubkey_hex: coord.pubkey_hex(),
+            announcer_signature_hex: String::new(),
+        };
+        let ann_sig = net_assign_signing_input(&ann)?;
+        ann.announcer_signature_hex = coord.sign_hex(&ann_sig);
+        relay
+            .publish_work_assigned(&ann)
+            .map_err(|e| anyhow!("publish: {e}"))?;
+    }
+
+    Ok((a, root_hex))
+}
+
+async fn run_assign_work(args: AssignWorkArgs) -> Result<()> {
+    use omni_contributor::{CoordinatorSigner, OmniNetRelay};
 
     let snip = build_snip_adapter(args.snip_binary, args.snip_seed);
     let session = fetch_and_verify_session(&snip, &args.execution_session_snip_root)?;
@@ -2759,46 +3017,15 @@ async fn run_assign_work(args: AssignWorkArgs) -> Result<()> {
     let now_utc =
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     for spec in specs {
-        let mut a = WorkAssignment {
-            schema_version: SESSION_SCHEMA_VERSION,
-            session_id: session.session_id.clone(),
-            assignment_id: String::new(),
-            stage_index: spec.stage_index,
-            contributor_pubkey_hex: spec.contributor_pubkey_hex,
-            work_kind: spec.work_kind,
-            expected_work_units: spec.expected_work_units,
-            expected_work_unit_kind: spec.expected_work_unit_kind,
-            assigned_at_utc: spec.assigned_at_utc.unwrap_or_else(|| now_utc.clone()),
-            coordinator_signature_hex: String::new(),
-        };
-        a.assignment_id = assignment_id_hex(&a)?;
-        let sig_input = work_assignment_signing_input(&a)?;
-        a.coordinator_signature_hex = coord.sign_hex(&sig_input);
-        a.validate_schema()
-            .map_err(|e| anyhow!("invalid WorkAssignment: {e}"))?;
-
-        let json = serde_json::to_vec_pretty(&a)?;
-        let root = omni_contributor::snip::publish_bytes(&snip, &json, "assignment")
-            .map_err(|e| anyhow!("snip publish assignment: {e}"))?;
-        let root_hex = format!("0x{}", hex_lower(root.as_bytes()));
-
-        let mut ann = NetworkWorkAssignedAnnouncement {
-            schema_version: NET_SCHEMA_VERSION,
-            work_assignment_snip_root: root_hex.clone(),
-            session_id: session.session_id.clone(),
-            assignment_id: a.assignment_id.clone(),
-            contributor_pubkey_hex: a.contributor_pubkey_hex.clone(),
-            announced_at_utc: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            announcer_pubkey_hex: coord.pubkey_hex(),
-            announcer_signature_hex: String::new(),
-        };
-        let ann_sig = net_assign_signing_input(&ann)?;
-        ann.announcer_signature_hex = coord.sign_hex(&ann_sig);
-
-        relay
-            .publish_work_assigned(&ann)
-            .map_err(|e| anyhow!("publish: {e}"))?;
+        let (a, root_hex) = publish_one_signed_assignment(
+            &snip,
+            Some(&mut relay),
+            &coord,
+            &session,
+            spec,
+            &now_utc,
+        )
+        .await?;
         println!(
             "assignment_id={} work_assignment_snip_root={}",
             a.assignment_id, root_hex
@@ -4922,5 +5149,433 @@ fn stringify_peer_advert_outcome(
         O::DriftMismatch { field } => format!("drift:{field}"),
         O::NoMatchingJoin => "no_matching_join".into(),
         O::Expired { expires_at, now } => format!("expired:expires_at={expires_at}:now={now}"),
+    }
+}
+
+// ── Stage 12.8 — plan-session-assignments ────────────────────────────────
+
+fn run_plan_session_assignments(args: PlanSessionAssignmentsArgs) -> Result<()> {
+    use omni_contributor::{
+        plan_assignments, ContributorStateStore, ModelPlan, PlannerInputs,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // Open the state store. Stage 12.7 auto-prune applies unless
+    // the operator opts out.
+    let (store, prune_report) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        !args.no_prune_state_on_start,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    println!(
+        "event=state_store_opened path={} pruned_sessions={} pruned_peer_adverts={} kept={}",
+        args.contributor_state_dir.display(),
+        prune_report.removed_sessions,
+        prune_report.removed_peer_adverts,
+        prune_report.kept
+    );
+
+    // Load + re-verify the session.json the operator named. State-dir
+    // loaders are parse-only (Stage 12.7 trust-boundary review pin);
+    // the planner caller MUST run verify_execution_session first.
+    let session: omni_contributor::ExecutionSession = store
+        .read_verified_json(
+            omni_contributor::StateObjectKind::Session,
+            &args.session_id,
+        )
+        .map_err(|e| anyhow!("read verified session from state dir: {e}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "no verified session.json at <state>/verified/sessions/{}/session.json",
+                args.session_id
+            )
+        })?;
+    if !omni_contributor::verify_execution_session(&session).is_ok() {
+        return Err(anyhow!(
+            "session.json in state dir failed verify_execution_session"
+        ));
+    }
+    if session.session_id != args.session_id {
+        return Err(anyhow!(
+            "state-dir session.json carries session_id={} but --session-id={}",
+            session.session_id,
+            args.session_id
+        ));
+    }
+
+    // Load + re-verify each ContributorJoin for the session.
+    let raw_joins = store
+        .list_verified_joins_for(&session.session_id)
+        .map_err(|e| anyhow!("list verified joins: {e}"))?;
+    let joins: Vec<omni_contributor::ContributorJoin> = raw_joins
+        .into_iter()
+        .filter(|j| {
+            let ok = omni_contributor::verify_contributor_join(&session, j).is_ok();
+            if !ok {
+                eprintln!(
+                    "event=warn context=planner_join_verify_failed \
+                     session_id={} contributor_pubkey={}",
+                    j.session_id, j.contributor_pubkey_hex
+                );
+            }
+            ok
+        })
+        .collect();
+
+    // Optionally load + re-verify peer adverts when live routing is
+    // required. The planner re-verifies internally too (defense in
+    // depth), so we don't double-fail if a parsed entry doesn't
+    // verify — just drop it with a warning.
+    let peer_adverts: Vec<omni_contributor::ContributorPeerAdvertisement> =
+        if args.require_live_routing {
+            let raw = store
+                .list_verified_peer_adverts_for(&session.session_id)
+                .map_err(|e| anyhow!("list verified peer adverts: {e}"))?;
+            raw.into_iter()
+                .filter(|a| {
+                    let outcome = omni_contributor::verify_peer_advertisement_body(
+                        a,
+                        &joins,
+                        Some(&now_utc),
+                    );
+                    let ok = matches!(
+                        outcome,
+                        omni_contributor::PeerAdvertisementOutcome::Verified { .. }
+                    );
+                    if !ok {
+                        eprintln!(
+                            "event=warn context=planner_advert_verify_failed \
+                             session_id={} contributor_pubkey={} outcome={}",
+                            a.session_id,
+                            a.contributor_pubkey_hex,
+                            stringify_peer_advert_outcome(&outcome)
+                        );
+                    }
+                    ok
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    // Optional operator-supplied model-plan.
+    let model_plan: Option<ModelPlan> = if let Some(path) = args.model_plan.as_deref() {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read model-plan: {}", path.display()))?;
+        let mp: ModelPlan = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse model-plan: {}", path.display()))?;
+        Some(mp)
+    } else {
+        None
+    };
+
+    let plan = plan_assignments(
+        PlannerInputs {
+            session: &session,
+            joins: &joins,
+            peer_adverts: &peer_adverts,
+            required_dtype: args.required_dtype.into(),
+            min_available_ram_bytes: args.min_available_ram_bytes,
+            max_assignments: args.max_assignments,
+            require_live_routing: args.require_live_routing,
+            layer_count: args.layer_count,
+        },
+        args.strategy.into(),
+        model_plan.as_ref(),
+        &now_utc,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("plan_assignments: {e}"))?;
+
+    let json = serde_json::to_vec_pretty(&plan)?;
+    std::fs::write(&args.out, &json)
+        .with_context(|| format!("write plan: {}", args.out.display()))?;
+
+    println!(
+        "event=plan_created session_id={} strategy={:?} assignments={} \
+         plan_hash={} out={}",
+        plan.session_id,
+        plan.strategy,
+        plan.assignments.len(),
+        plan.plan_hash,
+        args.out.display()
+    );
+    Ok(())
+}
+
+// ── Stage 12.8 — assign-session-plan ─────────────────────────────────────
+
+async fn run_assign_session_plan(args: AssignSessionPlanArgs) -> Result<()> {
+    use omni_contributor::{plan_hash_hex, AssignmentPlan, CoordinatorSigner, OmniNetRelay};
+
+    // Read + integrity-check the plan.
+    let bytes = std::fs::read(&args.plan)
+        .with_context(|| format!("read plan: {}", args.plan.display()))?;
+    let plan: AssignmentPlan = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse plan: {}", args.plan.display()))?;
+    if plan.schema_version != omni_contributor::PLANNER_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "plan.schema_version {} not supported (expected {})",
+            plan.schema_version,
+            omni_contributor::PLANNER_SCHEMA_VERSION
+        ));
+    }
+    let recomputed = plan_hash_hex(&plan);
+    if recomputed != plan.plan_hash {
+        return Err(anyhow!(
+            "plan_hash mismatch: stored={} recomputed={} (plan may have been edited after creation)",
+            plan.plan_hash,
+            recomputed
+        ));
+    }
+    if plan.assignments.is_empty() {
+        return Err(anyhow!("plan carries zero assignments; nothing to publish"));
+    }
+
+    let snip = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let session = fetch_and_verify_session(&snip, &args.session_snip_root)?;
+    if session.session_id != plan.session_id {
+        return Err(anyhow!(
+            "plan.session_id={} but --session-snip-root resolves to session_id={}",
+            plan.session_id,
+            session.session_id
+        ));
+    }
+    let coord = CoordinatorSigner::from_seed_file(&args.coordinator_seed)?;
+    if coord.pubkey_hex() != session.coordinator_pubkey_hex {
+        return Err(anyhow!(
+            "coordinator_seed pubkey does not match session.coordinator_pubkey_hex"
+        ));
+    }
+    if let Some(ref planner_coord) = plan.coordinator_pubkey_hex {
+        if planner_coord != &coord.pubkey_hex() {
+            return Err(anyhow!(
+                "plan.coordinator_pubkey_hex={} does not match \
+                 --coordinator-seed pubkey={}",
+                planner_coord,
+                coord.pubkey_hex()
+            ));
+        }
+    }
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // Refuse expired sessions even on the publish path. The
+    // planner already refuses to emit assignments against expired
+    // sessions, but a stale on-disk plan + a stale session SNIP
+    // root could otherwise still get through. Mirrors what the
+    // pre-12.7 pipeline already did at runtime.
+    if let omni_contributor::session_verify::SessionVerifyOutcome::ExpiredAtCheck {
+        now,
+        expires_at,
+    } = omni_contributor::check_not_expired(&now_utc, &session.expires_at_utc)
+    {
+        return Err(anyhow!(
+            "session is expired: now_utc={now}, expires_at_utc={expires_at}"
+        ));
+    }
+
+    if args.dry_run {
+        use omni_contributor::canonical::{
+            assignment_id_hex, work_assignment_signing_input,
+        };
+        // Build, sign (local), and run the full Stage 12.3
+        // `WorkAssignment::validate_schema` for each planned entry
+        // before printing the dry-run event. A plan whose
+        // `expected_work_units == 0` or malformed `work_kind`
+        // survives `plan_hash` recompute (the planner accepts
+        // model-plan input verbatim into the plan) but fails
+        // schema validation at publish time; catch that on
+        // dry-run so an operator doesn't get a green dry-run and
+        // then a failed real publish. Signing is local — no SNIP,
+        // no mesh — so it's a valid dry-run side effect.
+        for pa in &plan.assignments {
+            let mut a = pa.to_unsigned_work_assignment(
+                &plan.session_id,
+                &now_utc,
+            );
+            a.assignment_id = assignment_id_hex(&a).map_err(|e| {
+                anyhow!(
+                    "dry-run: stage_index={} canonical encode failed: {e}",
+                    pa.stage_index
+                )
+            })?;
+            let sig_input = work_assignment_signing_input(&a).map_err(|e| {
+                anyhow!(
+                    "dry-run: stage_index={} canonical encode failed: {e}",
+                    pa.stage_index
+                )
+            })?;
+            a.coordinator_signature_hex = coord.sign_hex(&sig_input);
+            a.validate_schema().map_err(|e| {
+                anyhow!(
+                    "dry-run: planned assignment for stage_index={} \
+                     would fail WorkAssignment::validate_schema: {e}",
+                    pa.stage_index
+                )
+            })?;
+            println!(
+                "event=would_assign session_id={} stage_index={} \
+                 assignment_id={} contributor_pubkey={} work_kind={} \
+                 expected_work_units={} expected_work_unit_kind={:?}",
+                plan.session_id,
+                pa.stage_index,
+                a.assignment_id,
+                pa.contributor_pubkey_hex,
+                serde_json::to_string(&pa.work_kind).unwrap_or_default(),
+                pa.expected_work_units,
+                pa.expected_work_unit_kind,
+            );
+        }
+        println!(
+            "event=plan_assigned_dry_run session_id={} assignments={}",
+            plan.session_id,
+            plan.assignments.len()
+        );
+        return Ok(());
+    }
+
+    // Optionally mirror published assignments back into a Stage 12.7
+    // state-dir. Opened BEFORE entering spawn_blocking territory so
+    // a bad path surfaces synchronously.
+    let state_store = open_optional_state_store(
+        args.contributor_state_dir.as_deref(),
+        args.no_prune_state_on_start,
+    )?;
+
+    let (net, handle) = open_omninet_with_peer_wait(
+        args.listen_port,
+        args.peer,
+        args.peer_wait_secs,
+        args.mesh_stabilize_ms,
+        args.net_identity_file.as_deref(),
+    )
+    .await?;
+    let mut relay = OmniNetRelay::new(net.clone(), handle);
+
+    let total_to_publish = plan.assignments.len();
+    for pa in plan.assignments {
+        let spec = AssignmentSpec {
+            contributor_pubkey_hex: pa.contributor_pubkey_hex.clone(),
+            stage_index: pa.stage_index,
+            work_kind: pa.work_kind.clone(),
+            expected_work_units: pa.expected_work_units,
+            expected_work_unit_kind: pa.expected_work_unit_kind,
+            assigned_at_utc: None,
+        };
+        let (assignment, root_hex) = publish_one_signed_assignment(
+            &snip,
+            if args.no_publish_announcements {
+                None
+            } else {
+                Some(&mut relay)
+            },
+            &coord,
+            &session,
+            spec,
+            &now_utc,
+        )
+        .await?;
+
+        // Stage 12.7 — dual-write into the state dir when supplied.
+        if let Some(ref store) = state_store {
+            if let Err(e) = store.write_verified_json(
+                omni_contributor::StateObjectKind::Assignment {
+                    session_id: assignment.session_id.clone(),
+                },
+                &assignment.assignment_id,
+                &assignment,
+            ) {
+                eprintln!("event=warn context=state_store_write_assignment message={e}");
+            }
+            let marker = format!(
+                "{}--{}", assignment.session_id, assignment.assignment_id
+            );
+            if let Err(e) = store.mark_seen(
+                omni_contributor::StateNamespace::Assignments,
+                &marker,
+            ) {
+                eprintln!(
+                    "event=warn context=state_store_mark_seen_assignment message={e}"
+                );
+            }
+        }
+
+        println!(
+            "event=assignment_published session_id={} stage_index={} \
+             assignment_id={} contributor_pubkey={} \
+             assignment_snip_root={}",
+            assignment.session_id,
+            assignment.stage_index,
+            assignment.assignment_id,
+            assignment.contributor_pubkey_hex,
+            root_hex
+        );
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
+    {
+        let g = net.lock().await;
+        let _ = g.shutdown().await;
+    }
+    println!(
+        "event=plan_assigned session_id={} assignments_published={}",
+        plan.session_id, total_to_publish
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Wrapper so `try_parse_from` has a single top-level parser.
+    /// We pass `assign-session-plan ...` and let the subcommand
+    /// matcher route into the per-subcommand args struct.
+    #[derive(clap::Parser)]
+    struct TestRoot {
+        #[command(flatten)]
+        contributor: ContributorArgs,
+    }
+
+    fn parse_assign_session_plan(extra: &[&str]) -> AssignSessionPlanArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "assign-session-plan".into(),
+            "--plan".into(),
+            "/tmp/plan.json".into(),
+            "--session-snip-root".into(),
+            "0x00".into(),
+            "--coordinator-seed".into(),
+            "/tmp/coord.seed".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::AssignSessionPlan(a) => a,
+            _ => panic!("expected AssignSessionPlan"),
+        }
+    }
+
+    /// Stage 12.8 — `--no-publish-announcements` toggle. Pre-fix,
+    /// `publish_announcements: bool` had `default_value_t = true`,
+    /// which is a clap footgun: a presence flag whose default
+    /// equals the only value it can set is unreachable. This
+    /// regression test confirms the inverted flag actually toggles.
+    #[test]
+    fn no_publish_announcements_flag_default_is_false_and_presence_toggles_it_true() {
+        // Default (omitted) — broadcast in addition to SNIP publish.
+        let args = parse_assign_session_plan(&[]);
+        assert!(!args.no_publish_announcements);
+        // Explicit — skip the mesh broadcast.
+        let args = parse_assign_session_plan(&["--no-publish-announcements"]);
+        assert!(args.no_publish_announcements);
     }
 }

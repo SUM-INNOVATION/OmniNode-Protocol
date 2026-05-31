@@ -269,6 +269,95 @@ pub enum StateError {
     AmbiguousSource { legacy_flag: &'static str },
 }
 
+/// Stage 12.8 — typed errors from the local assignment planner.
+///
+/// The planner is a coordinator-side hint generator. Errors here are
+/// operator-facing — they describe why a plan could not be produced
+/// from the supplied inputs. None of these errors are network-visible
+/// or chain-visible; the `AssignmentPlan` artifact is local-only and
+/// unsigned in v1.
+#[derive(Debug, thiserror::Error)]
+pub enum PlannerError {
+    #[error("planner schema_version {got} not supported (expected {expected})")]
+    UnsupportedSchemaVersion { got: u32, expected: u32 },
+
+    #[error("model-plan schema_version {got} not supported (expected {expected})")]
+    UnsupportedModelPlanVersion { got: u32, expected: u32 },
+
+    /// No `ContributorJoin` survived eligibility filtering (RAM,
+    /// dtype-via-advert, live-routing requirement).
+    #[error(
+        "no eligible contributors after filtering: \
+         {joins_total} joined, {filtered_out} filtered \
+         (reason: {reason})"
+    )]
+    NoEligibleContributors {
+        joins_total: usize,
+        filtered_out: usize,
+        reason: String,
+    },
+
+    /// Strategy + inputs don't agree on how to shape the work.
+    /// E.g. `sequential-layers` with neither a model-plan nor
+    /// `--layer-count`, or a model-plan with zero stages.
+    #[error("planner inputs are inconsistent: {reason}")]
+    InconsistentInputs { reason: String },
+
+    /// A `ModelPlan` stage carries a `WorkKind::Layers { start, end }`
+    /// with `start >= end`, a zero `expected_work_units`, or
+    /// out-of-order `stage_index` values.
+    #[error("model-plan stage {stage_index} invalid: {reason}")]
+    InvalidModelPlanStage { stage_index: u32, reason: String },
+
+    /// The planner was asked to split N layers across M contributors
+    /// where the equal-split would round down to zero layers for at
+    /// least one contributor. Operator should reduce `--max-assignments`
+    /// or supply an explicit model-plan.
+    #[error(
+        "equal layer split would assign zero layers to at least one \
+         contributor: layer_count={layer_count}, contributor_count={contributor_count}"
+    )]
+    EqualSplitProducesEmptyStage {
+        layer_count: u32,
+        contributor_count: u32,
+    },
+
+    /// `--max-assignments` is below the number of assignments the
+    /// chosen strategy needs to cover the requested work. Silently
+    /// truncating would drop layers / stages, leaving an incomplete
+    /// plan; refuse instead. `single-contributor` with a model-plan
+    /// requires `stages.len()` assignments; `sequential-layers`
+    /// with a model-plan requires `stages.len()`; `round-robin`
+    /// requires `stages.len()` (model-plan) or `layer_count`
+    /// (`--layer-count` fallback). For `sequential-layers` without
+    /// a model-plan, `--max-assignments` is a contributor cap and
+    /// does NOT raise this error.
+    #[error(
+        "--max-assignments={max} is below the {required} assignments the \
+         {strategy} strategy needs to cover the requested work; \
+         increase the cap or refine the strategy"
+    )]
+    MaxAssignmentsTooSmall {
+        strategy: &'static str,
+        required: u32,
+        max: u32,
+    },
+
+    /// `now_utc >= session.expires_at_utc`. Planner refuses to
+    /// emit assignments against expired sessions, and
+    /// `assign-session-plan` refuses to publish against one. The
+    /// pre-12.7 path (no `--contributor-state-dir`) already refused
+    /// expired sessions through the verifier; this variant covers
+    /// the state-dir + `--no-prune-state-on-start` case.
+    #[error(
+        "session is expired: now_utc={now_utc}, expires_at_utc={expires_at_utc}"
+    )]
+    SessionExpired {
+        now_utc: String,
+        expires_at_utc: String,
+    },
+}
+
 /// Canonical-bytes / hash encoding errors.
 #[derive(Debug, Error)]
 pub enum CanonicalError {
