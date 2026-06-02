@@ -55,7 +55,13 @@ use crate::signing::verify_signature_hex;
 
 /// Per-helper outcome. Each variant maps to one CLI bare-stdout event
 /// and one typed test assertion (mirrors 12.2's pattern).
+///
+/// `#[non_exhaustive]` since Stage 12.11 — future Stage 12.x verifier
+/// extensions may add new variants without breaking downstream
+/// `matches!` / `.is_ok()` patterns. Exhaustive `match` blocks need a
+/// wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionVerifyOutcome {
     Ok,
     SchemaMalformed(String),
@@ -71,6 +77,35 @@ pub enum SessionVerifyOutcome {
     AggregatePartialRefDrift { field: &'static str, assignment_id: String },
     AggregateCoordinatorMismatch,
     InternalError(String),
+
+    // ── Stage 12.11 — assignment supersession verifier outcomes ──
+
+    /// Supersession body failed its standalone schema check.
+    SupersessionSchemaMalformed(String),
+    /// `supersession.session_id != session.session_id`.
+    SupersessionSessionMismatch,
+    /// `supersession.coordinator_pubkey_hex != session.coordinator_pubkey_hex`.
+    SupersessionCoordinatorMismatch,
+    /// Stored `supersession_id` does not equal the recomputed
+    /// canonical hash.
+    SupersessionIdMismatch { stored: String, derived: String },
+    /// `coordinator_signature_hex` over canonical signing input is
+    /// invalid against `session.coordinator_pubkey_hex`.
+    SupersessionCoordinatorSignatureFailed,
+    /// A `superseded_assignment_ids` or `replacement_assignment_ids`
+    /// entry references an `assignment_id` not present in the
+    /// supplied assignments slice.
+    SupersessionReferenceUnknown {
+        kind: &'static str,
+        assignment_id: String,
+    },
+    /// Two supersessions claim the same `assignment_id` in their
+    /// `superseded_assignment_ids` lists. No double-supersession.
+    SupersessionDuplicateSupersedes { assignment_id: String },
+    /// `aggregate.partial_refs` references an `assignment_id` that
+    /// is in the superseded set computed from the supersessions
+    /// slice.
+    AggregatePartialRefSuperseded { assignment_id: String },
 }
 
 impl SessionVerifyOutcome {
@@ -260,6 +295,46 @@ pub fn verify_aggregated_result(
     partials: &[PartialContributorResult],
     aggregate: &AggregatedContributorResult,
 ) -> SessionVerifyOutcome {
+    // Stage 12.11 — wrapper for backwards compatibility. The Stage
+    // 12.3 contract ("every assignment referenced exactly once") is
+    // exactly the supersession-aware contract with an empty
+    // supersessions slice (active == all assignments).
+    verify_aggregated_result_with_supersessions(
+        session,
+        joins,
+        assignments,
+        &[],
+        partials,
+        aggregate,
+    )
+}
+
+/// Stage 12.11 — full-chain aggregate verifier with supersession
+/// support. Same posture as [`verify_aggregated_result`] plus:
+///
+/// - Each supplied `WorkAssignmentSupersession` is verified
+///   individually via [`verify_assignment_supersession`].
+/// - No `assignment_id` may appear in `superseded_assignment_ids`
+///   of more than one supersession (no double-supersession). Chains
+///   via sequential supersessions (`A→B`, `B→C`) ARE permitted.
+/// - Coverage is computed over `active = assignments \ superseded`
+///   rather than `assignments`.
+/// - Partials whose `assignment_id` is in the superseded set are
+///   **skipped** from the per-partial binding loop (a tampered
+///   partial for an `InvalidPartial`-superseded assignment is
+///   precisely the reason the supersession exists — re-failing the
+///   verifier on the same bytes the coordinator already declared
+///   invalid would defeat the purpose).
+/// - `aggregate.partial_refs` referencing a superseded assignment
+///   is rejected with `AggregatePartialRefSuperseded`.
+pub fn verify_aggregated_result_with_supersessions(
+    session: &ExecutionSession,
+    joins: &[ContributorJoin],
+    assignments: &[WorkAssignment],
+    supersessions: &[crate::supersession::WorkAssignmentSupersession],
+    partials: &[PartialContributorResult],
+    aggregate: &AggregatedContributorResult,
+) -> SessionVerifyOutcome {
     // 1. Session.
     let s_out = verify_execution_session(session);
     if !s_out.is_ok() {
@@ -281,8 +356,36 @@ pub fn verify_aggregated_result(
             return a_out;
         }
     }
-    // 4. Partials, each bound to its assignment.
+
+    // 3'. Supersessions (Stage 12.11). Verify each individually
+    // before computing the union, then enforce no double-
+    // supersession. Replacement assignments are normal
+    // WorkAssignments and were verified in step 3.
+    let mut superseded: HashSet<String> = HashSet::new();
+    for s in supersessions {
+        let s_out = crate::supersession_verify::verify_assignment_supersession(
+            session,
+            assignments,
+            s,
+        );
+        if !s_out.is_ok() {
+            return s_out;
+        }
+        for id in &s.superseded_assignment_ids {
+            if !superseded.insert(id.clone()) {
+                return SessionVerifyOutcome::SupersessionDuplicateSupersedes {
+                    assignment_id: id.clone(),
+                };
+            }
+        }
+    }
+
+    // 4. Partials, each bound to its assignment. Skip partials
+    // whose assignment is in the superseded set.
     for p in partials {
+        if superseded.contains(&p.assignment_id) {
+            continue;
+        }
         let assignment = match assignments
             .iter()
             .find(|a| a.assignment_id == p.assignment_id)
@@ -317,10 +420,16 @@ pub fn verify_aggregated_result(
         return SessionVerifyOutcome::AggregateCoordinatorMismatch;
     }
 
-    // Every assignment must have exactly one ref; every ref must
-    // resolve to a partial we have; drift fields must match.
+    // Every ACTIVE assignment must have exactly one ref; every ref
+    // must resolve to a partial we have; drift fields must match.
+    // Refs pointing at superseded assignments are rejected.
     let mut seen_for: HashSet<&str> = HashSet::new();
     for r in &aggregate.partial_refs {
+        if superseded.contains(&r.assignment_id) {
+            return SessionVerifyOutcome::AggregatePartialRefSuperseded {
+                assignment_id: r.assignment_id.clone(),
+            };
+        }
         if !seen_for.insert(r.assignment_id.as_str()) {
             return SessionVerifyOutcome::AggregateDuplicatePartialFor {
                 assignment_id: r.assignment_id.clone(),
@@ -373,8 +482,12 @@ pub fn verify_aggregated_result(
             };
         }
     }
-    // Now check coverage: every assignment must be referenced exactly once.
+    // Coverage: every ACTIVE assignment must be referenced exactly
+    // once. Superseded assignments are excluded.
     for a in assignments {
+        if superseded.contains(&a.assignment_id) {
+            continue;
+        }
         if !seen_for.contains(a.assignment_id.as_str()) {
             return SessionVerifyOutcome::AggregateMissingPartialFor {
                 assignment_id: a.assignment_id.clone(),

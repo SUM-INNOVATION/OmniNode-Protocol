@@ -114,6 +114,20 @@ pub trait ContributorRelay {
     fn poll_peer_advertisements(
         &mut self,
     ) -> Result<Vec<NetworkPeerAdvertisementAnnouncement>, RelayError>;
+
+    // ── Stage 12.11 — assignment supersession surface ────────────
+
+    fn publish_assignment_supersession(
+        &mut self,
+        msg: &crate::net::NetworkWorkAssignmentSupersessionAnnouncement,
+    ) -> Result<(), RelayError>;
+
+    fn poll_assignment_supersessions(
+        &mut self,
+    ) -> Result<
+        Vec<crate::net::NetworkWorkAssignmentSupersessionAnnouncement>,
+        RelayError,
+    >;
 }
 
 // ── InMemoryRelay ─────────────────────────────────────────────────────────
@@ -133,6 +147,8 @@ pub struct InMemoryRelay {
     partial_results: VecDeque<NetworkPartialResultAnnouncement>,
     aggregated_results: VecDeque<NetworkAggregatedResultAnnouncement>,
     peer_adverts: VecDeque<NetworkPeerAdvertisementAnnouncement>,
+    assignment_supersessions:
+        VecDeque<crate::net::NetworkWorkAssignmentSupersessionAnnouncement>,
 }
 
 impl InMemoryRelay {
@@ -146,6 +162,7 @@ impl InMemoryRelay {
             partial_results: VecDeque::new(),
             aggregated_results: VecDeque::new(),
             peer_adverts: VecDeque::new(),
+            assignment_supersessions: VecDeque::new(),
         }
     }
 
@@ -279,6 +296,23 @@ impl ContributorRelay for InMemoryRelay {
     ) -> Result<Vec<NetworkPeerAdvertisementAnnouncement>, RelayError> {
         Ok(self.peer_adverts.drain(..).collect())
     }
+
+    fn publish_assignment_supersession(
+        &mut self,
+        msg: &crate::net::NetworkWorkAssignmentSupersessionAnnouncement,
+    ) -> Result<(), RelayError> {
+        self.assignment_supersessions.push_back(msg.clone());
+        Ok(())
+    }
+
+    fn poll_assignment_supersessions(
+        &mut self,
+    ) -> Result<
+        Vec<crate::net::NetworkWorkAssignmentSupersessionAnnouncement>,
+        RelayError,
+    > {
+        Ok(self.assignment_supersessions.drain(..).collect())
+    }
 }
 
 // ── OmniNetRelay ──────────────────────────────────────────────────────────
@@ -295,6 +329,7 @@ mod omni_net_relay {
     use omni_net::{
         OmniNet, OmniNetEvent, TOPIC_CONTRIBUTOR_JOB, TOPIC_CONTRIBUTOR_RESULT,
         TOPIC_CONTRIBUTOR_SESSION_AGGREGATED, TOPIC_CONTRIBUTOR_SESSION_ASSIGN,
+        TOPIC_CONTRIBUTOR_SESSION_ASSIGNMENT_SUPERSESSION,
         TOPIC_CONTRIBUTOR_SESSION_JOIN, TOPIC_CONTRIBUTOR_SESSION_OPEN,
         TOPIC_CONTRIBUTOR_SESSION_PARTIAL, TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT,
     };
@@ -341,6 +376,14 @@ mod omni_net_relay {
         // Stage 12.5 — peer-advert queue.
         pending_peer_adverts:
             Arc<StdMutex<VecDeque<NetworkPeerAdvertisementAnnouncement>>>,
+        // Stage 12.11 — assignment-supersession queue.
+        pending_assignment_supersessions: Arc<
+            StdMutex<
+                VecDeque<
+                    crate::net::NetworkWorkAssignmentSupersessionAnnouncement,
+                >,
+            >,
+        >,
     }
 
     impl OmniNetRelay {
@@ -361,6 +404,7 @@ mod omni_net_relay {
                 pending_partial_results: Arc::new(StdMutex::new(VecDeque::new())),
                 pending_aggregated_results: Arc::new(StdMutex::new(VecDeque::new())),
                 pending_peer_adverts: Arc::new(StdMutex::new(VecDeque::new())),
+                pending_assignment_supersessions: Arc::new(StdMutex::new(VecDeque::new())),
             }
         }
 
@@ -403,6 +447,10 @@ mod omni_net_relay {
                 .pending_peer_adverts
                 .lock()
                 .expect("pending_peer_adverts poisoned");
+            let mut s_super = self
+                .pending_assignment_supersessions
+                .lock()
+                .expect("pending_assignment_supersessions poisoned");
             while let Some(ev) = net.try_next_event() {
                 if let OmniNetEvent::MessageReceived { topic, data, .. } = ev {
                     match topic.as_str() {
@@ -469,6 +517,14 @@ mod omni_net_relay {
                             >(&data)
                             {
                                 s_peer.push_back(msg);
+                            }
+                        }
+                        TOPIC_CONTRIBUTOR_SESSION_ASSIGNMENT_SUPERSESSION => {
+                            if let Ok(msg) = serde_json::from_slice::<
+                                crate::net::NetworkWorkAssignmentSupersessionAnnouncement,
+                            >(&data)
+                            {
+                                s_super.push_back(msg);
                             }
                         }
                         _ => {
@@ -642,6 +698,28 @@ mod omni_net_relay {
                 .pending_peer_adverts
                 .lock()
                 .expect("pending_peer_adverts poisoned");
+            Ok(q.drain(..).collect())
+        }
+
+        fn publish_assignment_supersession(
+            &mut self,
+            msg: &crate::net::NetworkWorkAssignmentSupersessionAnnouncement,
+        ) -> Result<(), RelayError> {
+            let bytes = serde_json::to_vec(msg)?;
+            self.publish_topic(TOPIC_CONTRIBUTOR_SESSION_ASSIGNMENT_SUPERSESSION, bytes)
+        }
+
+        fn poll_assignment_supersessions(
+            &mut self,
+        ) -> Result<
+            Vec<crate::net::NetworkWorkAssignmentSupersessionAnnouncement>,
+            RelayError,
+        > {
+            self.drain_events();
+            let mut q = self
+                .pending_assignment_supersessions
+                .lock()
+                .expect("pending_assignment_supersessions poisoned");
             Ok(q.drain(..).collect())
         }
     }

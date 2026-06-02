@@ -60,6 +60,8 @@ pub mod signing;
 pub mod snip;
 pub mod state;
 pub mod status;
+pub mod supersession;
+pub mod supersession_verify;
 pub mod tensor_transport;
 pub mod verify;
 pub mod watch;
@@ -76,7 +78,7 @@ pub use repair::{
 };
 pub use status::{
     build_session_status_report, AssignmentStatus, SessionOverallStatus,
-    SessionStatusReport, STATUS_SCHEMA_VERSION,
+    SessionStatusReport, SupersessionStatus, STATUS_SCHEMA_VERSION,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,
@@ -87,7 +89,8 @@ pub use net::{
     NetworkAggregatedResultAnnouncement, NetworkContributorJoinedAnnouncement,
     NetworkPartialResultAnnouncement, NetworkPeerAdvertisementAnnouncement,
     NetworkPostedJobAnnouncement, NetworkPostedResultAnnouncement,
-    NetworkSessionOpenedAnnouncement, NetworkWorkAssignedAnnouncement, NET_SCHEMA_VERSION,
+    NetworkSessionOpenedAnnouncement, NetworkWorkAssignedAnnouncement,
+    NetworkWorkAssignmentSupersessionAnnouncement, NET_SCHEMA_VERSION,
 };
 pub use peer_advert::{
     ContributorPeerAdvertisement, PeerCapabilities, PEER_ADVERTISEMENT_MAX_LIFETIME_SECS,
@@ -134,11 +137,16 @@ pub use session_verify::{
     check_not_expired, process_aggregated_result_announcement,
     process_contributor_joined_announcement, process_partial_result_announcement,
     process_session_opened_announcement, process_work_assigned_announcement,
-    verify_aggregated_result, verify_contributor_join, verify_execution_session,
-    verify_partial_result, verify_work_assignment, AnnouncementOutcome,
-    SessionVerifyOutcome,
+    verify_aggregated_result, verify_aggregated_result_with_supersessions,
+    verify_contributor_join, verify_execution_session, verify_partial_result,
+    verify_work_assignment, AnnouncementOutcome, SessionVerifyOutcome,
 };
 pub use signing::{ContributorSigner, CoordinatorSigner, DispatcherSigner};
+pub use supersession::{
+    SupersessionReason, WorkAssignmentSupersession,
+    SUPERSESSION_REASON_CUSTOM_LABEL_MAX, SUPERSESSION_SCHEMA_VERSION,
+};
+pub use supersession_verify::verify_assignment_supersession;
 pub use state::{
     ContributorStateStore, PruneReport, StateNamespace, StateObjectKind,
     StateVersionMeta, STATE_VERSION,

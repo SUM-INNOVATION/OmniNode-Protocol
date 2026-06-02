@@ -231,6 +231,48 @@ pub enum SchemaError {
         expires_at: String,
         max_lifetime_secs: i64,
     },
+
+    // Stage 12.11 — assignment supersession schema errors.
+
+    #[error("WorkAssignmentSupersession.superseded_assignment_ids must be non-empty")]
+    SupersessionEmptySuperseded,
+
+    /// v1 replacement-only scope. Stage 12.11 forbids abandonment;
+    /// a partial-aggregate / cancellation envelope is deferred to a
+    /// later stage.
+    #[error(
+        "WorkAssignmentSupersession.replacement_assignment_ids must be non-empty \
+         in v1 (replacement-only scope; abandonment deferred)"
+    )]
+    SupersessionEmptyReplacement,
+
+    #[error(
+        "WorkAssignmentSupersession.{field} duplicate entry: assignment_id={assignment_id}"
+    )]
+    SupersessionDuplicateId {
+        field: &'static str,
+        assignment_id: String,
+    },
+
+    #[error(
+        "WorkAssignmentSupersession.{field} must be sorted ascending by hex value"
+    )]
+    SupersessionIdsNotSorted { field: &'static str },
+
+    #[error(
+        "WorkAssignmentSupersession: assignment_id {assignment_id} appears in BOTH \
+         superseded_assignment_ids and replacement_assignment_ids"
+    )]
+    SupersessionSupersededAndReplacement { assignment_id: String },
+
+    #[error("SupersessionReason::Custom label must be non-empty")]
+    SupersessionReasonCustomEmptyLabel,
+
+    #[error("SupersessionReason::Custom label length {got} exceeds bound {max}")]
+    SupersessionReasonCustomLabelTooLong { got: usize, max: usize },
+
+    #[error("SupersessionReason::Custom label must be printable ASCII (0x20..=0x7E)")]
+    SupersessionReasonCustomLabelNotPrintableAscii,
 }
 
 /// Stage 12.7 — typed errors from the contributor state store.

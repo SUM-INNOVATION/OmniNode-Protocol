@@ -861,3 +861,180 @@ fn report_treats_session_id_mismatch_as_missing() {
     let report = build_session_status_report(&store, &fake_id, NOW_UTC, false).unwrap();
     assert_eq!(report.overall_status, SessionOverallStatus::NoSession);
 }
+
+// ── Stage 12.11 regression — tampered partial under InvalidPartial
+// supersession must NOT flip overall_status to InvalidState. ───────
+
+/// The Stage 12.11 review caught this directly: the status reporter
+/// was loading partials BEFORE supersessions, so a tampered partial
+/// for an assignment later superseded with `InvalidPartial` would
+/// set `any_chain_invalid = true` and stick the session at
+/// `InvalidState` forever, defeating the whole point of the
+/// supersession. The fix loads supersessions FIRST and skips
+/// partials whose assignment is superseded. This regression test
+/// pins that fix.
+#[test]
+fn tampered_partial_under_invalid_partial_supersession_is_not_invalid_state() {
+    use omni_contributor::{
+        canonical::{supersession_id_hex, work_assignment_supersession_signing_input},
+        supersession::{SupersessionReason, WorkAssignmentSupersession},
+        SUPERSESSION_SCHEMA_VERSION,
+    };
+
+    let (_d, store) = fresh_store();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let contrib_a = ContributorSigner::from_seed_bytes(&CONTRIB_A_SEED).unwrap();
+    let contrib_b = ContributorSigner::from_seed_bytes(&CONTRIB_B_SEED).unwrap();
+    let session = signed_session(&coord, FAR_FUTURE);
+    let join_a = signed_join(&session, &contrib_a);
+    let join_b = signed_join(&session, &contrib_b);
+
+    // Original stage 0 — assigned to A. A delivered a tampered
+    // partial. The operator superseded with `InvalidPartial` and
+    // reassigned to B.
+    let asn_old = signed_assignment(
+        &session,
+        &coord,
+        &contrib_a.pubkey_hex(),
+        0,
+        WorkKind::Layers { start: 0, end: 8 },
+        8,
+    );
+    // Use a different `assigned_at_utc` so the replacement hashes
+    // to a different `assignment_id` even though stage_index +
+    // work_kind match.
+    let asn_new = {
+        let mut a = WorkAssignment {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: session.session_id.clone(),
+            assignment_id: String::new(),
+            stage_index: 0,
+            contributor_pubkey_hex: contrib_b.pubkey_hex(),
+            work_kind: WorkKind::Layers { start: 0, end: 8 },
+            expected_work_units: 8,
+            expected_work_unit_kind: WorkUnitKind::Layers,
+            assigned_at_utc: "2026-05-31T00:00:30Z".into(),
+            coordinator_signature_hex: String::new(),
+        };
+        a.assignment_id = assignment_id_hex(&a).unwrap();
+        let si = work_assignment_signing_input(&a).unwrap();
+        a.coordinator_signature_hex = coord.sign_hex(&si);
+        a
+    };
+
+    // Tampered partial for the OLD assignment.
+    let mut bad_partial = signed_partial(&asn_old, &contrib_a, "stage0-forged");
+    let mut sig: Vec<char> = bad_partial.contributor_signature_hex.chars().collect();
+    let last = sig.len() - 1;
+    sig[last] = if sig[last] == '0' { '1' } else { '0' };
+    bad_partial.contributor_signature_hex = sig.into_iter().collect();
+
+    // Valid partial for the REPLACEMENT.
+    let good_partial = signed_partial(&asn_new, &contrib_b, "stage0-replacement");
+
+    // Coordinator-signed supersession: old → new, reason InvalidPartial.
+    let mut superseded_ids = vec![asn_old.assignment_id.clone()];
+    superseded_ids.sort();
+    let mut replacement_ids = vec![asn_new.assignment_id.clone()];
+    replacement_ids.sort();
+    let mut s = WorkAssignmentSupersession {
+        schema_version: SUPERSESSION_SCHEMA_VERSION,
+        session_id: session.session_id.clone(),
+        supersession_id: String::new(),
+        superseded_assignment_ids: superseded_ids,
+        replacement_assignment_ids: replacement_ids,
+        reason: SupersessionReason::InvalidPartial,
+        created_at_utc: "2026-05-31T00:30:00Z".into(),
+        coordinator_pubkey_hex: coord.pubkey_hex(),
+        coordinator_signature_hex: String::new(),
+    };
+    s.supersession_id = supersession_id_hex(&s).unwrap();
+    let si = work_assignment_supersession_signing_input(&s).unwrap();
+    s.coordinator_signature_hex = coord.sign_hex(&si);
+
+    // Write everything to the state-dir.
+    store
+        .write_verified_json(StateObjectKind::Session, &session.session_id, &session)
+        .unwrap();
+    for j in [&join_a, &join_b] {
+        store
+            .write_verified_json(
+                StateObjectKind::Join {
+                    session_id: session.session_id.clone(),
+                },
+                &j.contributor_pubkey_hex,
+                j,
+            )
+            .unwrap();
+    }
+    for a in [&asn_old, &asn_new] {
+        store
+            .write_verified_json(
+                StateObjectKind::Assignment {
+                    session_id: session.session_id.clone(),
+                },
+                &a.assignment_id,
+                a,
+            )
+            .unwrap();
+    }
+    store
+        .write_verified_json(
+            StateObjectKind::Partial {
+                session_id: session.session_id.clone(),
+            },
+            &bad_partial.assignment_id,
+            &bad_partial,
+        )
+        .unwrap();
+    store
+        .write_verified_json(
+            StateObjectKind::Partial {
+                session_id: session.session_id.clone(),
+            },
+            &good_partial.assignment_id,
+            &good_partial,
+        )
+        .unwrap();
+    store
+        .write_verified_json(
+            StateObjectKind::AssignmentSupersession {
+                session_id: session.session_id.clone(),
+            },
+            &s.supersession_id,
+            &s,
+        )
+        .unwrap();
+
+    let report =
+        build_session_status_report(&store, &session.session_id, NOW_UTC, false).unwrap();
+
+    // The CORE assertion: the tampered partial for the SUPERSEDED
+    // assignment must NOT flip the overall status to InvalidState.
+    assert_ne!(
+        report.overall_status,
+        SessionOverallStatus::InvalidState,
+        "tampered partial whose assignment is superseded with \
+         InvalidPartial must NOT make the session InvalidState; \
+         notes={:?}",
+        report.notes
+    );
+    // Reported counts:
+    //   - assignment_count = 2 (old + replacement both verify on
+    //     their own bytes)
+    //   - superseded_assignment_count = 1 (old)
+    //   - active_assignment_count = 1 (replacement)
+    //   - partial_count = 1 (the good one; the bad one is skipped)
+    //   - missing_assignment_ids is empty (active replacement has
+    //     its partial)
+    assert_eq!(report.assignment_count, 2);
+    assert_eq!(report.superseded_assignment_count, 1);
+    assert_eq!(report.active_assignment_count, 1);
+    assert_eq!(report.partial_count, 1);
+    assert!(report.missing_assignment_ids.is_empty());
+    // No aggregate yet → CompletePartials.
+    assert_eq!(report.overall_status, SessionOverallStatus::CompletePartials);
+    // Supersession is in the report and valid.
+    assert_eq!(report.supersession_count, 1);
+    assert!(report.supersessions[0].valid);
+}

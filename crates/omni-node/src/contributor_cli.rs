@@ -6367,11 +6367,28 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
     }
     let mut verified: Vec<VerifiedAction> = Vec::with_capacity(plan.actions.len());
     for action in &plan.actions {
-        let RepairAction::ReannounceAssignment {
-            assignment_id,
-            stage_index,
-            contributor_pubkey_hex,
-        } = action;
+        // Stage 12.10 applier path: only `ReannounceAssignment`
+        // actions are accepted here. `ReassignAssignment` (Stage
+        // 12.11) is handled by `apply-session-reassign` instead;
+        // mixing the two in a single plan is intentionally
+        // disallowed by the planner (it commits to one strategy
+        // per plan). A future plan that smuggled in a Stage 12.11
+        // action must surface a typed error rather than silently
+        // skip — the operator-meaningful invariant is "every
+        // action in a v1-reannounce plan is a reannounce."
+        let (assignment_id, stage_index, contributor_pubkey_hex) = match action {
+            RepairAction::ReannounceAssignment {
+                assignment_id,
+                stage_index,
+                contributor_pubkey_hex,
+            } => (assignment_id, stage_index, contributor_pubkey_hex),
+            RepairAction::ReassignAssignment { .. } => {
+                return Err(anyhow!(
+                    "apply-session-repair only handles ReannounceAssignment \
+                     actions; use apply-session-reassign for ReassignAssignment"
+                ));
+            }
+        };
         let asn: WorkAssignment = match store.read_verified_json(
             omni_contributor::StateObjectKind::Assignment {
                 session_id: plan.session_id.clone(),

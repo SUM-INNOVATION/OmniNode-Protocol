@@ -62,12 +62,16 @@ fn empty_report(
         peer_advert_count: 0,
         assignment_count: 0,
         partial_count: 0,
+        active_assignment_count: 0,
+        superseded_assignment_count: 0,
+        supersession_count: 0,
         missing_assignment_ids: Vec::new(),
         duplicate_partial_assignment_ids: Vec::new(),
         aggregate_present: matches!(overall, SessionOverallStatus::Aggregated),
         aggregate_valid: matches!(overall, SessionOverallStatus::Aggregated),
         overall_status: overall,
         assignments: Vec::new(),
+        supersessions: Vec::new(),
         notes: Vec::new(),
     }
 }
@@ -78,6 +82,7 @@ fn in_progress_with(assignments: Vec<AssignmentStatus>) -> SessionStatusReport {
         .filter(|a| !a.partial_present)
         .map(|a| a.assignment_id.clone())
         .collect();
+    let count = assignments.len() as u32;
     SessionStatusReport {
         schema_version: STATUS_SCHEMA_VERSION,
         session_id: "11".repeat(32),
@@ -86,16 +91,20 @@ fn in_progress_with(assignments: Vec<AssignmentStatus>) -> SessionStatusReport {
         generated_at_utc: NOW_UTC.into(),
         session_expires_at_utc: Some(FAR_FUTURE.into()),
         session_expired: false,
-        join_count: assignments.len() as u32,
+        join_count: count,
         peer_advert_count: 0,
-        assignment_count: assignments.len() as u32,
+        assignment_count: count,
         partial_count: assignments.iter().filter(|a| a.partial_present).count() as u32,
+        active_assignment_count: count,
+        superseded_assignment_count: 0,
+        supersession_count: 0,
         missing_assignment_ids: missing,
         duplicate_partial_assignment_ids: Vec::new(),
         aggregate_present: false,
         aggregate_valid: false,
         overall_status: SessionOverallStatus::InProgress,
         assignments,
+        supersessions: Vec::new(),
         notes: Vec::new(),
     }
 }
@@ -118,6 +127,8 @@ fn assignment_status(
         partial_present,
         partial_valid: partial_present,
         partial_snip_root: None,
+        superseded: false,
+        superseded_by_supersession_id: None,
         notes: Vec::new(),
     }
 }
@@ -240,6 +251,7 @@ fn planner_emits_one_reannounce_per_missing_partial() {
             assert_eq!(assignment_id, &"aa".repeat(32));
             assert_eq!(*stage_index, 0);
         }
+        other => panic!("expected ReannounceAssignment, got {other:?}"),
     }
     match &plan.actions[1] {
         RepairAction::ReannounceAssignment {
@@ -250,6 +262,7 @@ fn planner_emits_one_reannounce_per_missing_partial() {
             assert_eq!(assignment_id, &"cc".repeat(32));
             assert_eq!(*stage_index, 2);
         }
+        other => panic!("expected ReannounceAssignment, got {other:?}"),
     }
     assert_eq!(plan.schema_version, REPAIR_PLAN_SCHEMA_VERSION);
     assert_eq!(plan.strategy, RepairStrategy::ReannounceMissing);
@@ -519,6 +532,7 @@ fn end_to_end_state_dir_status_then_plan() {
             assert_eq!(*stage_index, 1);
             assert_eq!(contributor_pubkey_hex, &contrib_b.pubkey_hex());
         }
+        other => panic!("expected ReannounceAssignment, got {other:?}"),
     }
     // source_status_hash binds to current state-dir shape.
     assert_eq!(plan.source_status_hash, source_status_hash_hex(&status));

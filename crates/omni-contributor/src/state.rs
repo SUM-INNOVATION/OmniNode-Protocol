@@ -77,8 +77,14 @@ use crate::session::{
     PartialContributorResult, WorkAssignment,
 };
 
-/// Pinned v1. Future versions are refused on `open`.
-pub const STATE_VERSION: u32 = 1;
+/// Stage 12.11 bump: v1 → v2. v2 adds the supersessions subtree
+/// under `verified/sessions/<id>/supersessions/` and the
+/// `seen/assignment-supersessions/` namespace. Stage 12.7–12.10
+/// binaries opening a v2 state-dir would silently miss superseded
+/// assignments and report stale `InProgress` for sessions where
+/// only superseded assignments lack partials. The bump forces an
+/// explicit upgrade signal via `StateError::UnsupportedVersion`.
+pub const STATE_VERSION: u32 = 2;
 
 /// Stored in `<state-dir>/meta/state_version.json` so a future
 /// 12.8+ migration is clean.
@@ -100,6 +106,8 @@ pub enum StateNamespace {
     Partials,
     Aggregates,
     PeerAdverts,
+    /// Stage 12.11.
+    AssignmentSupersessions,
 }
 
 impl StateNamespace {
@@ -114,6 +122,7 @@ impl StateNamespace {
             StateNamespace::Partials => "partials",
             StateNamespace::Aggregates => "aggregates",
             StateNamespace::PeerAdverts => "peer-adverts",
+            StateNamespace::AssignmentSupersessions => "assignment-supersessions",
         }
     }
 }
@@ -130,6 +139,9 @@ pub enum StateObjectKind {
     /// Keyed by `session_id` (one aggregated.json per session).
     Aggregate,
     PeerAdvert { session_id: String },
+    /// Stage 12.11 — keyed by `supersession_id`.
+    /// `<state>/verified/sessions/<session_id>/supersessions/<supersession_id>.json`.
+    AssignmentSupersession { session_id: String },
     /// `<state>/results/contributor-results/<job_id>.json`
     ContributorResult,
     /// `<state>/results/contributor-results/<job_id>.rejected.json`
@@ -176,6 +188,13 @@ impl StateObjectKind {
                     .join("sessions")
                     .join(session_id)
                     .join("peer-adverts"),
+                format!("{id}.json"),
+            ),
+            StateObjectKind::AssignmentSupersession { session_id } => (
+                root.join("verified")
+                    .join("sessions")
+                    .join(session_id)
+                    .join("supersessions"),
                 format!("{id}.json"),
             ),
             StateObjectKind::ContributorResult => (
@@ -424,6 +443,18 @@ impl ContributorStateStore {
         session_id: &str,
     ) -> Result<Vec<ContributorPeerAdvertisement>, StateError> {
         self.list_verified_under(session_id, "peer-adverts")
+    }
+
+    /// Stage 12.11 — list verified `WorkAssignmentSupersession`
+    /// envelopes for a session. Parse-only; the caller is
+    /// responsible for re-running `verify_assignment_supersession`
+    /// before treating any entry as trusted (Stage 12.7 trust
+    /// boundary).
+    pub fn list_verified_supersessions_for(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::supersession::WorkAssignmentSupersession>, StateError> {
+        self.list_verified_under(session_id, "supersessions")
     }
 
     pub fn read_verified_aggregate_for(
@@ -688,6 +719,8 @@ fn cascade_remove_session(root: &Path, session_id: &str) -> Result<(), StateErro
     seen_dirs_to_walk.insert("assignments");
     seen_dirs_to_walk.insert("partials");
     seen_dirs_to_walk.insert("peer-adverts");
+    // Stage 12.11 — supersessions cascade out with their session.
+    seen_dirs_to_walk.insert("assignment-supersessions");
     for d in seen_dirs_to_walk {
         let dir = seen.join(d);
         if !dir.is_dir() {

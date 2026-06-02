@@ -57,9 +57,12 @@ use crate::error::RepairError;
 use crate::status::{SessionOverallStatus, SessionStatusReport};
 
 /// Pinned planner schema version. A future stage that adds
-/// `RepairAction::ReassignMissing` (with a supersession field)
-/// bumps this and migrates.
-pub const REPAIR_PLAN_SCHEMA_VERSION: u32 = 1;
+/// Stage 12.11 bump: v1 → v2. v2 adds
+/// `RepairStrategy::ReassignMissing` + `RepairAction::ReassignAssignment`
+/// alongside the existing reannounce-only variants. Stage 12.10 v1
+/// readers refuse to parse v2 plans (deny_unknown_fields on the
+/// new enum tag), forcing an explicit upgrade signal.
+pub const REPAIR_PLAN_SCHEMA_VERSION: u32 = 2;
 
 // ── RepairStrategy ──────────────────────────────────────────────
 
@@ -72,6 +75,10 @@ pub const REPAIR_PLAN_SCHEMA_VERSION: u32 = 1;
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum RepairStrategy {
     ReannounceMissing,
+    /// Stage 12.11 — build replacement `WorkAssignment`s for every
+    /// missing active assignment, then publish a single signed
+    /// `WorkAssignmentSupersession` covering the set.
+    ReassignMissing,
 }
 
 // ── RepairAction ────────────────────────────────────────────────
@@ -103,6 +110,31 @@ pub enum RepairAction {
         /// Copied from the status report. Verified against the
         /// re-fetched assignment body at apply time.
         contributor_pubkey_hex: String,
+    },
+    /// Stage 12.11 — supersede a missing assignment and replace it
+    /// with a newly-signed `WorkAssignment` targeting a different
+    /// contributor (or the same, with a different `assigned_at_utc`
+    /// to produce a fresh `assignment_id`). The applier publishes
+    /// the replacement assignment first, then publishes a single
+    /// signed `WorkAssignmentSupersession` referencing all
+    /// superseded + replacement IDs.
+    ReassignAssignment {
+        /// `assignment_id` of the missing original.
+        superseded_assignment_id: String,
+        /// Copied from the status report for dry-run context.
+        original_stage_index: u32,
+        /// `contributor_pubkey_hex` of the new contributor.
+        replacement_contributor_pubkey_hex: String,
+        /// Stage index for the replacement (typically matches the
+        /// original — the planner enforces compatibility).
+        replacement_stage_index: u32,
+        /// `WorkKind` for the replacement assignment.
+        replacement_work_kind: crate::session::WorkKind,
+        replacement_expected_work_units: u64,
+        replacement_expected_work_unit_kind: crate::result::WorkUnitKind,
+        /// `SupersessionReason` that will be embedded in the
+        /// signed `WorkAssignmentSupersession`.
+        reason: crate::supersession::SupersessionReason,
     },
 }
 
@@ -250,18 +282,48 @@ pub fn build_session_repair_plan(
     }
     check_repair_eligible(status)?;
 
-    let mut actions: Vec<RepairAction> = status
+    // Stage 12.11 — both strategies operate on the ACTIVE missing
+    // assignment set: a partial that's missing for a SUPERSEDED
+    // assignment doesn't need any repair (the aggregate verifier
+    // ignores superseded entries entirely).
+    let actionable: Vec<&crate::status::AssignmentStatus> = status
         .assignments
         .iter()
-        .filter(|a| !a.partial_present)
-        .map(|a| RepairAction::ReannounceAssignment {
-            assignment_id: a.assignment_id.clone(),
-            stage_index: a.stage_index,
-            contributor_pubkey_hex: a.contributor_pubkey_hex.clone(),
-        })
+        .filter(|a| !a.partial_present && !a.superseded)
         .collect();
 
-    // Determinism: sort by (stage_index ASC, assignment_id ASC).
+    let mut actions: Vec<RepairAction> = match strategy {
+        RepairStrategy::ReannounceMissing => actionable
+            .iter()
+            .map(|a| RepairAction::ReannounceAssignment {
+                assignment_id: a.assignment_id.clone(),
+                stage_index: a.stage_index,
+                contributor_pubkey_hex: a.contributor_pubkey_hex.clone(),
+            })
+            .collect(),
+        RepairStrategy::ReassignMissing => actionable
+            .iter()
+            .map(|a| RepairAction::ReassignAssignment {
+                superseded_assignment_id: a.assignment_id.clone(),
+                original_stage_index: a.stage_index,
+                // v1 ReassignMissing baseline: replacement targets
+                // the SAME contributor (operator can swap via the
+                // explicit Stage 12.11 reassign planner; this is
+                // the minimum-viable default that keeps the rest
+                // of the chain identical). Future Stage 12.12+ may
+                // grow a contributor-rebalance selector.
+                replacement_contributor_pubkey_hex: a.contributor_pubkey_hex.clone(),
+                replacement_stage_index: a.stage_index,
+                replacement_work_kind: a.work_kind.clone(),
+                replacement_expected_work_units: a.expected_work_units,
+                replacement_expected_work_unit_kind: a.expected_work_unit_kind,
+                reason: crate::supersession::SupersessionReason::MissingPartial,
+            })
+            .collect(),
+    };
+
+    // Determinism: sort by (stage_index ASC, then assignment_id /
+    // superseded_assignment_id ASC).
     actions.sort_by(|x, y| {
         let (xs, xi) = match x {
             RepairAction::ReannounceAssignment {
@@ -269,6 +331,11 @@ pub fn build_session_repair_plan(
                 assignment_id,
                 ..
             } => (*stage_index, assignment_id.clone()),
+            RepairAction::ReassignAssignment {
+                original_stage_index,
+                superseded_assignment_id,
+                ..
+            } => (*original_stage_index, superseded_assignment_id.clone()),
         };
         let (ys, yi) = match y {
             RepairAction::ReannounceAssignment {
@@ -276,6 +343,11 @@ pub fn build_session_repair_plan(
                 assignment_id,
                 ..
             } => (*stage_index, assignment_id.clone()),
+            RepairAction::ReassignAssignment {
+                original_stage_index,
+                superseded_assignment_id,
+                ..
+            } => (*original_stage_index, superseded_assignment_id.clone()),
         };
         xs.cmp(&ys).then_with(|| xi.cmp(&yi))
     });

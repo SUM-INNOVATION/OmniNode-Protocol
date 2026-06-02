@@ -799,6 +799,64 @@ pub fn aggregated_result_signing_input(
     canonical_aggregated_result_bytes(a)
 }
 
+// ── Stage 12.11 — WorkAssignmentSupersession canonical bytes ──────────────
+
+use crate::supersession::{SupersessionReason, WorkAssignmentSupersession};
+
+/// 47 ASCII bytes.
+pub const SUPERSESSION_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-SESSION-SUPERSESSION:v1:";
+
+#[derive(Debug, Serialize)]
+struct SupersessionCanonicalBody<'a> {
+    schema_version: u32,
+    session_id: &'a str,
+    superseded_assignment_ids: &'a [String],
+    replacement_assignment_ids: &'a [String],
+    reason: &'a SupersessionReason,
+    created_at_utc: &'a str,
+    coordinator_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a WorkAssignmentSupersession> for SupersessionCanonicalBody<'a> {
+    fn from(s: &'a WorkAssignmentSupersession) -> Self {
+        Self {
+            schema_version: s.schema_version,
+            session_id: &s.session_id,
+            superseded_assignment_ids: &s.superseded_assignment_ids,
+            replacement_assignment_ids: &s.replacement_assignment_ids,
+            reason: &s.reason,
+            created_at_utc: &s.created_at_utc,
+            coordinator_pubkey_hex: &s.coordinator_pubkey_hex,
+        }
+    }
+}
+
+pub fn canonical_work_assignment_supersession_bytes(
+    s: &WorkAssignmentSupersession,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: SupersessionCanonicalBody = s.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(SUPERSESSION_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(SUPERSESSION_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// 64-char lowercase hex. Value stored in
+/// `WorkAssignmentSupersession.supersession_id`.
+pub fn supersession_id_hex(
+    s: &WorkAssignmentSupersession,
+) -> Result<String, CanonicalError> {
+    let bytes = canonical_work_assignment_supersession_bytes(s)?;
+    Ok(hex_lower(blake3::hash(&bytes).as_bytes()))
+}
+
+pub fn work_assignment_supersession_signing_input(
+    s: &WorkAssignmentSupersession,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_work_assignment_supersession_bytes(s)
+}
+
 // ── Stage 12.3 — session network announcement canonical bytes ────────────
 
 use crate::net::{
@@ -1244,6 +1302,56 @@ pub fn net_peer_advert_signing_input(
     a: &NetworkPeerAdvertisementAnnouncement,
 ) -> Result<Vec<u8>, CanonicalError> {
     canonical_net_peer_advert_bytes(a)
+}
+
+// --- NetworkWorkAssignmentSupersessionAnnouncement (Stage 12.11) ---
+
+pub const NET_SUPERSESSION_DOMAIN: &[u8] =
+    b"OMNINODE-CONTRIBUTOR-NET-SUPERSESSION:v1:";
+
+#[derive(Debug, Serialize)]
+struct NetSupersessionCanonicalBody<'a> {
+    schema_version: u32,
+    work_assignment_supersession_snip_root: &'a str,
+    session_id: &'a str,
+    supersession_id: &'a str,
+    announced_at_utc: &'a str,
+    announcer_pubkey_hex: &'a str,
+}
+
+impl<'a> From<&'a crate::net::NetworkWorkAssignmentSupersessionAnnouncement>
+    for NetSupersessionCanonicalBody<'a>
+{
+    fn from(
+        a: &'a crate::net::NetworkWorkAssignmentSupersessionAnnouncement,
+    ) -> Self {
+        Self {
+            schema_version: a.schema_version,
+            work_assignment_supersession_snip_root: &a
+                .work_assignment_supersession_snip_root,
+            session_id: &a.session_id,
+            supersession_id: &a.supersession_id,
+            announced_at_utc: &a.announced_at_utc,
+            announcer_pubkey_hex: &a.announcer_pubkey_hex,
+        }
+    }
+}
+
+pub fn canonical_net_supersession_bytes(
+    a: &crate::net::NetworkWorkAssignmentSupersessionAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    let body: NetSupersessionCanonicalBody = a.into();
+    let body_bytes = bincode1::serialize(&body)?;
+    let mut out = Vec::with_capacity(NET_SUPERSESSION_DOMAIN.len() + body_bytes.len());
+    out.extend_from_slice(NET_SUPERSESSION_DOMAIN);
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+pub fn net_supersession_signing_input(
+    a: &crate::net::NetworkWorkAssignmentSupersessionAnnouncement,
+) -> Result<Vec<u8>, CanonicalError> {
+    canonical_net_supersession_bytes(a)
 }
 
 // ── Hex helpers ───────────────────────────────────────────────────────────

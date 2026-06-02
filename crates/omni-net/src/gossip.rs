@@ -34,6 +34,16 @@ pub const TOPIC_CONTRIBUTOR_SESSION_AGGREGATED: &str = "omni/contributor/session
 pub const TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT: &str =
     "omni/contributor/session/peer-advert/v1";
 
+// Stage 12.11 — signed assignment supersession (reassignment
+// coordination). Carries pointer-only
+// NetworkWorkAssignmentSupersessionAnnouncement envelopes; the
+// inner WorkAssignmentSupersession (Ed25519 signed by the
+// coordinator) lives on SNIP. Verified by the receiver's local
+// aggregate verifier via
+// `verify_aggregated_result_with_supersessions`.
+pub const TOPIC_CONTRIBUTOR_SESSION_ASSIGNMENT_SUPERSESSION: &str =
+    "omni/contributor/session/assignment-supersession/v1";
+
 /// Typed error for unknown / unsupported topic names. Replaces the
 /// pre-Stage-12.2-pre silent fallback to `TOPIC_TEST`, which silently
 /// misrouted any unknown topic and could not be detected by callers.
@@ -64,6 +74,8 @@ pub struct GossipManager {
     topic_contributor_session_aggregated: IdentTopic,
     // Stage 12.5 — signed contributor peer advertisement topic.
     topic_contributor_session_peer_advert: IdentTopic,
+    // Stage 12.11 — signed assignment supersession topic.
+    topic_contributor_session_assignment_supersession: IdentTopic,
 }
 
 impl GossipManager {
@@ -88,6 +100,8 @@ impl GossipManager {
                 IdentTopic::new(TOPIC_CONTRIBUTOR_SESSION_AGGREGATED),
             topic_contributor_session_peer_advert:
                 IdentTopic::new(TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT),
+            topic_contributor_session_assignment_supersession:
+                IdentTopic::new(TOPIC_CONTRIBUTOR_SESSION_ASSIGNMENT_SUPERSESSION),
         }
     }
 
@@ -122,7 +136,7 @@ impl GossipManager {
         Ok(id)
     }
 
-    fn all_topics(&self) -> [&IdentTopic; 13] {
+    fn all_topics(&self) -> [&IdentTopic; 14] {
         [
             &self.topic_test,
             &self.topic_capability,
@@ -137,6 +151,7 @@ impl GossipManager {
             &self.topic_contributor_session_partial,
             &self.topic_contributor_session_aggregated,
             &self.topic_contributor_session_peer_advert,
+            &self.topic_contributor_session_assignment_supersession,
         ]
     }
 
@@ -168,6 +183,8 @@ impl GossipManager {
                 => Ok(&self.topic_contributor_session_aggregated),
             TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT
                 => Ok(&self.topic_contributor_session_peer_advert),
+            TOPIC_CONTRIBUTOR_SESSION_ASSIGNMENT_SUPERSESSION
+                => Ok(&self.topic_contributor_session_assignment_supersession),
             other                     => Err(UnknownTopic(other.to_string())),
         }
     }
@@ -213,6 +230,8 @@ mod tests {
             TOPIC_CONTRIBUTOR_SESSION_PARTIAL,
             TOPIC_CONTRIBUTOR_SESSION_AGGREGATED,
             TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT,
+            // Stage 12.11
+            TOPIC_CONTRIBUTOR_SESSION_ASSIGNMENT_SUPERSESSION,
         ] {
             assert!(
                 g.topic_by_name(name).is_ok(),
@@ -222,8 +241,8 @@ mod tests {
 
         // Defense-in-depth: the count of routed topics matches
         // all_topics. If a new TOPIC_* constant is added without
-        // routing, this fails.
-        assert_eq!(g.all_topics().len(), 13);
+        // routing, this fails. Bumped 13 → 14 at Stage 12.11.
+        assert_eq!(g.all_topics().len(), 14);
     }
 
     #[test]
