@@ -57,9 +57,12 @@ use crate::error::RepairError;
 use crate::status::{SessionOverallStatus, SessionStatusReport};
 
 /// Pinned planner schema version. A future stage that adds
-/// `RepairAction::ReassignMissing` (with a supersession field)
-/// bumps this and migrates.
-pub const REPAIR_PLAN_SCHEMA_VERSION: u32 = 1;
+/// Stage 12.11 bump: v1 → v2. v2 adds
+/// `RepairStrategy::ReassignMissing` + `RepairAction::ReassignAssignment`
+/// alongside the existing reannounce-only variants. Stage 12.10 v1
+/// readers refuse to parse v2 plans (deny_unknown_fields on the
+/// new enum tag), forcing an explicit upgrade signal.
+pub const REPAIR_PLAN_SCHEMA_VERSION: u32 = 2;
 
 // ── RepairStrategy ──────────────────────────────────────────────
 
@@ -72,6 +75,10 @@ pub const REPAIR_PLAN_SCHEMA_VERSION: u32 = 1;
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum RepairStrategy {
     ReannounceMissing,
+    /// Stage 12.11 — build replacement `WorkAssignment`s for every
+    /// missing active assignment, then publish a single signed
+    /// `WorkAssignmentSupersession` covering the set.
+    ReassignMissing,
 }
 
 // ── RepairAction ────────────────────────────────────────────────
@@ -104,6 +111,31 @@ pub enum RepairAction {
         /// re-fetched assignment body at apply time.
         contributor_pubkey_hex: String,
     },
+    /// Stage 12.11 — supersede a missing assignment and replace it
+    /// with a newly-signed `WorkAssignment` targeting a different
+    /// contributor (or the same, with a different `assigned_at_utc`
+    /// to produce a fresh `assignment_id`). The applier publishes
+    /// the replacement assignment first, then publishes a single
+    /// signed `WorkAssignmentSupersession` referencing all
+    /// superseded + replacement IDs.
+    ReassignAssignment {
+        /// `assignment_id` of the missing original.
+        superseded_assignment_id: String,
+        /// Copied from the status report for dry-run context.
+        original_stage_index: u32,
+        /// `contributor_pubkey_hex` of the new contributor.
+        replacement_contributor_pubkey_hex: String,
+        /// Stage index for the replacement (typically matches the
+        /// original — the planner enforces compatibility).
+        replacement_stage_index: u32,
+        /// `WorkKind` for the replacement assignment.
+        replacement_work_kind: crate::session::WorkKind,
+        replacement_expected_work_units: u64,
+        replacement_expected_work_unit_kind: crate::result::WorkUnitKind,
+        /// `SupersessionReason` that will be embedded in the
+        /// signed `WorkAssignmentSupersession`.
+        reason: crate::supersession::SupersessionReason,
+    },
 }
 
 // ── SessionRepairPlan ───────────────────────────────────────────
@@ -113,10 +145,13 @@ pub enum RepairAction {
 pub struct SessionRepairPlan {
     pub schema_version: u32,
     pub session_id: String,
-    /// BLAKE3 of the `(session_id, sorted [assignment_id,
-    /// partial_present] pairs)` projection of the status report
-    /// used to build this plan. Apply-time recomputes from the
-    /// current state-dir; drift → typed error.
+    /// BLAKE3 of the `(session_id, sorted [(assignment_id,
+    /// partial_present, superseded, superseded_by_supersession_id)]
+    /// pairs)` projection of the status report used to build this
+    /// plan (Stage 12.11 v2 projection; see
+    /// [`source_status_hash_hex`] for the v1 → v2 lift rationale).
+    /// Apply-time recomputes from the current state-dir; drift →
+    /// typed error.
     pub source_status_hash: String,
     pub strategy: RepairStrategy,
     pub created_at_utc: String,
@@ -133,21 +168,42 @@ pub struct SessionRepairPlan {
 /// Compute the projection hash the apply step uses to detect drift.
 ///
 /// The projection is **operator-meaningful**: `(session_id, sorted
-/// [(assignment_id, partial_present)] pairs)`. Two status reports
+/// [(assignment_id, partial_present, superseded,
+/// superseded_by_supersession_id)] pairs)`. Two status reports
 /// with different `generated_at_utc` or different `notes` but the
 /// same shape produce the same projection — so a plan built from a
 /// long-running watcher's snapshot stays valid until a partial
-/// actually arrives.
+/// actually arrives OR a supersession changes the active-assignment
+/// shape.
+///
+/// **Stage 12.11 lift**: prior to this stage the projection only
+/// covered `(assignment_id, partial_present)`, which let a
+/// supersession that arrived between plan and apply slip past the
+/// drift check (the `partial_present` flag wouldn't flip if the
+/// retired assignment never had a partial in the first place). The
+/// applier would then reannounce/reassign an already-retired
+/// assignment. Including the per-assignment `superseded` flag plus
+/// the retiring `supersession_id` makes any change to the
+/// active-assignment cover observable through this projection.
 pub fn source_status_hash_hex(status: &SessionStatusReport) -> String {
     #[derive(serde::Serialize)]
     struct Projection<'a> {
         session_id: &'a str,
-        assignments: Vec<(String, bool)>,
+        assignments: Vec<(String, bool, bool, String)>,
     }
-    let mut assignments: Vec<(String, bool)> = status
+    let mut assignments: Vec<(String, bool, bool, String)> = status
         .assignments
         .iter()
-        .map(|a| (a.assignment_id.clone(), a.partial_present))
+        .map(|a| {
+            (
+                a.assignment_id.clone(),
+                a.partial_present,
+                a.superseded,
+                a.superseded_by_supersession_id
+                    .clone()
+                    .unwrap_or_default(),
+            )
+        })
         .collect();
     assignments.sort_by(|a, b| a.0.cmp(&b.0));
     let p = Projection {
@@ -191,10 +247,12 @@ pub fn repair_plan_hash_hex(plan: &SessionRepairPlan) -> String {
 /// `apply-session-repair` at apply time — the applier rebuilds the
 /// current `SessionStatusReport` and re-checks before any SNIP /
 /// mesh work, because [`source_status_hash_hex`] is a projection
-/// over `(session_id, sorted [(assignment_id, partial_present)]
-/// pairs)` ONLY: an `ExpiredIncomplete` (`--no-prune-state-on-start`)
+/// over `(session_id, sorted [(assignment_id, partial_present,
+/// superseded, superseded_by_supersession_id)] pairs)` ONLY (Stage
+/// 12.11 lift; see [`source_status_hash_hex`] for the v1 → v2
+/// rationale): an `ExpiredIncomplete` (`--no-prune-state-on-start`)
 /// or an `InvalidState` (e.g. invalid aggregate body) with the same
-/// partial-present shape would otherwise slip past the projection
+/// active-assignment cover would otherwise slip past the projection
 /// drift check.
 pub fn check_repair_eligible(
     status: &SessionStatusReport,
@@ -212,6 +270,86 @@ pub fn check_repair_eligible(
         }),
         SessionOverallStatus::InProgress => Ok(()),
     }
+}
+
+/// Stage 12.11 — apply-time per-action enforcement for
+/// `ReassignMissing` plans. The `source_status_hash` projection
+/// re-check binds the session-level *shape*, and `check_repair_eligible`
+/// binds the overall status, but neither verifies that each
+/// individual `ReassignAssignment` action targets a row that is
+/// safe to retire.
+///
+/// `SessionRepairPlan` is **unsigned** and stored as local JSON, so
+/// `repair_plan_hash_hex` is reachable by hand-editing the JSON
+/// then recomputing the hash. Without this enforcement, an edited
+/// plan can target an assignment that already has a valid partial
+/// or is already retired by a prior verified supersession —
+/// wasting valid work or producing a no-op publish — while the
+/// session itself stays `InProgress` because some OTHER assignment
+/// is still missing.
+///
+/// For each `ReassignAssignment` action this helper verifies the
+/// targeted `superseded_assignment_id` exists in the current
+/// status report, is `partial_present == false` AND
+/// `superseded == false`, and has a `stage_index` matching the
+/// plan's `original_stage_index`. Returns
+/// [`RepairError::ReassignTargetNotActiveMissing`] with a
+/// stable `reason` tag on the first failure.
+///
+/// No-op when `plan.actions` is empty or when every action is a
+/// non-`ReassignAssignment` variant.
+pub fn check_reassign_targets_active_missing(
+    plan: &SessionRepairPlan,
+    current_status: &SessionStatusReport,
+) -> Result<(), RepairError> {
+    let status_by_id: std::collections::HashMap<&str, &crate::status::AssignmentStatus> =
+        current_status
+            .assignments
+            .iter()
+            .map(|a| (a.assignment_id.as_str(), a))
+            .collect();
+    for action in &plan.actions {
+        let RepairAction::ReassignAssignment {
+            superseded_assignment_id,
+            original_stage_index,
+            ..
+        } = action
+        else {
+            continue;
+        };
+        let row = match status_by_id.get(superseded_assignment_id.as_str()) {
+            Some(r) => *r,
+            None => {
+                return Err(RepairError::ReassignTargetNotActiveMissing {
+                    session_id: plan.session_id.clone(),
+                    assignment_id: superseded_assignment_id.clone(),
+                    reason: "not_in_status",
+                });
+            }
+        };
+        if row.superseded {
+            return Err(RepairError::ReassignTargetNotActiveMissing {
+                session_id: plan.session_id.clone(),
+                assignment_id: superseded_assignment_id.clone(),
+                reason: "already_superseded",
+            });
+        }
+        if row.partial_present {
+            return Err(RepairError::ReassignTargetNotActiveMissing {
+                session_id: plan.session_id.clone(),
+                assignment_id: superseded_assignment_id.clone(),
+                reason: "already_completed",
+            });
+        }
+        if row.stage_index != *original_stage_index {
+            return Err(RepairError::ReassignTargetNotActiveMissing {
+                session_id: plan.session_id.clone(),
+                assignment_id: superseded_assignment_id.clone(),
+                reason: "stage_index_mismatch",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Build a deterministic repair plan from a verified
@@ -242,6 +380,27 @@ pub fn build_session_repair_plan(
     now_utc: &str,
     coordinator_pubkey_hex: Option<&str>,
 ) -> Result<SessionRepairPlan, RepairError> {
+    build_session_repair_plan_with_reason(
+        status,
+        strategy,
+        crate::supersession::SupersessionReason::MissingPartial,
+        now_utc,
+        coordinator_pubkey_hex,
+    )
+}
+
+/// Stage 12.11 — same as [`build_session_repair_plan`] but lets the
+/// caller specify the `SupersessionReason` that gets embedded in
+/// every `ReassignAssignment` action's downstream supersession.
+/// `ReannounceMissing` ignores the reason (reannounce doesn't carry
+/// one).
+pub fn build_session_repair_plan_with_reason(
+    status: &SessionStatusReport,
+    strategy: RepairStrategy,
+    reassign_reason: crate::supersession::SupersessionReason,
+    now_utc: &str,
+    coordinator_pubkey_hex: Option<&str>,
+) -> Result<SessionRepairPlan, RepairError> {
     if status.schema_version != crate::status::STATUS_SCHEMA_VERSION {
         return Err(RepairError::UnsupportedSchemaVersion {
             got: status.schema_version,
@@ -250,18 +409,45 @@ pub fn build_session_repair_plan(
     }
     check_repair_eligible(status)?;
 
-    let mut actions: Vec<RepairAction> = status
+    // Stage 12.11 — both strategies operate on the ACTIVE missing
+    // assignment set: a partial that's missing for a SUPERSEDED
+    // assignment doesn't need any repair (the aggregate verifier
+    // ignores superseded entries entirely).
+    let actionable: Vec<&crate::status::AssignmentStatus> = status
         .assignments
         .iter()
-        .filter(|a| !a.partial_present)
-        .map(|a| RepairAction::ReannounceAssignment {
-            assignment_id: a.assignment_id.clone(),
-            stage_index: a.stage_index,
-            contributor_pubkey_hex: a.contributor_pubkey_hex.clone(),
-        })
+        .filter(|a| !a.partial_present && !a.superseded)
         .collect();
 
-    // Determinism: sort by (stage_index ASC, assignment_id ASC).
+    let mut actions: Vec<RepairAction> = match strategy {
+        RepairStrategy::ReannounceMissing => actionable
+            .iter()
+            .map(|a| RepairAction::ReannounceAssignment {
+                assignment_id: a.assignment_id.clone(),
+                stage_index: a.stage_index,
+                contributor_pubkey_hex: a.contributor_pubkey_hex.clone(),
+            })
+            .collect(),
+        RepairStrategy::ReassignMissing => actionable
+            .iter()
+            .map(|a| RepairAction::ReassignAssignment {
+                superseded_assignment_id: a.assignment_id.clone(),
+                original_stage_index: a.stage_index,
+                // v1 ReassignMissing baseline: replacement targets
+                // the SAME contributor. Stage 12.12+ may grow a
+                // contributor-rebalance selector.
+                replacement_contributor_pubkey_hex: a.contributor_pubkey_hex.clone(),
+                replacement_stage_index: a.stage_index,
+                replacement_work_kind: a.work_kind.clone(),
+                replacement_expected_work_units: a.expected_work_units,
+                replacement_expected_work_unit_kind: a.expected_work_unit_kind,
+                reason: reassign_reason.clone(),
+            })
+            .collect(),
+    };
+
+    // Determinism: sort by (stage_index ASC, then assignment_id /
+    // superseded_assignment_id ASC).
     actions.sort_by(|x, y| {
         let (xs, xi) = match x {
             RepairAction::ReannounceAssignment {
@@ -269,6 +455,11 @@ pub fn build_session_repair_plan(
                 assignment_id,
                 ..
             } => (*stage_index, assignment_id.clone()),
+            RepairAction::ReassignAssignment {
+                original_stage_index,
+                superseded_assignment_id,
+                ..
+            } => (*original_stage_index, superseded_assignment_id.clone()),
         };
         let (ys, yi) = match y {
             RepairAction::ReannounceAssignment {
@@ -276,6 +467,11 @@ pub fn build_session_repair_plan(
                 assignment_id,
                 ..
             } => (*stage_index, assignment_id.clone()),
+            RepairAction::ReassignAssignment {
+                original_stage_index,
+                superseded_assignment_id,
+                ..
+            } => (*original_stage_index, superseded_assignment_id.clone()),
         };
         xs.cmp(&ys).then_with(|| xi.cmp(&yi))
     });

@@ -358,3 +358,43 @@ impl NetworkPeerAdvertisementAnnouncement {
         Ok(())
     }
 }
+
+/// Stage 12.11 — pointer-only mesh announcement for a
+/// `WorkAssignmentSupersession` published to SNIP. Same posture as
+/// every other Stage 12.x announcement: the announcer signature is
+/// anti-spam + provenance; the inner supersession envelope is
+/// verified separately by the aggregate verifier
+/// (`verify_aggregated_result_with_supersessions`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkWorkAssignmentSupersessionAnnouncement {
+    pub schema_version: u32,
+    /// SNIP V2 Merkle root of the `WorkAssignmentSupersession` JSON.
+    pub work_assignment_supersession_snip_root: String,
+    pub session_id: String,
+    pub supersession_id: String,
+    pub announced_at_utc: String,
+    pub announcer_pubkey_hex: String,
+    pub announcer_signature_hex: String,
+}
+
+impl NetworkWorkAssignmentSupersessionAnnouncement {
+    pub fn validate_schema(&self) -> Result<(), SchemaError> {
+        if self.schema_version != NET_SCHEMA_VERSION {
+            return Err(SchemaError::UnsupportedVersion { got: self.schema_version });
+        }
+        check_snip_root_hex(
+            "work_assignment_supersession_snip_root",
+            &self.work_assignment_supersession_snip_root,
+        )?;
+        check_blake3_hex("session_id", &self.session_id)?;
+        check_blake3_hex("supersession_id", &self.supersession_id)?;
+        check_iso_8601("announced_at_utc", &self.announced_at_utc)?;
+        check_pubkey_hex("announcer_pubkey_hex", &self.announcer_pubkey_hex)?;
+        check_signature_hex(
+            "announcer_signature_hex",
+            &self.announcer_signature_hex,
+        )?;
+        Ok(())
+    }
+}

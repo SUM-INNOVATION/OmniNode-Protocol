@@ -1552,7 +1552,7 @@ State-dir loaders are parse-only (Stage 12.7 review, restated). The planner cons
 
 1. Recomputes `repair_plan_hash` and refuses on drift.
 2. Recomputes `source_status_hash` from the **current** state-dir and refuses on drift (a partial may have arrived between plan and apply).
-3. Re-runs `check_repair_eligible` on the current status. The `source_status_hash` projection is intentionally narrow — it covers only `(session_id, sorted [(assignment_id, partial_present)] pairs)` — so a status flip from `InProgress` to `ExpiredIncomplete` (clock advanced past `session.expires_at_utc`) or `InvalidState` (an aggregate body added between plan and apply that failed the verifier) can leave the projection unchanged. The eligibility re-check catches that explicitly, using the same status→error matrix as the planner.
+3. Re-runs `check_repair_eligible` on the current status. The `source_status_hash` projection (`(session_id, sorted [(assignment_id, partial_present, superseded, superseded_by_supersession_id)] pairs)` as of Stage 12.11 — see the "`source_status_hash` projection" section below for the v1 → v2 lift) does NOT cover session-level health: a status flip from `InProgress` to `ExpiredIncomplete` (clock advanced past `session.expires_at_utc`) or `InvalidState` (an aggregate body added between plan and apply that failed the verifier) can leave the projection unchanged. The eligibility re-check catches that explicitly, using the same status→error matrix as the planner.
 4. Re-fetches and re-verifies the session via `--session-snip-root` at apply time.
 5. Re-verifies each referenced assignment from the state-dir via `verify_work_assignment` before any SNIP write.
 
@@ -1564,7 +1564,9 @@ When set, the applier skips the entire omni-net layer: no mesh open, no peer wai
 
 ### `source_status_hash` projection
 
-BLAKE3 over `(session_id, sorted [(assignment_id, partial_present)] pairs)`. Two status reports with different `generated_at_utc` or different `notes` but the same operator-meaningful shape produce the same projection — so a plan built from a long-running watcher's snapshot stays valid until a partial actually arrives. As soon as a partial lands, the projection changes and the applier refuses with `RepairError::SourceStatusDrift`.
+BLAKE3 over `(session_id, sorted [(assignment_id, partial_present, superseded, superseded_by_supersession_id)] pairs)`. Two status reports with different `generated_at_utc` or different `notes` but the same operator-meaningful shape produce the same projection — so a plan built from a long-running watcher's snapshot stays valid until a partial actually arrives **or** a supersession arrives that retires an assignment.
+
+**Stage 12.11 lift:** prior to Stage 12.11 the projection only covered `(assignment_id, partial_present)`. A verified supersession arriving between plan and apply that retired a missing assignment would not flip any `partial_present` (the retired assignment never had a partial), so the projection stayed identical and the applier could reannounce or reassign an already-retired assignment. Stage 12.11 adds per-assignment `superseded` + `superseded_by_supersession_id` to the projection so any active-cover change trips drift, surfaced as `RepairError::SourceStatusDrift`. The projection still ignores `generated_at_utc`, `notes`, peer-advert state, aggregate state, and join/assignment counts that don't change shape.
 
 ### CLI surface
 
@@ -1700,3 +1702,92 @@ omni-node operator contributor apply-session-repair \
 | Binary smoke: `apply-session-repair --no-publish-announcements` fails fast (no peer-wait) | Manual (verified in PR review) |
 
 **Residual gap (deliberate):** the apply path's final SNIP-republish + mesh-broadcast loop is not exercised in CI — it would require either spawning `sum-node` + a libp2p mesh, or refactoring `run_apply_session_repair` to be generic over `SnipV2Adapter + ContributorRelay` so a `MockSnipStore` + `InMemoryRelay` can be injected. The underlying primitives (`snip::publish_bytes`, `OmniNetRelay::publish_work_assigned`, `NetworkWorkAssignedAnnouncement` signing) are exercised by Stage 12.2 / 12.3 integration tests. Adding mocked end-to-end apply tests is a future refactoring opportunity that would also benefit Stage 12.8 `assign-session-plan`.
+
+---
+
+# Stage 12.11 — signed assignment supersession
+
+**Status**: shipped at Stage 12.11. Builds on Stage 12.7 state-dir + Stage 12.9 status reporter + Stage 12.10 repair planner. Introduces a **coordinator-signed** envelope (`WorkAssignmentSupersession`) that marks a set of assignments as retired and names their replacements — strictly **replacement-only in v1**. No chain wire / `InferenceAttestationDigest` / Stage 7b tx / SUM Chain RPC change. No proof-mode evidence change. No payment, reward, staking, slashing, marketplace, auction, bid, pricing, reputation, exclusive-claim, or lease change. SNIP remains the sole content-addressed surface.
+
+## What changed
+
+1. **New off-chain envelope.** `WorkAssignmentSupersession { schema_version: 1, session_id, supersession_id, superseded_assignment_ids, replacement_assignment_ids, reason, created_at_utc, coordinator_pubkey_hex, coordinator_signature_hex }`. Closed `SupersessionReason` enum: `MissingPartial | InvalidPartial | OperatorRebalance | Custom { label }`. Both ID lists are sorted ascending, unique, disjoint; `replacement_assignment_ids` is **non-empty** in v1 (review-mandated; the "operator abandons stage" happy path requires a separate aggregate-cancellation envelope that does not exist in v1, and is out of scope here).
+2. **New gossipsub topic.** `omni/contributor/session/assignment-supersession/v1` carries the pointer-only `NetworkWorkAssignmentSupersessionAnnouncement`. Body bytes live in SNIP.
+3. **Aggregate verifier extension.** `verify_aggregated_result_with_supersessions(session, joins, assignments, partials, supersessions, aggregate)`: union of every supersession's `superseded_assignment_ids` is excluded from the partial-coverage requirement. Sequential chains (A → B then B → C) accumulate `{A, B}` to superseded, `{C}` to active. The classic Stage 12.10 `verify_aggregated_result(...)` is now `verify_aggregated_result_with_supersessions(..., &[])` — bit-for-bit unchanged on zero supersessions.
+4. **Stage 12.7 state-dir bump.** `STATE_VERSION = 2`. Adds `verified/sessions/<id>/supersessions/<supersession_id>.json` and `seen/assignment-supersessions/`. v1 stores are auto-migrated by extending the layout; existing artifacts are not rewritten.
+5. **Stage 12.9 status report bump.** `STATUS_SCHEMA_VERSION = 2`. Adds `active_assignment_count`, `superseded_assignment_count`, `supersession_count`, `supersessions: Vec<SupersessionStatus>`, and `AssignmentStatus { superseded, superseded_by_supersession_id }`. `missing_assignment_ids` is now **active-only** (superseded assignments missing partials no longer block aggregation, mirroring the aggregate verifier's posture). The status reporter loads supersessions BEFORE partials so that a tampered partial under an `InvalidPartial` supersession does not flip `overall_status` to `InvalidState` — the assignment is already retired.
+6. **Stage 12.10 repair planner bump.** `REPAIR_PLAN_SCHEMA_VERSION = 2`. Adds `RepairStrategy::ReassignMissing` and `RepairAction::ReassignAssignment { superseded_assignment_id, new_stage_index, new_contributor_pubkey_hex, new_work_kind, new_expected_work_units, new_expected_work_unit_kind, reason }`. The `ReannounceMissing` planner additionally **filters out** any active-missing assignment that is already named in a verified supersession (replacement-in-flight) — so `plan-session-repair` no longer racing-emits a reannounce while a reassignment is pending.
+
+## CLI surface
+
+Two new subcommands. Both live under `operator contributor`.
+
+```text
+plan-session-reassign
+    --contributor-state-dir <path>
+    --session-id <hex>
+    (--build-status | --status-report <path>)
+    [--reason <missing-partial | invalid-partial | operator-rebalance>]
+    [--coordinator-pubkey-hex <hex>]
+    [--include-expired]
+    [--no-prune-state-on-start]
+    --out <path>
+```
+
+Produces a `SessionRepairPlan` v2 with `strategy: ReassignMissing` and one `ReassignAssignment` action per active-missing assignment. Note: `--reason` only controls the reason copied into the planned supersession; `Custom { label }` is reachable only by hand-editing the JSON before apply (closed-enum, but operator-overridable).
+
+```text
+apply-session-reassign
+    --reassignment-plan <path>
+    --session-snip-root <hex>
+    --coordinator-seed <path>
+    --contributor-state-dir <path>
+    [--no-prune-state-on-start]
+    [--snip-binary <path>] [--snip-seed <path>]
+    [--listen-port <u16>] [--peer <multiaddr>...]
+    [--net-identity-file <path>]
+    [--propagation-wait-ms <u64>] [--peer-wait-secs <u64>] [--mesh-stabilize-ms <u64>]
+    [--no-publish-announcements]
+    [--dry-run]
+```
+
+Validates the plan (refuses any non-`ReassignMissing` strategy and any non-`ReassignAssignment` action, refuses `InvalidState` per **v1 spec — InvalidState is for human triage, not automatic reassignment**), recomputes `source_status_hash` against the live state-dir and refuses on drift, re-runs `check_repair_eligible`, fetches + verifies the session via the supplied SNIP root, pins the coordinator seed to `session.coordinator_pubkey_hex`, loads + filters verified joins + assignments from the state-dir, builds + signs each replacement `WorkAssignment`, builds + signs **one** `WorkAssignmentSupersession` covering every superseded + replacement ID, and:
+
+- on `--dry-run`: prints `event=would_reassign` per replacement plus `event=would_publish_supersession` and exits without writing.
+- otherwise: **Phase A** — SNIP-publishes every body up-front (replacements first, then supersession) WITHOUT any state-dir mutation or mesh broadcast. SNIP is content-addressed and republish is idempotent, so a transient failure here is safe to retry and `source_status_hash` is unchanged. **Phase B** — once every SNIP body is durably content-addressed, mutates the state-dir + broadcasts on the mesh in publish order (replacements first, then supersession). The supersession state-dir write closes the loop; sleeps `--propagation-wait-ms`, shuts down the mesh.
+
+Phase A / Phase B split was introduced in the Stage 12.11 review: prior to it, replacement assignments were dual-written to the state-dir immediately after each SNIP publish, BEFORE the supersession publish was even attempted. A failed supersession publish would leave extra active replacements in the state-dir without the retiring supersession — and a retry would then refuse on `source_status_hash` drift, forcing manual state cleanup. The two-phase ordering eliminates that window; the remaining window (one local FS op for the supersession state-dir write) is much narrower than the original SNIP round-trip window and matches the standard local-FS failure profile.
+
+Mesh ordering still respects the invariant that replacements must be observable before any peer sees the supersession naming them, so a watcher receiving the supersession announcement can already fetch every replacement assignment body it names.
+
+### Watcher integration
+
+`watch-sessions` polls the new topic and routes verified announcements to `<out-dir>/<session_id>/supersessions/<supersession_id>.json` + the Stage 12.7 state-dir mirror. When the in-memory session cache and the state-dir's verified-assignment slice are both available, the watcher upgrades the processor to the full `verify_assignment_supersession` reference-resolution leg. Otherwise the announcement is accepted on its own (announcer sig + body schema + body sig + drift); the aggregate verifier re-checks references at aggregate time.
+
+### Status report renderer
+
+`events` adds: top-line `active=`, `superseded=`, `supersessions=`; per-assignment `superseded=yes|no` + `superseded_by=<id|->`; new `event=supersession_status` lines. `pretty` mirrors with new column + a supersessions table. `json` exposes everything through serde (no renderer change required; the schema bump is wire-visible).
+
+## Out of scope (Stage 12.11)
+
+- **Abandonment / cancellation.** v1 is replacement-only. A future stage will introduce a separate signed envelope (aggregate-cancellation) so an operator can mark a stage retired without naming a replacement. The empty-replacement-list path returns `SchemaError::SupersessionEmptyReplacement` today.
+- **Work-kind-aware planner.** The Stage 12.10 reassignment planner copies the superseded assignment's `work_kind` and `expected_work_units` verbatim; live re-shaping (different stage range, different work-unit kind) is operator-policy and reachable by hand-editing the plan JSON. The planner intentionally does not encode shaping heuristics.
+- **InvalidState auto-recovery.** `apply-session-reassign` refuses `InvalidState` (the `check_repair_eligible` gate). Recovery from a tampered partial that has not yet been superseded is operator manual: build a supersession with `reason = InvalidPartial`, sign it offline, and feed the SNIP root into `apply-session-reassign` via a hand-built plan. The automation lives at Stage 12.12+.
+- **Chain wire / proof-mode evidence / payment / reward / staking / slashing / marketplace.** Unchanged. No `InferenceAttestationDigest` field touched. No A–F flow primitives reintroduced.
+
+## Test coverage map
+
+| What's covered | Where |
+|---|---|
+| Supersession body schema (incl. v1 empty-replacement refusal, disjointness) | `supersession_negatives.rs` |
+| `verify_assignment_supersession` rejection matrix (schema / session binding / coord binding / ID derivation / sig / reference resolution) | `supersession_negatives.rs` |
+| Aggregate verifier with supersessions (happy path, sequential chains, post-supersession-missing-partial) | `aggregate_supersession_integration.rs` |
+| Aggregate verifier without supersessions remains bit-for-bit unchanged | Stage 12.10 `aggregate_verifier_*` (re-run under 12.11) |
+| Status reporter v2 fields (active vs superseded counts, `superseded` flag) + tampered-partial-under-`InvalidPartial` not flipping `InvalidState` | `status_report.rs` (`tampered_partial_under_invalid_partial_supersession_is_not_invalid_state`) |
+| Repair planner v2 (`ReassignMissing` strategy, `ReassignAssignment` action, in-flight supersession filter on `ReannounceMissing`) | `repair_plan.rs` |
+| `process_assignment_supersession_announcement` (happy path with + without session context, drift on session_id, body-coord-pubkey drift under session) | `session_announcement_processing.rs` (`supersession_processor::*`) |
+| Watch-sessions handler dispatch + state-dir dual-write + seen-marker | `omni_net::topics::all_topics_includes_every_public_constant` (topic count bump) + manual `watch-sessions` smoke |
+| CLI flag matrix for `plan-session-reassign` + `apply-session-reassign` (mutual exclusion, `--reason` parse, `--no-publish-announcements`, `--dry-run`) | `session_reassign_flag_parse_smoke` (omni-node) |
+| `source_status_hash` v2 projection lift — supersession arriving between plan and apply trips drift | `source_status_hash_drifts_when_supersession_arrives_after_planning` |
+
+**Residual gap (deliberate):** the apply path's two-phase SNIP-republish + mesh-broadcast loop is not exercised in CI (same constraint as Stage 12.10's apply gap). The primitives are exercised by Stage 12.2 / 12.3 / 12.10 integration tests; the v1 invariants (replacement-only, single supersession covering all reassignments, publish ordering) are mechanically asserted by the verifier suite, the body schema, and the apply-time refusal arms.

@@ -64,15 +64,19 @@ use crate::session::{
     WorkAssignment, WorkKind,
 };
 use crate::session_verify::{
-    check_not_expired, verify_aggregated_result, verify_contributor_join,
-    verify_execution_session, verify_partial_result, verify_work_assignment,
-    SessionVerifyOutcome,
+    check_not_expired, verify_contributor_join, verify_execution_session,
+    verify_partial_result, verify_work_assignment, SessionVerifyOutcome,
 };
 use crate::state::{ContributorStateStore, StateObjectKind};
 
-/// Pinned v1. A future stage that needs e.g. a chain-anchor field
-/// bumps this and migrates.
-pub const STATUS_SCHEMA_VERSION: u32 = 1;
+/// Stage 12.11 bump: v1 → v2. v2 adds supersession-aware fields:
+/// `supersessions: Vec<SupersessionStatus>`, `superseded` /
+/// `superseded_by_supersession_id` on each `AssignmentStatus`,
+/// `active_assignment_count`, `superseded_assignment_count`. The
+/// `CompletePartials` decision now uses active assignments. Old
+/// Stage 12.9 / 12.10 readers refuse to parse v2 (deny_unknown_fields)
+/// and the schema_version mismatch surfaces clearly.
+pub const STATUS_SCHEMA_VERSION: u32 = 2;
 
 // ── SessionOverallStatus ────────────────────────────────────────
 
@@ -126,6 +130,29 @@ pub struct AssignmentStatus {
     pub partial_present: bool,
     pub partial_valid: bool,
     pub partial_snip_root: Option<String>,
+    /// Stage 12.11: true iff this assignment_id appears in some
+    /// verified supersession's `superseded_assignment_ids`.
+    pub superseded: bool,
+    /// Stage 12.11: when `superseded == true`, the supersession_id
+    /// of the verified supersession that supersedes this
+    /// assignment. (At most one — double-supersession is verifier-
+    /// level rejected.)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub superseded_by_supersession_id: Option<String>,
+    pub notes: Vec<String>,
+}
+
+/// Stage 12.11 — per-supersession status entry on the report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupersessionStatus {
+    pub supersession_id: String,
+    pub superseded_assignment_ids: Vec<String>,
+    pub replacement_assignment_ids: Vec<String>,
+    pub reason: crate::supersession::SupersessionReason,
+    /// `true` iff `verify_assignment_supersession` returned `Ok`
+    /// against the loaded session + assignments.
+    pub valid: bool,
     pub notes: Vec<String>,
 }
 
@@ -151,19 +178,29 @@ pub struct SessionStatusReport {
     pub peer_advert_count: u32,
     pub assignment_count: u32,
     pub partial_count: u32,
+    /// Stage 12.11 — Active = assignments NOT superseded by a
+    /// verified `WorkAssignmentSupersession`. Derived counts.
+    pub active_assignment_count: u32,
+    pub superseded_assignment_count: u32,
+    pub supersession_count: u32,
+    /// Stage 12.11 — `missing_assignment_ids` is **active-only**:
+    /// superseded assignments missing partials do NOT appear here
+    /// because the chain doesn't need their partials anymore.
     pub missing_assignment_ids: Vec<String>,
     /// State layout writes
     /// `verified/sessions/<id>/partials/<assignment_id>.json`, so
     /// a duplicate per assignment_id is filesystem-impossible.
-    /// Always empty in v1; retained for forward compatibility.
+    /// Always empty in v1+v2; retained for forward compatibility.
     pub duplicate_partial_assignment_ids: Vec<String>,
     pub aggregate_present: bool,
     pub aggregate_valid: bool,
     pub overall_status: SessionOverallStatus,
     pub assignments: Vec<AssignmentStatus>,
+    /// Stage 12.11 — verified supersessions for this session.
+    pub supersessions: Vec<SupersessionStatus>,
     /// Free-form per-artifact failure descriptions. Stable order:
     /// session → joins → assignments → partials → adverts →
-    /// aggregate. Renderers print these as
+    /// supersessions → aggregate. Renderers print these as
     /// `event=note context=... message=...` lines.
     pub notes: Vec<String>,
 }
@@ -267,7 +304,79 @@ pub fn build_session_status_report(
             .then_with(|| a.assignment_id.cmp(&b.assignment_id))
     });
 
-    // ── 4. Load + re-verify partials (matched by assignment) ───
+    // ── 4. Load + re-verify supersessions (Stage 12.11) ──────
+    //
+    // Stage 12.11 review fix (post-merge): supersessions MUST be
+    // loaded and validated BEFORE partials. The aggregate verifier
+    // skips partials whose assignment is superseded (the entire
+    // point of `SupersessionReason::InvalidPartial`); the status
+    // reporter has to match that posture or a coordinator-signed
+    // InvalidPartial supersession would still leave the session
+    // stuck at `InvalidState` because the tampered partial body
+    // failed `verify_partial_result` before the supersession
+    // told us it didn't need to be valid.
+    let raw_supersessions = store.list_verified_supersessions_for(session_id)?;
+    let mut supersession_statuses: Vec<SupersessionStatus> = Vec::new();
+    let mut verified_supersessions: Vec<crate::supersession::WorkAssignmentSupersession> =
+        Vec::new();
+    // Map: assignment_id → the supersession_id that supersedes it
+    // (for per-assignment status reporting).
+    let mut superseded_by: HashMap<String, String> = HashMap::new();
+    let mut seen_superseded: HashSet<String> = HashSet::new();
+    for s in raw_supersessions {
+        let outcome = crate::supersession_verify::verify_assignment_supersession(
+            &session,
+            &assignments,
+            &s,
+        );
+        let mut s_notes: Vec<String> = Vec::new();
+        let mut s_valid = false;
+        if outcome.is_ok() {
+            // Check cross-supersession duplicate-supersedes here
+            // too — the standalone verifier only checks one
+            // supersession at a time.
+            let mut any_duplicate = false;
+            for id in &s.superseded_assignment_ids {
+                if !seen_superseded.insert(id.clone()) {
+                    s_notes.push(format!(
+                        "double-supersession of assignment_id={id}"
+                    ));
+                    any_chain_invalid = true;
+                    any_duplicate = true;
+                }
+            }
+            if !any_duplicate {
+                s_valid = true;
+                for id in &s.superseded_assignment_ids {
+                    superseded_by.insert(id.clone(), s.supersession_id.clone());
+                }
+                verified_supersessions.push(s.clone());
+            }
+        } else {
+            s_notes.push(format!(
+                "supersession_id={} failed verify_assignment_supersession: {outcome:?}",
+                s.supersession_id
+            ));
+            any_chain_invalid = true;
+        }
+        supersession_statuses.push(SupersessionStatus {
+            supersession_id: s.supersession_id.clone(),
+            superseded_assignment_ids: s.superseded_assignment_ids.clone(),
+            replacement_assignment_ids: s.replacement_assignment_ids.clone(),
+            reason: s.reason.clone(),
+            valid: s_valid,
+            notes: s_notes,
+        });
+    }
+    let superseded_set: HashSet<String> = superseded_by.keys().cloned().collect();
+
+    // ── 4'. Load + re-verify partials (matched by assignment) ───
+    //
+    // Partials whose `assignment_id` is in `superseded_set` are
+    // SKIPPED — they're declared not-needed by a coordinator-signed
+    // supersession. A tampered bad partial body for such an
+    // assignment is exactly the `SupersessionReason::InvalidPartial`
+    // case; failing the verifier on it would defeat the supersession.
     let raw_partials = store.list_verified_partials_for(session_id)?;
     let mut valid_partials_by_assignment: HashMap<String, PartialContributorResult> =
         HashMap::new();
@@ -276,6 +385,10 @@ pub fn build_session_status_report(
         .map(|a| (a.assignment_id.clone(), a))
         .collect();
     for p in raw_partials {
+        if superseded_set.contains(&p.assignment_id) {
+            // Skipped — supersession says we don't need this one.
+            continue;
+        }
         let Some(asn) = assignments_by_id.get(&p.assignment_id) else {
             notes.push(format!(
                 "partial assignment_id={} has no matching verified assignment",
@@ -333,25 +446,26 @@ pub fn build_session_status_report(
         Some(agg) => {
             // The state-dir keeps every body the full-chain
             // verifier needs in-memory — no SNIP fetch required.
-            // We pass the VALID joins/assignments/partials we
-            // already verified individually so a single bad sub-
-            // artifact can't poison the full-chain check.
+            // Stage 12.11: we pass the verified supersessions
+            // through to the supersession-aware verifier.
             let partials_vec: Vec<PartialContributorResult> = valid_partials_by_assignment
                 .values()
                 .cloned()
                 .collect();
-            let outcome = verify_aggregated_result(
-                &session,
-                &joins,
-                &assignments,
-                &partials_vec,
-                agg,
-            );
+            let outcome =
+                crate::session_verify::verify_aggregated_result_with_supersessions(
+                    &session,
+                    &joins,
+                    &assignments,
+                    &verified_supersessions,
+                    &partials_vec,
+                    agg,
+                );
             if outcome.is_ok() {
                 (true, true)
             } else {
                 notes.push(format!(
-                    "aggregated.json failed verify_aggregated_result: {outcome:?}"
+                    "aggregated.json failed verify_aggregated_result_with_supersessions: {outcome:?}"
                 ));
                 any_chain_invalid = true;
                 (true, false)
@@ -373,8 +487,15 @@ pub fn build_session_status_report(
         let partial_valid = partial.is_some();
         let partial_snip_root = partial
             .map(|p| p.partial_artifact_snip_root.clone());
+        let superseded = superseded_set.contains(&a.assignment_id);
+        let superseded_by_supersession_id =
+            superseded_by.get(&a.assignment_id).cloned();
         let mut a_notes = Vec::new();
-        if !partial_present {
+        if superseded {
+            a_notes.push("superseded".to_string());
+        }
+        // Stage 12.11 — `missing_assignment_ids` is active-only.
+        if !partial_present && !superseded {
             a_notes.push("missing partial".to_string());
             missing_assignment_ids.push(a.assignment_id.clone());
         }
@@ -390,6 +511,8 @@ pub fn build_session_status_report(
             partial_present,
             partial_valid,
             partial_snip_root,
+            superseded,
+            superseded_by_supersession_id,
             notes: a_notes,
         });
     }
@@ -399,12 +522,15 @@ pub fn build_session_status_report(
         check_not_expired(now_utc, &session.expires_at_utc),
         SessionVerifyOutcome::ExpiredAtCheck { .. }
     );
+    let active_assignment_count =
+        (assignments.len() as u32).saturating_sub(superseded_set.len() as u32);
     let overall_status = decide_overall_status(
         any_chain_invalid,
         aggregate_present,
         aggregate_valid,
         session_expired,
         &assignments,
+        &superseded_set,
         &valid_partials_by_assignment,
     );
 
@@ -420,12 +546,16 @@ pub fn build_session_status_report(
         peer_advert_count: peer_adverts.len() as u32,
         assignment_count: assignments.len() as u32,
         partial_count: valid_partials_by_assignment.len() as u32,
+        active_assignment_count,
+        superseded_assignment_count: superseded_set.len() as u32,
+        supersession_count: supersession_statuses.len() as u32,
         missing_assignment_ids,
         duplicate_partial_assignment_ids: Vec::new(),
         aggregate_present,
         aggregate_valid,
         overall_status,
         assignments: assignment_statuses,
+        supersessions: supersession_statuses,
         notes,
     })
 }
@@ -438,10 +568,14 @@ fn decide_overall_status(
     aggregate_valid: bool,
     session_expired: bool,
     assignments: &[WorkAssignment],
+    superseded_set: &HashSet<String>,
     valid_partials_by_assignment: &HashMap<String, PartialContributorResult>,
 ) -> SessionOverallStatus {
     // The priority order is documented at module level + Stage
-    // 12.9 doc. Each branch is a documented condition.
+    // 12.9 doc. Stage 12.11 update: `CompletePartials` is computed
+    // over ACTIVE assignments (`assignments - superseded`) rather
+    // than all assignments. `NoAssignments` likewise requires zero
+    // ACTIVE assignments.
     if any_chain_invalid {
         return SessionOverallStatus::InvalidState;
     }
@@ -451,10 +585,14 @@ fn decide_overall_status(
     if session_expired && !aggregate_valid {
         return SessionOverallStatus::ExpiredIncomplete;
     }
-    if assignments.is_empty() {
+    let active: Vec<&WorkAssignment> = assignments
+        .iter()
+        .filter(|a| !superseded_set.contains(&a.assignment_id))
+        .collect();
+    if active.is_empty() {
         return SessionOverallStatus::NoAssignments;
     }
-    let all_have_partials = assignments
+    let all_have_partials = active
         .iter()
         .all(|a| valid_partials_by_assignment.contains_key(&a.assignment_id));
     if all_have_partials {
@@ -476,12 +614,16 @@ fn empty_no_session_report(session_id: &str, now_utc: &str) -> SessionStatusRepo
         peer_advert_count: 0,
         assignment_count: 0,
         partial_count: 0,
+        active_assignment_count: 0,
+        superseded_assignment_count: 0,
+        supersession_count: 0,
         missing_assignment_ids: Vec::new(),
         duplicate_partial_assignment_ids: Vec::new(),
         aggregate_present: false,
         aggregate_valid: false,
         overall_status: SessionOverallStatus::NoSession,
         assignments: Vec::new(),
+        supersessions: Vec::new(),
         notes: Vec::new(),
     }
 }
