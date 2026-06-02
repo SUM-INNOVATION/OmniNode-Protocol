@@ -112,6 +112,79 @@ impl SessionVerifyOutcome {
     pub fn is_ok(&self) -> bool {
         matches!(self, SessionVerifyOutcome::Ok)
     }
+
+    /// Stage 12.12 — stable, machine-readable label naming the
+    /// verifier-outcome variant. Used by the Stage 12.9 status
+    /// reporter v3 to populate
+    /// `InvalidArtifactStatus::*.reason_tag` so automation can
+    /// decide whether an `InvalidState` is triagable (e.g. an
+    /// `InvalidPartial` with `reason_tag = "ContributorSignatureFailed"`
+    /// is reassignable; an `InvalidJoin` with `reason_tag =
+    /// "ContributorSignatureFailed"` is NOT).
+    ///
+    /// Tags are part of the local `SessionStatusReport` v3 contract:
+    /// they may be added (alongside new variants) but the existing
+    /// tag → variant mapping is frozen. **Never derive from
+    /// `format!("{self:?}")`** — `Debug` is not a stability surface
+    /// and the tags must not silently drift if a variant is renamed.
+    pub fn reason_tag(&self) -> &'static str {
+        match self {
+            SessionVerifyOutcome::Ok => "Ok",
+            SessionVerifyOutcome::SchemaMalformed(_) => "SchemaMalformed",
+            SessionVerifyOutcome::SessionIdMismatch { .. } => "SessionIdMismatch",
+            SessionVerifyOutcome::AssignmentIdMismatch { .. } => {
+                "AssignmentIdMismatch"
+            }
+            SessionVerifyOutcome::CoordinatorSignatureFailed => {
+                "CoordinatorSignatureFailed"
+            }
+            SessionVerifyOutcome::ContributorSignatureFailed => {
+                "ContributorSignatureFailed"
+            }
+            SessionVerifyOutcome::BindingMismatch { .. } => "BindingMismatch",
+            SessionVerifyOutcome::ExpiredAtCheck { .. } => "ExpiredAtCheck",
+            SessionVerifyOutcome::AggregateMissingPartialFor { .. } => {
+                "AggregateMissingPartialFor"
+            }
+            SessionVerifyOutcome::AggregateExtraPartialFor { .. } => {
+                "AggregateExtraPartialFor"
+            }
+            SessionVerifyOutcome::AggregateDuplicatePartialFor { .. } => {
+                "AggregateDuplicatePartialFor"
+            }
+            SessionVerifyOutcome::AggregatePartialRefDrift { .. } => {
+                "AggregatePartialRefDrift"
+            }
+            SessionVerifyOutcome::AggregateCoordinatorMismatch => {
+                "AggregateCoordinatorMismatch"
+            }
+            SessionVerifyOutcome::InternalError(_) => "InternalError",
+            SessionVerifyOutcome::SupersessionSchemaMalformed(_) => {
+                "SupersessionSchemaMalformed"
+            }
+            SessionVerifyOutcome::SupersessionSessionMismatch => {
+                "SupersessionSessionMismatch"
+            }
+            SessionVerifyOutcome::SupersessionCoordinatorMismatch => {
+                "SupersessionCoordinatorMismatch"
+            }
+            SessionVerifyOutcome::SupersessionIdMismatch { .. } => {
+                "SupersessionIdMismatch"
+            }
+            SessionVerifyOutcome::SupersessionCoordinatorSignatureFailed => {
+                "SupersessionCoordinatorSignatureFailed"
+            }
+            SessionVerifyOutcome::SupersessionReferenceUnknown { .. } => {
+                "SupersessionReferenceUnknown"
+            }
+            SessionVerifyOutcome::SupersessionDuplicateSupersedes { .. } => {
+                "SupersessionDuplicateSupersedes"
+            }
+            SessionVerifyOutcome::AggregatePartialRefSuperseded { .. } => {
+                "AggregatePartialRefSuperseded"
+            }
+        }
+    }
 }
 
 /// Verify an `ExecutionSession` standalone: schema OK, `session_id`

@@ -492,6 +492,31 @@ pub enum RepairError {
         assignment_id: String,
     },
 
+    /// Stage 12.12 apply-time refusal — `InvalidState` is not
+    /// triagable via the `--reason invalid-partial` reassign path
+    /// because of an additional non-`InvalidPartial` chain failure
+    /// (e.g. invalid join, invalid assignment, invalid aggregate,
+    /// invalid session, invalid supersession), OR because an
+    /// `InvalidPartial` entry exists for an assignment NOT in the
+    /// reassignment plan's superseded set.
+    ///
+    /// `kind` is one of: `"invalid_session"`, `"invalid_join"`,
+    /// `"invalid_assignment"`, `"invalid_aggregate"`,
+    /// `"invalid_supersession"`, `"invalid_partial_not_in_plan"`.
+    /// `context` carries the relevant id (`assignment_id=...`,
+    /// `contributor_pubkey_hex=...`, `supersession_id=...`) or is
+    /// empty for `invalid_session` / `invalid_aggregate`. Both
+    /// fields are stable across `schema_version: 3` for
+    /// scripting.
+    #[error("InvalidState not triagable via reassign: kind={kind}{context}")]
+    InvalidStateNotTriagable {
+        kind: &'static str,
+        /// Optional id context. When non-empty, MUST start with a
+        /// leading space (e.g. `" assignment_id=ff..."`) so the
+        /// `Display` impl renders cleanly.
+        context: String,
+    },
+
     /// Stage 12.11 apply-time enforcement. A `ReassignAssignment`
     /// action targeted an assignment that, in the current rebuilt
     /// status, is NOT active-missing: it is either already

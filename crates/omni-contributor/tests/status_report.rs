@@ -24,8 +24,9 @@ use omni_contributor::{
         WorkAssignment, WorkKind,
     },
     ContributorJoin, ContributorPeerAdvertisement, ContributorSigner,
-    ContributorStateStore, CoordinatorSigner, ExecutionSession, PeerCapabilities,
-    SessionOverallStatus, SessionStatusReport, StateNamespace, StateObjectKind,
+    ContributorStateStore, CoordinatorSigner, ExecutionSession,
+    InvalidArtifactStatus, PeerCapabilities, SessionOverallStatus,
+    SessionStatusReport, StateNamespace, StateObjectKind,
     PEER_ADVERTISEMENT_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
     STATUS_SCHEMA_VERSION,
 };
@@ -1037,4 +1038,354 @@ fn tampered_partial_under_invalid_partial_supersession_is_not_invalid_state() {
     // Supersession is in the report and valid.
     assert_eq!(report.supersession_count, 1);
     assert!(report.supersessions[0].valid);
+}
+
+// ── Stage 12.12 — structured `invalid_artifacts` diagnostics ─────
+//
+// The reporter must publish a typed entry for every chain-link
+// failure so automation can decide whether an `InvalidState` is
+// triagable via `--reason invalid-partial`. The `notes` free-form
+// strings stay populated alongside — dashboards keep working —
+// but automation reads `invalid_artifacts` only. Each test pins
+// the variant + the stable `reason_tag` so a verifier-side rename
+// trips immediately.
+
+#[test]
+fn invalid_artifacts_emit_invalid_partial_for_tampered_partial() {
+    let (_d, store) = fresh_store();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let contrib_a = ContributorSigner::from_seed_bytes(&CONTRIB_A_SEED).unwrap();
+    let contrib_b = ContributorSigner::from_seed_bytes(&CONTRIB_B_SEED).unwrap();
+    let session = signed_session(&coord, FAR_FUTURE);
+    let join_a = signed_join(&session, &contrib_a);
+    let asn_0 = signed_assignment(
+        &session,
+        &coord,
+        &contrib_a.pubkey_hex(),
+        0,
+        WorkKind::Layers { start: 0, end: 8 },
+        8,
+    );
+    // Forge the partial by signing with the WRONG contributor.
+    let bad_partial = signed_partial(&asn_0, &contrib_b, "stage0-forged");
+    write_session_chain(
+        &store,
+        &session,
+        &[join_a],
+        &[asn_0.clone()],
+        &[bad_partial],
+        None,
+        &[],
+    );
+    let report =
+        build_session_status_report(&store, &session.session_id, NOW_UTC, false).unwrap();
+    assert_eq!(report.overall_status, SessionOverallStatus::InvalidState);
+    let entry = report
+        .invalid_artifacts
+        .iter()
+        .find(|e| matches!(e, InvalidArtifactStatus::InvalidPartial { .. }))
+        .expect("expected at least one InvalidPartial entry");
+    match entry {
+        InvalidArtifactStatus::InvalidPartial {
+            assignment_id,
+            reason_tag,
+        } => {
+            assert_eq!(assignment_id, &asn_0.assignment_id);
+            // The signed_partial fixture sets the partial's
+            // contributor_pubkey_hex to the signer (contrib_b),
+            // which does NOT match the assignment's
+            // contributor_pubkey_hex (contrib_a) —
+            // `verify_partial_result` rejects on the binding
+            // leg before reaching the signature leg.
+            assert_eq!(reason_tag, "BindingMismatch");
+        }
+        other => panic!("expected InvalidPartial, got {other:?}"),
+    }
+    // notes still populated alongside.
+    assert!(!report.notes.is_empty());
+    // Invariant holds.
+    assert!(!report.invalid_artifacts.is_empty());
+}
+
+#[test]
+fn invalid_artifacts_emit_invalid_join_for_forged_join() {
+    let (_d, store) = fresh_store();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let contrib_a = ContributorSigner::from_seed_bytes(&CONTRIB_A_SEED).unwrap();
+    let contrib_b = ContributorSigner::from_seed_bytes(&CONTRIB_B_SEED).unwrap();
+    let session = signed_session(&coord, FAR_FUTURE);
+    // Sign the join with the WRONG contributor key; its
+    // `contributor_pubkey_hex` advertises contrib_a but the
+    // signature is from contrib_b. `verify_contributor_join` fails.
+    let mut forged_join = signed_join(&session, &contrib_a);
+    let si = contributor_join_signing_input(&forged_join).unwrap();
+    forged_join.contributor_signature_hex = contrib_b.sign_hex(&si);
+    write_session_chain(
+        &store,
+        &session,
+        &[forged_join.clone()],
+        &[],
+        &[],
+        None,
+        &[],
+    );
+    let report =
+        build_session_status_report(&store, &session.session_id, NOW_UTC, false).unwrap();
+    assert_eq!(report.overall_status, SessionOverallStatus::InvalidState);
+    let entry = report
+        .invalid_artifacts
+        .iter()
+        .find(|e| matches!(e, InvalidArtifactStatus::InvalidJoin { .. }))
+        .expect("expected an InvalidJoin entry");
+    match entry {
+        InvalidArtifactStatus::InvalidJoin {
+            contributor_pubkey_hex,
+            reason_tag,
+        } => {
+            assert_eq!(contributor_pubkey_hex, &contrib_a.pubkey_hex());
+            assert_eq!(reason_tag, "ContributorSignatureFailed");
+        }
+        other => panic!("expected InvalidJoin, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_artifacts_emit_invalid_assignment_for_tampered_assignment() {
+    let (_d, store) = fresh_store();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let wrong_coord = CoordinatorSigner::from_seed_bytes(&COORD_WRONG_SEED).unwrap();
+    let contrib_a = ContributorSigner::from_seed_bytes(&CONTRIB_A_SEED).unwrap();
+    let session = signed_session(&coord, FAR_FUTURE);
+    let join_a = signed_join(&session, &contrib_a);
+    // Assignment signed by the WRONG coordinator key — session's
+    // coordinator_pubkey_hex is the real coord, so
+    // verify_work_assignment fails on the coord-signature leg.
+    let bad_assignment = signed_assignment(
+        &session,
+        &wrong_coord,
+        &contrib_a.pubkey_hex(),
+        0,
+        WorkKind::Layers { start: 0, end: 8 },
+        8,
+    );
+    write_session_chain(
+        &store,
+        &session,
+        &[join_a],
+        &[bad_assignment.clone()],
+        &[],
+        None,
+        &[],
+    );
+    let report =
+        build_session_status_report(&store, &session.session_id, NOW_UTC, false).unwrap();
+    assert_eq!(report.overall_status, SessionOverallStatus::InvalidState);
+    let entry = report
+        .invalid_artifacts
+        .iter()
+        .find(|e| matches!(e, InvalidArtifactStatus::InvalidAssignment { .. }))
+        .expect("expected an InvalidAssignment entry");
+    match entry {
+        InvalidArtifactStatus::InvalidAssignment {
+            assignment_id,
+            reason_tag,
+        } => {
+            assert_eq!(assignment_id, &bad_assignment.assignment_id);
+            assert_eq!(reason_tag, "CoordinatorSignatureFailed");
+        }
+        other => panic!("expected InvalidAssignment, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_artifacts_emit_invalid_aggregate_for_aggregate_signed_by_wrong_coord() {
+    let (_d, store) = fresh_store();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let wrong_coord = CoordinatorSigner::from_seed_bytes(&COORD_WRONG_SEED).unwrap();
+    let contrib_a = ContributorSigner::from_seed_bytes(&CONTRIB_A_SEED).unwrap();
+    let session = signed_session(&coord, FAR_FUTURE);
+    let join_a = signed_join(&session, &contrib_a);
+    let asn_0 = signed_assignment(
+        &session,
+        &coord,
+        &contrib_a.pubkey_hex(),
+        0,
+        WorkKind::Layers { start: 0, end: 8 },
+        8,
+    );
+    let p_0 = signed_partial(&asn_0, &contrib_a, "stage0");
+    // Build a valid aggregate then resign with the wrong coord
+    // (so coordinator_pubkey_hex still advertises the real coord
+    // but the signature is from the wrong one).
+    let mut bad_agg = signed_aggregate(&session, &[asn_0.clone()], &[p_0.clone()], &coord);
+    let si = aggregated_result_signing_input(&bad_agg).unwrap();
+    bad_agg.coordinator_signature_hex = wrong_coord.sign_hex(&si);
+    write_session_chain(
+        &store,
+        &session,
+        &[join_a],
+        &[asn_0],
+        &[p_0],
+        Some(&bad_agg),
+        &[],
+    );
+    let report =
+        build_session_status_report(&store, &session.session_id, NOW_UTC, false).unwrap();
+    assert_eq!(report.overall_status, SessionOverallStatus::InvalidState);
+    let entry = report
+        .invalid_artifacts
+        .iter()
+        .find(|e| matches!(e, InvalidArtifactStatus::InvalidAggregate { .. }))
+        .expect("expected an InvalidAggregate entry");
+    if let InvalidArtifactStatus::InvalidAggregate { reason_tag } = entry {
+        // `verify_aggregated_result_with_supersessions` returns
+        // `CoordinatorSignatureFailed` for a bad agg sig.
+        assert_eq!(reason_tag, "CoordinatorSignatureFailed");
+    } else {
+        panic!("expected InvalidAggregate");
+    }
+}
+
+#[test]
+fn invalid_artifacts_emit_invalid_session_returned_early() {
+    let (_d, store) = fresh_store();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let wrong_coord = CoordinatorSigner::from_seed_bytes(&COORD_WRONG_SEED).unwrap();
+    // Build a session with the coord pubkey but resign with the
+    // wrong key — verify_execution_session fails on the
+    // coord-signature leg and the reporter returns early with an
+    // InvalidSession diagnostic.
+    let mut bad_session = signed_session(&coord, FAR_FUTURE);
+    let si = execution_session_signing_input(&bad_session).unwrap();
+    bad_session.coordinator_signature_hex = wrong_coord.sign_hex(&si);
+    // Insert directly so the reporter's read picks it up.
+    store
+        .write_verified_json(
+            StateObjectKind::Session,
+            &bad_session.session_id,
+            &bad_session,
+        )
+        .unwrap();
+    let report =
+        build_session_status_report(&store, &bad_session.session_id, NOW_UTC, false)
+            .unwrap();
+    assert_eq!(report.overall_status, SessionOverallStatus::InvalidState);
+    // Early-return path: invalid_artifacts holds exactly one entry,
+    // the InvalidSession. Joins / assignments / etc. are NOT
+    // populated because we have no anchored session.
+    assert_eq!(report.invalid_artifacts.len(), 1);
+    match &report.invalid_artifacts[0] {
+        InvalidArtifactStatus::InvalidSession { reason_tag } => {
+            assert_eq!(reason_tag, "CoordinatorSignatureFailed");
+        }
+        other => panic!("expected InvalidSession, got {other:?}"),
+    }
+    assert!(report.assignments.is_empty());
+    assert!(report.supersessions.is_empty());
+}
+
+#[test]
+fn invalid_artifacts_emit_invalid_partial_unmatched_for_orphan_partial() {
+    let (_d, store) = fresh_store();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let contrib_a = ContributorSigner::from_seed_bytes(&CONTRIB_A_SEED).unwrap();
+    let session = signed_session(&coord, FAR_FUTURE);
+    let join_a = signed_join(&session, &contrib_a);
+    // Build an assignment but do NOT write it. Build a partial
+    // for it and write the partial — the reporter then sees a
+    // partial with no matching verified assignment.
+    let orphan_asn = signed_assignment(
+        &session,
+        &coord,
+        &contrib_a.pubkey_hex(),
+        0,
+        WorkKind::Layers { start: 0, end: 8 },
+        8,
+    );
+    let orphan_partial = signed_partial(&orphan_asn, &contrib_a, "stage0");
+    write_session_chain(
+        &store,
+        &session,
+        &[join_a],
+        /* assignments = */ &[],
+        &[orphan_partial],
+        None,
+        &[],
+    );
+    let report =
+        build_session_status_report(&store, &session.session_id, NOW_UTC, false).unwrap();
+    assert_eq!(report.overall_status, SessionOverallStatus::InvalidState);
+    let entry = report
+        .invalid_artifacts
+        .iter()
+        .find(|e| matches!(e, InvalidArtifactStatus::InvalidPartial { .. }))
+        .expect("expected an InvalidPartial entry for the orphan");
+    match entry {
+        InvalidArtifactStatus::InvalidPartial {
+            assignment_id,
+            reason_tag,
+        } => {
+            assert_eq!(assignment_id, &orphan_asn.assignment_id);
+            // Approved plan: orphan partials use the uniform
+            // InvalidPartial variant with the stable
+            // "unmatched" tag (NOT a separate OrphanPartial).
+            assert_eq!(reason_tag, "unmatched");
+        }
+        other => panic!("expected InvalidPartial, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_artifacts_is_empty_when_overall_status_is_not_invalid_state() {
+    // Stage 12.12 reporter invariant: the structured diagnostics
+    // are populated <==> overall_status == InvalidState. The
+    // existing complete-partials test gives us a happy-path
+    // status; just re-run it and assert the new field stays
+    // empty.
+    let (_d, store) = fresh_store();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let contrib_a = ContributorSigner::from_seed_bytes(&CONTRIB_A_SEED).unwrap();
+    let contrib_b = ContributorSigner::from_seed_bytes(&CONTRIB_B_SEED).unwrap();
+    let session = signed_session(&coord, FAR_FUTURE);
+    let join_a = signed_join(&session, &contrib_a);
+    let join_b = signed_join(&session, &contrib_b);
+    let asn_0 = signed_assignment(
+        &session,
+        &coord,
+        &contrib_a.pubkey_hex(),
+        0,
+        WorkKind::Layers { start: 0, end: 8 },
+        8,
+    );
+    let asn_1 = signed_assignment(
+        &session,
+        &coord,
+        &contrib_b.pubkey_hex(),
+        1,
+        WorkKind::Layers { start: 8, end: 16 },
+        8,
+    );
+    let p_0 = signed_partial(&asn_0, &contrib_a, "stage0");
+    let p_1 = signed_partial(&asn_1, &contrib_b, "stage1");
+    write_session_chain(
+        &store,
+        &session,
+        &[join_a, join_b],
+        &[asn_0, asn_1],
+        &[p_0, p_1],
+        None,
+        &[],
+    );
+    let report =
+        build_session_status_report(&store, &session.session_id, NOW_UTC, false).unwrap();
+    assert_eq!(
+        report.overall_status,
+        SessionOverallStatus::CompletePartials
+    );
+    assert!(
+        report.invalid_artifacts.is_empty(),
+        "Stage 12.12 invariant: invalid_artifacts must be empty when \
+         overall_status != InvalidState; got {:?}",
+        report.invalid_artifacts
+    );
 }

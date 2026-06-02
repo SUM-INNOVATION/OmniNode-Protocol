@@ -6531,6 +6531,71 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
             s.valid,
         );
     }
+    // Stage 12.12 — surface structured chain-failure diagnostics
+    // so operators see the kind + reason_tag at a glance and so
+    // automation can scrape `event=invalid_artifact` lines.
+    // Mirrors the JSON `invalid_artifacts` field.
+    for entry in &report.invalid_artifacts {
+        match entry {
+            omni_contributor::InvalidArtifactStatus::InvalidSession { reason_tag } => {
+                println!(
+                    "event=invalid_artifact session_id={} kind=invalid_session \
+                     reason_tag={reason_tag}",
+                    report.session_id,
+                );
+            }
+            omni_contributor::InvalidArtifactStatus::InvalidJoin {
+                contributor_pubkey_hex,
+                reason_tag,
+            } => {
+                println!(
+                    "event=invalid_artifact session_id={} kind=invalid_join \
+                     contributor_pubkey_hex={contributor_pubkey_hex} \
+                     reason_tag={reason_tag}",
+                    report.session_id,
+                );
+            }
+            omni_contributor::InvalidArtifactStatus::InvalidAssignment {
+                assignment_id,
+                reason_tag,
+            } => {
+                println!(
+                    "event=invalid_artifact session_id={} kind=invalid_assignment \
+                     assignment_id={assignment_id} reason_tag={reason_tag}",
+                    report.session_id,
+                );
+            }
+            omni_contributor::InvalidArtifactStatus::InvalidPartial {
+                assignment_id,
+                reason_tag,
+            } => {
+                println!(
+                    "event=invalid_artifact session_id={} kind=invalid_partial \
+                     assignment_id={assignment_id} reason_tag={reason_tag}",
+                    report.session_id,
+                );
+            }
+            omni_contributor::InvalidArtifactStatus::InvalidSupersession {
+                supersession_id,
+                reason_tag,
+            } => {
+                println!(
+                    "event=invalid_artifact session_id={} kind=invalid_supersession \
+                     supersession_id={supersession_id} reason_tag={reason_tag}",
+                    report.session_id,
+                );
+            }
+            omni_contributor::InvalidArtifactStatus::InvalidAggregate {
+                reason_tag,
+            } => {
+                println!(
+                    "event=invalid_artifact session_id={} kind=invalid_aggregate \
+                     reason_tag={reason_tag}",
+                    report.session_id,
+                );
+            }
+        }
+    }
     for missing in &report.missing_assignment_ids {
         // Find the corresponding assignment for stage_index and
         // contributor context. Linear scan is fine — assignment
@@ -6621,6 +6686,67 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
                 format!("{:?}", s.reason),
                 short_id,
             );
+        }
+    }
+    // Stage 12.12 — Invalid-artifact diagnostics section. The
+    // events renderer emits one `event=invalid_artifact` line per
+    // entry; pretty groups them under a header so an operator
+    // can see the chain-failure shape at a glance and decide
+    // whether the InvalidState is triagable.
+    if !report.invalid_artifacts.is_empty() {
+        println!("Invalid artifacts:");
+        println!(
+            "  {:<22} {:<32} {}",
+            "kind", "reason_tag", "id"
+        );
+        for entry in &report.invalid_artifacts {
+            let (kind, id, reason_tag) = match entry {
+                omni_contributor::InvalidArtifactStatus::InvalidSession { reason_tag } => (
+                    "invalid_session",
+                    String::from("-"),
+                    reason_tag.as_str(),
+                ),
+                omni_contributor::InvalidArtifactStatus::InvalidJoin {
+                    contributor_pubkey_hex,
+                    reason_tag,
+                } => (
+                    "invalid_join",
+                    contributor_pubkey_hex.chars().take(12).collect::<String>(),
+                    reason_tag.as_str(),
+                ),
+                omni_contributor::InvalidArtifactStatus::InvalidAssignment {
+                    assignment_id,
+                    reason_tag,
+                } => (
+                    "invalid_assignment",
+                    assignment_id.chars().take(12).collect::<String>(),
+                    reason_tag.as_str(),
+                ),
+                omni_contributor::InvalidArtifactStatus::InvalidPartial {
+                    assignment_id,
+                    reason_tag,
+                } => (
+                    "invalid_partial",
+                    assignment_id.chars().take(12).collect::<String>(),
+                    reason_tag.as_str(),
+                ),
+                omni_contributor::InvalidArtifactStatus::InvalidSupersession {
+                    supersession_id,
+                    reason_tag,
+                } => (
+                    "invalid_supersession",
+                    supersession_id.chars().take(12).collect::<String>(),
+                    reason_tag.as_str(),
+                ),
+                omni_contributor::InvalidArtifactStatus::InvalidAggregate {
+                    reason_tag,
+                } => (
+                    "invalid_aggregate",
+                    String::from("-"),
+                    reason_tag.as_str(),
+                ),
+            };
+            println!("  {:<22} {:<32} {}", kind, reason_tag, id);
         }
     }
     if !report.missing_assignment_ids.is_empty() {
@@ -7155,6 +7281,35 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
         }
     }
 
+    // Stage 12.12 — mixed-reason defense. The planner emits a
+    // uniform `SupersessionReason` across every action in one
+    // plan, but the plan is unsigned/local so an operator could
+    // hand-edit it. The apply path's eligibility check dispatches
+    // on the plan's reason (only `InvalidPartial` takes the
+    // relaxed `InvalidState`-accepting branch); a mixed-reason
+    // plan would either smuggle one reason's relaxed eligibility
+    // onto another reason's actions or silently apply under the
+    // wrong gate. Refuse before any eligibility / drift / SNIP /
+    // mesh / state-dir work.
+    let plan_reason =
+        match &plan.actions[0] {
+            RepairAction::ReassignAssignment { reason, .. } => reason.clone(),
+            _ => unreachable!("validated above"),
+        };
+    for action in &plan.actions[1..] {
+        if let RepairAction::ReassignAssignment { reason, .. } = action {
+            if reason != &plan_reason {
+                return Err(anyhow!(
+                    "apply-session-reassign refuses mixed-reason plan: \
+                     plan.actions[0].reason={:?} but a later action has \
+                     reason={:?}",
+                    plan_reason,
+                    reason,
+                ));
+            }
+        }
+    }
+
     let now_utc =
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -7184,11 +7339,36 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
     if current_projection != plan.source_status_hash {
         return Err(anyhow!(omni_contributor::RepairError::SourceStatusDrift));
     }
-    // Stage 12.11 — apply-session-reassign refuses InvalidState in
-    // v1 (the operator must clean tampered artifacts first). Same
-    // posture as Stage 12.10's apply-session-repair.
-    omni_contributor::check_repair_eligible(&current_status)
+    // Stage 12.12 — eligibility dispatch.
+    //
+    //   reason == InvalidPartial → relaxed gate that accepts
+    //     `InvalidState` ONLY when every `invalid_artifacts`
+    //     entry is an `InvalidPartial` whose `assignment_id` is
+    //     in the plan's superseded set. Every other invalid-kind
+    //     (InvalidSession / InvalidJoin / InvalidAssignment /
+    //     InvalidSupersession / InvalidAggregate) refuses; every
+    //     non-`InvalidState` overall status defers to
+    //     `check_repair_eligible`.
+    //
+    //   reason == MissingPartial / OperatorRebalance / Custom →
+    //     standard gate (refuses `InvalidState` outright), same
+    //     posture as Stage 12.11's original apply path. This
+    //     preserves the contract that triage is bounded by the
+    //     coordinator-supplied reason: an operator cannot bypass
+    //     `InvalidState` via `MissingPartial` semantics.
+    if matches!(
+        plan_reason,
+        omni_contributor::SupersessionReason::InvalidPartial
+    ) {
+        omni_contributor::check_reassign_eligible_allowing_invalid_partials(
+            &current_status,
+            &plan,
+        )
         .map_err(|e| anyhow!("apply rejected by current status: {e}"))?;
+    } else {
+        omni_contributor::check_repair_eligible(&current_status)
+            .map_err(|e| anyhow!("apply rejected by current status: {e}"))?;
+    }
 
     // ── 3. Fetch + verify session, check coordinator seed ──────
     let snip = build_snip_adapter(args.snip_binary, args.snip_seed);

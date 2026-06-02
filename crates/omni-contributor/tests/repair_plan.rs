@@ -72,6 +72,7 @@ fn empty_report(
         overall_status: overall,
         assignments: Vec::new(),
         supersessions: Vec::new(),
+        invalid_artifacts: Vec::new(),
         notes: Vec::new(),
     }
 }
@@ -105,6 +106,7 @@ fn in_progress_with(assignments: Vec<AssignmentStatus>) -> SessionStatusReport {
         overall_status: SessionOverallStatus::InProgress,
         assignments,
         supersessions: Vec::new(),
+        invalid_artifacts: Vec::new(),
         notes: Vec::new(),
     }
 }
@@ -1148,4 +1150,253 @@ fn aggregate_verifier_rejects_extra_assignment_without_partial() {
         matched,
         "extra assignment without partial must be rejected; got {outcome:?}"
     );
+}
+
+// ── Stage 12.12 — `--reason invalid-partial` planner branch ─────
+//
+// The planner's action set for `MissingPartial` /
+// `OperatorRebalance` is `partial_present == false && !superseded`.
+// For `InvalidPartial` + `ReassignMissing` the action set is
+// "every ACTIVE assignment named in `status.invalid_artifacts` as
+// `InvalidPartial`". These tests pin the action selection: only
+// the planned assignments are emitted, and the regular
+// missing-partial set is NOT — they're orthogonal.
+
+#[test]
+fn invalid_partial_plan_targets_only_assignments_with_invalid_partials() {
+    use omni_contributor::{
+        supersession::SupersessionReason, InvalidArtifactStatus,
+    };
+
+    // Build a synthetic InvalidState status: assignment A has an
+    // InvalidPartial diagnostic; assignment B is just plain
+    // missing (no diagnostic). The planner must select ONLY A.
+    let asn_a_id = "aa".repeat(32);
+    let asn_b_id = "bb".repeat(32);
+    let asn_a = assignment_status(&asn_a_id, 0, &"01".repeat(32), false);
+    let asn_b = assignment_status(&asn_b_id, 1, &"02".repeat(32), false);
+    let mut status = in_progress_with(vec![asn_a, asn_b]);
+    status.overall_status = SessionOverallStatus::InvalidState;
+    status.invalid_artifacts = vec![InvalidArtifactStatus::InvalidPartial {
+        assignment_id: asn_a_id.clone(),
+        reason_tag: "ContributorSignatureFailed".into(),
+    }];
+
+    let plan = omni_contributor::build_session_repair_plan_with_reason(
+        &status,
+        RepairStrategy::ReassignMissing,
+        SupersessionReason::InvalidPartial,
+        NOW_UTC,
+        None,
+    )
+    .expect("InvalidPartial path accepts InvalidState when only InvalidPartial entries");
+
+    // Exactly one action, targeting A.
+    assert_eq!(plan.actions.len(), 1);
+    match &plan.actions[0] {
+        RepairAction::ReassignAssignment {
+            superseded_assignment_id,
+            reason,
+            ..
+        } => {
+            assert_eq!(superseded_assignment_id, &asn_a_id);
+            assert!(matches!(reason, SupersessionReason::InvalidPartial));
+        }
+        other => panic!("expected ReassignAssignment, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_partial_planner_refuses_when_invalid_partial_targets_superseded_assignment() {
+    use omni_contributor::{
+        supersession::SupersessionReason, InvalidArtifactStatus,
+    };
+
+    // Defensive case: the Stage 12.9 reporter SKIPS superseded
+    // partials before running `verify_partial_result`, so an
+    // `InvalidPartial` entry for a superseded assignment is
+    // structurally unreachable from a real status report. But
+    // the planner-time precheck (added in the Stage 12.12
+    // review fix) still defends against a hand-crafted status:
+    // if it ever sees an `InvalidPartial(A_superseded)` entry,
+    // it refuses with `kind: "invalid_partial_not_in_plan"`
+    // rather than silently dropping A from the plan and
+    // emitting a plan that would later violate the
+    // planner-contract `emits a plan <=> apply will accept it`.
+    let asn_a_id = "aa".repeat(32);
+    let asn_b_id = "bb".repeat(32);
+    let mut asn_a = assignment_status(&asn_a_id, 0, &"01".repeat(32), false);
+    asn_a.superseded = true;
+    asn_a.superseded_by_supersession_id = Some("ee".repeat(32));
+    let asn_b = assignment_status(&asn_b_id, 1, &"02".repeat(32), false);
+    let mut status = in_progress_with(vec![asn_a, asn_b]);
+    status.overall_status = SessionOverallStatus::InvalidState;
+    status.invalid_artifacts = vec![
+        InvalidArtifactStatus::InvalidPartial {
+            assignment_id: asn_a_id.clone(),
+            reason_tag: "ContributorSignatureFailed".into(),
+        },
+        InvalidArtifactStatus::InvalidPartial {
+            assignment_id: asn_b_id.clone(),
+            reason_tag: "ContributorSignatureFailed".into(),
+        },
+    ];
+
+    let err = omni_contributor::build_session_repair_plan_with_reason(
+        &status,
+        RepairStrategy::ReassignMissing,
+        SupersessionReason::InvalidPartial,
+        NOW_UTC,
+        None,
+    )
+    .unwrap_err();
+    match err {
+        RepairError::InvalidStateNotTriagable { kind, context } => {
+            assert_eq!(kind, "invalid_partial_not_in_plan");
+            assert!(context.contains(&asn_a_id));
+        }
+        other => panic!("expected invalid_partial_not_in_plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_partial_planner_refuses_when_invalid_state_also_has_invalid_join() {
+    use omni_contributor::{
+        supersession::SupersessionReason, InvalidArtifactStatus,
+    };
+
+    // Reviewer's requested regression. Status has
+    // `InvalidPartial(A)` plus a separate `InvalidJoin(...)`.
+    // The Stage 12.11 apply helper would refuse this plan
+    // (additional `InvalidJoin` is not triagable via reassign);
+    // the Stage 12.12 review fix makes the planner refuse with
+    // the SAME typed error surface at plan time, so the
+    // operator doesn't have to discover the rejection at apply
+    // time after paying the cost of plan creation + review.
+    let asn_a_id = "aa".repeat(32);
+    let asn_a = assignment_status(&asn_a_id, 0, &"01".repeat(32), false);
+    let mut status = in_progress_with(vec![asn_a]);
+    status.overall_status = SessionOverallStatus::InvalidState;
+    status.invalid_artifacts = vec![
+        InvalidArtifactStatus::InvalidPartial {
+            assignment_id: asn_a_id.clone(),
+            reason_tag: "ContributorSignatureFailed".into(),
+        },
+        InvalidArtifactStatus::InvalidJoin {
+            contributor_pubkey_hex: "01".repeat(32),
+            reason_tag: "ContributorSignatureFailed".into(),
+        },
+    ];
+    let err = omni_contributor::build_session_repair_plan_with_reason(
+        &status,
+        RepairStrategy::ReassignMissing,
+        SupersessionReason::InvalidPartial,
+        NOW_UTC,
+        None,
+    )
+    .unwrap_err();
+    match err {
+        RepairError::InvalidStateNotTriagable { kind, context } => {
+            assert_eq!(kind, "invalid_join");
+            assert!(context.contains("contributor_pubkey_hex="));
+        }
+        other => panic!("expected invalid_join, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_partial_planner_refuses_orphan_unmatched_invalid_partial() {
+    use omni_contributor::{
+        supersession::SupersessionReason, InvalidArtifactStatus,
+    };
+
+    // Orphan partials (`reason_tag == "unmatched"`) have NO
+    // parent assignment by construction, so the planner cannot
+    // emit a `ReassignAssignment` action for them. The planner
+    // refuses upfront with `invalid_partial_not_in_plan`,
+    // matching what the apply helper would do.
+    let asn_a_id = "aa".repeat(32);
+    let orphan_id = "ff".repeat(32);
+    let asn_a = assignment_status(&asn_a_id, 0, &"01".repeat(32), false);
+    let mut status = in_progress_with(vec![asn_a]);
+    status.overall_status = SessionOverallStatus::InvalidState;
+    status.invalid_artifacts = vec![InvalidArtifactStatus::InvalidPartial {
+        assignment_id: orphan_id.clone(),
+        reason_tag: "unmatched".into(),
+    }];
+    let err = omni_contributor::build_session_repair_plan_with_reason(
+        &status,
+        RepairStrategy::ReassignMissing,
+        SupersessionReason::InvalidPartial,
+        NOW_UTC,
+        None,
+    )
+    .unwrap_err();
+    match err {
+        RepairError::InvalidStateNotTriagable { kind, context } => {
+            assert_eq!(kind, "invalid_partial_not_in_plan");
+            assert!(context.contains(&orphan_id));
+        }
+        other => panic!("expected invalid_partial_not_in_plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_partial_strategy_still_refuses_invalid_state() {
+    use omni_contributor::{supersession::SupersessionReason, InvalidArtifactStatus};
+
+    let asn_a_id = "aa".repeat(32);
+    let asn_a = assignment_status(&asn_a_id, 0, &"01".repeat(32), false);
+    let mut status = in_progress_with(vec![asn_a]);
+    status.overall_status = SessionOverallStatus::InvalidState;
+    status.invalid_artifacts = vec![InvalidArtifactStatus::InvalidPartial {
+        assignment_id: asn_a_id.clone(),
+        reason_tag: "ContributorSignatureFailed".into(),
+    }];
+    let err = omni_contributor::build_session_repair_plan_with_reason(
+        &status,
+        RepairStrategy::ReassignMissing,
+        SupersessionReason::MissingPartial,
+        NOW_UTC,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, RepairError::InvalidState));
+
+    // Same for OperatorRebalance.
+    let err2 = omni_contributor::build_session_repair_plan_with_reason(
+        &status,
+        RepairStrategy::ReassignMissing,
+        SupersessionReason::OperatorRebalance,
+        NOW_UTC,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err2, RepairError::InvalidState));
+}
+
+#[test]
+fn reannounce_missing_strategy_still_refuses_invalid_state() {
+    use omni_contributor::{supersession::SupersessionReason, InvalidArtifactStatus};
+
+    // ReannounceMissing carries no reason (the helper ignores it),
+    // but to be defensive we pass InvalidPartial — the path is the
+    // strategy-bound branch, so it must STILL refuse InvalidState.
+    let asn_a_id = "aa".repeat(32);
+    let asn_a = assignment_status(&asn_a_id, 0, &"01".repeat(32), false);
+    let mut status = in_progress_with(vec![asn_a]);
+    status.overall_status = SessionOverallStatus::InvalidState;
+    status.invalid_artifacts = vec![InvalidArtifactStatus::InvalidPartial {
+        assignment_id: asn_a_id.clone(),
+        reason_tag: "ContributorSignatureFailed".into(),
+    }];
+    let err = omni_contributor::build_session_repair_plan_with_reason(
+        &status,
+        RepairStrategy::ReannounceMissing,
+        SupersessionReason::InvalidPartial,
+        NOW_UTC,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, RepairError::InvalidState));
 }

@@ -69,14 +69,23 @@ use crate::session_verify::{
 };
 use crate::state::{ContributorStateStore, StateObjectKind};
 
-/// Stage 12.11 bump: v1 → v2. v2 adds supersession-aware fields:
-/// `supersessions: Vec<SupersessionStatus>`, `superseded` /
-/// `superseded_by_supersession_id` on each `AssignmentStatus`,
-/// `active_assignment_count`, `superseded_assignment_count`. The
-/// `CompletePartials` decision now uses active assignments. Old
-/// Stage 12.9 / 12.10 readers refuse to parse v2 (deny_unknown_fields)
-/// and the schema_version mismatch surfaces clearly.
-pub const STATUS_SCHEMA_VERSION: u32 = 2;
+/// Stage 12.12 bump: v2 → v3. v3 adds **structured** chain-failure
+/// diagnostics via `invalid_artifacts: Vec<InvalidArtifactStatus>`
+/// so automation can decide whether an `InvalidState` is triagable
+/// (e.g. via a Stage 12.11 `--reason invalid-partial` reassignment)
+/// without parsing free-form `notes` strings. Every site that
+/// currently flips `any_chain_invalid` also pushes a structured
+/// entry. `notes` text is preserved (operator dashboards keep
+/// rendering it); automation **must not** parse `notes` — the
+/// stable contract is `invalid_artifacts` + each entry's
+/// `reason_tag` from [`crate::SessionVerifyOutcome::reason_tag`].
+///
+/// Stage 12.11 bump: v1 → v2 added supersession-aware fields
+/// (`supersessions`, `superseded` / `superseded_by_supersession_id`,
+/// `active_assignment_count`, `superseded_assignment_count`).
+/// Old v1/v2 readers refuse v3 (`deny_unknown_fields`) and the
+/// schema_version mismatch surfaces clearly.
+pub const STATUS_SCHEMA_VERSION: u32 = 3;
 
 // ── SessionOverallStatus ────────────────────────────────────────
 
@@ -198,11 +207,77 @@ pub struct SessionStatusReport {
     pub assignments: Vec<AssignmentStatus>,
     /// Stage 12.11 — verified supersessions for this session.
     pub supersessions: Vec<SupersessionStatus>,
+    /// Stage 12.12 — **structured** per-artifact failure diagnostics
+    /// suitable for machine policy. Populated alongside (not instead
+    /// of) `notes` so existing operator dashboards keep rendering
+    /// the free-form text. Invariant:
+    /// `invalid_artifacts.is_empty() <==> overall_status != InvalidState`.
+    /// Stable order: session → joins → assignments → partials →
+    /// supersessions → aggregate (mirrors the loader walk in
+    /// `build_session_status_report`). Automation that drives a
+    /// triage policy (e.g. `--reason invalid-partial` reassignment)
+    /// MUST read this field and never parse `notes`.
+    #[serde(default)]
+    pub invalid_artifacts: Vec<InvalidArtifactStatus>,
     /// Free-form per-artifact failure descriptions. Stable order:
     /// session → joins → assignments → partials → adverts →
     /// supersessions → aggregate. Renderers print these as
-    /// `event=note context=... message=...` lines.
+    /// `event=note context=... message=...` lines. Stage 12.12 keeps
+    /// this populated alongside `invalid_artifacts` so dashboard
+    /// output does not go dark — but automation must read the
+    /// structured field instead.
     pub notes: Vec<String>,
+}
+
+// ── InvalidArtifactStatus (Stage 12.12) ─────────────────────────
+
+/// Stage 12.12 — closed, externally-tagged enum naming **which**
+/// chain artifact failed verification and **why**. One variant per
+/// failure mode; the `reason_tag` field within each variant is the
+/// stable string returned by
+/// [`crate::SessionVerifyOutcome::reason_tag`]. Renaming a
+/// `SessionVerifyOutcome` variant must NOT silently change the
+/// reason tag — `reason_tag` is part of the v3 contract and is
+/// pinned by `outcome_reason_tag_strings_are_stable` in
+/// `session_verify` tests.
+///
+/// The `kind` discriminator (`invalid_session`, `invalid_join`,
+/// `invalid_assignment`, `invalid_partial`, `invalid_supersession`,
+/// `invalid_aggregate`) plus the `reason_tag` is what Stage 12.12
+/// `check_reassign_eligible_allowing_invalid_partials` consults to
+/// decide whether an `InvalidState` is triagable.
+///
+/// Special tags:
+/// - `InvalidPartial { reason_tag: "unmatched" }` covers the "partial
+///   body has no matching verified assignment" case. There is no
+///   separate `OrphanPartial` variant — the apply-time
+///   `check_reassign_targets_active_missing` check already refuses
+///   `not_in_status` for any plan targeting an unmatched id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InvalidArtifactStatus {
+    InvalidSession {
+        reason_tag: String,
+    },
+    InvalidJoin {
+        contributor_pubkey_hex: String,
+        reason_tag: String,
+    },
+    InvalidAssignment {
+        assignment_id: String,
+        reason_tag: String,
+    },
+    InvalidPartial {
+        assignment_id: String,
+        reason_tag: String,
+    },
+    InvalidSupersession {
+        supersession_id: String,
+        reason_tag: String,
+    },
+    InvalidAggregate {
+        reason_tag: String,
+    },
 }
 
 // ── public entry point ─────────────────────────────────────────
@@ -223,6 +298,10 @@ pub fn build_session_status_report(
     include_expired: bool,
 ) -> Result<SessionStatusReport, StatusError> {
     let mut notes: Vec<String> = Vec::new();
+    // Stage 12.12 — every chain-link failure ALSO pushes a typed
+    // entry here. Invariant on return:
+    //   invalid_artifacts.is_empty() <==> overall_status != InvalidState
+    let mut invalid_artifacts: Vec<InvalidArtifactStatus> = Vec::new();
     // Chain-link failures (session/joins/assignments/partials/
     // aggregate) flip overall_status to InvalidState. Advert
     // failures produce notes but do NOT — adverts are routing
@@ -253,13 +332,17 @@ pub fn build_session_status_report(
     // signature failed. Instead, return an InvalidState report
     // carrying NO session-derived fields and a single note
     // pointing at the failure.
-    if !verify_execution_session(&session).is_ok() {
+    let session_outcome = verify_execution_session(&session);
+    if !session_outcome.is_ok() {
         let mut report = empty_no_session_report(session_id, now_utc);
         report.overall_status = SessionOverallStatus::InvalidState;
         report.notes.push(format!(
             "session.json failed verify_execution_session for session_id={}",
             session_id
         ));
+        report.invalid_artifacts.push(InvalidArtifactStatus::InvalidSession {
+            reason_tag: session_outcome.reason_tag().to_string(),
+        });
         return Ok(report);
     }
 
@@ -267,13 +350,18 @@ pub fn build_session_status_report(
     let raw_joins = store.list_verified_joins_for(session_id)?;
     let mut joins: Vec<ContributorJoin> = Vec::new();
     for j in raw_joins {
-        if verify_contributor_join(&session, &j).is_ok() {
+        let outcome = verify_contributor_join(&session, &j);
+        if outcome.is_ok() {
             joins.push(j);
         } else {
             notes.push(format!(
                 "join contributor_pubkey={} failed verify_contributor_join",
                 j.contributor_pubkey_hex
             ));
+            invalid_artifacts.push(InvalidArtifactStatus::InvalidJoin {
+                contributor_pubkey_hex: j.contributor_pubkey_hex.clone(),
+                reason_tag: outcome.reason_tag().to_string(),
+            });
             any_chain_invalid = true;
         }
     }
@@ -293,6 +381,10 @@ pub fn build_session_status_report(
                     "assignment_id={} failed verify_work_assignment: {other:?}",
                     a.assignment_id
                 ));
+                invalid_artifacts.push(InvalidArtifactStatus::InvalidAssignment {
+                    assignment_id: a.assignment_id.clone(),
+                    reason_tag: other.reason_tag().to_string(),
+                });
                 any_chain_invalid = true;
             }
         }
@@ -341,6 +433,14 @@ pub fn build_session_status_report(
                     s_notes.push(format!(
                         "double-supersession of assignment_id={id}"
                     ));
+                    invalid_artifacts.push(InvalidArtifactStatus::InvalidSupersession {
+                        supersession_id: s.supersession_id.clone(),
+                        reason_tag: SessionVerifyOutcome::SupersessionDuplicateSupersedes {
+                            assignment_id: id.clone(),
+                        }
+                        .reason_tag()
+                        .to_string(),
+                    });
                     any_chain_invalid = true;
                     any_duplicate = true;
                 }
@@ -357,6 +457,10 @@ pub fn build_session_status_report(
                 "supersession_id={} failed verify_assignment_supersession: {outcome:?}",
                 s.supersession_id
             ));
+            invalid_artifacts.push(InvalidArtifactStatus::InvalidSupersession {
+                supersession_id: s.supersession_id.clone(),
+                reason_tag: outcome.reason_tag().to_string(),
+            });
             any_chain_invalid = true;
         }
         supersession_statuses.push(SupersessionStatus {
@@ -394,6 +498,18 @@ pub fn build_session_status_report(
                 "partial assignment_id={} has no matching verified assignment",
                 p.assignment_id
             ));
+            // Stage 12.12 — orphan partial. Approved plan uses
+            // a uniform InvalidPartial variant with the stable
+            // tag "unmatched" rather than a separate
+            // OrphanPartial variant. The apply-time
+            // check_reassign_targets_active_missing already
+            // refuses any plan whose superseded_assignment_id
+            // is unknown, so unmatched partials cannot be
+            // triaged via reassignment.
+            invalid_artifacts.push(InvalidArtifactStatus::InvalidPartial {
+                assignment_id: p.assignment_id.clone(),
+                reason_tag: "unmatched".to_string(),
+            });
             any_chain_invalid = true;
             continue;
         };
@@ -406,6 +522,10 @@ pub fn build_session_status_report(
                     "partial assignment_id={} failed verify_partial_result: {other:?}",
                     p.assignment_id
                 ));
+                invalid_artifacts.push(InvalidArtifactStatus::InvalidPartial {
+                    assignment_id: p.assignment_id.clone(),
+                    reason_tag: other.reason_tag().to_string(),
+                });
                 any_chain_invalid = true;
             }
         }
@@ -467,6 +587,9 @@ pub fn build_session_status_report(
                 notes.push(format!(
                     "aggregated.json failed verify_aggregated_result_with_supersessions: {outcome:?}"
                 ));
+                invalid_artifacts.push(InvalidArtifactStatus::InvalidAggregate {
+                    reason_tag: outcome.reason_tag().to_string(),
+                });
                 any_chain_invalid = true;
                 (true, false)
             }
@@ -556,6 +679,7 @@ pub fn build_session_status_report(
         overall_status,
         assignments: assignment_statuses,
         supersessions: supersession_statuses,
+        invalid_artifacts,
         notes,
     })
 }
@@ -624,6 +748,7 @@ fn empty_no_session_report(session_id: &str, now_utc: &str) -> SessionStatusRepo
         overall_status: SessionOverallStatus::NoSession,
         assignments: Vec::new(),
         supersessions: Vec::new(),
+        invalid_artifacts: Vec::new(),
         notes: Vec::new(),
     }
 }

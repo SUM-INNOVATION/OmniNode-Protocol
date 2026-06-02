@@ -73,13 +73,16 @@ pub use error::{
 };
 pub use repair::{
     build_session_repair_plan, build_session_repair_plan_with_reason,
+    check_invalid_partial_plan_eligible,
+    check_reassign_eligible_allowing_invalid_partials,
     check_reassign_targets_active_missing, check_repair_eligible, repair_plan_hash_hex,
     source_status_hash_hex, RepairAction, RepairStrategy, SessionRepairPlan,
     REPAIR_PLAN_SCHEMA_VERSION,
 };
 pub use status::{
-    build_session_status_report, AssignmentStatus, SessionOverallStatus,
-    SessionStatusReport, SupersessionStatus, STATUS_SCHEMA_VERSION,
+    build_session_status_report, AssignmentStatus, InvalidArtifactStatus,
+    SessionOverallStatus, SessionStatusReport, SupersessionStatus,
+    STATUS_SCHEMA_VERSION,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,

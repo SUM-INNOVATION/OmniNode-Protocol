@@ -1791,3 +1791,137 @@ Mesh ordering still respects the invariant that replacements must be observable 
 | `source_status_hash` v2 projection lift — supersession arriving between plan and apply trips drift | `source_status_hash_drifts_when_supersession_arrives_after_planning` |
 
 **Residual gap (deliberate):** the apply path's two-phase SNIP-republish + mesh-broadcast loop is not exercised in CI (same constraint as Stage 12.10's apply gap). The primitives are exercised by Stage 12.2 / 12.3 / 12.10 integration tests; the v1 invariants (replacement-only, single supersession covering all reassignments, publish ordering) are mechanically asserted by the verifier suite, the body schema, and the apply-time refusal arms.
+
+---
+
+# Stage 12.12 — Invalid-partial triage for supersession
+
+**Status**: shipped at Stage 12.12. Builds on Stage 12.9 status reporter + Stage 12.11 supersession verifier + Stage 12.11 reassign CLI. Allows operators to use `apply-session-reassign --reason invalid-partial` to triage an `InvalidState` session when — and only when — every chain-link failure is a tampered partial (`SupersessionReason::InvalidPartial`) whose retiring assignment is named in the plan. Every other `InvalidState` cause (invalid session, invalid join, invalid assignment, invalid aggregate, invalid supersession, or even an invalid partial NOT in the plan) continues to refuse. No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing / reputation. No exclusive claim / lease. No proof mode / on-chain verification / chain proof allowlist. No A–F flow. SNIP only. No new gossipsub topic.
+
+## What this stage is, in one sentence
+
+Stage 12.11 introduced the `SupersessionReason::InvalidPartial` label so a coordinator can retire a tampered partial; Stage 12.12 introduces the **structured diagnostic surface** that tells an operator (and only the operator's local `apply-session-reassign`) which `InvalidState` sessions are safe to triage that way.
+
+## Why structured diagnostics
+
+Stage 12.9–12.11's `SessionStatusReport` had a single boolean (`any_chain_invalid`) driving `InvalidState`, with free-form strings appended to `notes`. Seven distinct failure modes — `verify_execution_session`, join, assignment, supersession, partial-orphan, partial-verify, aggregate — all routed through that one bit. A policy that reads "is this triagable?" has to know **which** failure(s) occurred; `notes` is documentation, not contract.
+
+Stage 12.12 bumps `STATUS_SCHEMA_VERSION` 2 → 3 and adds one field:
+
+```rust
+pub invalid_artifacts: Vec<InvalidArtifactStatus>,
+```
+
+`InvalidArtifactStatus` is a closed externally-tagged enum (`kind` discriminator: `invalid_session` / `invalid_join` / `invalid_assignment` / `invalid_partial` / `invalid_supersession` / `invalid_aggregate`). Each variant carries the relevant id (`assignment_id`, `contributor_pubkey_hex`, `supersession_id`, or nothing for session / aggregate) plus a `reason_tag: String`.
+
+**`reason_tag` is the stable string returned by `SessionVerifyOutcome::reason_tag()`.** It is NOT derived from `format!("{outcome:?}")`. Renaming a `SessionVerifyOutcome` variant must NOT silently change the wire-visible tag — the `session_verify_outcome_reason_tags_are_stable` test in `invalid_partial_triage.rs` pins every existing variant's tag.
+
+### Special case: orphan partials
+
+A partial body that references an `assignment_id` with no matching verified assignment surfaces as `InvalidPartial { assignment_id, reason_tag: "unmatched" }`. No separate `OrphanPartial` variant — the uniform shape lets `check_reassign_targets_active_missing` refuse via the existing `not_in_status` arm at apply time.
+
+### Invariant
+
+```
+invalid_artifacts.is_empty()  <==>  overall_status != InvalidState
+```
+
+Pinned by `invalid_artifacts_is_empty_when_overall_status_is_not_invalid_state` and defended-in-depth by `check_reassign_eligible_allowing_invalid_partials` (refuses `invalid_state_without_diagnostics` when an attacker-supplied report violates it).
+
+### `notes` is preserved alongside
+
+`notes` strings are still populated at every site. Operator dashboards rendering free-form text keep working. **Automation must read `invalid_artifacts`** — `notes` content is documentation.
+
+## Eligibility helper
+
+```rust
+pub fn check_reassign_eligible_allowing_invalid_partials(
+    status: &SessionStatusReport,
+    plan: &SessionRepairPlan,
+) -> Result<(), RepairError>
+```
+
+Decision matrix:
+
+| `status.overall_status` | Decision |
+|---|---|
+| `InProgress` | `Ok(())` |
+| `NoSession` / `NoAssignments` / `CompletePartials` / `Aggregated` / `ExpiredIncomplete` | Forwarded to `check_repair_eligible` → unchanged typed error |
+| `InvalidState`, `plan.strategy != ReassignMissing` | `RepairError::InvalidState` (e.g. `ReannounceMissing` never triages) |
+| `InvalidState`, any entry in `invalid_artifacts` is not `InvalidPartial` | `RepairError::InvalidStateNotTriagable { kind: <invalid_*>, context: <id> }` |
+| `InvalidState`, every `InvalidPartial.assignment_id` is in the plan's superseded set | `Ok(())` |
+| `InvalidState`, an `InvalidPartial.assignment_id` is NOT in the plan | `RepairError::InvalidStateNotTriagable { kind: "invalid_partial_not_in_plan", context }` |
+| `InvalidState`, `invalid_artifacts` is empty | `RepairError::InvalidStateNotTriagable { kind: "invalid_state_without_diagnostics", context: "" }` |
+
+`MissingPartial` / `OperatorRebalance` reassigns + every `ReannounceMissing` reannounce continue to call `check_repair_eligible` directly and hard-refuse `InvalidState`. The Stage 12.12 split is **strictly** `--reason invalid-partial` plumbing.
+
+## Planner change
+
+`build_session_repair_plan_with_reason` branches on `(strategy, reason)`. Only `ReassignMissing + InvalidPartial` takes the relaxed path; it calls a dedicated **plan-time** precheck `check_invalid_partial_plan_eligible(status)` (mirror of the apply helper expressed against the implicit candidate target set the planner is about to emit) and then selects actions from `status.invalid_artifacts.iter().filter_map(InvalidPartial)` (filtering out superseded assignments and orphan-tagged entries). All other reason / strategy combinations keep the existing `check_repair_eligible` gate and the `partial_present == false && !superseded` selection.
+
+The plan-time precheck enforces the **planner contract**: the planner emits a plan **if and only if** apply will accept it. Without this gate, a status with `InvalidPartial(A) + InvalidJoin(...)` would still produce a plan covering A, and the operator would only discover the refusal at `apply-session-reassign` after paying the cost of plan creation, review, and hash-pinning. The precheck returns the same typed `RepairError::InvalidStateNotTriagable { kind, context }` surface the apply helper uses, so scripts can write one rule across both layers.
+
+## CLI changes
+
+- **`plan-session-reassign --reason invalid-partial`** now emits actions for the active assignments whose status row carries an `InvalidPartial` diagnostic (no longer silently refused by the `InvalidState` gate).
+- **`apply-session-reassign`** dispatches on `plan.actions[0].reason`:
+  - `InvalidPartial` → `check_reassign_eligible_allowing_invalid_partials(&current_status, &plan)`
+  - everything else → `check_repair_eligible(&current_status)`
+
+### Apply-time mixed-reason defense
+
+The planner emits a uniform `SupersessionReason` across one plan, but the plan is unsigned/local — hand-editing can produce mixed reasons that would smuggle one reason's relaxed gate onto another reason's actions. Stage 12.12 adds an early refusal:
+
+```text
+apply-session-reassign refuses mixed-reason plan: plan.actions[0].reason=InvalidPartial
+but a later action has reason=MissingPartial
+```
+
+This check runs after the existing `ReassignAssignment`-only check and before any eligibility / drift / SNIP / mesh / state-dir work.
+
+### Renderer additions
+
+`events`: new `event=invalid_artifact session_id=... kind=... reason_tag=... [assignment_id=... | contributor_pubkey_hex=... | supersession_id=...]` lines, one per entry. `pretty`: new "Invalid artifacts" section under counts. `json`: unchanged (serde already exposes the field; v3 is additive).
+
+## Out of scope (Stage 12.12)
+
+- **Proof of partial wrongness.** Stage 12.12 trusts the coordinator's local triage label. No chain claim that the partial was objectively wrong.
+- **Slashing, reputation, payment, chain reporting.** Untouched.
+- **Automatic retry daemon.** Operator-initiated only.
+- **Work-kind reshaping.** Replacement assignment copies `work_kind` and `expected_work_units` verbatim, same as Stage 12.11.
+- **Abandonment / cancellation.** Still v1 replacement-only.
+- **New gossipsub topic.** None added.
+- **Chain wire / `InferenceAttestationDigest` / proof mode / chain proof allowlist / A–F flow.** Untouched.
+- **`MissingPartial` / `OperatorRebalance` triage of `InvalidState`.** Refused — only `InvalidPartial` plus the tightly-scoped helper accepts.
+
+## Test coverage map
+
+| What's covered | Where |
+|---|---|
+| `SessionVerifyOutcome::reason_tag` stability across every variant | `session_verify_outcome_reason_tags_are_stable` (`invalid_partial_triage.rs`) |
+| Status v3 emits `InvalidPartial` for a forged partial | `invalid_artifacts_emit_invalid_partial_for_tampered_partial` (`status_report.rs`) |
+| Status v3 emits `InvalidJoin` for a forged join | `invalid_artifacts_emit_invalid_join_for_forged_join` |
+| Status v3 emits `InvalidAssignment` for a tampered assignment | `invalid_artifacts_emit_invalid_assignment_for_tampered_assignment` |
+| Status v3 emits `InvalidAggregate` for a tampered aggregate | `invalid_artifacts_emit_invalid_aggregate_for_aggregate_signed_by_wrong_coord` |
+| Status v3 early-return for invalid session carries only `InvalidSession` | `invalid_artifacts_emit_invalid_session_returned_early` |
+| Orphan partials emit `InvalidPartial { reason_tag: "unmatched" }` | `invalid_artifacts_emit_invalid_partial_unmatched_for_orphan_partial` |
+| Reporter invariant — empty `invalid_artifacts` when not `InvalidState` | `invalid_artifacts_is_empty_when_overall_status_is_not_invalid_state` |
+| Planner `--reason invalid-partial` selects only active assignments with `InvalidPartial` | `invalid_partial_plan_targets_only_assignments_with_invalid_partials` (`repair_plan.rs`) |
+| Plan-time precheck refuses superseded `InvalidPartial` target (defense-in-depth) | `invalid_partial_planner_refuses_when_invalid_partial_targets_superseded_assignment` |
+| Plan-time precheck refuses extra non-`InvalidPartial` artifacts (e.g. `InvalidJoin`) | `invalid_partial_planner_refuses_when_invalid_state_also_has_invalid_join` |
+| Plan-time precheck refuses orphan `InvalidPartial { reason_tag: "unmatched" }` | `invalid_partial_planner_refuses_orphan_unmatched_invalid_partial` |
+| `MissingPartial` / `OperatorRebalance` strategies still refuse `InvalidState` | `missing_partial_strategy_still_refuses_invalid_state` |
+| `ReannounceMissing` never accepts `InvalidState` | `reannounce_missing_strategy_still_refuses_invalid_state` |
+| Helper accepts when every `InvalidPartial` is targeted | `accepts_invalid_state_when_all_invalid_artifacts_are_planned_invalid_partials` (`invalid_partial_triage.rs`) |
+| Helper refuses on additional `InvalidJoin` | `refuses_when_invalid_state_also_has_invalid_join` |
+| Helper refuses on additional `InvalidAssignment` | `refuses_when_invalid_state_also_has_invalid_assignment` |
+| Helper refuses on `InvalidAggregate` | `refuses_when_invalid_state_has_invalid_aggregate` |
+| Helper refuses on `InvalidSupersession` | `refuses_when_invalid_state_has_invalid_supersession` |
+| Helper refuses on `InvalidSession` | `refuses_when_invalid_state_has_invalid_session` |
+| Helper refuses when an `InvalidPartial` is not in the plan | `refuses_when_invalid_partial_assignment_is_not_in_plan` |
+| Helper refuses `ReannounceMissing` under `InvalidState` | `refuses_reannounce_missing_strategy_under_invalid_state` |
+| Defense-in-depth: empty diagnostics array under `InvalidState` | `refuses_invalid_state_when_diagnostics_array_is_empty` |
+| Helper forwards `Aggregated` / `ExpiredIncomplete` / `InProgress` to `check_repair_eligible` | `forwards_to_check_repair_eligible_for_non_invalid_state` |
+| Apply-time mixed-reason defense | inline in `run_apply_session_reassign`; refuses before eligibility / drift / SNIP / mesh |
+
+**Residual gap (deliberate):** the apply path's CLI dispatch + mixed-reason defense + dry-run + Phase A / Phase B publish under `--reason invalid-partial` is not exercised end-to-end in CI (same constraint as Stage 12.10 / 12.11 — would require mocked SNIP + InMemoryRelay end-to-end refactor). The library helper, the planner branch, and the structured reporter are mechanically tested; the CLI is a single dispatch line on top of the well-tested helper.
