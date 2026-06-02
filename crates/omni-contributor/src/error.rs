@@ -491,6 +491,30 @@ pub enum RepairError {
         session_id: String,
         assignment_id: String,
     },
+
+    /// Stage 12.11 apply-time enforcement. A `ReassignAssignment`
+    /// action targeted an assignment that, in the current rebuilt
+    /// status, is NOT active-missing: it is either already
+    /// completed (`partial_present == true`), already superseded
+    /// by a prior verified `WorkAssignmentSupersession`, missing
+    /// from the status report entirely, or has a `stage_index`
+    /// that disagrees with the plan's `original_stage_index`.
+    ///
+    /// The plan is unsigned and local — a hand-edited plan can
+    /// recompute its `repair_plan_hash` so the integrity check
+    /// passes, so the applier must independently re-verify that
+    /// every targeted assignment is still safe to retire.
+    #[error(
+        "reassign target not active-missing: session_id={session_id} \
+         assignment_id={assignment_id} reason={reason}"
+    )]
+    ReassignTargetNotActiveMissing {
+        session_id: String,
+        assignment_id: String,
+        /// `not_in_status` / `already_superseded` / `already_completed` /
+        /// `stage_index_mismatch`.
+        reason: &'static str,
+    },
 }
 
 /// Canonical-bytes / hash encoding errors.

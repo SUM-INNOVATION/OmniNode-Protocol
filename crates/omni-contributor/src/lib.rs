@@ -72,7 +72,8 @@ pub use error::{
     RunnerError, SchemaError, SigningError, SnipError, StatusError, VerifyError,
 };
 pub use repair::{
-    build_session_repair_plan, check_repair_eligible, repair_plan_hash_hex,
+    build_session_repair_plan, build_session_repair_plan_with_reason,
+    check_reassign_targets_active_missing, check_repair_eligible, repair_plan_hash_hex,
     source_status_hash_hex, RepairAction, RepairStrategy, SessionRepairPlan,
     REPAIR_PLAN_SCHEMA_VERSION,
 };
@@ -135,6 +136,7 @@ pub use tensor_transport::{
 pub use tensor_transport::OmniNetTensorTransport;
 pub use session_verify::{
     check_not_expired, process_aggregated_result_announcement,
+    process_assignment_supersession_announcement,
     process_contributor_joined_announcement, process_partial_result_announcement,
     process_session_opened_announcement, process_work_assigned_announcement,
     verify_aggregated_result, verify_aggregated_result_with_supersessions,

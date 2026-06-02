@@ -900,3 +900,130 @@ pub fn process_aggregated_result_announcement<A: SnipV2Adapter + ?Sized>(
     }
     AnnouncementOutcome::Verified { body: agg }
 }
+
+/// Stage 12.11 — process a
+/// `NetworkWorkAssignmentSupersessionAnnouncement`.
+///
+/// Validates the announcement schema + announcer signature, fetches
+/// the `WorkAssignmentSupersession` body from SNIP, validates the
+/// body schema, re-derives `supersession_id`, verifies the body's
+/// coordinator signature against the body's own
+/// `coordinator_pubkey_hex`, and drift-checks every shared field.
+///
+/// If the caller knows the parent `ExecutionSession`, it can pass
+/// it as `session`: the helper will then additionally pin the body
+/// `coordinator_pubkey_hex` to `session.coordinator_pubkey_hex`. If
+/// the caller also passes the list of verified `WorkAssignment`s
+/// for the session, the helper will run the full
+/// `verify_assignment_supersession` reference-resolution leg too
+/// — including the v1 non-empty replacement and disjointness
+/// invariants. (Both contexts default to `None` so a watcher that
+/// has not yet seen the session can still accept the announcement
+/// for later coord-pinning at aggregate time.)
+pub fn process_assignment_supersession_announcement<A: SnipV2Adapter + ?Sized>(
+    ann: &crate::net::NetworkWorkAssignmentSupersessionAnnouncement,
+    adapter: &A,
+    session: Option<&ExecutionSession>,
+    assignments: Option<&[WorkAssignment]>,
+) -> AnnouncementOutcome<crate::supersession::WorkAssignmentSupersession> {
+    use crate::canonical::{
+        net_supersession_signing_input, supersession_id_hex,
+        work_assignment_supersession_signing_input,
+    };
+    use crate::supersession::WorkAssignmentSupersession;
+
+    if let Err(e) = ann.validate_schema() {
+        return AnnouncementOutcome::AnnouncementSchemaMalformed(e.to_string());
+    }
+    let signing_input = match net_supersession_signing_input(ann) {
+        Ok(b) => b,
+        Err(e) => return AnnouncementOutcome::AnnouncementSchemaMalformed(e.to_string()),
+    };
+    let ok = verify_signature_hex(
+        &ann.announcer_pubkey_hex,
+        &signing_input,
+        &ann.announcer_signature_hex,
+    )
+    .unwrap_or(false);
+    if !ok {
+        return AnnouncementOutcome::AnnouncerSignatureFailed;
+    }
+    let (sup, _bytes): (WorkAssignmentSupersession, _) =
+        match snip_fetch_body(adapter, &ann.work_assignment_supersession_snip_root) {
+            Ok(x) => x,
+            Err((tag, msg)) => match tag {
+                "body-parse" => return AnnouncementOutcome::BodyParseFailed(msg),
+                _ => return AnnouncementOutcome::SnipFetchFailed(format!("{tag}: {msg}")),
+            },
+        };
+    if let Err(e) = sup.validate_schema() {
+        return AnnouncementOutcome::BodySchemaInvalid(e.to_string());
+    }
+    // Body coordinator signature verifies against the body's
+    // self-declared `coordinator_pubkey_hex`. The session-pubkey
+    // pin is performed below as a drift check if a session was
+    // supplied.
+    let derived = match supersession_id_hex(&sup) {
+        Ok(s) => s,
+        Err(e) => return AnnouncementOutcome::BodySchemaInvalid(e.to_string()),
+    };
+    if derived != sup.supersession_id {
+        return AnnouncementOutcome::BodySchemaInvalid(format!(
+            "supersession_id mismatch: stored={}, derived={derived}",
+            sup.supersession_id
+        ));
+    }
+    let body_sig_input = match work_assignment_supersession_signing_input(&sup) {
+        Ok(b) => b,
+        Err(e) => return AnnouncementOutcome::BodySchemaInvalid(e.to_string()),
+    };
+    let body_sig_ok = verify_signature_hex(
+        &sup.coordinator_pubkey_hex,
+        &body_sig_input,
+        &sup.coordinator_signature_hex,
+    )
+    .unwrap_or(false);
+    if !body_sig_ok {
+        return AnnouncementOutcome::BodySignatureFailed;
+    }
+    if ann.session_id != sup.session_id {
+        return AnnouncementOutcome::DriftMismatch { field: "session_id" };
+    }
+    if ann.supersession_id != sup.supersession_id {
+        return AnnouncementOutcome::DriftMismatch { field: "supersession_id" };
+    }
+    // Optional session pinning: when a session is supplied, the
+    // body must name the same coordinator. This is the
+    // moral-equivalent of `process_work_assigned_announcement`'s
+    // `session_coord_pubkey_hex` path.
+    if let Some(s) = session {
+        if sup.session_id != s.session_id {
+            return AnnouncementOutcome::DriftMismatch { field: "session_id" };
+        }
+        if sup.coordinator_pubkey_hex != s.coordinator_pubkey_hex {
+            return AnnouncementOutcome::DriftMismatch {
+                field: "coordinator_pubkey_hex",
+            };
+        }
+        if let Some(asns) = assignments {
+            // Full reference resolution + re-runs the same checks
+            // above. We've already gated on schema + sig +
+            // supersession_id derivation; this leg adds the
+            // reference-set invariants from
+            // `verify_assignment_supersession`.
+            match crate::supersession_verify::verify_assignment_supersession(s, asns, &sup) {
+                crate::session_verify::SessionVerifyOutcome::Ok => {}
+                crate::session_verify::SessionVerifyOutcome::SupersessionSchemaMalformed(m) => {
+                    return AnnouncementOutcome::BodySchemaInvalid(m);
+                }
+                crate::session_verify::SessionVerifyOutcome::SupersessionCoordinatorSignatureFailed => {
+                    return AnnouncementOutcome::BodySignatureFailed;
+                }
+                other => {
+                    return AnnouncementOutcome::BodySchemaInvalid(format!("{other:?}"));
+                }
+            }
+        }
+    }
+    AnnouncementOutcome::Verified { body: sup }
+}

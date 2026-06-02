@@ -550,3 +550,231 @@ fn process_aggregated_body_sig_failed_refused() {
     let out = process_aggregated_result_announcement(&ann, &snip);
     assert!(matches!(out, AnnouncementOutcome::BodySignatureFailed), "{out:?}");
 }
+
+// ── Stage 12.11 — assignment supersession ───────────────────────
+
+mod supersession_processor {
+    use super::*;
+    use omni_contributor::{
+        canonical::{net_supersession_signing_input, supersession_id_hex},
+        process_assignment_supersession_announcement,
+        supersession::{SupersessionReason, WorkAssignmentSupersession},
+        NetworkWorkAssignmentSupersessionAnnouncement, SUPERSESSION_SCHEMA_VERSION,
+    };
+
+    /// Local helper: like `make_assignment` but lets the caller
+    /// pick the stage_index so two assignments in the same
+    /// session hash to distinct `assignment_id`s. Without this
+    /// the supersession's superseded vs replacement IDs would
+    /// collide and trip the disjointness schema check.
+    fn make_assignment_stage(
+        session: &ExecutionSession,
+        contrib_pub: &str,
+        coord: &CoordinatorSigner,
+        stage_index: u32,
+    ) -> WorkAssignment {
+        use omni_contributor::canonical::{assignment_id_hex, work_assignment_signing_input};
+        let mut a = WorkAssignment {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: session.session_id.clone(),
+            assignment_id: String::new(),
+            stage_index,
+            contributor_pubkey_hex: contrib_pub.to_string(),
+            work_kind: WorkKind::Prefill,
+            expected_work_units: 100,
+            expected_work_unit_kind: WorkUnitKind::PrefillTokens,
+            assigned_at_utc: "2026-05-27T00:00:02Z".into(),
+            coordinator_signature_hex: String::new(),
+        };
+        a.assignment_id = assignment_id_hex(&a).unwrap();
+        let si = work_assignment_signing_input(&a).unwrap();
+        a.coordinator_signature_hex = coord.sign_hex(&si);
+        a
+    }
+
+    fn make_supersession(
+        session: &ExecutionSession,
+        coord: &CoordinatorSigner,
+        superseded: Vec<String>,
+        replacement: Vec<String>,
+    ) -> WorkAssignmentSupersession {
+        let mut superseded = superseded;
+        superseded.sort();
+        let mut replacement = replacement;
+        replacement.sort();
+        let mut s = WorkAssignmentSupersession {
+            schema_version: SUPERSESSION_SCHEMA_VERSION,
+            session_id: session.session_id.clone(),
+            supersession_id: String::new(),
+            superseded_assignment_ids: superseded,
+            replacement_assignment_ids: replacement,
+            reason: SupersessionReason::MissingPartial,
+            created_at_utc: "2026-05-27T00:00:20Z".into(),
+            coordinator_pubkey_hex: coord.pubkey_hex(),
+            coordinator_signature_hex: String::new(),
+        };
+        s.supersession_id = supersession_id_hex(&s).unwrap();
+        let si = omni_contributor::canonical::work_assignment_supersession_signing_input(
+            &s,
+        )
+        .unwrap();
+        s.coordinator_signature_hex = coord.sign_hex(&si);
+        s
+    }
+
+    fn make_ann(
+        snip: &MockSnipStore,
+        coord: &CoordinatorSigner,
+        sup: &WorkAssignmentSupersession,
+    ) -> NetworkWorkAssignmentSupersessionAnnouncement {
+        let root = snip.insert_bytes(&serde_json::to_vec(sup).unwrap());
+        let mut ann = NetworkWorkAssignmentSupersessionAnnouncement {
+            schema_version: NET_SCHEMA_VERSION,
+            work_assignment_supersession_snip_root: root.to_hex(),
+            session_id: sup.session_id.clone(),
+            supersession_id: sup.supersession_id.clone(),
+            announced_at_utc: "2026-05-27T00:00:25Z".into(),
+            announcer_pubkey_hex: coord.pubkey_hex(),
+            announcer_signature_hex: String::new(),
+        };
+        let si = net_supersession_signing_input(&ann).unwrap();
+        ann.announcer_signature_hex = coord.sign_hex(&si);
+        ann
+    }
+
+    #[test]
+    fn happy_path_no_session_context() {
+        let snip = MockSnipStore::new();
+        let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+        let contrib = ContributorSigner::from_seed_bytes(&CONTRIB_SEED).unwrap();
+        let session = make_session(&coord);
+        // The processor's reference-resolution leg is gated on
+        // `session.is_some() && assignments.is_some()`; passing
+        // None for both must still pass when announcer sig + body
+        // sig + drift are all clean.
+        let asn_old = make_assignment_stage(&session, &contrib.pubkey_hex(), &coord, 0);
+        let asn_new = make_assignment_stage(&session, &contrib.pubkey_hex(), &coord, 1);
+        let sup = make_supersession(
+            &session,
+            &coord,
+            vec![asn_old.assignment_id.clone()],
+            vec![asn_new.assignment_id.clone()],
+        );
+        let ann = make_ann(&snip, &coord, &sup);
+        let out = process_assignment_supersession_announcement(&ann, &snip, None, None);
+        assert!(out.is_verified(), "{out:?}");
+    }
+
+    #[test]
+    fn happy_path_with_session_and_assignments() {
+        let snip = MockSnipStore::new();
+        let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+        let contrib = ContributorSigner::from_seed_bytes(&CONTRIB_SEED).unwrap();
+        let session = make_session(&coord);
+        let asn_old = make_assignment_stage(&session, &contrib.pubkey_hex(), &coord, 0);
+        let asn_new = make_assignment_stage(&session, &contrib.pubkey_hex(), &coord, 1);
+        let sup = make_supersession(
+            &session,
+            &coord,
+            vec![asn_old.assignment_id.clone()],
+            vec![asn_new.assignment_id.clone()],
+        );
+        let ann = make_ann(&snip, &coord, &sup);
+        let assignments = vec![asn_old, asn_new];
+        let out = process_assignment_supersession_announcement(
+            &ann,
+            &snip,
+            Some(&session),
+            Some(&assignments),
+        );
+        assert!(out.is_verified(), "{out:?}");
+    }
+
+    #[test]
+    fn drift_session_id_refused() {
+        let snip = MockSnipStore::new();
+        let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+        let contrib = ContributorSigner::from_seed_bytes(&CONTRIB_SEED).unwrap();
+        let session = make_session(&coord);
+        let asn_old = make_assignment_stage(&session, &contrib.pubkey_hex(), &coord, 0);
+        let asn_new = make_assignment_stage(&session, &contrib.pubkey_hex(), &coord, 1);
+        let sup = make_supersession(
+            &session,
+            &coord,
+            vec![asn_old.assignment_id.clone()],
+            vec![asn_new.assignment_id.clone()],
+        );
+        // The body is correctly bound to `sup.session_id`; the
+        // announcement lies about it. Announcer-sig recomputes
+        // over the lying announcement, so re-sign it after the
+        // tamper.
+        let root = snip.insert_bytes(&serde_json::to_vec(&sup).unwrap());
+        let mut ann = NetworkWorkAssignmentSupersessionAnnouncement {
+            schema_version: NET_SCHEMA_VERSION,
+            work_assignment_supersession_snip_root: root.to_hex(),
+            session_id: "ff".repeat(32),
+            supersession_id: sup.supersession_id.clone(),
+            announced_at_utc: "2026-05-27T00:00:25Z".into(),
+            announcer_pubkey_hex: coord.pubkey_hex(),
+            announcer_signature_hex: String::new(),
+        };
+        let si = net_supersession_signing_input(&ann).unwrap();
+        ann.announcer_signature_hex = coord.sign_hex(&si);
+        let out = process_assignment_supersession_announcement(&ann, &snip, None, None);
+        assert!(
+            matches!(out, AnnouncementOutcome::DriftMismatch { field: "session_id" }),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn body_coord_pubkey_drift_under_session_refused() {
+        // Body is signed by a rogue coord; the body's
+        // self-declared `coordinator_pubkey_hex` is the rogue's,
+        // so the body sig itself verifies. The session-pinning
+        // drift check must catch the mismatch against the
+        // session's coord pubkey.
+        let snip = MockSnipStore::new();
+        let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+        let rogue = CoordinatorSigner::from_seed_bytes(&ROGUE_SEED).unwrap();
+        let contrib = ContributorSigner::from_seed_bytes(&CONTRIB_SEED).unwrap();
+        let session = make_session(&coord);
+        let asn_old = make_assignment_stage(&session, &contrib.pubkey_hex(), &coord, 0);
+        let asn_new = make_assignment_stage(&session, &contrib.pubkey_hex(), &coord, 1);
+        let sup = make_supersession(
+            &session,
+            &rogue,
+            vec![asn_old.assignment_id.clone()],
+            vec![asn_new.assignment_id.clone()],
+        );
+        // Announce with the rogue's pubkey too so the announcer
+        // sig matches but the session pinning fails.
+        let root = snip.insert_bytes(&serde_json::to_vec(&sup).unwrap());
+        let mut ann = NetworkWorkAssignmentSupersessionAnnouncement {
+            schema_version: NET_SCHEMA_VERSION,
+            work_assignment_supersession_snip_root: root.to_hex(),
+            session_id: sup.session_id.clone(),
+            supersession_id: sup.supersession_id.clone(),
+            announced_at_utc: "2026-05-27T00:00:25Z".into(),
+            announcer_pubkey_hex: rogue.pubkey_hex(),
+            announcer_signature_hex: String::new(),
+        };
+        let si = net_supersession_signing_input(&ann).unwrap();
+        ann.announcer_signature_hex = rogue.sign_hex(&si);
+        let out = process_assignment_supersession_announcement(
+            &ann,
+            &snip,
+            Some(&session),
+            None,
+        );
+        assert!(
+            matches!(
+                out,
+                AnnouncementOutcome::DriftMismatch {
+                    field: "coordinator_pubkey_hex",
+                }
+            ),
+            "{out:?}"
+        );
+    }
+}

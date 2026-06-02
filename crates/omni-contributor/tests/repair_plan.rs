@@ -606,17 +606,66 @@ fn source_status_hash_drifts_when_partial_arrives_after_planning() {
     );
 }
 
+/// Stage 12.11 — same drift posture, but the change between plan
+/// and apply is a **supersession** arriving (not a partial). Prior
+/// to the projection lift the hash only covered
+/// `(assignment_id, partial_present)`, so a supersession that
+/// retires a missing assignment without a partial flipping would
+/// slip past the drift check, and the applier could reannounce or
+/// reassign an already-retired assignment. The v2 projection
+/// includes per-assignment `(superseded, superseded_by_supersession_id)`,
+/// so this test fails closed.
+#[test]
+fn source_status_hash_drifts_when_supersession_arrives_after_planning() {
+    let assignments = vec![
+        assignment_status(&"aa".repeat(32), 0, &"01".repeat(32), false),
+        assignment_status(&"bb".repeat(32), 1, &"02".repeat(32), false),
+    ];
+    let status_before = in_progress_with(assignments.clone());
+    // The pre-supersession projection is the plan's baseline.
+    let baseline = source_status_hash_hex(&status_before);
+
+    // Simulate: between plan and apply, a verified supersession
+    // arrived that retires assignment "aa..." with replacement
+    // "cc...". `partial_present` did NOT flip — the retired
+    // assignment never had a partial. The status reporter's v2
+    // semantics flag the superseded assignment AND drop it from
+    // active accounting.
+    let supersession_id = "ee".repeat(32);
+    let mut status_after = status_before.clone();
+    status_after.assignments[0].superseded = true;
+    status_after.assignments[0].superseded_by_supersession_id =
+        Some(supersession_id.clone());
+    // Active accounting drops the retired assignment + bumps the
+    // supersession counters. (Not strictly needed for the
+    // projection assertion, but mirrors what the reporter would
+    // produce so the test reads like the real call site.)
+    status_after.active_assignment_count = 1;
+    status_after.superseded_assignment_count = 1;
+    status_after.supersession_count = 1;
+
+    let recomputed = source_status_hash_hex(&status_after);
+    assert_ne!(
+        recomputed, baseline,
+        "drift must be detected when a verified supersession arrives \
+         between plan and apply (Stage 12.11 projection lift)"
+    );
+}
+
 // ── 8. Apply-time eligibility re-check ──────────────────────────
 
-/// `source_status_hash_hex` is intentionally a projection over
-/// `(session_id, sorted [(assignment_id, partial_present)] pairs)`,
-/// so a status that flips from `InProgress` to `ExpiredIncomplete`
-/// (e.g. clock advances past `session.expires_at_utc`) leaves the
-/// projection IDENTICAL. The applier must therefore re-check
-/// eligibility against the rebuilt current status BEFORE any SNIP
-/// or mesh work, using the same matrix as the planner. This test
-/// pins that contract via the library-level `check_repair_eligible`
-/// helper that the apply CLI calls.
+/// `source_status_hash_hex`'s projection (as of Stage 12.11:
+/// `(session_id, sorted [(assignment_id, partial_present,
+/// superseded, superseded_by_supersession_id)] pairs)`) is
+/// intentionally narrow — it covers the active-assignment cover
+/// but NOT session-level health. So a status that flips from
+/// `InProgress` to `ExpiredIncomplete` (e.g. clock advances past
+/// `session.expires_at_utc`) leaves the projection IDENTICAL.
+/// The applier must therefore re-check eligibility against the
+/// rebuilt current status BEFORE any SNIP or mesh work, using
+/// the same matrix as the planner. This test pins that contract
+/// via the library-level `check_repair_eligible` helper that the
+/// apply CLI calls.
 #[test]
 fn apply_eligibility_check_catches_expired_when_projection_is_unchanged() {
     use omni_contributor::check_repair_eligible;
@@ -692,6 +741,174 @@ fn apply_eligibility_check_catches_invalid_state_when_projection_is_unchanged() 
     );
     let err = check_repair_eligible(&now_invalid).unwrap_err();
     assert!(matches!(err, RepairError::InvalidState));
+}
+
+/// Stage 12.11 — apply-time per-action enforcement. The plan is
+/// unsigned + local so an operator can hand-edit the JSON and
+/// recompute `repair_plan_hash`. Without this check the applier
+/// would happily retire an assignment that already has a valid
+/// partial (`partial_present == true`) or is already superseded
+/// by a prior verified supersession — wasting valid work — while
+/// the session stayed `InProgress` due to some OTHER missing
+/// assignment.
+///
+/// Status: A missing (`partial_present == false`), B completed
+/// (`partial_present == true`). A hand-edited `ReassignMissing`
+/// plan targets B instead of A; the apply-time enforcement must
+/// reject with `reason = "already_completed"`. This test also
+/// exercises the other rejection reasons:
+/// `already_superseded`, `not_in_status`, `stage_index_mismatch`.
+#[test]
+fn apply_per_action_check_rejects_hand_edited_plan_targeting_completed_assignment() {
+    use omni_contributor::{
+        check_reassign_targets_active_missing, supersession::SupersessionReason,
+        SupersessionStatus,
+    };
+
+    let asn_a_id = "aa".repeat(32);
+    let asn_b_id = "bb".repeat(32);
+    let asn_a = AssignmentStatus {
+        partial_present: false,
+        partial_valid: false,
+        ..assignment_status(&asn_a_id, 0, &"01".repeat(32), false)
+    };
+    let asn_b = AssignmentStatus {
+        partial_present: true,
+        partial_valid: true,
+        ..assignment_status(&asn_b_id, 1, &"02".repeat(32), true)
+    };
+    let status = in_progress_with(vec![asn_a.clone(), asn_b.clone()]);
+
+    // Hand-build a reassignment plan whose ONLY action targets
+    // assignment B (the COMPLETED one). The `source_status_hash`
+    // and `repair_plan_hash` are recomputed so the integrity
+    // checks would pass — only the per-action active-missing
+    // check stands between the edited plan and a wasted publish.
+    let mut hand_edited = SessionRepairPlan {
+        schema_version: REPAIR_PLAN_SCHEMA_VERSION,
+        session_id: status.session_id.clone(),
+        source_status_hash: source_status_hash_hex(&status),
+        created_at_utc: NOW_UTC.into(),
+        strategy: RepairStrategy::ReassignMissing,
+        actions: vec![RepairAction::ReassignAssignment {
+            superseded_assignment_id: asn_b_id.clone(),
+            original_stage_index: asn_b.stage_index,
+            replacement_contributor_pubkey_hex: "ff".repeat(32),
+            replacement_stage_index: asn_b.stage_index,
+            replacement_work_kind: WorkKind::Layers { start: 0, end: 8 },
+            replacement_expected_work_units: 8,
+            replacement_expected_work_unit_kind: WorkUnitKind::Layers,
+            reason: SupersessionReason::MissingPartial,
+        }],
+        coordinator_pubkey_hex: None,
+        repair_plan_hash: String::new(),
+    };
+    hand_edited.repair_plan_hash = repair_plan_hash_hex(&hand_edited);
+    let err =
+        check_reassign_targets_active_missing(&hand_edited, &status).unwrap_err();
+    match err {
+        RepairError::ReassignTargetNotActiveMissing {
+            ref assignment_id,
+            reason,
+            ..
+        } => {
+            assert_eq!(assignment_id, &asn_b_id);
+            assert_eq!(reason, "already_completed");
+        }
+        other => panic!("expected ReassignTargetNotActiveMissing, got {other:?}"),
+    }
+
+    // `not_in_status`: same plan shape, but pointing at an
+    // assignment_id the current status doesn't know.
+    let unknown_id = "cc".repeat(32);
+    let mut p2 = hand_edited.clone();
+    if let RepairAction::ReassignAssignment {
+        ref mut superseded_assignment_id,
+        ..
+    } = p2.actions[0]
+    {
+        *superseded_assignment_id = unknown_id.clone();
+    }
+    p2.repair_plan_hash = repair_plan_hash_hex(&p2);
+    let err = check_reassign_targets_active_missing(&p2, &status).unwrap_err();
+    match err {
+        RepairError::ReassignTargetNotActiveMissing { reason, .. } => {
+            assert_eq!(reason, "not_in_status");
+        }
+        other => panic!("expected ReassignTargetNotActiveMissing, got {other:?}"),
+    }
+
+    // `already_superseded`: status now shows A retired by a
+    // prior verified supersession (per Stage 12.11 status v2
+    // semantics).
+    let supersession_id = "ee".repeat(32);
+    let mut status_a_superseded = status.clone();
+    status_a_superseded.assignments[0].superseded = true;
+    status_a_superseded.assignments[0].superseded_by_supersession_id =
+        Some(supersession_id.clone());
+    status_a_superseded.supersessions.push(SupersessionStatus {
+        supersession_id: supersession_id.clone(),
+        superseded_assignment_ids: vec![asn_a_id.clone()],
+        replacement_assignment_ids: vec!["dd".repeat(32)],
+        reason: SupersessionReason::MissingPartial,
+        valid: true,
+        notes: vec![],
+    });
+    let mut p3 = hand_edited.clone();
+    if let RepairAction::ReassignAssignment {
+        ref mut superseded_assignment_id,
+        ref mut original_stage_index,
+        ..
+    } = p3.actions[0]
+    {
+        *superseded_assignment_id = asn_a_id.clone();
+        *original_stage_index = asn_a.stage_index;
+    }
+    p3.repair_plan_hash = repair_plan_hash_hex(&p3);
+    let err =
+        check_reassign_targets_active_missing(&p3, &status_a_superseded).unwrap_err();
+    match err {
+        RepairError::ReassignTargetNotActiveMissing { reason, .. } => {
+            assert_eq!(reason, "already_superseded");
+        }
+        other => panic!("expected ReassignTargetNotActiveMissing, got {other:?}"),
+    }
+
+    // `stage_index_mismatch`: target A (active-missing) but the
+    // plan's `original_stage_index` doesn't match the status row.
+    let mut p4 = hand_edited.clone();
+    if let RepairAction::ReassignAssignment {
+        ref mut superseded_assignment_id,
+        ref mut original_stage_index,
+        ..
+    } = p4.actions[0]
+    {
+        *superseded_assignment_id = asn_a_id.clone();
+        *original_stage_index = asn_a.stage_index + 7;
+    }
+    p4.repair_plan_hash = repair_plan_hash_hex(&p4);
+    let err = check_reassign_targets_active_missing(&p4, &status).unwrap_err();
+    match err {
+        RepairError::ReassignTargetNotActiveMissing { reason, .. } => {
+            assert_eq!(reason, "stage_index_mismatch");
+        }
+        other => panic!("expected ReassignTargetNotActiveMissing, got {other:?}"),
+    }
+
+    // Positive control: a well-formed plan targeting A (the
+    // active-missing one) passes.
+    let mut p5 = hand_edited.clone();
+    if let RepairAction::ReassignAssignment {
+        ref mut superseded_assignment_id,
+        ref mut original_stage_index,
+        ..
+    } = p5.actions[0]
+    {
+        *superseded_assignment_id = asn_a_id.clone();
+        *original_stage_index = asn_a.stage_index;
+    }
+    p5.repair_plan_hash = repair_plan_hash_hex(&p5);
+    assert!(check_reassign_targets_active_missing(&p5, &status).is_ok());
 }
 
 // ── 9. Apply-time library-contract tests ─────────────────────

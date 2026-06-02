@@ -177,6 +177,23 @@ enum ContributorCmd {
     /// broadcast a fresh `NetworkWorkAssignedAnnouncement` unless
     /// `--no-publish-announcements`. The state-dir is NOT mutated.
     ApplySessionRepair(ApplySessionRepairArgs),
+
+    /// Stage 12.11 — emit a `SessionRepairPlan` v2 whose actions
+    /// are `ReassignAssignment` entries (one per missing active
+    /// assignment). Read-only; the plan is operator-reviewable
+    /// JSON. Companion to `apply-session-reassign`.
+    PlanSessionReassign(PlanSessionReassignArgs),
+
+    /// Stage 12.11 — read a v2 `SessionRepairPlan` with
+    /// `RepairStrategy::ReassignMissing`, build + sign replacement
+    /// `WorkAssignment` bodies, build + sign one
+    /// `WorkAssignmentSupersession` covering them, publish
+    /// everything to SNIP, and broadcast the matching mesh
+    /// announcements (unless `--no-publish-announcements`). The
+    /// state-dir IS mutated on real apply: replacement
+    /// assignments + the supersession are dual-written to
+    /// `verified/sessions/<id>/...` and seen markers are laid down.
+    ApplySessionReassign(ApplySessionReassignArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -1660,12 +1677,13 @@ struct SessionStatusArgs {
 
 // ── Stage 12.10 args ─────────────────────────────────────────────────────
 
-/// CLI mirror of `omni_contributor::repair::RepairStrategy`. v1
-/// closed enum with a single variant; `ReassignMissing` is a Stage
-/// 12.11+ migration after a supersession model exists.
+/// CLI mirror of `omni_contributor::repair::RepairStrategy`. Stage
+/// 12.11 added `ReassignMissing` once the `WorkAssignmentSupersession`
+/// envelope shipped.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum CliRepairStrategy {
     ReannounceMissing,
+    ReassignMissing,
 }
 
 impl From<CliRepairStrategy> for omni_contributor::RepairStrategy {
@@ -1673,6 +1691,36 @@ impl From<CliRepairStrategy> for omni_contributor::RepairStrategy {
         match v {
             CliRepairStrategy::ReannounceMissing => {
                 omni_contributor::RepairStrategy::ReannounceMissing
+            }
+            CliRepairStrategy::ReassignMissing => {
+                omni_contributor::RepairStrategy::ReassignMissing
+            }
+        }
+    }
+}
+
+/// CLI mirror of `omni_contributor::supersession::SupersessionReason`.
+/// `Custom { label }` is intentionally NOT exposed at the CLI level
+/// in v1 — operators wanting Custom write the plan JSON by hand. The
+/// three closed-enum variants cover the common operator cases.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CliSupersessionReason {
+    MissingPartial,
+    InvalidPartial,
+    OperatorRebalance,
+}
+
+impl From<CliSupersessionReason> for omni_contributor::SupersessionReason {
+    fn from(v: CliSupersessionReason) -> Self {
+        match v {
+            CliSupersessionReason::MissingPartial => {
+                omni_contributor::SupersessionReason::MissingPartial
+            }
+            CliSupersessionReason::InvalidPartial => {
+                omni_contributor::SupersessionReason::InvalidPartial
+            }
+            CliSupersessionReason::OperatorRebalance => {
+                omni_contributor::SupersessionReason::OperatorRebalance
             }
         }
     }
@@ -1788,6 +1836,116 @@ struct ApplySessionRepairArgs {
     dry_run: bool,
 }
 
+// ── Stage 12.11 args ─────────────────────────────────────────────────────
+
+#[derive(Args)]
+struct PlanSessionReassignArgs {
+    /// Stage 12.7 contributor workflow state directory.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    /// 64-char lowercase hex `session_id` to plan a reassignment for.
+    #[arg(long)]
+    session_id: String,
+
+    /// Either supply a pre-built `SessionStatusReport` JSON OR pass
+    /// `--build-status` to build one on the fly from the state-dir.
+    #[arg(long, conflicts_with = "build_status")]
+    status_report: Option<PathBuf>,
+
+    /// Build the Stage 12.9 status report on the fly. Mutually
+    /// exclusive with `--status-report`.
+    #[arg(long, default_value_t = false)]
+    build_status: bool,
+
+    /// Reason embedded in every `ReassignAssignment` action's
+    /// downstream `WorkAssignmentSupersession`. v1 CLI exposes the
+    /// three closed-enum reasons (`Custom` is reachable only by
+    /// hand-editing the plan JSON before apply).
+    #[arg(long, value_enum, default_value_t = CliSupersessionReason::MissingPartial)]
+    reason: CliSupersessionReason,
+
+    /// Optional operator hint copied into the plan for dry-run
+    /// review. Not a trust check.
+    #[arg(long)]
+    coordinator_pubkey_hex: Option<String>,
+
+    /// Passed through to `build_session_status_report` when
+    /// `--build-status` is set.
+    #[arg(long, default_value_t = false)]
+    include_expired: bool,
+
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+
+    /// Output path for the produced `SessionRepairPlan` v2 JSON.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Args)]
+struct ApplySessionReassignArgs {
+    /// Path to a v2 `SessionRepairPlan` JSON whose
+    /// `strategy == ReassignMissing` and every action is
+    /// `ReassignAssignment`. `repair_plan_hash` is recomputed and
+    /// verified on read.
+    #[arg(long)]
+    reassignment_plan: PathBuf,
+
+    /// SNIP V2 root of the `ExecutionSession` the plan targets.
+    #[arg(long)]
+    session_snip_root: String,
+
+    /// 32-byte raw coordinator seed file. Pubkey must match
+    /// `session.coordinator_pubkey_hex`.
+    #[arg(long)]
+    coordinator_seed: PathBuf,
+
+    /// Stage 12.7 contributor workflow state directory. Required
+    /// because the applier re-verifies the session-on-disk shape
+    /// (joins / supersedee assignments) before publishing and
+    /// mirrors the new replacement + supersession bodies back
+    /// into the state-dir.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+
+    #[arg(long, default_value = "sum-node")]
+    snip_binary: PathBuf,
+    #[arg(long)]
+    snip_seed: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 0)]
+    listen_port: u16,
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+
+    /// Stage 12.6 — persistent libp2p mesh identity file.
+    #[arg(long)]
+    net_identity_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 200)]
+    propagation_wait_ms: u64,
+    #[arg(long, default_value_t = 30)]
+    peer_wait_secs: u64,
+    #[arg(long, default_value_t = 500)]
+    mesh_stabilize_ms: u64,
+
+    /// When set, the mesh broadcasts (replacement assignment
+    /// announcements + the supersession announcement) are skipped;
+    /// only the SNIP publish steps run.
+    #[arg(long, default_value_t = false)]
+    no_publish_announcements: bool,
+
+    /// Validate the plan + session + assignments + signed
+    /// replacement bodies + signed supersession body, then print
+    /// `event=would_reassign` + `event=would_publish_supersession`
+    /// lines without touching SNIP, the mesh, or the state-dir.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -1816,6 +1974,8 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::SessionStatus(a) => run_session_status(a),
         ContributorCmd::PlanSessionRepair(a) => run_plan_session_repair(a),
         ContributorCmd::ApplySessionRepair(a) => run_apply_session_repair(a).await,
+        ContributorCmd::PlanSessionReassign(a) => run_plan_session_reassign(a),
+        ContributorCmd::ApplySessionReassign(a) => run_apply_session_reassign(a).await,
     }
 }
 
@@ -4466,6 +4626,24 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
                     state_store.as_ref(),
                 );
             }
+            // Stage 12.11 — supersession topic. Pinning the body to
+            // the in-memory session cache lets the processor fail
+            // closed on coordinator-pubkey drift; the assignment
+            // reference-resolution leg runs only when the state
+            // store can supply the verified assignment slice.
+            for ann in relay
+                .poll_assignment_supersessions()
+                .map_err(|e| anyhow!("poll supersession: {e}"))?
+            {
+                handle_assignment_supersession(
+                    &snip,
+                    &args.out_dir,
+                    &session_id_filter,
+                    &ann,
+                    &sessions,
+                    state_store.as_ref(),
+                );
+            }
             std::thread::sleep(Duration::from_secs(args.poll_interval_secs));
         }
     })
@@ -4754,6 +4932,110 @@ fn handle_assignment<A: omni_store::SnipV2Adapter + ?Sized>(
             }
         }
         Err(e) => println!("event=error context=write_assignment message={e}"),
+    }
+}
+
+/// Stage 12.11 — watch-sessions handler for the assignment
+/// supersession topic. Mirrors `handle_assignment`:
+/// processor → schema/sig/SNIP/drift gate → dual-write to
+/// `<out_dir>/<session_id>/supersessions/<supersession_id>.json`
+/// → state-dir mirror under
+/// `verified/sessions/<session_id>/supersessions/...` →
+/// seen-marker in `AssignmentSupersessions` namespace.
+///
+/// When the session cache and state store both know this
+/// session, the processor is upgraded to run the full
+/// `verify_assignment_supersession` reference-resolution leg.
+/// Otherwise the announcement is accepted on its own (announcer
+/// sig + body schema + body-sig + drift); aggregate verification
+/// re-checks the references later.
+fn handle_assignment_supersession<A: omni_store::SnipV2Adapter + ?Sized>(
+    snip: &A,
+    out_dir: &std::path::Path,
+    session_id_filter: &std::collections::HashSet<String>,
+    ann: &omni_contributor::NetworkWorkAssignmentSupersessionAnnouncement,
+    sessions: &std::collections::HashMap<String, omni_contributor::ExecutionSession>,
+    state_store: Option<&omni_contributor::ContributorStateStore>,
+) {
+    if !session_id_filter.is_empty() && !session_id_filter.contains(&ann.session_id) {
+        return;
+    }
+    let cross_restart_key = format!("{}--{}", ann.session_id, ann.supersession_id);
+    if let Some(store) = state_store {
+        if matches!(
+            store.is_seen(
+                omni_contributor::StateNamespace::AssignmentSupersessions,
+                &cross_restart_key,
+            ),
+            Ok(true)
+        ) {
+            return;
+        }
+    }
+    // Upgrade to full reference-resolution when both the session
+    // and the verified-assignment slice are locally available.
+    let session_ref = sessions.get(&ann.session_id);
+    let assignments_vec: Option<Vec<omni_contributor::WorkAssignment>> = state_store
+        .and_then(|store| store.list_verified_assignments_for(&ann.session_id).ok());
+    let assignments_slice = assignments_vec.as_deref();
+    let outcome = omni_contributor::process_assignment_supersession_announcement(
+        ann,
+        snip,
+        session_ref,
+        assignments_slice,
+    );
+    if !log_announcement_failure("supersession", &ann.session_id, &outcome) {
+        return;
+    }
+    let sup = match outcome {
+        omni_contributor::AnnouncementOutcome::Verified { body } => body,
+        _ => return,
+    };
+    let bytes = serde_json::to_vec_pretty(&sup).unwrap_or_default();
+    let filename = format!("{}.json", sup.supersession_id);
+    match write_session_artifact(
+        out_dir,
+        &sup.session_id,
+        Some("supersessions"),
+        &filename,
+        &bytes,
+    ) {
+        Ok(p) => {
+            println!(
+                "event=assignment_supersession session_id={} supersession_id={} \
+                 superseded_count={} replacement_count={} session_pinned={} \
+                 references_resolved={} path={}",
+                sup.session_id,
+                sup.supersession_id,
+                sup.superseded_assignment_ids.len(),
+                sup.replacement_assignment_ids.len(),
+                session_ref.is_some(),
+                session_ref.is_some() && assignments_slice.is_some(),
+                p.display()
+            );
+            if let Some(store) = state_store {
+                if let Err(e) = store.write_verified_json(
+                    omni_contributor::StateObjectKind::AssignmentSupersession {
+                        session_id: sup.session_id.clone(),
+                    },
+                    &sup.supersession_id,
+                    &sup,
+                ) {
+                    println!(
+                        "event=warn context=state_store_write_supersession message={e}"
+                    );
+                }
+                if let Err(e) = store.mark_seen(
+                    omni_contributor::StateNamespace::AssignmentSupersessions,
+                    &cross_restart_key,
+                ) {
+                    println!(
+                        "event=warn context=state_store_mark_seen_supersession message={e}"
+                    );
+                }
+            }
+        }
+        Err(e) => println!("event=error context=write_supersession message={e}"),
     }
 }
 
@@ -5964,6 +6246,135 @@ mod tests {
         assert!(apply_dry.dry_run);
         assert!(!apply_dry.no_publish_announcements);
     }
+
+    fn parse_plan_session_reassign(extra: &[&str]) -> PlanSessionReassignArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "plan-session-reassign".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+            "--session-id".into(),
+            "00".repeat(32),
+            "--out".into(),
+            "/tmp/reassign.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::PlanSessionReassign(a) => a,
+            _ => panic!("expected PlanSessionReassign"),
+        }
+    }
+
+    fn parse_apply_session_reassign(extra: &[&str]) -> ApplySessionReassignArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "apply-session-reassign".into(),
+            "--reassignment-plan".into(),
+            "/tmp/reassign.json".into(),
+            "--session-snip-root".into(),
+            "0x00".into(),
+            "--coordinator-seed".into(),
+            "/tmp/coord.seed".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::ApplySessionReassign(a) => a,
+            _ => panic!("expected ApplySessionReassign"),
+        }
+    }
+
+    /// Stage 12.11 — clap regression for the reassignment CLI pair.
+    /// Mirrors the Stage 12.10 `session_repair_flag_parse_smoke` posture:
+    /// pins the `--build-status` xor `--status-report` mutual exclusion,
+    /// the default `--reason` (`missing-partial`), the inverted
+    /// `--no-publish-announcements` posture, and the `--dry-run` toggle.
+    #[test]
+    fn session_reassign_flag_parse_smoke() {
+        // plan: defaults
+        let plan_defaults = parse_plan_session_reassign(&[]);
+        assert!(!plan_defaults.build_status);
+        assert!(plan_defaults.status_report.is_none());
+        assert!(matches!(
+            plan_defaults.reason,
+            CliSupersessionReason::MissingPartial
+        ));
+        assert!(!plan_defaults.include_expired);
+        assert!(!plan_defaults.no_prune_state_on_start);
+        assert!(plan_defaults.coordinator_pubkey_hex.is_none());
+
+        // plan: --build-status flips on, --status-report stays None.
+        let plan_build = parse_plan_session_reassign(&["--build-status"]);
+        assert!(plan_build.build_status);
+        assert!(plan_build.status_report.is_none());
+
+        // plan: --status-report fills the path; conflicts with
+        // --build-status at clap level.
+        let plan_with_path =
+            parse_plan_session_reassign(&["--status-report", "/tmp/s.json"]);
+        assert!(!plan_with_path.build_status);
+        assert_eq!(
+            plan_with_path.status_report.as_deref(),
+            Some(std::path::Path::new("/tmp/s.json"))
+        );
+
+        // plan: clap-level mutual exclusion.
+        let conflict = TestRoot::try_parse_from(&[
+            "omni-node",
+            "plan-session-reassign",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--session-id",
+            &"00".repeat(32),
+            "--out",
+            "/tmp/reassign.json",
+            "--build-status",
+            "--status-report",
+            "/tmp/s.json",
+        ]);
+        assert!(
+            conflict.is_err(),
+            "clap must reject --build-status + --status-report combo"
+        );
+
+        // plan: each non-Custom reason value reaches the parser.
+        let plan_invalid =
+            parse_plan_session_reassign(&["--reason", "invalid-partial"]);
+        assert!(matches!(
+            plan_invalid.reason,
+            CliSupersessionReason::InvalidPartial
+        ));
+        let plan_rebalance =
+            parse_plan_session_reassign(&["--reason", "operator-rebalance"]);
+        assert!(matches!(
+            plan_rebalance.reason,
+            CliSupersessionReason::OperatorRebalance
+        ));
+
+        // apply: defaults — broadcast in addition to SNIP publish.
+        let apply_defaults = parse_apply_session_reassign(&[]);
+        assert!(!apply_defaults.no_publish_announcements);
+        assert!(!apply_defaults.dry_run);
+        assert!(!apply_defaults.no_prune_state_on_start);
+
+        // apply: --no-publish-announcements is reachable AND
+        // toggles independently of --dry-run.
+        let apply_no_mesh =
+            parse_apply_session_reassign(&["--no-publish-announcements"]);
+        assert!(apply_no_mesh.no_publish_announcements);
+        assert!(!apply_no_mesh.dry_run);
+
+        let apply_dry = parse_apply_session_reassign(&["--dry-run"]);
+        assert!(apply_dry.dry_run);
+        assert!(!apply_dry.no_publish_announcements);
+    }
 }
 
 // ── Stage 12.9 — session-status ──────────────────────────────────────────
@@ -6064,22 +6475,39 @@ fn run_session_status(args: SessionStatusArgs) -> Result<()> {
 }
 
 fn render_status_events(report: &omni_contributor::SessionStatusReport) {
+    // Stage 12.11 — top line gains active/superseded/supersession
+    // counts. `assignments=` remains the *all-verified* count so
+    // existing tooling does not silently break; `active=` is the
+    // verifier-relevant subset.
     println!(
         "event=session_status session_id={} status={:?} \
-         assignments={} partials={} missing={} aggregate={} expired={}",
+         assignments={} active={} superseded={} supersessions={} \
+         partials={} missing={} aggregate={} expired={}",
         report.session_id,
         report.overall_status,
         report.assignment_count,
+        report.active_assignment_count,
+        report.superseded_assignment_count,
+        report.supersession_count,
         report.partial_count,
         report.missing_assignment_ids.len(),
         report.aggregate_valid,
         report.session_expired,
     );
     for a in &report.assignments {
+        // Stage 12.11 — surface per-assignment supersession flag
+        // and (when present) the supersession_id that retired it.
+        // Active assignments print `superseded=no superseded_by=-`
+        // so log filters can pattern-match either state without
+        // optional-field gymnastics.
+        let superseded_by = a
+            .superseded_by_supersession_id
+            .as_deref()
+            .unwrap_or("-");
         println!(
             "event=assignment_status session_id={} assignment_id={} \
              stage_index={} contributor={} join={} peer_advert={} \
-             partial={}",
+             partial={} superseded={} superseded_by={}",
             report.session_id,
             a.assignment_id,
             a.stage_index,
@@ -6087,6 +6515,20 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
             if a.join_present { "present" } else { "missing" },
             if a.peer_advert_present { "present" } else { "missing" },
             if a.partial_present { "present" } else { "missing" },
+            if a.superseded { "yes" } else { "no" },
+            superseded_by,
+        );
+    }
+    for s in &report.supersessions {
+        println!(
+            "event=supersession_status session_id={} supersession_id={} \
+             superseded_count={} replacement_count={} reason={:?} valid={}",
+            report.session_id,
+            s.supersession_id,
+            s.superseded_assignment_ids.len(),
+            s.replacement_assignment_ids.len(),
+            s.reason,
+            s.valid,
         );
     }
     for missing in &report.missing_assignment_ids {
@@ -6129,10 +6571,16 @@ fn render_status_json(
 fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
     println!("Session   {}", report.session_id);
     println!("Status    {:?}", report.overall_status);
+    // Stage 12.11 — surface active / superseded / supersession
+    // counts inline with the existing roll-up.
     println!(
-        "Counts    joins={} assignments={} partials={} adverts={} aggregate_present={} aggregate_valid={}",
+        "Counts    joins={} assignments={} active={} superseded={} \
+         supersessions={} partials={} adverts={} aggregate_present={} aggregate_valid={}",
         report.join_count,
         report.assignment_count,
+        report.active_assignment_count,
+        report.superseded_assignment_count,
+        report.supersession_count,
         report.partial_count,
         report.peer_advert_count,
         report.aggregate_present,
@@ -6141,26 +6589,47 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
     if !report.assignments.is_empty() {
         println!("Assignments:");
         println!(
-            "  {:<5} {:<10} {:<10} {:<10} {:<10}",
-            "stage", "join", "advert", "partial", "assignment_id (12)"
+            "  {:<5} {:<10} {:<10} {:<10} {:<10} {:<10}",
+            "stage", "join", "advert", "partial", "superseded", "assignment_id (12)"
         );
         for a in &report.assignments {
             let short_id: String = a.assignment_id.chars().take(12).collect();
             println!(
-                "  {:<5} {:<10} {:<10} {:<10} {}",
+                "  {:<5} {:<10} {:<10} {:<10} {:<10} {}",
                 a.stage_index,
                 if a.join_present { "present" } else { "missing" },
                 if a.peer_advert_present { "present" } else { "missing" },
                 if a.partial_present { "present" } else { "missing" },
+                if a.superseded { "yes" } else { "no" },
+                short_id,
+            );
+        }
+    }
+    if !report.supersessions.is_empty() {
+        println!("Supersessions:");
+        println!(
+            "  {:<10} {:<10} {:<10} {:<20} {:<10}",
+            "valid", "superseded", "replacement", "reason", "supersession_id (12)"
+        );
+        for s in &report.supersessions {
+            let short_id: String = s.supersession_id.chars().take(12).collect();
+            println!(
+                "  {:<10} {:<10} {:<10} {:<20} {}",
+                if s.valid { "yes" } else { "no" },
+                s.superseded_assignment_ids.len(),
+                s.replacement_assignment_ids.len(),
+                format!("{:?}", s.reason),
                 short_id,
             );
         }
     }
     if !report.missing_assignment_ids.is_empty() {
+        // Stage 12.11 — denominator is active_assignment_count
+        // because missing_assignment_ids is active-only.
         println!(
             "Missing partials: {} / {}",
             report.missing_assignment_ids.len(),
-            report.assignment_count
+            report.active_assignment_count
         );
     }
     if !report.notes.is_empty() {
@@ -6539,6 +7008,562 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
     println!(
         "event=repair_applied session_id={} assignments_reannounced={}",
         plan.session_id, reannounced
+    );
+    Ok(())
+}
+
+// ── Stage 12.11 — plan-session-reassign ──────────────────────────────────
+
+fn run_plan_session_reassign(args: PlanSessionReassignArgs) -> Result<()> {
+    use omni_contributor::{
+        build_session_repair_plan_with_reason, build_session_status_report,
+        ContributorStateStore, SessionStatusReport,
+    };
+
+    if args.status_report.is_some() == args.build_status {
+        return Err(anyhow!(
+            "supply exactly one of --status-report <path> or --build-status"
+        ));
+    }
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let (store, prune_report) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        !args.no_prune_state_on_start,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    println!(
+        "event=state_store_opened path={} pruned_sessions={} pruned_peer_adverts={} kept={}",
+        args.contributor_state_dir.display(),
+        prune_report.removed_sessions,
+        prune_report.removed_peer_adverts,
+        prune_report.kept
+    );
+
+    let status: SessionStatusReport = if args.build_status {
+        build_session_status_report(
+            &store,
+            &args.session_id,
+            &now_utc,
+            args.include_expired,
+        )
+        .map_err(|e| anyhow!("build session status report: {e}"))?
+    } else {
+        let path = args.status_report.as_deref().expect("validated above");
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read status-report: {}", path.display()))?;
+        let report: SessionStatusReport = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse status-report: {}", path.display()))?;
+        if report.session_id != args.session_id {
+            return Err(anyhow!(
+                "status-report.session_id={} but --session-id={}",
+                report.session_id,
+                args.session_id
+            ));
+        }
+        report
+    };
+
+    let plan = build_session_repair_plan_with_reason(
+        &status,
+        omni_contributor::RepairStrategy::ReassignMissing,
+        omni_contributor::SupersessionReason::from(args.reason),
+        &now_utc,
+        args.coordinator_pubkey_hex.as_deref(),
+    )
+    .map_err(|e| anyhow!("build session repair plan: {e}"))?;
+
+    let json = serde_json::to_vec_pretty(&plan)?;
+    std::fs::write(&args.out, &json)
+        .with_context(|| format!("write reassignment plan: {}", args.out.display()))?;
+
+    println!(
+        "event=reassignment_plan_created session_id={} actions={} \
+         repair_plan_hash={} source_status_hash={} out={}",
+        plan.session_id,
+        plan.actions.len(),
+        plan.repair_plan_hash,
+        plan.source_status_hash,
+        args.out.display()
+    );
+    Ok(())
+}
+
+// ── Stage 12.11 — apply-session-reassign ─────────────────────────────────
+
+async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()> {
+    use omni_contributor::canonical::{
+        assignment_id_hex, hex_lower, net_assign_signing_input,
+        net_supersession_signing_input, supersession_id_hex,
+        work_assignment_signing_input, work_assignment_supersession_signing_input,
+    };
+    use omni_contributor::{
+        build_session_status_report, repair_plan_hash_hex, source_status_hash_hex,
+        ContributorRelay, ContributorStateStore, CoordinatorSigner,
+        NetworkWorkAssignedAnnouncement, NetworkWorkAssignmentSupersessionAnnouncement,
+        OmniNetRelay, RepairAction, SessionRepairPlan, WorkAssignment,
+        WorkAssignmentSupersession, NET_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
+        SUPERSESSION_SCHEMA_VERSION,
+    };
+
+    // ── 1. Read + integrity-check the plan ─────────────────────
+    let bytes = std::fs::read(&args.reassignment_plan)
+        .with_context(|| {
+            format!("read reassignment-plan: {}", args.reassignment_plan.display())
+        })?;
+    let plan: SessionRepairPlan = serde_json::from_slice(&bytes).with_context(|| {
+        format!("parse reassignment-plan: {}", args.reassignment_plan.display())
+    })?;
+    if plan.schema_version != omni_contributor::REPAIR_PLAN_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "repair_plan.schema_version {} not supported (expected {})",
+            plan.schema_version,
+            omni_contributor::REPAIR_PLAN_SCHEMA_VERSION
+        ));
+    }
+    let recomputed_plan_hash = repair_plan_hash_hex(&plan);
+    if recomputed_plan_hash != plan.repair_plan_hash {
+        return Err(anyhow!(omni_contributor::RepairError::PlanHashDrift {
+            stored: plan.repair_plan_hash.clone(),
+            recomputed: recomputed_plan_hash,
+        }));
+    }
+    if plan.strategy != omni_contributor::RepairStrategy::ReassignMissing {
+        return Err(anyhow!(
+            "apply-session-reassign requires plan.strategy == ReassignMissing; got {:?}",
+            plan.strategy
+        ));
+    }
+    if plan.actions.is_empty() {
+        return Err(anyhow!(
+            "reassignment-plan carries zero actions; nothing to apply"
+        ));
+    }
+    // Every action must be ReassignAssignment.
+    for action in &plan.actions {
+        match action {
+            RepairAction::ReassignAssignment { .. } => {}
+            RepairAction::ReannounceAssignment { .. } => {
+                return Err(anyhow!(
+                    "apply-session-reassign only accepts ReassignAssignment actions; \
+                     use apply-session-repair for ReannounceAssignment"
+                ));
+            }
+        }
+    }
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // ── 2. Open state store + recompute source-status drift ────
+    let (store, prune_report) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        !args.no_prune_state_on_start,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    println!(
+        "event=state_store_opened path={} pruned_sessions={} pruned_peer_adverts={} kept={}",
+        args.contributor_state_dir.display(),
+        prune_report.removed_sessions,
+        prune_report.removed_peer_adverts,
+        prune_report.kept
+    );
+
+    let current_status = build_session_status_report(
+        &store,
+        &plan.session_id,
+        &now_utc,
+        /* include_expired = */ false,
+    )
+    .map_err(|e| anyhow!("rebuild status report for drift check: {e}"))?;
+    let current_projection = source_status_hash_hex(&current_status);
+    if current_projection != plan.source_status_hash {
+        return Err(anyhow!(omni_contributor::RepairError::SourceStatusDrift));
+    }
+    // Stage 12.11 — apply-session-reassign refuses InvalidState in
+    // v1 (the operator must clean tampered artifacts first). Same
+    // posture as Stage 12.10's apply-session-repair.
+    omni_contributor::check_repair_eligible(&current_status)
+        .map_err(|e| anyhow!("apply rejected by current status: {e}"))?;
+
+    // ── 3. Fetch + verify session, check coordinator seed ──────
+    let snip = build_snip_adapter(args.snip_binary, args.snip_seed);
+    let session = fetch_and_verify_session(&snip, &args.session_snip_root)?;
+    if session.session_id != plan.session_id {
+        return Err(anyhow!(
+            "reassignment-plan.session_id={} but --session-snip-root resolves to session_id={}",
+            plan.session_id,
+            session.session_id
+        ));
+    }
+    let coord = CoordinatorSigner::from_seed_file(&args.coordinator_seed)?;
+    if coord.pubkey_hex() != session.coordinator_pubkey_hex {
+        return Err(anyhow!(
+            "coordinator_seed pubkey does not match session.coordinator_pubkey_hex"
+        ));
+    }
+
+    // ── 4. Load + re-verify joins (needed for replacement assignment
+    //       verification because verify_work_assignment requires the
+    //       replacement contributor to be in the joined set) + load
+    //       current verified assignments (the supersession's
+    //       superseded_assignment_ids reference these). ─────────
+    let raw_joins = store.list_verified_joins_for(&plan.session_id)?;
+    let joins: Vec<omni_contributor::ContributorJoin> = raw_joins
+        .into_iter()
+        .filter(|j| omni_contributor::verify_contributor_join(&session, j).is_ok())
+        .collect();
+    let joined_pubkeys: std::collections::HashSet<String> = joins
+        .iter()
+        .map(|j| j.contributor_pubkey_hex.clone())
+        .collect();
+
+    // ── 5. Build, sign, validate each replacement WorkAssignment
+    //       (in plan order so dry-run output is deterministic). ──
+    struct PreparedReplacement {
+        replacement: WorkAssignment,
+        superseded_assignment_id: String,
+    }
+    let mut prepared: Vec<PreparedReplacement> = Vec::with_capacity(plan.actions.len());
+    let mut all_assignments_with_replacements: Vec<WorkAssignment> = Vec::new();
+    // Stage 12.7 state-dir already has every Stage 12.0–12.10
+    // assignment; load them once so we can fold replacements in and
+    // pass the full set to the supersession verifier.
+    let raw_existing = store.list_verified_assignments_for(&plan.session_id)?;
+    for a in raw_existing {
+        if omni_contributor::verify_work_assignment(&session, &joined_pubkeys, &a)
+            .is_ok()
+        {
+            all_assignments_with_replacements.push(a);
+        }
+    }
+    let existing_ids: std::collections::HashSet<String> = all_assignments_with_replacements
+        .iter()
+        .map(|a| a.assignment_id.clone())
+        .collect();
+
+    // Stage 12.11 review enforcement — the plan is unsigned/local
+    // and `repair_plan_hash` is reachable by hand-editing the JSON.
+    // Without this guard, an edited plan can target an assignment
+    // that is already `superseded` or already has a valid partial
+    // (`partial_present == true`), while the session is still
+    // `InProgress` due to some OTHER missing assignment. The
+    // session-level `source_status_hash` recheck above proves the
+    // overall shape is unchanged but does not bind per-action
+    // intent. The helper required every `ReassignAssignment` to
+    // target an active-missing row whose `stage_index` matches
+    // the plan's `original_stage_index`.
+    omni_contributor::check_reassign_targets_active_missing(&plan, &current_status)
+        .map_err(|e| anyhow!("apply rejected by per-action enforcement: {e}"))?;
+
+    for action in &plan.actions {
+        let RepairAction::ReassignAssignment {
+            superseded_assignment_id,
+            replacement_contributor_pubkey_hex,
+            replacement_stage_index,
+            replacement_work_kind,
+            replacement_expected_work_units,
+            replacement_expected_work_unit_kind,
+            ..
+        } = action
+        else {
+            unreachable!("validated above");
+        };
+        if !existing_ids.contains(superseded_assignment_id) {
+            return Err(anyhow!(
+                omni_contributor::RepairError::AssignmentNotPresent {
+                    session_id: plan.session_id.clone(),
+                    assignment_id: superseded_assignment_id.clone(),
+                }
+            ));
+        }
+        // Build the replacement WorkAssignment body. `assigned_at_utc`
+        // = now_utc gives a fresh assignment_id even when the rest
+        // of the body matches the superseded original.
+        let mut replacement = WorkAssignment {
+            schema_version: SESSION_SCHEMA_VERSION,
+            session_id: plan.session_id.clone(),
+            assignment_id: String::new(),
+            stage_index: *replacement_stage_index,
+            contributor_pubkey_hex: replacement_contributor_pubkey_hex.clone(),
+            work_kind: replacement_work_kind.clone(),
+            expected_work_units: *replacement_expected_work_units,
+            expected_work_unit_kind: *replacement_expected_work_unit_kind,
+            assigned_at_utc: now_utc.clone(),
+            coordinator_signature_hex: String::new(),
+        };
+        replacement.assignment_id = assignment_id_hex(&replacement)?;
+        let sig_input = work_assignment_signing_input(&replacement)?;
+        replacement.coordinator_signature_hex = coord.sign_hex(&sig_input);
+        replacement.validate_schema().map_err(|e| {
+            anyhow!("replacement WorkAssignment failed validate_schema: {e}")
+        })?;
+        // The replacement's contributor must be in the joined set;
+        // otherwise verify_work_assignment fails and the chain is
+        // unusable.
+        let outcome = omni_contributor::verify_work_assignment(
+            &session,
+            &joined_pubkeys,
+            &replacement,
+        );
+        if !outcome.is_ok() {
+            return Err(anyhow!(
+                "replacement WorkAssignment failed verify_work_assignment: {outcome:?}"
+            ));
+        }
+        // Fold into the slice we pass to the supersession verifier
+        // (its reference-resolution check needs to see replacement
+        // assignment_ids).
+        all_assignments_with_replacements.push(replacement.clone());
+        prepared.push(PreparedReplacement {
+            replacement,
+            superseded_assignment_id: superseded_assignment_id.clone(),
+        });
+    }
+
+    // ── 6. Build, sign, validate the single supersession envelope
+    //       covering every superseded + replacement id. ─────────
+    let mut superseded_ids: Vec<String> = prepared
+        .iter()
+        .map(|p| p.superseded_assignment_id.clone())
+        .collect();
+    superseded_ids.sort();
+    superseded_ids.dedup();
+    let mut replacement_ids: Vec<String> = prepared
+        .iter()
+        .map(|p| p.replacement.assignment_id.clone())
+        .collect();
+    replacement_ids.sort();
+    replacement_ids.dedup();
+    // All actions in a single plan share one reason (the planner
+    // builds them uniformly). Pull the first.
+    let reason = match &plan.actions[0] {
+        RepairAction::ReassignAssignment { reason, .. } => reason.clone(),
+        _ => unreachable!("validated above"),
+    };
+    let mut supersession = WorkAssignmentSupersession {
+        schema_version: SUPERSESSION_SCHEMA_VERSION,
+        session_id: plan.session_id.clone(),
+        supersession_id: String::new(),
+        superseded_assignment_ids: superseded_ids.clone(),
+        replacement_assignment_ids: replacement_ids.clone(),
+        reason,
+        created_at_utc: now_utc.clone(),
+        coordinator_pubkey_hex: coord.pubkey_hex(),
+        coordinator_signature_hex: String::new(),
+    };
+    supersession.supersession_id = supersession_id_hex(&supersession)?;
+    let s_sig = work_assignment_supersession_signing_input(&supersession)?;
+    supersession.coordinator_signature_hex = coord.sign_hex(&s_sig);
+    supersession.validate_schema().map_err(|e| {
+        anyhow!("WorkAssignmentSupersession failed validate_schema: {e}")
+    })?;
+    let s_outcome = omni_contributor::verify_assignment_supersession(
+        &session,
+        &all_assignments_with_replacements,
+        &supersession,
+    );
+    if !s_outcome.is_ok() {
+        return Err(anyhow!(
+            "WorkAssignmentSupersession failed verify_assignment_supersession: {s_outcome:?}"
+        ));
+    }
+
+    // ── 7. Dry-run path: print would-* events, exit clean. ────
+    if args.dry_run {
+        for p in &prepared {
+            println!(
+                "event=would_reassign session_id={} superseded_assignment_id={} \
+                 replacement_assignment_id={} stage_index={} contributor={}",
+                plan.session_id,
+                p.superseded_assignment_id,
+                p.replacement.assignment_id,
+                p.replacement.stage_index,
+                p.replacement.contributor_pubkey_hex,
+            );
+        }
+        println!(
+            "event=would_publish_supersession session_id={} supersession_id={} \
+             superseded={} replacement={}",
+            plan.session_id,
+            supersession.supersession_id,
+            superseded_ids.len(),
+            replacement_ids.len(),
+        );
+        println!(
+            "event=reassign_dry_run session_id={} replacements={} supersession=1",
+            plan.session_id,
+            prepared.len()
+        );
+        return Ok(());
+    }
+
+    // ── 8. Real publish path. ────────────────────────────────
+    let should_publish_announcements = !args.no_publish_announcements;
+    let mut mesh: Option<(
+        std::sync::Arc<tokio::sync::Mutex<omni_net::OmniNet>>,
+        OmniNetRelay,
+    )> = if should_publish_announcements {
+        let (net, handle) = open_omninet_with_peer_wait(
+            args.listen_port,
+            args.peer,
+            args.peer_wait_secs,
+            args.mesh_stabilize_ms,
+            args.net_identity_file.as_deref(),
+        )
+        .await?;
+        let relay = OmniNetRelay::new(net.clone(), handle);
+        Some((net, relay))
+    } else {
+        None
+    };
+
+    // 8a. **Phase A — SNIP-publish every body first**, before
+    // ANY state-dir mutation or mesh broadcast. SNIP is
+    // content-addressed and republish is idempotent (same bytes →
+    // same root), so a transient failure here is safe to retry
+    // and the operator's local state-dir + source_status_hash are
+    // unchanged. This avoids the Stage 12.11 review's flagged
+    // partial-apply window: previously, replacement assignments
+    // were written + marked into the state-dir BEFORE the
+    // supersession was even attempted, so a failed supersession
+    // publish would leave extra active replacements in the
+    // state-dir without the retiring supersession — and a retry
+    // would then refuse on `source_status_hash` drift, forcing
+    // manual state cleanup. Now Phase A commits every SNIP body
+    // up-front, Phase B only runs after every Phase-A publish
+    // succeeded.
+    let mut replacement_roots: Vec<String> =
+        Vec::with_capacity(prepared.len());
+    for p in &prepared {
+        let json = serde_json::to_vec_pretty(&p.replacement)?;
+        let root = omni_contributor::snip::publish_bytes(
+            &snip,
+            &json,
+            "replacement-assignment",
+        )
+        .map_err(|e| anyhow!("snip publish replacement: {e}"))?;
+        replacement_roots.push(format!("0x{}", hex_lower(root.as_bytes())));
+    }
+    let s_json = serde_json::to_vec_pretty(&supersession)?;
+    let s_root = omni_contributor::snip::publish_bytes(
+        &snip,
+        &s_json,
+        "assignment-supersession",
+    )
+    .map_err(|e| anyhow!("snip publish supersession: {e}"))?;
+    let s_root_hex = format!("0x{}", hex_lower(s_root.as_bytes()));
+
+    // 8b. **Phase B — local + mesh side effects**. Both SNIP
+    // bodies (replacements + supersession) are durably content-
+    // addressed at this point, so it is safe to mutate the
+    // local state-dir + broadcast on the mesh. Replacements go
+    // first so a peer receiving the supersession announcement
+    // can already fetch every replacement assignment body it
+    // names. The supersession state-dir write closes the loop.
+    for (p, root_hex) in prepared.iter().zip(replacement_roots.iter()) {
+        if let Some((_, ref mut relay)) = mesh.as_mut().map(|(n, r)| (n, r)) {
+            let mut ann = NetworkWorkAssignedAnnouncement {
+                schema_version: NET_SCHEMA_VERSION,
+                work_assignment_snip_root: root_hex.clone(),
+                session_id: plan.session_id.clone(),
+                assignment_id: p.replacement.assignment_id.clone(),
+                contributor_pubkey_hex: p.replacement.contributor_pubkey_hex.clone(),
+                announced_at_utc: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                announcer_pubkey_hex: coord.pubkey_hex(),
+                announcer_signature_hex: String::new(),
+            };
+            let ann_sig = net_assign_signing_input(&ann)?;
+            ann.announcer_signature_hex = coord.sign_hex(&ann_sig);
+            relay
+                .publish_work_assigned(&ann)
+                .map_err(|e| anyhow!("publish replacement assignment: {e}"))?;
+        }
+
+        // Dual-write into state-dir.
+        store.write_verified_json(
+            omni_contributor::StateObjectKind::Assignment {
+                session_id: plan.session_id.clone(),
+            },
+            &p.replacement.assignment_id,
+            &p.replacement,
+        )?;
+        let marker = format!("{}--{}", plan.session_id, p.replacement.assignment_id);
+        store.mark_seen(
+            omni_contributor::StateNamespace::Assignments,
+            &marker,
+        )?;
+
+        println!(
+            "event=replacement_assignment_published session_id={} \
+             superseded_assignment_id={} replacement_assignment_id={} \
+             stage_index={} contributor={} work_assignment_snip_root={}",
+            plan.session_id,
+            p.superseded_assignment_id,
+            p.replacement.assignment_id,
+            p.replacement.stage_index,
+            p.replacement.contributor_pubkey_hex,
+            root_hex,
+        );
+    }
+
+    if let Some((_, ref mut relay)) = mesh.as_mut().map(|(n, r)| (n, r)) {
+        let mut ann = NetworkWorkAssignmentSupersessionAnnouncement {
+            schema_version: NET_SCHEMA_VERSION,
+            work_assignment_supersession_snip_root: s_root_hex.clone(),
+            session_id: plan.session_id.clone(),
+            supersession_id: supersession.supersession_id.clone(),
+            announced_at_utc: chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            announcer_pubkey_hex: coord.pubkey_hex(),
+            announcer_signature_hex: String::new(),
+        };
+        let ann_sig = net_supersession_signing_input(&ann)?;
+        ann.announcer_signature_hex = coord.sign_hex(&ann_sig);
+        relay
+            .publish_assignment_supersession(&ann)
+            .map_err(|e| anyhow!("publish supersession announcement: {e}"))?;
+    }
+
+    // Dual-write supersession into state-dir.
+    store.write_verified_json(
+        omni_contributor::StateObjectKind::AssignmentSupersession {
+            session_id: plan.session_id.clone(),
+        },
+        &supersession.supersession_id,
+        &supersession,
+    )?;
+    let s_marker = format!("{}--{}", plan.session_id, supersession.supersession_id);
+    store.mark_seen(
+        omni_contributor::StateNamespace::AssignmentSupersessions,
+        &s_marker,
+    )?;
+
+    println!(
+        "event=supersession_published session_id={} supersession_id={} \
+         superseded={} replacement={} work_assignment_supersession_snip_root={}",
+        plan.session_id,
+        supersession.supersession_id,
+        superseded_ids.len(),
+        replacement_ids.len(),
+        s_root_hex,
+    );
+
+    if let Some((net, _relay)) = mesh {
+        tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms))
+            .await;
+        let g = net.lock().await;
+        let _ = g.shutdown().await;
+    }
+    println!(
+        "event=reassign_applied session_id={} replacements_published={} supersession_published=1",
+        plan.session_id,
+        prepared.len()
     );
     Ok(())
 }
