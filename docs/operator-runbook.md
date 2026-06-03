@@ -1109,4 +1109,64 @@ cp -r /backup/contributor-archive/<session_id>/seen/* \
       <state-dir>/seen/
 ```
 
-Then run `omni-node operator contributor session-status --contributor-state-dir <state> --session-id <hex>` to confirm the chain re-verifies. A future stage will likely add `restore-session`; until then manual `cp` is the path.
+Then run `omni-node operator contributor session-status --contributor-state-dir <state> --session-id <hex>` to confirm the chain re-verifies.
+
+### Restoring an archived session (Stage 12.15)
+
+`restore-session-archive` is the inverse of `archive-session`. It reads `<archive-session-dir>/manifest.json` (or `<archive-dir>/<session_id>/manifest.json` if you supply the pair), validates every file's BLAKE3 + safe-path + state-dir version compatibility, then writes the bytes back into your state-dir. **No chain, mesh, or SNIP wire is touched** — restore is local byte-identical replay.
+
+**Stop the watcher first.** Stage 12.7 explicitly treats `<state-dir>` as operator-local; concurrent writes from a running `watch-sessions` and the restore command are not coordinated. The simplest pattern: SIGTERM the watcher, restore, restart the watcher.
+
+**Three modes** — fastest to slowest:
+
+| Mode | What it does | When to use |
+|---|---|---|
+| `--dry-run` | Parses the manifest, runs path safety + whitelist + schema/version/session-id checks. Touches no archive bytes beyond the manifest; touches no state-dir files. | Quick "is this archive shaped right?" check. |
+| `--verify-only` | Adds full BLAKE3 walk over every archived file. Touches no state-dir files. | "Is this archive byte-intact on disk before I commit to a real restore?" |
+| (real restore) | Adds destination-existence preflight (all-or-nothing) + writes every byte verbatim through the state-store's atomic helper. | The real thing. |
+
+**Typical workflow:**
+
+```bash
+# 1. Stop the watcher (if any).
+systemctl stop omni-node-watcher.service     # or your equivalent
+
+# 2. Dry-run: cheap manifest validation.
+omni-node operator contributor restore-session-archive \
+  --contributor-state-dir <state> \
+  --archive-session-dir /backup/contributor-archive/<session_id> \
+  --dry-run
+
+# 3. Verify-only: full BLAKE3 walk over the archive. Slow if the
+#    archive is large but catches bit-rot.
+omni-node operator contributor restore-session-archive \
+  --contributor-state-dir <state> \
+  --archive-session-dir /backup/contributor-archive/<session_id> \
+  --verify-only
+
+# 4. Real restore.
+omni-node operator contributor restore-session-archive \
+  --contributor-state-dir <state> \
+  --archive-session-dir /backup/contributor-archive/<session_id>
+
+# 5. Confirm with session-status. (NOT auto-run.)
+omni-node operator contributor session-status \
+  --contributor-state-dir <state> \
+  --session-id <session_id>
+
+# 6. Restart the watcher.
+systemctl start omni-node-watcher.service
+```
+
+**Defaults are safe-by-default.** `--overwrite-existing` is OFF — restore refuses BEFORE writing if any destination file already exists. `--include-results` is OFF; result-link entries in the archive are skipped unless you opt in.
+
+**Recovery from a refusal:**
+
+- `RestoreError::BlakeMismatch` → archive bit-rot or hand-tamper. Re-pull the archive from your durable backup before re-running.
+- `RestoreError::ManifestFileMissing` → the archive is incomplete (a partial copy from another tool). Re-pull or re-archive from source.
+- `RestoreError::DestinationExists` → state-dir already holds files at the restore paths. Either re-run with `--overwrite-existing` (knowing what you're overwriting) or first delete the conflicting subtree (e.g. `omni-node operator contributor session-status` to identify it, then manual cleanup).
+- `RestoreError::UnsafeRelativePath` / `RestoreError::DisallowedRelativePath` → the archive's manifest was hand-edited or produced by a non-Stage-12.14 tool. Refuse to ingest; treat the archive as untrusted.
+- `RestoreError::IncompatibleSourceStateVersion` → the archive was produced by a state-dir at a different `STATE_VERSION`. v1 enforces strict equality (`== 2`). Either upgrade/downgrade your binary OR re-archive from a current state-dir.
+- `RestoreError::SessionIdMismatch` → the archive directory was renamed and no longer matches the manifest's `session_id`. Rename it back, or use `--archive-dir + --session-id` to be explicit.
+
+The restore command exits **nonzero** on every `RestoreError` variant so automation can detect refusals and trigger triage.

@@ -52,6 +52,7 @@ pub mod planner;
 pub mod posted;
 pub mod relay;
 pub mod repair;
+pub mod restore;
 pub mod result;
 pub mod resume;
 pub mod run;
@@ -71,8 +72,8 @@ pub mod watch;
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
     ArchiveError, CanonicalError, ContributorError, DiscoverError, PlannerError,
-    RelayError, RepairError, RunnerError, SchemaError, SigningError, SnipError,
-    StatusError, VerifyError,
+    RelayError, RepairError, RestoreError, RunnerError, SchemaError, SigningError,
+    SnipError, StatusError, VerifyError,
 };
 pub use repair::{
     build_session_repair_plan, build_session_repair_plan_with_reason,
@@ -94,6 +95,10 @@ pub use resume::{
 pub use archive::{
     archive_session, ArchiveManifest, ArchiveMode, ArchiveOptions,
     ArchiveStatusRequirement, ArchivedFile, ARCHIVE_MANIFEST_SCHEMA_VERSION,
+};
+pub use restore::{
+    restore_session_archive, verify_archive_manifest, RestoreOptions,
+    RestoreReport, RestoreSource,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,

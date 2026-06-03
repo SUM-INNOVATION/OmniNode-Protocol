@@ -309,6 +309,29 @@ pub enum StateError {
          {legacy_flag}; supply one or the other"
     )]
     AmbiguousSource { legacy_flag: &'static str },
+
+    /// Stage 12.15 — `write_archived_bytes` refused the supplied
+    /// `source_relative` path because it contains traversal
+    /// (`..`), is absolute, or uses a Windows-style backslash.
+    /// Restore callers should bubble this up as
+    /// `RestoreError::UnsafeRelativePath`.
+    #[error("unsafe relative path: {path}")]
+    UnsafeRelativePath { path: String },
+
+    /// Stage 12.15 — `write_archived_bytes` refused the supplied
+    /// `source_relative` path because it does not match the
+    /// Stage 12.14 archive whitelist (the leading components
+    /// must address a `verified/sessions/<session_id>/...`
+    /// subtree, a session-keyed `seen/*` marker, or
+    /// `results/result-links/<posted_id>.link.json`).
+    #[error("disallowed relative path: {path}")]
+    DisallowedRelativePath { path: String },
+
+    /// Stage 12.15 — `write_archived_bytes` refused because the
+    /// destination already exists and `overwrite_existing == false`.
+    /// Surfaced as `RestoreError::DestinationExists` upstream.
+    #[error("destination already exists: {path}")]
+    DestinationExists { path: std::path::PathBuf },
 }
 
 /// Stage 12.8 — typed errors from the local assignment planner.
@@ -849,6 +872,112 @@ pub enum ArchiveError {
     Status(#[from] StatusError),
 
     /// Bubbled-up `StateError`.
+    #[error("state error: {0}")]
+    State(#[from] StateError),
+}
+
+/// Stage 12.15 — local session archive restore errors. The
+/// inverse of `ArchiveError`: each variant names exactly one
+/// safety check the restore path enforces before any state-dir
+/// write.
+#[derive(Debug, thiserror::Error)]
+pub enum RestoreError {
+    /// The supplied archive directory does not exist on disk.
+    #[error("archive directory not found: {path}")]
+    ArchiveNotFound { path: std::path::PathBuf },
+
+    /// The expected `manifest.json` is missing from the archive
+    /// directory. Stage 12.14 writes the manifest LAST, so a
+    /// missing manifest typically means the archive was created
+    /// by a tool that crashed mid-copy.
+    #[error("manifest.json missing at {path}")]
+    ManifestMissing { path: std::path::PathBuf },
+
+    /// `manifest.json` did not parse as a v1 `ArchiveManifest`.
+    /// Bubbled `serde_json::Error` carries the column/line.
+    #[error("malformed archive manifest at {path}: {source}")]
+    MalformedManifest {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// `manifest.schema_version` is not `ARCHIVE_MANIFEST_SCHEMA_VERSION`.
+    /// Stage 12.15 v1 accepts exactly version `1`.
+    #[error(
+        "unsupported archive manifest schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedManifestVersion { got: u32, expected: u32 },
+
+    /// The `manifest.session_id` field does not match the
+    /// session_id derived from the archive directory name (or
+    /// the operator-supplied `--session-id`). Defends against
+    /// hand-renamed archive directories.
+    #[error(
+        "session_id mismatch: manifest.session_id={manifest_session_id} \
+         dir.session_id={dir_session_id}"
+    )]
+    SessionIdMismatch {
+        manifest_session_id: String,
+        dir_session_id: String,
+    },
+
+    /// `manifest.source_state_version != STATE_VERSION`. Stage
+    /// 12.15 v1 enforces strict equality — restoring across a
+    /// state-dir version boundary would require a migration
+    /// story that does not exist yet.
+    #[error(
+        "incompatible source state-dir version: archive={archive} current={current}"
+    )]
+    IncompatibleSourceStateVersion { archive: u32, current: u32 },
+
+    /// `source_relative` contains `..`, is absolute, or uses a
+    /// backslash. Bubbled from `StateError::UnsafeRelativePath`.
+    #[error("unsafe relative path in manifest: {path}")]
+    UnsafeRelativePath { path: String },
+
+    /// `source_relative` does not match the Stage 12.14 archive
+    /// whitelist. Bubbled from `StateError::DisallowedRelativePath`.
+    #[error("disallowed relative path in manifest: {path}")]
+    DisallowedRelativePath { path: String },
+
+    /// A file named in the manifest does not exist under the
+    /// archive directory. Restore is fail-fast — operator
+    /// triages then re-runs.
+    #[error("archive file missing for manifest entry: {archive_path}")]
+    ManifestFileMissing { archive_path: std::path::PathBuf },
+
+    /// BLAKE3 of the archive file did not match the manifest's
+    /// `blake3_hex`. Fail-fast (no retry); operator triages
+    /// the FS / archive integrity.
+    #[error(
+        "blake3 mismatch on archive file: path={path} expected={expected} got={got}"
+    )]
+    BlakeMismatch {
+        path: std::path::PathBuf,
+        expected: String,
+        got: String,
+    },
+
+    /// Preflight check found a destination file that already
+    /// exists in the state-dir AND `--overwrite-existing` was
+    /// false. Stage 12.15 enforces all-or-nothing: any
+    /// pre-existing destination refuses BEFORE any state-dir
+    /// write happens. Operator re-runs with
+    /// `--overwrite-existing` or cleans state-dir first.
+    #[error("destination already exists: {path} (re-run with --overwrite-existing)")]
+    DestinationExists { path: std::path::PathBuf },
+
+    /// Generic FS error.
+    #[error("restore io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Bubbled `StateError` — typically from
+    /// `write_archived_bytes`.
     #[error("state error: {0}")]
     State(#[from] StateError),
 }

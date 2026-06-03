@@ -498,6 +498,47 @@ impl ContributorStateStore {
         cascade_remove_session_strict(&self.root, session_id)
     }
 
+    /// Stage 12.15 — write raw archived bytes at a state-dir
+    /// relative path. The Stage 12.14 archive layout under
+    /// `<archive-dir>/<session_id>/...` mirrors the source
+    /// `<state-dir>/...` 1-for-1, so restore is mechanically
+    /// "read archive file bytes, write them at the same
+    /// relative path under the state-dir, BLAKE3-verify".
+    ///
+    /// `source_relative` is validated up-front:
+    /// - Must be a relative UTF-8 path.
+    /// - No path component may be `..`.
+    /// - No backslash characters (a Windows-style separator
+    ///   would let a malformed manifest escape the prefix
+    ///   whitelist via component aliasing).
+    /// - The leading components must match the Stage 12.14
+    ///   archive whitelist (see [`is_allowed_archive_relative`]).
+    ///
+    /// If `overwrite_existing == false` and the destination
+    /// already exists, returns `StateError::DestinationExists`.
+    /// On success the bytes are atomically tempfile+renamed
+    /// into place, exactly like `write_verified_json`.
+    pub fn write_archived_bytes(
+        &self,
+        source_relative: &str,
+        bytes: &[u8],
+        overwrite_existing: bool,
+    ) -> Result<PathBuf, StateError> {
+        validate_archive_relative_path(source_relative)?;
+        let dest = self.root.join(source_relative);
+        if dest.exists() && !overwrite_existing {
+            return Err(StateError::DestinationExists { path: dest });
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| StateError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+        atomic_write(&dest, bytes)?;
+        Ok(dest)
+    }
+
     fn list_verified_under<T: serde::de::DeserializeOwned>(
         &self,
         session_id: &str,
@@ -893,4 +934,91 @@ fn cascade_remove_session_strict(
         }
     }
     Ok(())
+}
+
+// ── Stage 12.15 — archive-restore path validators ───────────────
+
+/// Returns `Ok(())` iff `source_relative` is a Stage 12.14 archive
+/// path safe to write under a state-dir root. Used by
+/// `ContributorStateStore::write_archived_bytes`.
+///
+/// Safety + whitelist contract:
+/// 1. Path must be relative (not absolute).
+/// 2. No path component may be `..`.
+/// 3. No backslash characters (Windows-style separators would
+///    let a manifest forge component-aliasing that bypasses the
+///    whitelist check below).
+/// 4. The leading components must match one of:
+///    - `verified/sessions/<64-hex>/...`
+///    - `seen/sessions/<64-hex>`
+///    - `seen/aggregates/<64-hex>`
+///    - `seen/{joins,assignments,partials,peer-adverts,assignment-supersessions}/<64-hex>--<rest>`
+///    - `results/result-links/<64-hex>.link.json`
+fn validate_archive_relative_path(source_relative: &str) -> Result<(), StateError> {
+    // (1) + (3): reject absolute paths and backslashes up front.
+    if source_relative.is_empty()
+        || source_relative.contains('\\')
+        || Path::new(source_relative).is_absolute()
+    {
+        return Err(StateError::UnsafeRelativePath {
+            path: source_relative.to_string(),
+        });
+    }
+    // (2): no `..` component anywhere.
+    if source_relative.split('/').any(|seg| seg == "..") {
+        return Err(StateError::UnsafeRelativePath {
+            path: source_relative.to_string(),
+        });
+    }
+
+    // (4): whitelist match. Use string splitting (not
+    // `Path::components`) so the check is bit-equal across
+    // platforms.
+    let parts: Vec<&str> = source_relative.split('/').collect();
+    let allowed = match parts.as_slice() {
+        // `verified/sessions/<sid>/<rest...>`
+        ["verified", "sessions", sid, rest @ ..] => {
+            is_blake3_hex(sid) && !rest.is_empty() && rest.iter().all(|s| !s.is_empty())
+        }
+        // `seen/sessions/<sid>`
+        ["seen", "sessions", sid] => is_blake3_hex(sid),
+        // `seen/aggregates/<sid>`
+        ["seen", "aggregates", sid] => is_blake3_hex(sid),
+        // `seen/<ns>/<sid>--<suffix>`
+        ["seen", ns, key]
+            if matches!(
+                *ns,
+                "joins"
+                    | "assignments"
+                    | "partials"
+                    | "peer-adverts"
+                    | "assignment-supersessions"
+            ) =>
+        {
+            match key.split_once("--") {
+                Some((sid, suffix)) => is_blake3_hex(sid) && !suffix.is_empty(),
+                None => false,
+            }
+        }
+        // `results/result-links/<posted_id>.link.json`
+        ["results", "result-links", file] => file
+            .strip_suffix(".link.json")
+            .map(is_blake3_hex)
+            .unwrap_or(false),
+        _ => false,
+    };
+    if !allowed {
+        return Err(StateError::DisallowedRelativePath {
+            path: source_relative.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// 64-char lowercase hex check. Closed contract — the Stage
+/// 12.3 envelope ids (`session_id`, `posted_id`, `assignment_id`,
+/// `supersession_id`) are all defined as 64-char lowercase hex,
+/// so the whitelist validator uses this single helper.
+fn is_blake3_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
