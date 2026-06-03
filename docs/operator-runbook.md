@@ -939,3 +939,98 @@ binding. Stage 10b will evaluate whether a `workflow_dispatch`
 artifact build + checksum publication is the right next step; until
 that lands, items 8–10 are manual and recorded in the operator's
 release log.
+
+---
+
+## Phase 5 — Contributor protocol supersession / reassign workflow
+
+Walkthrough for operators driving Stage 12.11–12.13 contributor-protocol sessions. For the technical reference (verifier semantics, schema versions, canonical bytes) see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md). This section is the **playbook**.
+
+### When to use which `--reason`
+
+`plan-session-reassign` and `apply-session-reassign` accept a closed `--reason` flag controlling the `SupersessionReason` embedded in the signed supersession:
+
+| `--reason` | Use when | Apply-time `InvalidState` policy |
+|---|---|---|
+| `missing-partial` (default) | An active assignment has no partial after the assigned contributor went offline / dropped the work. Status is `InProgress` with an active-missing entry. | **Refused.** Operator must clean tampered artifacts first. |
+| `invalid-partial` | A contributor returned a partial whose `verify_partial_result` fails. Status flips to `InvalidState` with a structured `invalid_partial` diagnostic. | **Accepted** only when every `invalid_artifacts` entry is `InvalidPartial` whose `assignment_id` is in the plan. |
+| `operator-rebalance` | Coordinator-driven re-assignment for capacity or fairness reasons; no chain failure. | **Refused.** Same posture as `missing-partial`. |
+
+The Stage 12.13 audit roll-up at the bottom of `session-status` tells you which reason applies:
+
+```text
+event=audit_health session_id=... coherence=reassign_triagable \
+  triagable_by_reassign=true \
+  recommended_action="run plan-session-reassign --reason invalid-partial"
+```
+
+### Recovery from a Phase B partial-apply
+
+`apply-session-reassign` is split into Phase A (SNIP publish every body) and Phase B (state-dir write + mesh broadcast). Phase B is further split B1..B4:
+
+- **B1**: write each replacement assignment to the state-dir.
+- **B2**: write the supersession to the state-dir.
+- **B3**: broadcast each replacement on the mesh.
+- **B4**: broadcast the supersession on the mesh (only if B3 was 100% clean).
+
+If B1 succeeded but B2 failed (rare — single FS op), the state-dir has replacement assignments without the retiring supersession. Detection + recovery:
+
+1. **Run `session-status --format events`** against the affected session. Look for the `event=audit_health` line:
+   ```text
+   event=audit_health ... coherence=orphan_replacement_assignments count=N ids=<id>,<id>... \
+     recommended_action="clean state-dir orphan replacements before retry"
+   ```
+   The `ids` list names exactly the replacement assignments that landed in state without a retiring supersession.
+
+2. **Verify the partial-apply suspicion** before deleting anything. Compare:
+   - The reassignment plan you ran (its `actions[].replacement_assignment_id` set should equal the orphan list).
+   - The contents of `<state-dir>/verified/sessions/<session_id>/assignments/<id>.json` for each orphan — `assigned_at_utc` should be close to your apply timestamp.
+   - The contents of `<state-dir>/verified/sessions/<session_id>/supersessions/` — should NOT contain the supersession your plan would have produced.
+
+3. **Manually delete the orphan assignment files** + their seen markers:
+   ```bash
+   for ID in <orphan-ids>; do
+     rm <state-dir>/verified/sessions/<session_id>/assignments/$ID.json
+     rm <state-dir>/seen/assignments/<session_id>--$ID
+   done
+   ```
+
+4. **Re-run** `plan-session-reassign` (the status now matches the pre-apply shape; the new plan's `source_status_hash` will reflect that). Then `apply-session-reassign` with the new plan.
+
+If B3 (replacement broadcast) failed but B1 + B2 succeeded, the state-dir is fully coherent — no cleanup needed. Operator can either re-run apply (no-op on SNIP, idempotent on state-dir, re-attempts mesh broadcasts) or manually re-broadcast via `--no-publish-announcements=false` on a fresh apply once the mesh issue is resolved.
+
+**Exit codes**: `apply-session-reassign` exits **nonzero** when the mesh-broadcast state is incoherent (B3 partially broadcast and B4 skipped, OR B3 broadcast cleanly but B4 itself errored). The state-dir is coherent in every case — exit-nonzero is purely the "peers see a half-applied view" signal. Automation should treat any nonzero exit as a triage hand-off, NOT a state-dir corruption. The `event=reassign_applied … supersession_broadcast=<status> replacement_broadcast_failures=N` line right before exit names the failure mode (closed set; pattern-matchable).
+
+### Out-of-order supersession arrival
+
+The Stage 12.13 watch-sessions handler accepts a supersession in best-effort mode when local state hasn't yet seen the referenced replacement assignments. You'll see:
+
+```text
+event=supersession_partial_verify session_id=... supersession_id=... unresolved_assignment_count=K
+```
+
+This is **not** an error. The watcher stored the supersession; the aggregate verifier at `session-status` time will re-check references against the full state-dir snapshot. If references resolve later (the missing replacement assignment announcements arrive in a future poll cycle), `session-status` will report `coherence=coherent`. If they never resolve, `session-status` will report `coherence=partial_apply_supersession` and recommend operator triage.
+
+### Reading the structured diagnostics
+
+Stage 12.12's v3 status report surfaces every chain-failure mode as a typed `invalid_artifacts` entry. Each entry carries a stable `reason_tag` from `SessionVerifyOutcome::reason_tag()` (the tags are pinned by the test `session_verify_outcome_reason_tags_are_stable`). Closed `kind` set:
+
+| `kind` | Triagable via `--reason invalid-partial`? | Operator action |
+|---|---|---|
+| `invalid_partial` | Yes, if every entry in `invalid_artifacts` is this kind. | Plan + apply reassign. |
+| `invalid_join` | No. | Tampered local join file. Re-pull from chain / SNIP. |
+| `invalid_assignment` | No. | Tampered local assignment file. Re-pull from coordinator. |
+| `invalid_aggregate` | No. | Aggregator-side issue. Contact coordinator. |
+| `invalid_supersession` | No. | Forged or schema-malformed supersession body. Delete from state-dir + re-pull. |
+| `invalid_session` | No. | Session.json failed verification. State-dir compromised; rebuild from chain. |
+
+### Startup logs
+
+Stage 12.13 emits `event=state_store_restart_loaded` at watch-sessions startup with per-namespace accept/reject counts. Any rejection produces a structured warning:
+
+```text
+event=warn context=state_store_restart_load_rejected \
+  kind=supersession session_id=<hex> id=<hex> reason_tag=<SessionVerifyOutcome variant>
+```
+
+The `reason_tag` set is closed — `grep`-able. A high rejection count after restart usually means either (a) the state-dir is corrupted (run a backup-and-rebuild) or (b) a coordinator key was rotated and old artifacts no longer verify (operator policy decision — re-pull from chain or accept the historical gap).

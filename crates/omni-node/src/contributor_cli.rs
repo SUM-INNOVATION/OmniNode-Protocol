@@ -4517,39 +4517,69 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
         // the session's coordinator_pubkey_hex (assignments don't
         // carry their own coordinator pubkey).
         let mut sessions: HashMap<String, ExecutionSession> = HashMap::new();
-        // Stage 12.7 — pre-warm the in-memory session cache from
-        // the state-dir BEFORE the loop runs. Without this, after
-        // restart the seen marker on `sessions/<id>` causes
-        // `handle_session_opened` to skip the announcement, so
-        // `sessions` stays empty and `handle_assignment` falls
-        // back to passing `None` into the processor — which silently
-        // drops the assignment's coordinator-signature check. We
-        // re-verify each session.json before insert so a tampered
-        // local file can't poison the cache.
+        // Stage 12.13 — supersession-aware in-memory caches.
+        // `handle_assignment_supersession`'s out-of-order best-
+        // effort path (Bucket 2) needs to know whether referenced
+        // replacement assignments are present locally, and the
+        // restart preload now populates both caches up front so
+        // that knowledge is correct from the first poll cycle.
+        let mut assignments_by_session: HashMap<
+            String,
+            Vec<omni_contributor::WorkAssignment>,
+        > = HashMap::new();
+        let mut supersessions_by_session: HashMap<
+            String,
+            Vec<omni_contributor::supersession::WorkAssignmentSupersession>,
+        > = HashMap::new();
+        // Stage 12.7 + 12.13 — pre-warm the in-memory caches from
+        // the state-dir BEFORE the loop runs. Stage 12.7 lifted
+        // this for sessions only; Stage 12.13 lifts it to
+        // sessions + assignments + supersessions via the new
+        // `load_verified_restart_snapshot` helper, which re-runs
+        // every Stage 12.3 / 12.11 verifier on the way so a
+        // tampered local file is dropped with a structured
+        // rejection note. Aggregate re-verify is deliberately
+        // skipped at preload — the first status-build re-checks
+        // it via `verify_aggregated_result_with_supersessions`.
+        // Joins are loaded for verification but NOT cached — the
+        // watcher only needs them to validate other artifacts;
+        // joined-pubkey checks inside handlers always re-read.
         if let Some(ref store) = state_store {
-            match store.list_verified_sessions() {
-                Ok(loaded) => {
-                    let mut accepted: u64 = 0;
-                    for (sid, session) in loaded {
-                        if !omni_contributor::verify_execution_session(&session)
-                            .is_ok()
-                        {
-                            println!(
-                                "event=warn context=state_store_session_verify_failed \
-                                 session_id={sid}"
-                            );
-                            continue;
-                        }
-                        sessions.insert(session.session_id.clone(), session);
-                        accepted += 1;
-                    }
+            match omni_contributor::load_verified_restart_snapshot(store) {
+                Ok((snapshot, report)) => {
+                    let omni_contributor::RestartSnapshot {
+                        sessions: s,
+                        joins_by_session: _,
+                        assignments_by_session: a,
+                        supersessions_by_session: sup,
+                    } = snapshot;
+                    sessions.extend(s);
+                    assignments_by_session.extend(a);
+                    supersessions_by_session.extend(sup);
                     println!(
-                        "event=state_store_sessions_loaded count={accepted}"
+                        "event=state_store_restart_loaded \
+                         sessions_accepted={} sessions_rejected={} \
+                         joins_accepted={} joins_rejected={} \
+                         assignments_accepted={} assignments_rejected={} \
+                         supersessions_accepted={} supersessions_rejected={}",
+                        report.sessions_accepted,
+                        report.sessions_rejected,
+                        report.joins_accepted,
+                        report.joins_rejected,
+                        report.assignments_accepted,
+                        report.assignments_rejected,
+                        report.supersessions_accepted,
+                        report.supersessions_rejected,
                     );
+                    for note in &report.rejection_notes {
+                        println!(
+                            "event=warn context=state_store_restart_load_rejected {note}"
+                        );
+                    }
                 }
                 Err(e) => {
                     println!(
-                        "event=warn context=state_store_list_sessions message={e}"
+                        "event=warn context=state_store_restart_load message={e}"
                     );
                 }
             }
@@ -4598,6 +4628,7 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
                     &session_id_filter,
                     &ann,
                     &sessions,
+                    &mut assignments_by_session,
                     state_store.as_ref(),
                 );
             }
@@ -4626,11 +4657,17 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
                     state_store.as_ref(),
                 );
             }
-            // Stage 12.11 — supersession topic. Pinning the body to
-            // the in-memory session cache lets the processor fail
-            // closed on coordinator-pubkey drift; the assignment
-            // reference-resolution leg runs only when the state
-            // store can supply the verified assignment slice.
+            // Stage 12.11 — supersession topic. Pinning the body
+            // to the in-memory session cache lets the processor
+            // fail closed on coordinator-pubkey drift.
+            // Stage 12.13 — full reference-resolution runs when
+            // the in-memory assignments cache covers every
+            // referenced id; otherwise the handler falls back to
+            // best-effort accept and emits
+            // `event=supersession_partial_verify` so the operator
+            // sees the watcher took the looser path. Status-build
+            // re-checks references via the supersession-aware
+            // aggregate verifier later.
             for ann in relay
                 .poll_assignment_supersessions()
                 .map_err(|e| anyhow!("poll supersession: {e}"))?
@@ -4641,6 +4678,8 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
                     &session_id_filter,
                     &ann,
                     &sessions,
+                    &assignments_by_session,
+                    &mut supersessions_by_session,
                     state_store.as_ref(),
                 );
             }
@@ -4868,6 +4907,10 @@ fn handle_assignment<A: omni_store::SnipV2Adapter + ?Sized>(
     session_id_filter: &std::collections::HashSet<String>,
     ann: &omni_contributor::NetworkWorkAssignedAnnouncement,
     sessions: &std::collections::HashMap<String, omni_contributor::ExecutionSession>,
+    assignments_by_session: &mut std::collections::HashMap<
+        String,
+        Vec<omni_contributor::WorkAssignment>,
+    >,
     state_store: Option<&omni_contributor::ContributorStateStore>,
 ) {
     if !session_id_filter.is_empty() && !session_id_filter.contains(&ann.session_id) {
@@ -4913,6 +4956,14 @@ fn handle_assignment<A: omni_store::SnipV2Adapter + ?Sized>(
                 session_coord.is_some(),
                 p.display()
             );
+            // Stage 12.13 — keep the in-memory assignments cache
+            // current so a same-poll-cycle supersession that
+            // references this assignment can run full
+            // reference-resolution.
+            assignments_by_session
+                .entry(asn.session_id.clone())
+                .or_default()
+                .push(asn.clone());
             if let Some(store) = state_store {
                 if let Err(e) = store.write_verified_json(
                     omni_contributor::StateObjectKind::Assignment {
@@ -4955,6 +5006,14 @@ fn handle_assignment_supersession<A: omni_store::SnipV2Adapter + ?Sized>(
     session_id_filter: &std::collections::HashSet<String>,
     ann: &omni_contributor::NetworkWorkAssignmentSupersessionAnnouncement,
     sessions: &std::collections::HashMap<String, omni_contributor::ExecutionSession>,
+    assignments_by_session: &std::collections::HashMap<
+        String,
+        Vec<omni_contributor::WorkAssignment>,
+    >,
+    supersessions_by_session: &mut std::collections::HashMap<
+        String,
+        Vec<omni_contributor::supersession::WorkAssignmentSupersession>,
+    >,
     state_store: Option<&omni_contributor::ContributorStateStore>,
 ) {
     if !session_id_filter.is_empty() && !session_id_filter.contains(&ann.session_id) {
@@ -4972,17 +5031,21 @@ fn handle_assignment_supersession<A: omni_store::SnipV2Adapter + ?Sized>(
             return;
         }
     }
-    // Upgrade to full reference-resolution when both the session
-    // and the verified-assignment slice are locally available.
     let session_ref = sessions.get(&ann.session_id);
-    let assignments_vec: Option<Vec<omni_contributor::WorkAssignment>> = state_store
-        .and_then(|store| store.list_verified_assignments_for(&ann.session_id).ok());
-    let assignments_slice = assignments_vec.as_deref();
+
+    // Stage 12.13 — out-of-order supersession handling.
+    //
+    // First pass: call the processor with `Some(session), None`.
+    // This runs announcer-sig + body-schema + body-sig + drift +
+    // session-pinning checks AND parses the body, but skips the
+    // reference-resolution leg. We need the body in hand before
+    // we can decide whether the local assignment cache covers
+    // every referenced id (so we know which mode to report).
     let outcome = omni_contributor::process_assignment_supersession_announcement(
         ann,
         snip,
         session_ref,
-        assignments_slice,
+        /* assignments = */ None,
     );
     if !log_announcement_failure("supersession", &ann.session_id, &outcome) {
         return;
@@ -4991,6 +5054,64 @@ fn handle_assignment_supersession<A: omni_store::SnipV2Adapter + ?Sized>(
         omni_contributor::AnnouncementOutcome::Verified { body } => body,
         _ => return,
     };
+
+    // Second pass: if we have BOTH the session AND enough
+    // assignments in the in-memory cache to cover every
+    // referenced id, run the full reference-resolution leg via
+    // `verify_assignment_supersession`. Otherwise accept on the
+    // first-pass checks and emit `event=supersession_partial_verify`
+    // so the operator sees the watcher took the best-effort
+    // path. The aggregate verifier at `session-status` time will
+    // re-check references against the full state-dir snapshot.
+    let mut references_resolved = false;
+    let mut unresolved_count = 0u32;
+    if let Some(session) = session_ref {
+        let referenced: std::collections::HashSet<&str> = sup
+            .superseded_assignment_ids
+            .iter()
+            .chain(sup.replacement_assignment_ids.iter())
+            .map(|s| s.as_str())
+            .collect();
+        let cached = assignments_by_session.get(&ann.session_id);
+        let cached_ids: std::collections::HashSet<&str> = cached
+            .map(|v| v.iter().map(|a| a.assignment_id.as_str()).collect())
+            .unwrap_or_default();
+        let missing: Vec<&&str> =
+            referenced.iter().filter(|id| !cached_ids.contains(*id)).collect();
+        unresolved_count = missing.len() as u32;
+        if unresolved_count == 0 {
+            if let Some(slice) = cached {
+                let outcome = omni_contributor::verify_assignment_supersession(
+                    session, slice, &sup,
+                );
+                if outcome.is_ok() {
+                    references_resolved = true;
+                } else {
+                    // We had every referenced id in cache but
+                    // the verifier still rejected — drop the
+                    // announcement loudly so the operator
+                    // notices.
+                    println!(
+                        "event=supersession_reference_verify_failed \
+                         session_id={} supersession_id={} reason_tag={}",
+                        sup.session_id,
+                        sup.supersession_id,
+                        outcome.reason_tag(),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    if unresolved_count > 0 {
+        println!(
+            "event=supersession_partial_verify session_id={} supersession_id={} \
+             unresolved_assignment_count={unresolved_count}",
+            sup.session_id, sup.supersession_id,
+        );
+    }
+
     let bytes = serde_json::to_vec_pretty(&sup).unwrap_or_default();
     let filename = format!("{}.json", sup.supersession_id);
     match write_session_artifact(
@@ -5010,9 +5131,17 @@ fn handle_assignment_supersession<A: omni_store::SnipV2Adapter + ?Sized>(
                 sup.superseded_assignment_ids.len(),
                 sup.replacement_assignment_ids.len(),
                 session_ref.is_some(),
-                session_ref.is_some() && assignments_slice.is_some(),
+                references_resolved,
                 p.display()
             );
+            // Stage 12.13 — update in-memory supersessions cache
+            // so the next aggregate/status check in the same
+            // process sees the freshly-accepted body without
+            // re-reading the state-dir.
+            supersessions_by_session
+                .entry(sup.session_id.clone())
+                .or_default()
+                .push(sup.clone());
             if let Some(store) = state_store {
                 if let Err(e) = store.write_verified_json(
                     omni_contributor::StateObjectKind::AssignmentSupersession {
@@ -6623,6 +6752,43 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
     for note in &report.notes {
         println!("event=note context=session_status message={note}");
     }
+    // Stage 12.13 — audit health, derived from the v3 report
+    // fields. Closed `coherence` discriminator + static-string
+    // `recommended_action` so log scrapers can pattern-match
+    // deterministically. JSON renderer is unchanged (the v3 JSON
+    // schema is frozen at Stage 12.12); audit is an ergonomics
+    // extension on top of `events` + `pretty`.
+    let audit = omni_contributor::compute_audit_health(report);
+    let coherence_tag = match &audit.coherence {
+        omni_contributor::AuditCoherence::Coherent => "coherent".to_string(),
+        omni_contributor::AuditCoherence::PartialApplySupersession {
+            supersession_id,
+            unresolved_count,
+        } => format!(
+            "partial_apply_supersession supersession_id={supersession_id} \
+             unresolved_count={unresolved_count}"
+        ),
+        omni_contributor::AuditCoherence::OrphanReplacementAssignments {
+            assignment_ids,
+        } => format!(
+            "orphan_replacement_assignments count={} ids={}",
+            assignment_ids.len(),
+            assignment_ids.join(",")
+        ),
+        omni_contributor::AuditCoherence::NotReassignTriagable => {
+            "not_reassign_triagable".to_string()
+        }
+        omni_contributor::AuditCoherence::ReassignTriagable => {
+            "reassign_triagable".to_string()
+        }
+    };
+    println!(
+        "event=audit_health session_id={} coherence={coherence_tag} \
+         triagable_by_reassign={} recommended_action={:?}",
+        report.session_id,
+        audit.triagable_by_reassign,
+        audit.recommended_action,
+    );
 }
 
 fn render_status_json(
@@ -6764,6 +6930,52 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
             println!("  - {n}");
         }
     }
+    // Stage 12.13 — audit health roll-up. Closed enum + static
+    // recommended-action so the pretty output stays operator-
+    // friendly without leaking implementation detail. JSON
+    // renderer is unchanged (v3 JSON schema frozen at 12.12).
+    let audit = omni_contributor::compute_audit_health(report);
+    println!("Audit health:");
+    match &audit.coherence {
+        omni_contributor::AuditCoherence::Coherent => {
+            println!("  coherence       coherent");
+        }
+        omni_contributor::AuditCoherence::PartialApplySupersession {
+            supersession_id,
+            unresolved_count,
+        } => {
+            let short_id: String =
+                supersession_id.chars().take(12).collect();
+            println!(
+                "  coherence       partial_apply_supersession ({short_id}, \
+                 unresolved={unresolved_count})"
+            );
+        }
+        omni_contributor::AuditCoherence::OrphanReplacementAssignments {
+            assignment_ids,
+        } => {
+            println!(
+                "  coherence       orphan_replacement_assignments \
+                 (count={})",
+                assignment_ids.len()
+            );
+            for id in assignment_ids {
+                let short: String = id.chars().take(12).collect();
+                println!("    - {short}");
+            }
+        }
+        omni_contributor::AuditCoherence::NotReassignTriagable => {
+            println!("  coherence       not_reassign_triagable");
+        }
+        omni_contributor::AuditCoherence::ReassignTriagable => {
+            println!("  coherence       reassign_triagable");
+        }
+    }
+    println!(
+        "  triagable_by_reassign  {}",
+        audit.triagable_by_reassign
+    );
+    println!("  recommended_action     {}", audit.recommended_action);
 }
 
 // ── Stage 12.10 — plan-session-repair ───────────────────────────────────
@@ -7638,15 +7850,88 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
     .map_err(|e| anyhow!("snip publish supersession: {e}"))?;
     let s_root_hex = format!("0x{}", hex_lower(s_root.as_bytes()));
 
-    // 8b. **Phase B — local + mesh side effects**. Both SNIP
-    // bodies (replacements + supersession) are durably content-
-    // addressed at this point, so it is safe to mutate the
-    // local state-dir + broadcast on the mesh. Replacements go
-    // first so a peer receiving the supersession announcement
-    // can already fetch every replacement assignment body it
-    // names. The supersession state-dir write closes the loop.
+    // 8b. **Phase B — local + mesh side effects**, split into
+    // four sub-phases by Stage 12.13:
+    //
+    //   B1. Write every replacement assignment to the state-dir
+    //       + mark seen. NO mesh broadcast yet.
+    //   B2. Write the supersession body to the state-dir + mark
+    //       seen. NO mesh broadcast yet.
+    //   B3. Mesh-broadcast every replacement
+    //       (NetworkWorkAssignedAnnouncement). Failures here
+    //       emit a structured `event=warn` and continue; the
+    //       state-dir is already coherent, so a future apply
+    //       retry would just re-broadcast.
+    //   B4. Mesh-broadcast the supersession ONLY when every B3
+    //       replacement broadcast succeeded. Otherwise skip B4
+    //       and emit a structured warning so the operator can
+    //       investigate before announcing the supersession to
+    //       peers — preserving the "replacements observable on
+    //       mesh before supersession" invariant.
+    //
+    // The Stage 12.11 round-1 fix (Phase A SNIP-publishes
+    // everything first) closes the SNIP-publish failure window.
+    // Stage 12.13 closes the harder window where a Phase B mesh
+    // failure mid-loop left the state-dir half-applied: now
+    // every state-dir write completes before any mesh work, so
+    // a mid-loop failure during state writes is the only
+    // remaining trap (a single FS op for the supersession), and
+    // mesh failures degrade gracefully via warnings.
+
+    // ── B1: write replacement assignments ────────────────────
     for (p, root_hex) in prepared.iter().zip(replacement_roots.iter()) {
-        if let Some((_, ref mut relay)) = mesh.as_mut().map(|(n, r)| (n, r)) {
+        store.write_verified_json(
+            omni_contributor::StateObjectKind::Assignment {
+                session_id: plan.session_id.clone(),
+            },
+            &p.replacement.assignment_id,
+            &p.replacement,
+        )?;
+        let marker = format!("{}--{}", plan.session_id, p.replacement.assignment_id);
+        store.mark_seen(
+            omni_contributor::StateNamespace::Assignments,
+            &marker,
+        )?;
+        println!(
+            "event=replacement_assignment_state_written session_id={} \
+             superseded_assignment_id={} replacement_assignment_id={} \
+             stage_index={} contributor={} work_assignment_snip_root={}",
+            plan.session_id,
+            p.superseded_assignment_id,
+            p.replacement.assignment_id,
+            p.replacement.stage_index,
+            p.replacement.contributor_pubkey_hex,
+            root_hex,
+        );
+    }
+
+    // ── B2: write supersession ──────────────────────────────
+    store.write_verified_json(
+        omni_contributor::StateObjectKind::AssignmentSupersession {
+            session_id: plan.session_id.clone(),
+        },
+        &supersession.supersession_id,
+        &supersession,
+    )?;
+    let s_marker = format!("{}--{}", plan.session_id, supersession.supersession_id);
+    store.mark_seen(
+        omni_contributor::StateNamespace::AssignmentSupersessions,
+        &s_marker,
+    )?;
+    println!(
+        "event=supersession_state_written session_id={} supersession_id={} \
+         superseded={} replacement={} work_assignment_supersession_snip_root={}",
+        plan.session_id,
+        supersession.supersession_id,
+        superseded_ids.len(),
+        replacement_ids.len(),
+        s_root_hex,
+    );
+
+    // ── B3: mesh broadcast replacements ─────────────────────
+    let mut replacement_broadcast_failures = 0u32;
+    if let Some((_, ref mut relay)) = mesh.as_mut().map(|(n, r)| (n, r)) {
+        for (p, root_hex) in prepared.iter().zip(replacement_roots.iter()) {
             let mut ann = NetworkWorkAssignedAnnouncement {
                 schema_version: NET_SCHEMA_VERSION,
                 work_assignment_snip_root: root_hex.clone(),
@@ -7660,39 +7945,44 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
             };
             let ann_sig = net_assign_signing_input(&ann)?;
             ann.announcer_signature_hex = coord.sign_hex(&ann_sig);
-            relay
-                .publish_work_assigned(&ann)
-                .map_err(|e| anyhow!("publish replacement assignment: {e}"))?;
+            match relay.publish_work_assigned(&ann) {
+                Ok(()) => {
+                    println!(
+                        "event=replacement_assignment_broadcast session_id={} \
+                         replacement_assignment_id={}",
+                        plan.session_id, p.replacement.assignment_id,
+                    );
+                }
+                Err(e) => {
+                    replacement_broadcast_failures += 1;
+                    println!(
+                        "event=warn context=replacement_assignment_broadcast \
+                         session_id={} replacement_assignment_id={} message={e}",
+                        plan.session_id, p.replacement.assignment_id,
+                    );
+                }
+            }
         }
-
-        // Dual-write into state-dir.
-        store.write_verified_json(
-            omni_contributor::StateObjectKind::Assignment {
-                session_id: plan.session_id.clone(),
-            },
-            &p.replacement.assignment_id,
-            &p.replacement,
-        )?;
-        let marker = format!("{}--{}", plan.session_id, p.replacement.assignment_id);
-        store.mark_seen(
-            omni_contributor::StateNamespace::Assignments,
-            &marker,
-        )?;
-
-        println!(
-            "event=replacement_assignment_published session_id={} \
-             superseded_assignment_id={} replacement_assignment_id={} \
-             stage_index={} contributor={} work_assignment_snip_root={}",
-            plan.session_id,
-            p.superseded_assignment_id,
-            p.replacement.assignment_id,
-            p.replacement.stage_index,
-            p.replacement.contributor_pubkey_hex,
-            root_hex,
-        );
     }
 
-    if let Some((_, ref mut relay)) = mesh.as_mut().map(|(n, r)| (n, r)) {
+    // ── B4: mesh broadcast supersession (skip on any B3 failure) ──
+    let supersession_broadcast_status: &str;
+    if mesh.is_none() {
+        supersession_broadcast_status = "skipped_no_publish";
+    } else if replacement_broadcast_failures > 0 {
+        // Warn-and-skip: replacements must be observable on mesh
+        // before peers see the supersession naming them. Operator
+        // can re-run apply or manually rebroadcast after
+        // investigating the failures.
+        supersession_broadcast_status = "skipped_replacement_broadcast_failed";
+        println!(
+            "event=warn context=supersession_broadcast_skipped session_id={} \
+             supersession_id={} replacement_broadcast_failures={}",
+            plan.session_id,
+            supersession.supersession_id,
+            replacement_broadcast_failures,
+        );
+    } else if let Some((_, ref mut relay)) = mesh.as_mut().map(|(n, r)| (n, r)) {
         let mut ann = NetworkWorkAssignmentSupersessionAnnouncement {
             schema_version: NET_SCHEMA_VERSION,
             work_assignment_supersession_snip_root: s_root_hex.clone(),
@@ -7705,34 +7995,31 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
         };
         let ann_sig = net_supersession_signing_input(&ann)?;
         ann.announcer_signature_hex = coord.sign_hex(&ann_sig);
-        relay
-            .publish_assignment_supersession(&ann)
-            .map_err(|e| anyhow!("publish supersession announcement: {e}"))?;
+        match relay.publish_assignment_supersession(&ann) {
+            Ok(()) => {
+                supersession_broadcast_status = "broadcast_ok";
+                println!(
+                    "event=supersession_broadcast session_id={} \
+                     supersession_id={}",
+                    plan.session_id, supersession.supersession_id,
+                );
+            }
+            Err(e) => {
+                supersession_broadcast_status = "broadcast_failed";
+                println!(
+                    "event=warn context=supersession_broadcast \
+                     session_id={} supersession_id={} message={e}",
+                    plan.session_id, supersession.supersession_id,
+                );
+            }
+        }
+    } else {
+        // Unreachable in practice (mesh.is_some checked above)
+        // but kept as a defensive fallthrough so the local
+        // bookkeeping `supersession_broadcast_status` is always
+        // initialized.
+        supersession_broadcast_status = "skipped_no_publish";
     }
-
-    // Dual-write supersession into state-dir.
-    store.write_verified_json(
-        omni_contributor::StateObjectKind::AssignmentSupersession {
-            session_id: plan.session_id.clone(),
-        },
-        &supersession.supersession_id,
-        &supersession,
-    )?;
-    let s_marker = format!("{}--{}", plan.session_id, supersession.supersession_id);
-    store.mark_seen(
-        omni_contributor::StateNamespace::AssignmentSupersessions,
-        &s_marker,
-    )?;
-
-    println!(
-        "event=supersession_published session_id={} supersession_id={} \
-         superseded={} replacement={} work_assignment_supersession_snip_root={}",
-        plan.session_id,
-        supersession.supersession_id,
-        superseded_ids.len(),
-        replacement_ids.len(),
-        s_root_hex,
-    );
 
     if let Some((net, _relay)) = mesh {
         tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms))
@@ -7741,9 +8028,57 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
         let _ = g.shutdown().await;
     }
     println!(
-        "event=reassign_applied session_id={} replacements_published={} supersession_published=1",
+        "event=reassign_applied session_id={} replacements_published={} \
+         supersession_published=1 supersession_broadcast={} \
+         replacement_broadcast_failures={}",
         plan.session_id,
-        prepared.len()
+        prepared.len(),
+        supersession_broadcast_status,
+        replacement_broadcast_failures,
     );
-    Ok(())
+    // Stage 12.13 review fix — exit nonzero when mesh state is
+    // incoherent so automation does NOT treat a half-complete
+    // apply as a clean one. The state-dir is coherent in every
+    // case (B1 + B2 wrote everything before any mesh work) but
+    // peers see different views depending on the closed
+    // `supersession_broadcast` status:
+    //
+    //   - `broadcast_ok`       → mesh state coherent → Ok.
+    //   - `skipped_no_publish` → operator opted out of mesh →
+    //                            Ok (intentional).
+    //   - `skipped_replacement_broadcast_failed` → B3 partially
+    //                            published replacements but B4
+    //                            was skipped to preserve the
+    //                            "replacements observable on
+    //                            mesh before supersession"
+    //                            invariant → Err (operator
+    //                            must triage).
+    //   - `broadcast_failed`   → all B3 replacements broadcast
+    //                            cleanly but the B4 supersession
+    //                            broadcast itself errored →
+    //                            replacements are visible on
+    //                            mesh without the retiring
+    //                            supersession → Err (operator
+    //                            re-runs or manually
+    //                            re-broadcasts).
+    match supersession_broadcast_status {
+        "broadcast_ok" | "skipped_no_publish" => Ok(()),
+        "skipped_replacement_broadcast_failed" => Err(anyhow!(
+            "apply-session-reassign mesh state incoherent: \
+             {replacement_broadcast_failures} replacement broadcast(s) \
+             failed in B3, B4 supersession broadcast skipped to preserve \
+             ordering invariant; state-dir is coherent; \
+             re-run apply or manually re-broadcast"
+        )),
+        "broadcast_failed" => Err(anyhow!(
+            "apply-session-reassign mesh state incoherent: B3 \
+             replacement broadcasts succeeded but B4 supersession \
+             broadcast failed; state-dir is coherent; re-run apply \
+             or manually re-broadcast the supersession"
+        )),
+        other => Err(anyhow!(
+            "apply-session-reassign internal bookkeeping bug: unknown \
+             supersession_broadcast status {other:?}"
+        )),
+    }
 }

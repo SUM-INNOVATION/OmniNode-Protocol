@@ -1925,3 +1925,184 @@ This check runs after the existing `ReassignAssignment`-only check and before an
 | Apply-time mixed-reason defense | inline in `run_apply_session_reassign`; refuses before eligibility / drift / SNIP / mesh |
 
 **Residual gap (deliberate):** the apply path's CLI dispatch + mixed-reason defense + dry-run + Phase A / Phase B publish under `--reason invalid-partial` is not exercised end-to-end in CI (same constraint as Stage 12.10 / 12.11 — would require mocked SNIP + InMemoryRelay end-to-end refactor). The library helper, the planner branch, and the structured reporter are mechanically tested; the CLI is a single dispatch line on top of the well-tested helper.
+
+---
+
+# Stage 12.13 — supersession-aware resume / watch hardening + audit ergonomics
+
+**Status**: shipped at Stage 12.13. Builds on Stage 12.7 state-dir + Stage 12.11 supersession verifier + Stage 12.11 watch-sessions handler + Stage 12.11 apply-session-reassign Phase A/B + Stage 12.12 v3 status. Closes three runtime gaps and adds an operator-facing audit ergonomics layer — all **without** touching canonical bytes, gossipsub topics, or schema versions. No new envelope, no new wire format, no `schema_version` bump. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
+
+## What this stage is, in one sentence
+
+Stage 12.11 / 12.12 shipped the supersession verifier, the reassign CLI, and the structured invalid-artifacts diagnostic surface; Stage 12.13 hardens the **consumers** of those facilities (watch-sessions restart preload, the watch-sessions supersession handler's out-of-order arrival path, the apply-session-reassign Phase B sequence, and the session-status renderer) and adds an audit ergonomics layer over the existing v3 report.
+
+## Hardening 1 — restart preload across the supersession tree
+
+Prior to Stage 12.13, `run_watch_sessions` preloaded ONLY `list_verified_sessions()` into the in-memory `sessions: HashMap` cache. Per-session joins, assignments, supersessions, partials, and aggregates were loaded lazily per announcement. Consequences:
+
+- The watcher's supersession handler `handle_assignment_supersession` round-tripped through `state_store.list_verified_assignments_for(...)` on every single announcement — disk-cheap but not warmed.
+- Cross-restart double-supersession detection at announcement time was absent.
+
+Stage 12.13 adds a new library helper:
+
+```rust
+pub struct RestartSnapshot {
+    pub sessions: HashMap<String, ExecutionSession>,
+    pub joins_by_session: HashMap<String, Vec<ContributorJoin>>,
+    pub assignments_by_session: HashMap<String, Vec<WorkAssignment>>,
+    pub supersessions_by_session: HashMap<String, Vec<WorkAssignmentSupersession>>,
+}
+
+pub struct RestartReport {
+    pub sessions_accepted: u32,
+    pub sessions_rejected: u32,
+    pub joins_accepted: u32,
+    pub joins_rejected: u32,
+    pub assignments_accepted: u32,
+    pub assignments_rejected: u32,
+    pub supersessions_accepted: u32,
+    pub supersessions_rejected: u32,
+    pub rejection_notes: Vec<String>,
+}
+
+pub fn load_verified_restart_snapshot(
+    store: &ContributorStateStore,
+) -> Result<(RestartSnapshot, RestartReport), StatusError>
+```
+
+Walks the state-dir in **dependency order** — sessions → joins → assignments → supersessions — and re-runs each Stage 12.3 / 12.11 verifier on the way (`verify_execution_session`, `verify_contributor_join`, `verify_work_assignment`, `verify_assignment_supersession`). The Stage 12.7 trust boundary stays in place: `list_verified_*` are still parse-only, and `load_verified_restart_snapshot` is the **caller** re-running the verifier. Corrupted local entries surface as structured rejection notes (`kind=… session_id=… id=… reason_tag=…`) rather than panicking or silently polluting the cache.
+
+Aggregate re-verify is deliberately **skipped** at preload (Stage 12.13 decision 3) — the first `session-status` build re-runs `verify_aggregated_result_with_supersessions`. Partials are loaded lazily per-announcement (decision 5).
+
+`run_watch_sessions` consumes the snapshot and warms three caches: `sessions`, `assignments_by_session`, and `supersessions_by_session` (decision 5; partials and aggregates remain lazy). One new bare-stdout line at startup:
+
+```text
+event=state_store_restart_loaded sessions_accepted=N sessions_rejected=N \
+  joins_accepted=N joins_rejected=N \
+  assignments_accepted=N assignments_rejected=N \
+  supersessions_accepted=N supersessions_rejected=N
+```
+
+Followed by one `event=warn context=state_store_restart_load_rejected …` line per rejection note.
+
+## Hardening 2 — out-of-order supersession handler
+
+The Stage 12.11 supersession handler called `process_assignment_supersession_announcement` with `Some(session)` AND `Some(assignments)` — meaning the processor's full reference-resolution leg ran. If a supersession announcement arrived **before** every referenced replacement assignment was on disk (a race in gossipsub delivery between the assignment topic and the supersession topic), the verifier returned `SupersessionReferenceUnknown`, the processor classified that as `BodySchemaInvalid`, the handler logged an error and **dropped** the announcement.
+
+Stage 12.13 reverses the two-pass strategy (Stage 12.13 decision 1):
+
+1. **First pass** — call the processor with `Some(session), None` for assignments. This runs announcer-sig + body schema + body sig + drift + session pinning and returns the parsed body. Reference resolution is deferred.
+2. **Second pass** — if the in-memory assignments cache covers every referenced `superseded_assignment_id` and `replacement_assignment_id`, the handler runs `verify_assignment_supersession` directly against the slice. Reference resolution completes; the watcher emits the existing `event=assignment_supersession ... references_resolved=true …` line.
+3. **Otherwise** — the handler accepts the supersession on the first-pass checks alone and emits one new bare-stdout line:
+   ```text
+   event=supersession_partial_verify session_id=… supersession_id=… \
+     unresolved_assignment_count=K
+   ```
+
+The `session-status` build at audit time re-runs the supersession-aware aggregate verifier against the full state-dir snapshot, so any reference that never resolves surfaces as a structured `invalid_supersession` diagnostic via Stage 12.12's `invalid_artifacts` field. The watcher's best-effort accept does NOT bypass body-sig — a forged supersession is still rejected (pinned by `supersession_with_forged_body_signature_rejected_even_in_best_effort_pass`).
+
+The watcher also keeps the in-memory caches current: each `handle_assignment` success updates `assignments_by_session`, and each `handle_assignment_supersession` success appends to `supersessions_by_session`. Same-poll-cycle ordering is preserved.
+
+## Hardening 3 — apply-session-reassign Phase B split
+
+The Stage 12.11 round-1 fix made Phase A SNIP-publish every body before any local side effects. The Stage 12.11 round-1 review left a narrower window inside Phase B: state-dir writes were interleaved with mesh broadcasts per replacement, so a failure mid-loop left the state-dir half-applied.
+
+Stage 12.13 splits Phase B into four sub-phases (decision 4):
+
+- **B1** — write every replacement assignment to the state-dir + mark seen.
+- **B2** — write the supersession to the state-dir + mark seen.
+- **B3** — broadcast each replacement on the mesh. Failures emit `event=warn context=replacement_assignment_broadcast …` and the loop **continues**; the state-dir is already coherent.
+- **B4** — broadcast the supersession on the mesh **only if** every B3 broadcast succeeded. Otherwise emit `event=warn context=supersession_broadcast_skipped …` and skip B4 so the "replacements observable on mesh before supersession" invariant is preserved.
+
+The trailing `event=reassign_applied` line gains two new fields:
+
+```text
+event=reassign_applied session_id=… replacements_published=N \
+  supersession_published=1 supersession_broadcast=<status> \
+  replacement_broadcast_failures=N
+```
+
+`supersession_broadcast` ∈ `{broadcast_ok, broadcast_failed, skipped_replacement_broadcast_failed, skipped_no_publish}`. The closed status set lets log scrapers branch deterministically.
+
+**Exit code policy** (Stage 12.13 review fix):
+
+| `supersession_broadcast` | Process exit | Rationale |
+|---|---|---|
+| `broadcast_ok` | `0` | Mesh state coherent. |
+| `skipped_no_publish` | `0` | Operator opted out of mesh via `--no-publish-announcements`. |
+| `skipped_replacement_broadcast_failed` | nonzero | B3 partially broadcast replacements; B4 was skipped to preserve the "replacements observable before supersession" invariant. Mesh state is incoherent — operator must triage. State-dir is coherent; safe to re-run apply. |
+| `broadcast_failed` | nonzero | All B3 broadcasts succeeded but B4 itself errored; replacements are visible on mesh without the retiring supersession. Operator re-runs apply or manually rebroadcasts. |
+
+**What this closes**: a Phase B failure no longer requires manual state-dir cleanup unless both B1 AND B2 wrote partially (the only remaining trap is the supersession state-dir write — a single FS op). Mesh-broadcast failures degrade gracefully on the state-dir side but the process now exits **nonzero** when peers see a half-complete view, so automation can react.
+
+## Audit ergonomics — `session-status --format events | pretty`
+
+New derived helpers (no JSON schema change; v3 is frozen at Stage 12.12):
+
+```rust
+pub enum AuditCoherence {
+    Coherent,
+    PartialApplySupersession { supersession_id: String, unresolved_count: u32 },
+    OrphanReplacementAssignments { assignment_ids: Vec<String> },
+    NotReassignTriagable,
+    ReassignTriagable,
+}
+
+pub struct AuditHealth {
+    pub coherence: AuditCoherence,
+    pub triagable_by_reassign: bool,
+    pub recommended_action: &'static str,
+}
+
+pub fn compute_audit_health(report: &SessionStatusReport) -> AuditHealth;
+```
+
+`recommended_action` is a closed set of static strings:
+
+- `"none"`
+- `"run plan-session-reassign --reason missing-partial"`
+- `"run plan-session-reassign --reason invalid-partial"`
+- `"clean state-dir orphan replacements before retry"`
+- `"operator triage required"`
+
+`compute_audit_health` is a pure projection over the v3 report. The `events` renderer adds one new line at the end of every report:
+
+```text
+event=audit_health session_id=… coherence=<tag> \
+  triagable_by_reassign=<bool> recommended_action="<closed-string>"
+```
+
+The `pretty` renderer adds an "Audit health" section under "Notes:" with coherence, triagable_by_reassign, and recommended_action. JSON is **unchanged** — `--format json` still emits exactly the same v3 `SessionStatusReport`.
+
+## Out of scope (Stage 12.13)
+
+- No new envelope, no new canonical bytes, no `schema_version` bump anywhere.
+- No new gossipsub topic.
+- No SNIP wire change.
+- No automated state-dir cleanup tool — operators delete orphan replacements manually after consulting the audit_health roll-up.
+- No retry daemon.
+- No batched-atomic state-dir write (per-file tempfile+rename atomicity stays; batched atomicity is OS-dependent).
+- No standalone `session-audit` subcommand — audit lives in the existing `session-status` renderers.
+- Aggregate re-verify is NOT part of the restart preload — the first `session-status` build re-runs it.
+
+## Test coverage map
+
+| What's covered | Where |
+|---|---|
+| `load_verified_restart_snapshot` happy path + assignments cache shape | `restart_preload_loads_assignments_and_caches_them` (`state_resume_integration.rs`) |
+| Status report bit-equal across restart on the same state-dir | `restart_after_supersession_yields_same_status_report` |
+| Restart preload drops forged supersession with stable `reason_tag` note | `restart_preload_drops_corrupted_supersession_with_note` |
+| Phase B partial-apply causes `source_status_hash` drift on retry | `phase_b_partial_apply_state_drifts_source_status_hash` (`phase_b_partial_apply.rs`) |
+| Audit detects orphan replacement when supersession is invalid (Phase B2 corrupted) | `audit_detects_orphan_replacement_assignment` |
+| Audit detects B1-only orphan replacement via duplicate active stage_index (no supersession file) | `audit_detects_b1_only_orphan_via_duplicate_active_stage_index` |
+| Audit does NOT flag a properly-superseded original at the same stage as its replacement | `audit_does_not_flag_duplicate_when_one_assignment_is_superseded` |
+| Audit detects unresolved supersession references (best-effort accept) | `audit_detects_partial_apply_supersession_with_unresolved_reference` |
+| Audit reports `Coherent` on the happy path | `complete_apply_audits_coherent` |
+| Audit reports `ReassignTriagable` when every InvalidState entry is `InvalidPartial` | `audit_reports_reassign_triagable_when_only_invalid_partial_entries` |
+| Audit reports `NotReassignTriagable` when any non-`InvalidPartial` entry exists | `audit_reports_not_reassign_triagable_when_invalid_join_present` |
+| Out-of-order supersession with missing reference → best-effort first pass | `supersession_with_missing_reference_accepts_via_best_effort_first_pass` (`watch_session_supersession_out_of_order.rs`) |
+| Full verification path with complete slice | `supersession_with_complete_assignment_slice_runs_full_verification` |
+| No-session best-effort accept | `supersession_with_no_session_pinning_accepts_via_best_effort` |
+| Forged body signature still rejected in best-effort pass | `supersession_with_forged_body_signature_rejected_even_in_best_effort_pass` |
+
+**Residual gap (deliberate):** the Phase B reorder + the watcher restart preload are still not exercised through the live CLI end-to-end (same Stage 12.10/11/12 CI constraint — would require mocked SNIP + InMemoryRelay full apply). The library helpers and the projection-only audit are mechanically tested; the CLI wires them in single-call sites that are independently visible in code review.
