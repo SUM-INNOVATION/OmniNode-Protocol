@@ -194,6 +194,15 @@ enum ContributorCmd {
     /// assignments + the supersession are dual-written to
     /// `verified/sessions/<id>/...` and seen markers are laid down.
     ApplySessionReassign(ApplySessionReassignArgs),
+
+    /// Stage 12.14 — local archive + state-dir compaction for one
+    /// session. Copies the `verified/sessions/<session_id>/...`
+    /// subtree + matching seen markers to
+    /// `<archive-dir>/<session_id>/`, verifies BLAKE3 on every
+    /// copy, writes a manifest LAST, and (on `--move`) cascades
+    /// the source out of the state-dir. No protocol surface; no
+    /// chain, mesh, or SNIP wire is touched.
+    ArchiveSession(ArchiveSessionArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -1946,6 +1955,95 @@ struct ApplySessionReassignArgs {
     dry_run: bool,
 }
 
+// ── Stage 12.14 — archive-session ─────────────────────────────────────────
+
+/// Stage 12.14 — closed status-policy enum mirrored from
+/// `omni_contributor::ArchiveStatusRequirement`. clap-friendly.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum CliArchiveStatusRequirement {
+    Any,
+    Complete,
+    Aggregated,
+    CompletePartials,
+    ExpiredIncomplete,
+}
+
+impl From<CliArchiveStatusRequirement>
+    for omni_contributor::ArchiveStatusRequirement
+{
+    fn from(v: CliArchiveStatusRequirement) -> Self {
+        match v {
+            CliArchiveStatusRequirement::Any => {
+                omni_contributor::ArchiveStatusRequirement::Any
+            }
+            CliArchiveStatusRequirement::Complete => {
+                omni_contributor::ArchiveStatusRequirement::Complete
+            }
+            CliArchiveStatusRequirement::Aggregated => {
+                omni_contributor::ArchiveStatusRequirement::Aggregated
+            }
+            CliArchiveStatusRequirement::CompletePartials => {
+                omni_contributor::ArchiveStatusRequirement::CompletePartials
+            }
+            CliArchiveStatusRequirement::ExpiredIncomplete => {
+                omni_contributor::ArchiveStatusRequirement::ExpiredIncomplete
+            }
+        }
+    }
+}
+
+#[derive(Args)]
+struct ArchiveSessionArgs {
+    /// Stage 12.7 contributor workflow state directory.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    /// 64-char lowercase hex `session_id` to archive.
+    #[arg(long)]
+    session_id: String,
+
+    /// Operator-chosen archive root. `<archive-dir>/<session_id>/`
+    /// must NOT already exist; archive refuses to overwrite.
+    #[arg(long)]
+    archive_dir: PathBuf,
+
+    /// Status policy. `complete` (default) accepts `Aggregated`
+    /// or `CompletePartials`; `any` is the escape valve.
+    #[arg(long, value_enum, default_value_t = CliArchiveStatusRequirement::Complete)]
+    require_status: CliArchiveStatusRequirement,
+
+    /// Copy source to the archive. Source state-dir is
+    /// untouched. **Default** when neither `--copy` nor `--move`
+    /// is passed. `--copy` is the safe explicit form.
+    #[arg(long, conflicts_with = "move_mode", default_value_t = false)]
+    copy: bool,
+
+    /// Move source to the archive: copy + verify BLAKE3 + write
+    /// manifest, THEN cascade the source out of the state-dir.
+    /// Cascade runs only after every file's BLAKE3 verifies AND
+    /// the manifest write succeeds.
+    #[arg(long = "move", conflicts_with = "copy", default_value_t = false)]
+    move_mode: bool,
+
+    /// Also copy `results/result-links/<session.posted_id>.link.json`
+    /// when it exists. Stage 12.14 leaves `results/contributor-results/`
+    /// alone by default — those are job-keyed and the
+    /// session→job mapping isn't carried by the state-dir.
+    #[arg(long, default_value_t = false)]
+    include_results: bool,
+
+    /// Validate and produce the manifest in-memory; print
+    /// `event=would_archive_file` per entry and
+    /// `event=would_archive_complete files=N`; do NOT touch the
+    /// filesystem.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    /// Stage 12.7 — opt out of auto-prune on state-dir open.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -1976,6 +2074,7 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::ApplySessionRepair(a) => run_apply_session_repair(a).await,
         ContributorCmd::PlanSessionReassign(a) => run_plan_session_reassign(a),
         ContributorCmd::ApplySessionReassign(a) => run_apply_session_reassign(a).await,
+        ContributorCmd::ArchiveSession(a) => run_archive_session(a),
     }
 }
 
@@ -6504,6 +6603,95 @@ mod tests {
         assert!(apply_dry.dry_run);
         assert!(!apply_dry.no_publish_announcements);
     }
+
+    // ── Stage 12.14 — archive-session clap regression ─────────────
+
+    fn parse_archive_session(extra: &[&str]) -> ArchiveSessionArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "archive-session".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+            "--session-id".into(),
+            "00".repeat(32),
+            "--archive-dir".into(),
+            "/tmp/archive".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::ArchiveSession(a) => a,
+            _ => panic!("expected ArchiveSession"),
+        }
+    }
+
+    #[test]
+    fn archive_session_flag_parse_smoke() {
+        // Defaults: --require-status complete, --copy implicit
+        // (move_mode false), --include-results off, --dry-run off.
+        let defaults = parse_archive_session(&[]);
+        assert!(matches!(
+            defaults.require_status,
+            CliArchiveStatusRequirement::Complete
+        ));
+        assert!(!defaults.move_mode);
+        assert!(!defaults.copy);
+        assert!(!defaults.include_results);
+        assert!(!defaults.dry_run);
+
+        // --require-status closed enum values.
+        for (raw, expected) in &[
+            ("any", CliArchiveStatusRequirement::Any),
+            ("complete", CliArchiveStatusRequirement::Complete),
+            ("aggregated", CliArchiveStatusRequirement::Aggregated),
+            (
+                "complete-partials",
+                CliArchiveStatusRequirement::CompletePartials,
+            ),
+            (
+                "expired-incomplete",
+                CliArchiveStatusRequirement::ExpiredIncomplete,
+            ),
+        ] {
+            let got = parse_archive_session(&["--require-status", raw]);
+            assert!(
+                std::mem::discriminant(&got.require_status)
+                    == std::mem::discriminant(expected),
+                "require-status={raw} parsed wrong: {:?}",
+                got.require_status
+            );
+        }
+
+        // --move flips on; clap enforces conflicts_with so
+        // --copy + --move must NOT parse.
+        let move_run = parse_archive_session(&["--move"]);
+        assert!(move_run.move_mode);
+        let conflict = TestRoot::try_parse_from(&[
+            "omni-node",
+            "archive-session",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--session-id",
+            &"00".repeat(32),
+            "--archive-dir",
+            "/tmp/archive",
+            "--copy",
+            "--move",
+        ]);
+        assert!(
+            conflict.is_err(),
+            "clap must reject --copy + --move conflict"
+        );
+
+        // --include-results + --dry-run toggle independently.
+        let with_flags =
+            parse_archive_session(&["--include-results", "--dry-run"]);
+        assert!(with_flags.include_results);
+        assert!(with_flags.dry_run);
+        assert!(!with_flags.move_mode);
+    }
 }
 
 // ── Stage 12.9 — session-status ──────────────────────────────────────────
@@ -8081,4 +8269,108 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
              supersession_broadcast status {other:?}"
         )),
     }
+}
+
+// ── Stage 12.14 — archive-session ─────────────────────────────────────────
+
+fn run_archive_session(args: ArchiveSessionArgs) -> Result<()> {
+    use omni_contributor::{
+        archive_session, ArchiveMode, ArchiveOptions, ContributorStateStore,
+    };
+
+    // Resolve mode. The clap layer pins `--copy` xor `--move`;
+    // `--move` (default false) takes precedence when set.
+    let mode = if args.move_mode {
+        ArchiveMode::Move
+    } else {
+        ArchiveMode::Copy
+    };
+    let mode_tag = match mode {
+        ArchiveMode::Copy => "copy",
+        ArchiveMode::Move => "move",
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let (store, prune_report) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        !args.no_prune_state_on_start,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    println!(
+        "event=state_store_opened path={} pruned_sessions={} pruned_peer_adverts={} kept={}",
+        args.contributor_state_dir.display(),
+        prune_report.removed_sessions,
+        prune_report.removed_peer_adverts,
+        prune_report.kept
+    );
+
+    let opts = ArchiveOptions {
+        session_id: &args.session_id,
+        archive_dir: &args.archive_dir,
+        mode,
+        require_status:
+            omni_contributor::ArchiveStatusRequirement::from(args.require_status),
+        include_results: args.include_results,
+        now_utc: &now_utc,
+        dry_run: args.dry_run,
+    };
+
+    println!(
+        "event=archive_started session_id={} mode={mode_tag} \
+         require_status={} include_results={} dry_run={}",
+        args.session_id,
+        omni_contributor::ArchiveStatusRequirement::from(args.require_status)
+            .as_str(),
+        args.include_results,
+        args.dry_run,
+    );
+
+    let manifest = archive_session(&store, &opts)
+        .map_err(|e| anyhow!("archive-session refused: {e}"))?;
+
+    let total_bytes: u64 = manifest.files.iter().map(|f| f.bytes).sum();
+
+    if args.dry_run {
+        for f in &manifest.files {
+            println!(
+                "event=would_archive_file source_relative={} \
+                 archive_relative={} blake3_hex={} bytes={}",
+                f.source_relative, f.archive_relative, f.blake3_hex, f.bytes,
+            );
+        }
+        println!(
+            "event=would_archive_complete session_id={} files={} \
+             total_bytes={} mode={mode_tag}",
+            args.session_id,
+            manifest.files.len(),
+            total_bytes,
+        );
+        return Ok(());
+    }
+
+    // Real apply: emit per-file events, then the closing event.
+    for f in &manifest.files {
+        println!(
+            "event=archive_file session_id={} source_relative={} \
+             archive_relative={} blake3_hex={} bytes={}",
+            args.session_id,
+            f.source_relative,
+            f.archive_relative,
+            f.blake3_hex,
+            f.bytes,
+        );
+    }
+    let manifest_path = args.archive_dir.join(&args.session_id).join("manifest.json");
+    println!(
+        "event=archive_complete session_id={} files={} total_bytes={} \
+         mode={mode_tag} manifest={}",
+        args.session_id,
+        manifest.files.len(),
+        total_bytes,
+        manifest_path.display(),
+    );
+    Ok(())
 }

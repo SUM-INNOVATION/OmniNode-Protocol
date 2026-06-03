@@ -38,6 +38,7 @@
 //! - [`verify`]    — `verify_result` off-chain verification pipeline.
 //! - [`error`]     — Typed error surface.
 
+pub mod archive;
 pub mod canonical;
 pub mod discover;
 pub mod error;
@@ -69,8 +70,9 @@ pub mod watch;
 
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
-    CanonicalError, ContributorError, DiscoverError, PlannerError, RelayError, RepairError,
-    RunnerError, SchemaError, SigningError, SnipError, StatusError, VerifyError,
+    ArchiveError, CanonicalError, ContributorError, DiscoverError, PlannerError,
+    RelayError, RepairError, RunnerError, SchemaError, SigningError, SnipError,
+    StatusError, VerifyError,
 };
 pub use repair::{
     build_session_repair_plan, build_session_repair_plan_with_reason,
@@ -88,6 +90,10 @@ pub use status::{
 pub use resume::{
     compute_audit_health, load_verified_restart_snapshot, AuditCoherence,
     AuditHealth, RestartReport, RestartSnapshot,
+};
+pub use archive::{
+    archive_session, ArchiveManifest, ArchiveMode, ArchiveOptions,
+    ArchiveStatusRequirement, ArchivedFile, ARCHIVE_MANIFEST_SCHEMA_VERSION,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,

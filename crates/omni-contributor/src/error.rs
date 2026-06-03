@@ -787,3 +787,68 @@ impl From<serde_json::Error> for RelayError {
         RelayError::Serialization(e.to_string())
     }
 }
+
+/// Stage 12.14 — local session archival errors. Every variant is
+/// operator-actionable and carries enough context to triage
+/// without re-running the command.
+#[derive(Debug, thiserror::Error)]
+pub enum ArchiveError {
+    /// The state-dir holds no `verified/sessions/<session_id>/`
+    /// subtree. The session was never seen by this watcher, or has
+    /// already been pruned/archived/cascaded out.
+    #[error("session not present in state-dir: session_id={session_id}")]
+    SessionNotPresent { session_id: String },
+
+    /// The rebuilt `SessionStatusReport.overall_status` did not
+    /// satisfy the `--require-status` policy. `got` and
+    /// `requirement` are the stable Debug-stringified discriminators
+    /// (closed sets) so scripts can pattern-match.
+    #[error(
+        "session overall_status {got} does not satisfy --require-status {requirement}"
+    )]
+    StatusRequirementUnmet {
+        got: String,
+        requirement: String,
+    },
+
+    /// The archive destination already holds a subtree named
+    /// `<session_id>/`. Stage 12.14 refuses to overwrite — operators
+    /// must move/rename/delete the existing archive directory before
+    /// re-running.
+    #[error("archive directory already contains session: {path}")]
+    ArchiveAlreadyExists { path: std::path::PathBuf },
+
+    /// BLAKE3 of the destination file did not match the BLAKE3
+    /// computed at copy time. Fail-fast (no retry); operator must
+    /// triage the FS / hardware before retrying.
+    #[error(
+        "blake3 mismatch on copied file: path={path} expected={expected} got={got}"
+    )]
+    BlakeMismatch {
+        path: std::path::PathBuf,
+        expected: String,
+        got: String,
+    },
+
+    /// Generic FS error from a `fs::read` / `fs::write` /
+    /// `fs::copy` call. The `path` field names the artifact that
+    /// failed so operators can `ls` it.
+    #[error("archive io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Bubbled-up `StatusError` from
+    /// `build_session_status_report`. The archive entry point
+    /// builds the status report once (to enforce
+    /// `--require-status` + populate the manifest's
+    /// `session_overall_status` field).
+    #[error("status build for archive: {0}")]
+    Status(#[from] StatusError),
+
+    /// Bubbled-up `StateError`.
+    #[error("state error: {0}")]
+    State(#[from] StateError),
+}
