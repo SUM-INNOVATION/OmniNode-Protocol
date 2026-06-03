@@ -493,3 +493,175 @@ fn auto_prune_skipped_when_disabled() {
     assert_eq!(report.removed_sessions, 0);
     assert_eq!(store.list_verified_sessions().unwrap().len(), 1);
 }
+
+// ── Stage 12.14 — public cascade_remove_session ─────────────────
+
+#[test]
+fn cascade_remove_session_public_method_matches_prune_cascade() {
+    // The Stage 12.14 public `ContributorStateStore::cascade_remove_session`
+    // delegates to the same module-private free fn that Stage 12.7's
+    // `prune_expired` uses. This test pins behavior parity: planting a
+    // session + seen markers + calling the public method removes the
+    // verified subtree AND every session-keyed seen marker that the
+    // prune cascade would have removed.
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    let session = build_session("2026-06-30T00:00:00Z");
+    store
+        .write_verified_json(StateObjectKind::Session, &session.session_id, &session)
+        .unwrap();
+    store
+        .mark_seen(StateNamespace::Sessions, &session.session_id)
+        .unwrap();
+    store
+        .mark_seen(StateNamespace::Aggregates, &session.session_id)
+        .unwrap();
+    let join_marker = format!("{}--{}", session.session_id, "ab".repeat(32));
+    let asn_marker = format!("{}--{}", session.session_id, "cd".repeat(32));
+    let sup_marker = format!("{}--{}", session.session_id, "ef".repeat(32));
+    store.mark_seen(StateNamespace::Joins, &join_marker).unwrap();
+    store
+        .mark_seen(StateNamespace::Assignments, &asn_marker)
+        .unwrap();
+    store
+        .mark_seen(StateNamespace::AssignmentSupersessions, &sup_marker)
+        .unwrap();
+    // Pre-condition: everything present.
+    assert!(d
+        .path()
+        .join("verified/sessions")
+        .join(&session.session_id)
+        .is_dir());
+    assert!(store
+        .is_seen(StateNamespace::Sessions, &session.session_id)
+        .unwrap());
+
+    // Public cascade.
+    store
+        .cascade_remove_session(&session.session_id)
+        .unwrap();
+
+    // Post-condition: verified subtree gone + every seen marker
+    // is gone (matching the prune-cascade behavior pinned by
+    // `prune_cascade_drops_seen_markers_for_expired_session`).
+    assert!(!d
+        .path()
+        .join("verified/sessions")
+        .join(&session.session_id)
+        .exists());
+    assert!(!store
+        .is_seen(StateNamespace::Sessions, &session.session_id)
+        .unwrap());
+    assert!(!store
+        .is_seen(StateNamespace::Aggregates, &session.session_id)
+        .unwrap());
+    assert!(!store.is_seen(StateNamespace::Joins, &join_marker).unwrap());
+    assert!(!store
+        .is_seen(StateNamespace::Assignments, &asn_marker)
+        .unwrap());
+    assert!(!store
+        .is_seen(StateNamespace::AssignmentSupersessions, &sup_marker)
+        .unwrap());
+}
+
+// ── Stage 12.14 review fix — strict vs best-effort cascade ─────
+
+#[test]
+fn cascade_remove_session_strict_accepts_missing_markers_as_benign() {
+    // The strict variant must treat NotFound as benign so a
+    // partial-cascade retry idempotently re-runs to convergence.
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    let session_id = "aa".repeat(32);
+    // No verified subtree, no markers — cascade should still
+    // return Ok.
+    store.cascade_remove_session(&session_id).unwrap();
+}
+
+#[test]
+fn cascade_remove_session_strict_propagates_non_notfound_errors() {
+    use omni_contributor::error::StateError;
+    // Pin the Stage 12.14 review fix: when a seen marker file
+    // cannot be removed via `fs::remove_file` because it is
+    // actually a DIRECTORY at that path (reliably reproducible
+    // cross-platform — `remove_file` on a dir returns
+    // `IsADirectory` on Linux and `PermissionDenied` on macOS;
+    // both are non-`NotFound`), the strict cascade returns Err
+    // instead of silently succeeding. The original best-effort
+    // implementation used by `prune_expired` would swallow the
+    // error and return Ok — which is correct for prune but
+    // wrong for operator-facing `--move`.
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    let session = build_session("2026-06-30T00:00:00Z");
+    store
+        .write_verified_json(StateObjectKind::Session, &session.session_id, &session)
+        .unwrap();
+    // Force a non-NotFound error by replacing the `seen/sessions/<id>`
+    // marker FILE with a non-empty DIRECTORY at the same path —
+    // `fs::remove_file` returns an error other than NotFound.
+    let sessions_seen_dir = d.path().join("seen").join("sessions");
+    std::fs::create_dir_all(&sessions_seen_dir).unwrap();
+    let marker_path = sessions_seen_dir.join(&session.session_id);
+    // Make the marker a directory containing a file so the
+    // attempt to `remove_file` it is guaranteed to error.
+    std::fs::create_dir(&marker_path).unwrap();
+    std::fs::write(marker_path.join("decoy"), b"x").unwrap();
+
+    let err = store.cascade_remove_session(&session.session_id).unwrap_err();
+    match err {
+        StateError::Io { path, source } => {
+            assert_eq!(path, marker_path);
+            // Whatever the platform-specific error kind is, it
+            // MUST NOT be NotFound (the strict path classified
+            // NotFound as benign).
+            assert_ne!(
+                source.kind(),
+                std::io::ErrorKind::NotFound,
+                "strict cascade must NOT classify {source:?} as benign"
+            );
+        }
+        other => panic!("expected StateError::Io from strict cascade, got {other:?}"),
+    }
+}
+
+#[test]
+fn prune_expired_keeps_best_effort_posture_under_same_failure() {
+    // Negative control for the above: the same FS hazard
+    // (`seen/sessions/<id>` is a directory, not a file) must
+    // NOT break `prune_expired`. Stage 12.7 documented prune as
+    // conservative — a single unremovable marker should not
+    // abort the whole walk. This test pins that behavior so a
+    // future refactor doesn't accidentally promote prune to
+    // strict.
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    // Stale session whose expires_at is in the past.
+    let stale = {
+        let mut s = build_session("2026-05-29T00:00:00Z");
+        s.created_at_utc = "2026-05-28T00:00:00Z".into();
+        s.session_id = session_id_hex(&s).unwrap();
+        let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+        let si = execution_session_signing_input(&s).unwrap();
+        s.coordinator_signature_hex = coord.sign_hex(&si);
+        s
+    };
+    store
+        .write_verified_json(StateObjectKind::Session, &stale.session_id, &stale)
+        .unwrap();
+    // Plant the same FS hazard.
+    let sessions_seen_dir = d.path().join("seen").join("sessions");
+    std::fs::create_dir_all(&sessions_seen_dir).unwrap();
+    let marker_path = sessions_seen_dir.join(&stale.session_id);
+    std::fs::create_dir(&marker_path).unwrap();
+    std::fs::write(marker_path.join("decoy"), b"x").unwrap();
+
+    // Prune still returns Ok and reports the session as removed
+    // (best-effort).
+    let report = store.prune_expired(&now_inside_window()).unwrap();
+    assert_eq!(report.removed_sessions, 1);
+}

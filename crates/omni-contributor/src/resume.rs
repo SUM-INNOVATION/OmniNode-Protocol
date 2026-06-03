@@ -291,6 +291,8 @@ pub struct AuditHealth {
     /// - `"run plan-session-reassign --reason invalid-partial"`
     /// - `"clean state-dir orphan replacements before retry"`
     /// - `"operator triage required"`
+    /// - `"run archive-session --require-status aggregated"` (Stage 12.14)
+    /// - `"run archive-session --require-status expired-incomplete"` (Stage 12.14)
     pub recommended_action: &'static str,
 }
 
@@ -435,19 +437,28 @@ pub fn compute_audit_health(report: &SessionStatusReport) -> AuditHealth {
         }
     }
 
-    // (4) Default-healthy. Recommend a missing-partial reannounce
-    // if there ARE active assignments missing partials; else no
-    // action.
+    // (4) Default-healthy. Stage 12.14 — recommend archival for
+    // coherent terminal states (Aggregated, ExpiredIncomplete);
+    // otherwise fall through to the Stage 12.13 missing-partial
+    // recommendation for InProgress with an active-missing entry,
+    // or "none" for everything else. `CompletePartials` is
+    // intentionally NOT recommended for archival — the operator
+    // may still want the aggregate to land.
     let any_active_missing = report
         .assignments
         .iter()
         .any(|a: &AssignmentStatus| !a.superseded && !a.partial_present);
-    let recommended_action = if any_active_missing
-        && report.overall_status == SessionOverallStatus::InProgress
-    {
-        "run plan-session-reassign --reason missing-partial"
-    } else {
-        "none"
+    let recommended_action = match report.overall_status {
+        SessionOverallStatus::Aggregated => {
+            "run archive-session --require-status aggregated"
+        }
+        SessionOverallStatus::ExpiredIncomplete => {
+            "run archive-session --require-status expired-incomplete"
+        }
+        SessionOverallStatus::InProgress if any_active_missing => {
+            "run plan-session-reassign --reason missing-partial"
+        }
+        _ => "none",
     };
     AuditHealth {
         coherence: AuditCoherence::Coherent,

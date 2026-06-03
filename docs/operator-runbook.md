@@ -1034,3 +1034,79 @@ event=warn context=state_store_restart_load_rejected \
 ```
 
 The `reason_tag` set is closed — `grep`-able. A high rejection count after restart usually means either (a) the state-dir is corrupted (run a backup-and-rebuild) or (b) a coordinator key was rotated and old artifacts no longer verify (operator policy decision — re-pull from chain or accept the historical gap).
+
+### Archiving completed sessions (Stage 12.14)
+
+`prune_expired` (Stage 12.7) auto-removes sessions past `expires_at_utc` on watcher restart. **Aggregated sessions whose expires_at_utc is far in the future also accumulate** under `<state-dir>/verified/sessions/`, so over months the state-dir grows.
+
+`omni-node operator contributor archive-session` is the operator-driven tool: copies (or moves) one session's subtree to a separate `<archive-dir>`, BLAKE3-verifies every copy, writes a manifest LAST, and (on `--move`) cascades the source out. **No chain, no SNIP, no mesh** — archives are inert JSON files.
+
+**Default policy** is safe-by-default:
+
+- `--require-status complete` → accepts `Aggregated` or `CompletePartials`. Refuses `InProgress`, `InvalidState`, `NoAssignments`, `NoSession`.
+- `--copy` → source state-dir is untouched. `--move` is explicit opt-in.
+- `--include-results` → off. Even when on, only `results/result-links/<posted_id>.link.json` is archived; per-job artifacts under `results/contributor-results/` are left in place.
+- `--dry-run` → builds the manifest in memory and prints `event=would_archive_*` lines; does not touch the FS.
+
+**When should I archive?** When the audit roll-up tells you:
+
+```text
+event=audit_health session_id=... coherence=coherent triagable_by_reassign=false \
+  recommended_action="run archive-session --require-status aggregated"
+```
+
+The Stage 12.14 audit ergonomics emit that line for `Coherent + Aggregated` and `Coherent + ExpiredIncomplete` sessions. `CompletePartials` is intentionally NOT recommended for archive (operator may still want the aggregate to land).
+
+**Typical workflow:**
+
+```bash
+# 1. Inspect — dry-run first.
+omni-node operator contributor archive-session \
+  --contributor-state-dir <state> \
+  --session-id <hex> \
+  --archive-dir /backup/contributor-archive \
+  --dry-run
+
+# (review the event=would_archive_* lines + manifest size estimate)
+
+# 2. Copy. Source untouched; safe to repeat.
+omni-node operator contributor archive-session \
+  --contributor-state-dir <state> \
+  --session-id <hex> \
+  --archive-dir /backup/contributor-archive
+
+# 3. Inspect the archive on disk.
+cat /backup/contributor-archive/<session_id>/manifest.json
+ls /backup/contributor-archive/<session_id>/verified/sessions/<session_id>/
+
+# 4. (Optional) sync to remote storage.
+rsync -a /backup/contributor-archive/<session_id>/ \
+       s3://operator-bucket/contributor-archive/<session_id>/
+
+# 5. After verifying the archive is durable, free state-dir.
+omni-node operator contributor archive-session \
+  --contributor-state-dir <state> \
+  --session-id <hex> \
+  --archive-dir /backup/contributor-archive2 \
+  --move
+```
+
+Step 5 uses a fresh `--archive-dir` because step 2 already populated the first one (the call refuses to overwrite). Operators who don't need the safety belt can skip step 2 and go straight to `--move`.
+
+**Recovery from a partial copy:** a partial copy under `--copy` leaves no manifest in `<archive-dir>/<session_id>/`. Just `rm -rf <archive-dir>/<session_id>/` and re-run. The source state-dir is untouched.
+
+**Recovery from a BLAKE3 mismatch:** the command exits nonzero with `ArchiveError::BlakeMismatch` naming the failing file. Triage the filesystem / disk health, `rm -rf <archive-dir>/<session_id>/`, and re-run.
+
+**Recovery from a partial `--move` cascade:** the `--move` path runs a **strict** cascade after the manifest write — every IO error other than `NotFound` propagates as `ArchiveError::State(StateError::Io { path, source })` and the process exits nonzero. The archive in `<archive-dir>/<session_id>/` IS durable (manifest written, files BLAKE3-verified); the source state-dir may be partially-cascaded (some files removed, some remnants left). Triage the FS error at the named `path`, then re-run `omni-node operator contributor archive-session --move` against the SAME `<archive-dir>` to refuse cleanly (`ArchiveAlreadyExists`) and instead manually call the cascade — or, simpler, `rm -rf` the source remnants by hand. The cascade is idempotent (NotFound is benign), so a retry after FS triage converges to the same final state.
+
+**Manual restore (no Stage 12.14 restore command yet):**
+
+```bash
+cp -r /backup/contributor-archive/<session_id>/verified/sessions/<session_id>/ \
+      <state-dir>/verified/sessions/<session_id>/
+# (also restore seen markers if you need cross-restart dedup)
+cp -r /backup/contributor-archive/<session_id>/seen/* \
+      <state-dir>/seen/
+```
+
+Then run `omni-node operator contributor session-status --contributor-state-dir <state> --session-id <hex>` to confirm the chain re-verifies. A future stage will likely add `restore-session`; until then manual `cp` is the path.

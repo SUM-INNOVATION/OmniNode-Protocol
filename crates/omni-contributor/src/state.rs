@@ -464,6 +464,40 @@ impl ContributorStateStore {
         self.read_verified_json(StateObjectKind::Aggregate, session_id)
     }
 
+    /// Stage 12.14 — **strict** cascading session remover. Removes
+    /// `verified/sessions/<session_id>/...` entirely AND every
+    /// matching `seen/*` marker (incl. the Stage 12.11
+    /// `assignment-supersessions/` namespace and the per-session
+    /// keyed entries under `joins/` / `assignments/` /
+    /// `partials/` / `peer-adverts/`).
+    ///
+    /// Used by `archive_session` in `--move` mode AFTER a
+    /// successful copy + BLAKE3 verify + manifest write.
+    ///
+    /// Stage 12.14 review fix: this method is **strict** —
+    /// every IO error other than `NotFound` propagates as
+    /// `StateError::Io`. Operator-driven `--move` exposes the
+    /// cascade outcome to automation via the process exit code,
+    /// so silent best-effort behavior here would surface as
+    /// `event=archive_complete` + zero exit while state-dir
+    /// remnants remain — a class of bug review-flagged before
+    /// PR #33. Stage 12.7's `prune_expired` keeps its
+    /// documented conservative best-effort behavior via the
+    /// separate private `cascade_remove_session_best_effort`
+    /// path.
+    ///
+    /// **Destructive.** No undo. Cascade order is fail-fast on
+    /// the first non-`NotFound` error; the caller can re-run
+    /// after triaging the FS and the cascade is idempotent
+    /// (`NotFound` is benign, so files already removed don't
+    /// trip the next attempt).
+    pub fn cascade_remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), StateError> {
+        cascade_remove_session_strict(&self.root, session_id)
+    }
+
     fn list_verified_under<T: serde::de::DeserializeOwned>(
         &self,
         session_id: &str,
@@ -613,7 +647,14 @@ impl ContributorStateStore {
                 }
             }
             if session_expired {
-                cascade_remove_session(&self.root, &session_id)?;
+                // Stage 12.14 review fix — auto-prune keeps its
+                // Stage 12.7 documented best-effort posture
+                // (conservative: a partial cascade is preferable
+                // to aborting the whole prune walk because one
+                // marker is unreadable). Operator-driven `--move`
+                // archival uses the public strict variant via
+                // `ContributorStateStore::cascade_remove_session`.
+                cascade_remove_session_best_effort(&self.root, &session_id)?;
                 report.removed_sessions += 1;
             } else if session_path.is_file() {
                 report.kept += 1;
@@ -701,8 +742,25 @@ fn rand_token() -> String {
 }
 
 /// Remove a whole `verified/sessions/<session_id>/...` subtree and
-/// every matching `seen/*` marker for that session_id.
-fn cascade_remove_session(root: &Path, session_id: &str) -> Result<(), StateError> {
+/// every matching `seen/*` marker for that session_id. Best-effort:
+/// **every IO error is swallowed**.
+///
+/// Used by Stage 12.7's `prune_expired`, which is documented as
+/// conservative — auto-pruning past `expires_at_utc` shouldn't
+/// abort because one marker happens to be unreadable.
+///
+/// Stage 12.14 review fix: the Stage 12.14 `--move` cascade path
+/// MUST NOT use this variant. Operator-driven `--move` exposes
+/// the cascade outcome to automation via the process exit code,
+/// so a swallowed error there would silently surface as
+/// `event=archive_complete` + zero exit while
+/// `verified/sessions/<id>` or seen markers remain on disk. See
+/// [`cascade_remove_session_strict`] for the strict variant the
+/// public method calls.
+fn cascade_remove_session_best_effort(
+    root: &Path,
+    session_id: &str,
+) -> Result<(), StateError> {
     let sdir = root.join("verified").join("sessions").join(session_id);
     if sdir.is_dir() {
         let _ = fs::remove_dir_all(&sdir);
@@ -734,6 +792,102 @@ fn cascade_remove_session(root: &Path, session_id: &str) -> Result<(), StateErro
             if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
                 if name.starts_with(&prefix) {
                     let _ = fs::remove_file(&p);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stage 12.14 review fix — **strict** cascade: every IO error
+/// other than `NotFound` propagates as `StateError::Io`. Used by
+/// the public [`ContributorStateStore::cascade_remove_session`]
+/// method, which in turn drives operator-facing
+/// `archive-session --move`.
+///
+/// `NotFound` is treated as benign because the cascade is
+/// idempotent — a re-run after a partial cascade should still
+/// converge on the same final state.
+///
+/// Removal order is fail-fast: on the FIRST error the function
+/// returns. State may be partially-cascaded; the caller can
+/// re-run after triaging the FS, and the cascade will pick up
+/// where the previous attempt failed (the NotFound-is-benign
+/// rule means files already removed don't trip the next run).
+fn cascade_remove_session_strict(
+    root: &Path,
+    session_id: &str,
+) -> Result<(), StateError> {
+    let is_benign = |e: &std::io::Error| -> bool {
+        e.kind() == std::io::ErrorKind::NotFound
+    };
+
+    let remove_dir_all_strict = |path: &Path| -> Result<(), StateError> {
+        match fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if is_benign(&e) => Ok(()),
+            Err(e) => Err(StateError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }),
+        }
+    };
+
+    let remove_file_strict = |path: &Path| -> Result<(), StateError> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if is_benign(&e) => Ok(()),
+            Err(e) => Err(StateError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }),
+        }
+    };
+
+    let sdir = root.join("verified").join("sessions").join(session_id);
+    remove_dir_all_strict(&sdir)?;
+
+    let seen = root.join("seen");
+    remove_file_strict(&seen.join("sessions").join(session_id))?;
+    remove_file_strict(&seen.join("aggregates").join(session_id))?;
+
+    let prefix = format!("{session_id}--");
+    let mut seen_dirs_to_walk: HashSet<&str> = HashSet::new();
+    seen_dirs_to_walk.insert("joins");
+    seen_dirs_to_walk.insert("assignments");
+    seen_dirs_to_walk.insert("partials");
+    seen_dirs_to_walk.insert("peer-adverts");
+    seen_dirs_to_walk.insert("assignment-supersessions");
+    for d in seen_dirs_to_walk {
+        let dir = seen.join(d);
+        if !dir.is_dir() {
+            continue;
+        }
+        // Sort entries for determinism — operators tracing a
+        // failure can predict which file the cascade tripped on.
+        let mut entries: Vec<PathBuf> = match fs::read_dir(&dir) {
+            Ok(it) => it
+                .filter_map(|e| match e {
+                    Ok(de) => Some(Ok(de.path())),
+                    Err(e) => Some(Err(StateError::Io {
+                        path: dir.clone(),
+                        source: e,
+                    })),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(e) if is_benign(&e) => continue,
+            Err(e) => {
+                return Err(StateError::Io {
+                    path: dir,
+                    source: e,
+                });
+            }
+        };
+        entries.sort();
+        for p in entries {
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if name.starts_with(&prefix) {
+                    remove_file_strict(&p)?;
                 }
             }
         }

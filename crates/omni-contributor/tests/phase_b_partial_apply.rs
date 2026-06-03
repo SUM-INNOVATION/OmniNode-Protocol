@@ -495,3 +495,79 @@ fn audit_reports_not_reassign_triagable_when_invalid_join_present() {
     assert!(!audit.triagable_by_reassign);
     assert_eq!(audit.recommended_action, "operator triage required");
 }
+
+// ── Stage 12.14 — archive recommendations ──────────────────────
+
+#[test]
+fn audit_recommends_archive_for_coherent_aggregated() {
+    let asn_id = "aa".repeat(32);
+    let asn = synth_assignment(
+        &asn_id,
+        0,
+        &"01".repeat(32),
+        /* partial_present = */ true,
+        false,
+        None,
+    );
+    let report = synth_report(
+        vec![asn],
+        vec![],
+        SessionOverallStatus::Aggregated,
+    );
+    let audit = compute_audit_health(&report);
+    assert!(matches!(audit.coherence, AuditCoherence::Coherent));
+    assert_eq!(
+        audit.recommended_action,
+        "run archive-session --require-status aggregated"
+    );
+}
+
+#[test]
+fn audit_recommends_archive_for_coherent_expired_incomplete() {
+    let asn_id = "aa".repeat(32);
+    let asn = synth_assignment(
+        &asn_id,
+        0,
+        &"01".repeat(32),
+        false,
+        false,
+        None,
+    );
+    let mut report = synth_report(
+        vec![asn],
+        vec![],
+        SessionOverallStatus::ExpiredIncomplete,
+    );
+    report.session_expired = true;
+    let audit = compute_audit_health(&report);
+    assert!(matches!(audit.coherence, AuditCoherence::Coherent));
+    assert_eq!(
+        audit.recommended_action,
+        "run archive-session --require-status expired-incomplete"
+    );
+}
+
+#[test]
+fn audit_does_not_recommend_archive_for_complete_partials() {
+    // Stage 12.14 decision 3: archive is recommended only for
+    // Aggregated + ExpiredIncomplete. CompletePartials is left
+    // alone because the operator may still want the aggregate to
+    // land.
+    let asn_id = "aa".repeat(32);
+    let asn = synth_assignment(
+        &asn_id,
+        0,
+        &"01".repeat(32),
+        /* partial_present = */ true,
+        false,
+        None,
+    );
+    let report = synth_report(
+        vec![asn],
+        vec![],
+        SessionOverallStatus::CompletePartials,
+    );
+    let audit = compute_audit_health(&report);
+    assert!(matches!(audit.coherence, AuditCoherence::Coherent));
+    assert_eq!(audit.recommended_action, "none");
+}

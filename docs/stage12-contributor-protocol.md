@@ -2106,3 +2106,183 @@ The `pretty` renderer adds an "Audit health" section under "Notes:" with coheren
 | Forged body signature still rejected in best-effort pass | `supersession_with_forged_body_signature_rejected_even_in_best_effort_pass` |
 
 **Residual gap (deliberate):** the Phase B reorder + the watcher restart preload are still not exercised through the live CLI end-to-end (same Stage 12.10/11/12 CI constraint — would require mocked SNIP + InMemoryRelay full apply). The library helpers and the projection-only audit are mechanically tested; the CLI wires them in single-call sites that are independently visible in code review.
+
+---
+
+# Stage 12.14 — local session archival + state-dir compaction
+
+**Status**: shipped at Stage 12.14. Builds on Stage 12.7 state-dir + Stage 12.12 v3 status + Stage 12.13 audit ergonomics. Adds operator lifecycle management for completed / aggregated / expired session subtrees: an explicit `archive-session` CLI that copies (or moves) the `verified/sessions/<session_id>/...` subtree + matching seen markers to an operator-chosen archive directory, BLAKE3-verifies every copy, and writes a manifest LAST so a partial copy is detectable without source corruption. No new protocol envelope. No canonical-byte changes. No `schema_version` bump on any in-tree envelope. No `STATE_VERSION` bump. No new gossipsub topic. No SNIP wire change. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
+
+## Why archival is purely local
+
+Stage 12.7 made watcher state persistent; Stages 12.11–12.13 made the supersession / reassign / restart flows robust. The remaining operational gap is **disk growth**: completed, aggregated, expired, or abandoned sessions accumulate `verified/sessions/<id>/...` subtrees indefinitely unless the operator manually prunes them. `prune_expired` (Stage 12.7) handles expiry — but `Aggregated` sessions whose `expires_at_utc` is far in the future also pile up.
+
+Stage 12.14 addresses this with a strictly local tool. Archives are **inert JSON files** — not signed, not gossiped, not chain-bound, not SNIP-bound. The archive manifest is a new local-only document that lives in `<archive-dir>`, NOT inside `<state-dir>`. Consequently `STATE_VERSION` stays at `2`.
+
+## Library surface
+
+```rust
+pub const ARCHIVE_MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+pub enum ArchiveMode { Copy, Move }
+
+pub enum ArchiveStatusRequirement {
+    Any,
+    /// Aggregated OR CompletePartials. The safe default.
+    Complete,
+    Aggregated,
+    CompletePartials,
+    ExpiredIncomplete,
+}
+
+pub struct ArchivedFile {
+    pub source_relative: String,
+    pub archive_relative: String,
+    pub blake3_hex: String,
+    pub bytes: u64,
+}
+
+pub struct ArchiveManifest {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub generated_at_utc: String,
+    pub source_state_version: u32,
+    pub omni_contributor_version: String,
+    pub session_overall_status: String,   // Debug-stringified
+    pub audit_coherence: String,          // Debug-stringified
+    pub mode: ArchiveMode,
+    pub require_status: ArchiveStatusRequirement,
+    pub include_results: bool,
+    pub files: Vec<ArchivedFile>,
+}
+
+pub struct ArchiveOptions<'a> {
+    pub session_id: &'a str,
+    pub archive_dir: &'a Path,
+    pub mode: ArchiveMode,
+    pub require_status: ArchiveStatusRequirement,
+    pub include_results: bool,
+    pub now_utc: &'a str,
+    pub dry_run: bool,
+}
+
+pub fn archive_session(
+    store: &ContributorStateStore,
+    opts: &ArchiveOptions<'_>,
+) -> Result<ArchiveManifest, ArchiveError>;
+```
+
+Also new: `ContributorStateStore::cascade_remove_session(&self, session_id)` — a **strict** public method. Stage 12.7's `prune_expired` continues to use a `cascade_remove_session_best_effort` private variant that swallows IO errors (matching its documented conservative posture — auto-prune shouldn't abort because one marker is unreadable). The Stage 12.14 review surfaced a real gap with a single shared cascade: operator-driven `--move` archival exposes the cascade outcome via the process exit code, so silent best-effort behavior would surface as `event=archive_complete` + zero exit while state-dir remnants remain. The strict variant therefore propagates every IO error other than `NotFound` as `StateError::Io { path, source }`; `NotFound` is benign so a partial-cascade retry idempotently re-runs to convergence.
+
+## Safety contract
+
+- **`--dry-run`** returns a fully-populated manifest without touching the filesystem. No archive dir written; no source removed.
+- **`--copy`** (default) copies + BLAKE3-verifies; the source state-dir is untouched. The destination must NOT already contain `<archive-dir>/<session_id>/` — the call refuses with `ArchiveError::ArchiveAlreadyExists`.
+- **`--move`** copies + BLAKE3-verifies + writes the manifest, THEN runs `ContributorStateStore::cascade_remove_session`. A partial-copy failure leaves the source intact (cascade never runs unless every byte landed and verified).
+- **BLAKE3 mismatch** is **fail-fast**: no retry, no partial accept. Operator triages the FS / hardware and re-runs.
+
+## Status policy
+
+| `--require-status` | Accepts |
+|---|---|
+| `any` | every `SessionOverallStatus` (escape valve for InvalidState triage) |
+| `complete` (default) | `Aggregated` OR `CompletePartials` |
+| `aggregated` | only `Aggregated` |
+| `complete-partials` | only `CompletePartials` |
+| `expired-incomplete` | only `ExpiredIncomplete` |
+
+`InProgress`, `InvalidState`, `NoAssignments`, and `NoSession` are refused by every requirement except `any`. Stage 12.14 intentionally does NOT add a `--require-status invalid-state` variant — operators must explicitly opt into `--require-status any` to archive a chain-failed session, signaling they understand the artifacts will not satisfy a reload-and-status pipeline.
+
+## File walk
+
+`archive_session` enumerates two layers:
+
+1. **`verified/sessions/<session_id>/...`** — the full subtree, walked recursively. Stage 12.11 supersessions and Stage 12.5 peer-adverts are picked up naturally because they live under this root.
+2. **Session-keyed seen markers** — `seen/sessions/<id>`, `seen/aggregates/<id>`, plus every `seen/joins/<id>--*`, `seen/assignments/<id>--*`, `seen/partials/<id>--*`, `seen/peer-adverts/<id>--*`, and `seen/assignment-supersessions/<id>--*` whose key starts with `<id>--`. This matches the existing Stage 12.7 prune-cascade definition.
+
+`--include-results` additionally copies `results/result-links/<session.posted_id>.link.json` when present. Stage 12.14 leaves `results/contributor-results/<job_id>.json` alone by default — those are keyed by `job_id`, and the session→job mapping is not directly carried by the state-dir.
+
+The top-level `seen/posted-jobs/`, `seen/network-job-announcements/`, `seen/network-result-announcements/` namespaces are NOT archived: they are operator-job-scoped, not session-scoped.
+
+## CLI
+
+```text
+omni-node operator contributor archive-session
+    --contributor-state-dir <path>
+    --session-id <hex>
+    --archive-dir <path>
+    [--require-status any | complete | aggregated | complete-partials | expired-incomplete]
+                                            # default: complete
+    [--copy | --move]                       # default: copy
+    [--include-results]                     # default: off
+    [--dry-run]
+    [--no-prune-state-on-start]
+```
+
+Closed-set bare-stdout events:
+
+```text
+event=archive_started session_id=... mode=<copy|move> \
+  require_status=<any|complete|aggregated|complete_partials|expired_incomplete> \
+  include_results=<bool> dry_run=<bool>
+
+event=archive_file session_id=... source_relative=... archive_relative=... \
+  blake3_hex=... bytes=...
+
+event=archive_complete session_id=... files=N total_bytes=B mode=<copy|move> \
+  manifest=<path>
+
+event=would_archive_file ...
+event=would_archive_complete session_id=... files=N total_bytes=B mode=<copy|move>
+```
+
+Any `ArchiveError` from the library — `SessionNotPresent` / `StatusRequirementUnmet` / `ArchiveAlreadyExists` / `BlakeMismatch` / `Io` / `Status` / `State` — produces a nonzero exit code so automation can detect refusals.
+
+## Audit ergonomics
+
+Stage 12.13's `compute_audit_health` `recommended_action` closed set grows from 5 to 7 strings:
+
+- `"run archive-session --require-status aggregated"` — when `overall_status == Aggregated` and `coherence == Coherent`.
+- `"run archive-session --require-status expired-incomplete"` — when `overall_status == ExpiredIncomplete` and `coherence == Coherent`.
+
+`CompletePartials` is **deliberately** NOT recommended for archival — the operator may still want the aggregate to land. `InProgress` continues to recommend `plan-session-reassign --reason missing-partial` when there's an active-missing entry; otherwise `"none"`.
+
+JSON renderer is unchanged. The audit recommendation lives in the `events` line and the `pretty` section; v3 `SessionStatusReport` JSON schema stays frozen.
+
+## Out of scope (Stage 12.14)
+
+- **No restore-from-archive command.** Archives are inspectable JSON files; a future stage can add `restore-session` if useful. Manual restore today is `cp -r <archive-dir>/<session_id>/verified/sessions/<id>/ <state-dir>/verified/sessions/<id>/`.
+- **No remote backup destination.** `<archive-dir>` is local; operators can `rsync` / `s3 sync` on top.
+- **No bulk-archive command.** Operators loop in shell; Stage 12.15 can revisit.
+- **No `results/contributor-results/*.json` archival by default.** The mapping is per-job, not per-session.
+- **No retry daemon. No automatic periodic compaction.**
+- **No new envelope. No canonical-byte changes. No `schema_version` bump on any in-tree envelope. No `STATE_VERSION` bump. No new gossipsub topic. No SNIP wire change.**
+- No chain / proof / payment / marketplace / staking / slashing / lease / reputation surfaces.
+
+## Test coverage map
+
+| What's covered | Where |
+|---|---|
+| `--dry-run` writes nothing | `dry_run_archives_nothing` (`archive_session_integration.rs`) |
+| `--copy` writes manifest + verified BLAKE3 | `copy_writes_manifest_and_verifies_blake3` |
+| `--copy` preserves source bit-for-bit | `copy_preserves_source_state_dir` |
+| `--move` removes session subtree + matching seen markers | `move_removes_source_session_subtree_and_seen_markers` |
+| `--require-status complete` refuses `InProgress` | `refuses_in_progress_when_require_status_complete` |
+| `--require-status any` accepts `InvalidState` | `require_status_any_accepts_invalid_state` |
+| Missing session refusal | `refuses_when_session_not_in_state_dir` |
+| Existing archive dir refusal | `refuses_when_archive_dir_already_has_this_session` |
+| `--include-results` copies only `result-links/`, not `contributor-results/` | `include_results_copies_posted_result_link_only` |
+| Other sessions untouched by archive of a single session | `does_not_touch_other_sessions` |
+| Manifest serde round-trip | `manifest_serde_roundtrip` |
+| `ExpiredIncomplete` accepted under `expired-incomplete` requirement | `expired_incomplete_accepted_under_expired_incomplete_requirement` |
+| Stage 12.11 supersession files + seen markers archived | `supersession_files_and_seen_markers_are_archived` |
+| Public `ContributorStateStore::cascade_remove_session` matches Stage 12.7 prune cascade on the happy path | `cascade_remove_session_public_method_matches_prune_cascade` (`state_store_unit.rs`) |
+| Strict cascade treats `NotFound` as benign (idempotent retry) | `cascade_remove_session_strict_accepts_missing_markers_as_benign` |
+| Strict cascade propagates non-`NotFound` IO errors as `StateError::Io` | `cascade_remove_session_strict_propagates_non_notfound_errors` |
+| `prune_expired` keeps its best-effort posture under the same failure | `prune_expired_keeps_best_effort_posture_under_same_failure` |
+| Audit recommends archive for `Coherent + Aggregated` | `audit_recommends_archive_for_coherent_aggregated` (`phase_b_partial_apply.rs`) |
+| Audit recommends archive for `Coherent + ExpiredIncomplete` | `audit_recommends_archive_for_coherent_expired_incomplete` |
+| Audit does NOT recommend archive for `CompletePartials` | `audit_does_not_recommend_archive_for_complete_partials` |
+| CLI flag matrix (`--require-status` parse, `--copy` xor `--move`, `--include-results`, `--dry-run`) | `archive_session_flag_parse_smoke` (omni-node) |
+
+**Residual gap (deliberate):** the CLI run-fn `run_archive_session` is not exercised end-to-end (same constraint as Stage 12.10–12.13 — would require a CLI-process smoke harness). The library `archive_session` is exhaustively covered; the CLI is a thin dispatch on top.
