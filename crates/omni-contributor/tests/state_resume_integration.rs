@@ -362,3 +362,285 @@ fn state_dir_loaders_do_not_run_signature_verification() {
          as already-verified"
     );
 }
+
+// ── Stage 12.13 — restart preload hardening ─────────────────────
+//
+// `load_verified_restart_snapshot` walks the state-dir in
+// dependency order (sessions → joins → assignments →
+// supersessions), re-runs each Stage 12.3 / 12.11 verifier, and
+// returns the typed snapshot the `watch-sessions` restart preload
+// uses to warm its in-memory caches. These tests pin:
+//   - happy-path: every artifact re-verifies and is included.
+//   - rejection: a forged supersession is dropped with a structured
+//     note carrying the SessionVerifyOutcome reason_tag.
+//   - cache shape: the assignments map is populated per-session so
+//     the watcher's out-of-order supersession handler can resolve
+//     references from memory.
+
+use omni_contributor::{
+    canonical::{
+        assignment_id_hex, supersession_id_hex, work_assignment_signing_input,
+        work_assignment_supersession_signing_input,
+    },
+    session::{WorkAssignment, WorkKind},
+    supersession::{SupersessionReason, WorkAssignmentSupersession},
+    SESSION_SCHEMA_VERSION as SESSION_V,
+};
+
+fn build_assignment(
+    session: &ExecutionSession,
+    contrib: &ContributorSigner,
+    coord: &CoordinatorSigner,
+    stage_index: u32,
+) -> WorkAssignment {
+    let mut a = WorkAssignment {
+        schema_version: SESSION_V,
+        session_id: session.session_id.clone(),
+        assignment_id: String::new(),
+        stage_index,
+        contributor_pubkey_hex: contrib.pubkey_hex(),
+        work_kind: WorkKind::Layers {
+            start: stage_index * 8,
+            end: stage_index * 8 + 8,
+        },
+        expected_work_units: 8,
+        expected_work_unit_kind: WorkUnitKind::Layers,
+        assigned_at_utc: "2026-05-30T00:00:05Z".into(),
+        coordinator_signature_hex: String::new(),
+    };
+    a.assignment_id = assignment_id_hex(&a).unwrap();
+    let si = work_assignment_signing_input(&a).unwrap();
+    a.coordinator_signature_hex = coord.sign_hex(&si);
+    a
+}
+
+fn build_supersession(
+    session: &ExecutionSession,
+    coord: &CoordinatorSigner,
+    superseded: Vec<String>,
+    replacement: Vec<String>,
+) -> WorkAssignmentSupersession {
+    let mut superseded = superseded;
+    superseded.sort();
+    let mut replacement = replacement;
+    replacement.sort();
+    let mut s = WorkAssignmentSupersession {
+        schema_version: omni_contributor::SUPERSESSION_SCHEMA_VERSION,
+        session_id: session.session_id.clone(),
+        supersession_id: String::new(),
+        superseded_assignment_ids: superseded,
+        replacement_assignment_ids: replacement,
+        reason: SupersessionReason::MissingPartial,
+        created_at_utc: "2026-05-30T00:00:10Z".into(),
+        coordinator_pubkey_hex: coord.pubkey_hex(),
+        coordinator_signature_hex: String::new(),
+    };
+    s.supersession_id = supersession_id_hex(&s).unwrap();
+    let si = work_assignment_supersession_signing_input(&s).unwrap();
+    s.coordinator_signature_hex = coord.sign_hex(&si);
+    s
+}
+
+fn write_session_chain_into_state(
+    store: &ContributorStateStore,
+    session: &ExecutionSession,
+    joins: &[ContributorJoin],
+    assignments: &[WorkAssignment],
+    supersessions: &[WorkAssignmentSupersession],
+) {
+    store
+        .write_verified_json(StateObjectKind::Session, &session.session_id, session)
+        .unwrap();
+    for j in joins {
+        store
+            .write_verified_json(
+                StateObjectKind::Join {
+                    session_id: session.session_id.clone(),
+                },
+                &j.contributor_pubkey_hex,
+                j,
+            )
+            .unwrap();
+    }
+    for a in assignments {
+        store
+            .write_verified_json(
+                StateObjectKind::Assignment {
+                    session_id: session.session_id.clone(),
+                },
+                &a.assignment_id,
+                a,
+            )
+            .unwrap();
+    }
+    for s in supersessions {
+        store
+            .write_verified_json(
+                StateObjectKind::AssignmentSupersession {
+                    session_id: session.session_id.clone(),
+                },
+                &s.supersession_id,
+                s,
+            )
+            .unwrap();
+    }
+}
+
+const FAR_FUTURE_V13: &str = "2026-12-31T23:59:59Z";
+
+#[test]
+fn restart_preload_loads_assignments_and_caches_them() {
+    let dir = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(dir.path(), false, &now_inside_window()).unwrap();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let contrib = ContributorSigner::from_seed_bytes(&CONTRIB_SEED).unwrap();
+    let session = build_session(FAR_FUTURE_V13);
+    let join = build_join(&session);
+    let asn_0 = build_assignment(&session, &contrib, &coord, 0);
+    let asn_1 = build_assignment(&session, &contrib, &coord, 1);
+    let asn_2 = build_assignment(&session, &contrib, &coord, 2);
+    write_session_chain_into_state(
+        &store,
+        &session,
+        &[join],
+        &[asn_0.clone(), asn_1.clone(), asn_2.clone()],
+        &[],
+    );
+
+    // Reopen and run the Stage 12.13 preload.
+    let (store, _) =
+        ContributorStateStore::open(dir.path(), false, &now_inside_window()).unwrap();
+    let (snapshot, report) =
+        omni_contributor::load_verified_restart_snapshot(&store).unwrap();
+    assert_eq!(report.sessions_accepted, 1);
+    assert_eq!(report.assignments_accepted, 3);
+    assert_eq!(report.supersessions_accepted, 0);
+    assert!(report.rejection_notes.is_empty());
+    let cached = snapshot
+        .assignments_by_session
+        .get(&session.session_id)
+        .expect("session cached with assignments");
+    assert_eq!(cached.len(), 3);
+    let ids: std::collections::HashSet<String> =
+        cached.iter().map(|a| a.assignment_id.clone()).collect();
+    assert!(ids.contains(&asn_0.assignment_id));
+    assert!(ids.contains(&asn_1.assignment_id));
+    assert!(ids.contains(&asn_2.assignment_id));
+}
+
+#[test]
+fn restart_after_supersession_yields_same_status_report() {
+    let dir = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(dir.path(), false, &now_inside_window()).unwrap();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let contrib = ContributorSigner::from_seed_bytes(&CONTRIB_SEED).unwrap();
+    let session = build_session(FAR_FUTURE_V13);
+    let join = build_join(&session);
+    let asn_0 = build_assignment(&session, &contrib, &coord, 0);
+    let asn_1 = build_assignment(&session, &contrib, &coord, 1);
+    let sup = build_supersession(
+        &session,
+        &coord,
+        vec![asn_0.assignment_id.clone()],
+        vec![asn_1.assignment_id.clone()],
+    );
+    write_session_chain_into_state(
+        &store,
+        &session,
+        &[join],
+        &[asn_0.clone(), asn_1.clone()],
+        &[sup.clone()],
+    );
+
+    // Build status report from the original store.
+    let report_a = omni_contributor::build_session_status_report(
+        &store,
+        &session.session_id,
+        &now_inside_window(),
+        false,
+    )
+    .unwrap();
+
+    // Reopen the same state-dir; build the status report again.
+    let (store_reopen, _) =
+        ContributorStateStore::open(dir.path(), false, &now_inside_window()).unwrap();
+    let report_b = omni_contributor::build_session_status_report(
+        &store_reopen,
+        &session.session_id,
+        &now_inside_window(),
+        false,
+    )
+    .unwrap();
+
+    // Strip the timestamp-y fields that legitimately differ; the
+    // chain shape must be bit-equal.
+    let strip = |r: omni_contributor::SessionStatusReport| {
+        let mut r = r;
+        r.generated_at_utc.clear();
+        r.notes.clear();
+        r
+    };
+    assert_eq!(strip(report_a), strip(report_b));
+}
+
+#[test]
+fn restart_preload_drops_corrupted_supersession_with_note() {
+    let dir = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(dir.path(), false, &now_inside_window()).unwrap();
+    let coord = CoordinatorSigner::from_seed_bytes(&COORD_SEED).unwrap();
+    let wrong = CoordinatorSigner::from_seed_bytes(&[0xAB; 32]).unwrap();
+    let contrib = ContributorSigner::from_seed_bytes(&CONTRIB_SEED).unwrap();
+    let session = build_session(FAR_FUTURE_V13);
+    let join = build_join(&session);
+    let asn = build_assignment(&session, &contrib, &coord, 0);
+
+    // Forge a supersession signed by the wrong coordinator key.
+    // The body advertises the real coord, so
+    // `verify_assignment_supersession` fails on the
+    // SupersessionCoordinatorSignatureFailed leg. Use a distinct
+    // 64-hex replacement id so the schema's disjointness check
+    // passes (the verifier reaches the signature leg).
+    let mut sup = build_supersession(
+        &session,
+        &coord,
+        vec![asn.assignment_id.clone()],
+        vec!["cd".repeat(32)],
+    );
+    // After tampering with the sig, the body still re-derives a
+    // stable supersession_id from its canonical body — we keep
+    // the body as-is and just replace the signature with the
+    // rogue's.
+    let si = work_assignment_supersession_signing_input(&sup).unwrap();
+    sup.coordinator_signature_hex = wrong.sign_hex(&si);
+    write_session_chain_into_state(
+        &store,
+        &session,
+        &[join],
+        &[asn.clone()],
+        &[sup.clone()],
+    );
+
+    let (store, _) =
+        ContributorStateStore::open(dir.path(), false, &now_inside_window()).unwrap();
+    let (snapshot, report) =
+        omni_contributor::load_verified_restart_snapshot(&store).unwrap();
+    assert_eq!(report.sessions_accepted, 1);
+    assert_eq!(report.supersessions_accepted, 0);
+    assert_eq!(report.supersessions_rejected, 1);
+    let note = report
+        .rejection_notes
+        .iter()
+        .find(|n| n.contains("kind=supersession"))
+        .expect("a rejection note for the forged supersession");
+    assert!(
+        note.contains("reason_tag=SupersessionCoordinatorSignatureFailed"),
+        "reason_tag must come from SessionVerifyOutcome::reason_tag(); got {note}"
+    );
+    assert!(snapshot
+        .supersessions_by_session
+        .get(&session.session_id)
+        .is_none());
+}

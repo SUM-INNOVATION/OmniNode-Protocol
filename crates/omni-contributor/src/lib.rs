@@ -52,6 +52,7 @@ pub mod posted;
 pub mod relay;
 pub mod repair;
 pub mod result;
+pub mod resume;
 pub mod run;
 pub mod runner;
 pub mod session;
@@ -83,6 +84,10 @@ pub use status::{
     build_session_status_report, AssignmentStatus, InvalidArtifactStatus,
     SessionOverallStatus, SessionStatusReport, SupersessionStatus,
     STATUS_SCHEMA_VERSION,
+};
+pub use resume::{
+    compute_audit_health, load_verified_restart_snapshot, AuditCoherence,
+    AuditHealth, RestartReport, RestartSnapshot,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,
