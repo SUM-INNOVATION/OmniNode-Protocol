@@ -2286,3 +2286,182 @@ JSON renderer is unchanged. The audit recommendation lives in the `events` line 
 | CLI flag matrix (`--require-status` parse, `--copy` xor `--move`, `--include-results`, `--dry-run`) | `archive_session_flag_parse_smoke` (omni-node) |
 
 **Residual gap (deliberate):** the CLI run-fn `run_archive_session` is not exercised end-to-end (same constraint as Stage 12.10–12.13 — would require a CLI-process smoke harness). The library `archive_session` is exhaustively covered; the CLI is a thin dispatch on top.
+
+---
+
+# Stage 12.15 — local session archive restore / import validation
+
+**Status**: shipped at Stage 12.15. Builds on Stage 12.14's archive layout + Stage 12.13's restart preload. Adds the **inverse** of `archive-session`: read `<archive-session-dir>/manifest.json`, validate every file against the manifest's BLAKE3 + path whitelist + state-dir version compatibility, then write each archived byte back into the operator's state-dir. **No new protocol envelope. No canonical-byte changes. No `schema_version` bump on any in-tree envelope. No `STATE_VERSION` bump. No `ARCHIVE_MANIFEST_SCHEMA_VERSION` bump. No new gossipsub topic. No SNIP wire change.** Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
+
+## Why restore is byte-identical replay
+
+Stage 12.14's archive captured per-file BLAKE3 + raw bytes. Stage 12.15 restore writes those bytes back at the same `source_relative` paths. Because every Stage 12.0–12.11 envelope is signed over canonical bytes that are frozen per `schema_version`, the restored bodies verify against `verify_execution_session` / `verify_contributor_join` / `verify_work_assignment` / `verify_assignment_supersession` exactly as if they had never left the state-dir. **No "restored" provenance flag is needed in the state-dir** — and adding one would change the verified-envelope contract.
+
+## Library surface
+
+```rust
+pub enum RestoreSource<'a> {
+    SessionDir(&'a Path),
+    ArchiveRoot { archive_dir: &'a Path, session_id: &'a str },
+}
+
+pub struct RestoreOptions<'a> {
+    pub source: RestoreSource<'a>,
+    pub dry_run: bool,
+    pub verify_only: bool,
+    pub overwrite_existing: bool,
+    pub include_results: bool,
+    pub now_utc: &'a str,
+}
+
+pub struct RestoreReport {
+    pub session_id: String,
+    pub manifest_schema_version: u32,
+    pub source_state_version: u32,
+    pub files_restored: u32,
+    pub files_skipped_results: u32,
+    pub bytes_restored: u64,
+    pub mode: &'static str,             // "restore" | "dry_run" | "verify_only"
+    pub manifest_session_overall_status: String,
+    pub manifest_audit_coherence: String,
+}
+
+pub fn verify_archive_manifest(
+    source: &RestoreSource<'_>,
+) -> Result<ArchiveManifest, RestoreError>;
+
+pub fn restore_session_archive(
+    store: &ContributorStateStore,
+    opts: &RestoreOptions<'_>,
+) -> Result<RestoreReport, RestoreError>;
+```
+
+Also new on the state store:
+
+```rust
+impl ContributorStateStore {
+    pub fn write_archived_bytes(
+        &self,
+        source_relative: &str,
+        bytes: &[u8],
+        overwrite_existing: bool,
+    ) -> Result<PathBuf, StateError>;
+}
+```
+
+`write_archived_bytes` is the **single FS gate**: every byte that lands in the state-dir during restore goes through it. The function enforces:
+
+1. UTF-8 relative path (no `..`, no absolute path, no backslash).
+2. Whitelist match against the Stage 12.14 archive layout (`verified/sessions/<64-hex>/...` / `seen/sessions/<64-hex>` / `seen/aggregates/<64-hex>` / `seen/{joins,assignments,partials,peer-adverts,assignment-supersessions}/<64-hex>--*` / `results/result-links/<64-hex>.link.json`).
+3. Pre-existing destination refuses unless `overwrite_existing == true`.
+4. Atomic tempfile+rename via the existing Stage 12.7 helper.
+
+Path violations surface as new typed `StateError::UnsafeRelativePath` / `StateError::DisallowedRelativePath` / `StateError::DestinationExists` variants; the restore module bubbles them up as the matching `RestoreError` variants for operator clarity.
+
+## Safety contract (mode matrix)
+
+| Mode | Manifest parse + schema/version/session_id check | Per-entry path safety | Read archive file + BLAKE3 verify | Destination existence preflight | Write destination |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `--dry-run` | ✓ | ✓ | — | — | — |
+| `--verify-only` | ✓ | ✓ | ✓ | — | — |
+| (real restore) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `--dry-run` + `--verify-only` | ✓ | ✓ | ✓ | — | — (verify-only wins) |
+
+- **BLAKE3 mismatch** is **fail-fast** — no retry, no partial accept.
+- **Existing-destination preflight** is **all-or-nothing**: if any destination file already exists and `--overwrite-existing` is false, the call refuses BEFORE writing anything. With `--overwrite-existing`, every existing destination is replaced.
+- **`source_state_version`** is **strict equality only** in v1: `manifest.source_state_version == STATE_VERSION`. Anything else refuses with `RestoreError::IncompatibleSourceStateVersion`. A future stage can add a migration story when there's a `STATE_VERSION` bump.
+- **`session_id` binding**: the manifest's `session_id` must equal the resolved expected id (the trailing path component when `RestoreSource::SessionDir` is supplied; the caller-supplied id when `RestoreSource::ArchiveRoot` is used). Defends against hand-renamed archive directories.
+
+## CLI
+
+```text
+omni-node operator contributor restore-session-archive
+    --contributor-state-dir <path>
+    (--archive-session-dir <path> | --archive-dir <root> --session-id <hex>)
+    [--dry-run]
+    [--verify-only]
+    [--overwrite-existing]
+    [--include-results]
+    [--no-prune-state-on-start]
+```
+
+`--archive-session-dir` and `--archive-dir + --session-id` are mutually exclusive (`conflicts_with_all` on the former; `requires` paired on the latter). `--dry-run` and `--verify-only` are NOT mutually exclusive — `--verify-only` is the strict superset, so passing both behaves as verify-only.
+
+Closed-set bare-stdout events:
+
+```text
+event=restore_started session_id=... mode=<restore|dry_run|verify_only> \
+  archive_dir=... overwrite_existing=<bool> include_results=<bool> \
+  session_overall_status=<closed> audit_coherence=<closed>
+
+event=restore_file session_id=... source_relative=... blake3_hex=... \
+  bytes=... destination=...
+
+event=verify_only_file ...           # verify-only mode only
+event=would_restore_file ...         # dry-run mode only
+event=restore_skipped_result_link session_id=... source_relative=... \
+  reason=include_results_off
+
+event=restore_complete session_id=... mode=<...> files=N \
+  files_skipped_results=K bytes=B archive_dir=...
+```
+
+Any `RestoreError` exits nonzero so automation can detect refusals.
+
+## Post-restore workflow
+
+Stage 12.15 does **not** auto-run `session-status` after restore. Operators chain themselves:
+
+```bash
+omni-node operator contributor restore-session-archive \
+  --contributor-state-dir <state> \
+  --archive-session-dir /backup/contributor-archive/<session_id> \
+  && omni-node operator contributor session-status \
+       --contributor-state-dir <state> --session-id <session_id>
+```
+
+The runbook documents the chained pattern + the "stop the watcher before restoring" caveat (concurrent state-dir writes are Stage 12.7's operator policy).
+
+## Out of scope (Stage 12.15)
+
+- No restore from remote URLs or stdin — `<archive-dir>` is local.
+- No bulk-restore command — operators loop in shell.
+- No automatic chain reconciliation after restore.
+- No `--move` restore variant — v1 is copy-only; archive stays intact.
+- No restore-into-a-locked-watcher concurrency protection.
+- No `STATE_VERSION` migration path — strict equality only.
+
+## Test coverage map
+
+| What's covered | Where |
+|---|---|
+| `--dry-run` writes nothing | `dry_run_validates_manifest_without_touching_state_dir` (`restore_session_archive.rs`) |
+| `--verify-only` hashes intact archive without writing | `verify_only_hashes_intact_archive_without_writing` |
+| Round-trip is byte-for-byte equal to archive | `restore_round_trips_bytes_byte_for_byte` |
+| Restore after `archive --move` recreates state subtree | `restore_after_archive_move_recreates_full_state_subtree` |
+| Stage 12.13 restart preload accepts restored session (zero rejections) | `restored_session_is_accepted_by_load_verified_restart_snapshot` |
+| BLAKE3 mismatch refusal | `refuses_when_archive_file_blake3_mismatches_manifest` |
+| Missing archive file refusal | `refuses_when_manifest_references_missing_archive_file` |
+| Path traversal refusal | `refuses_path_traversal_in_manifest_entry` |
+| Absolute path refusal | `refuses_absolute_path_in_manifest_entry` |
+| Disallowed path-outside-whitelist refusal | `refuses_path_outside_session_whitelist` |
+| Existing destination refuses BEFORE any write (all-or-nothing preflight) | `refuses_when_any_destination_exists_without_overwrite_existing` |
+| `--overwrite-existing` replaces files | `overwrite_existing_replaces_destination_files` |
+| Result link skipped unless `--include-results` | `result_link_skipped_unless_include_results_true` |
+| Result link restored when `--include-results` | `result_link_restored_when_include_results_true` |
+| Incompatible `source_state_version` refusal | `refuses_incompatible_source_state_version` |
+| Unsupported manifest `schema_version` refusal | `refuses_unsupported_manifest_schema_version` |
+| Session-id mismatch refusal (renamed archive dir) | `refuses_when_manifest_session_id_mismatches_supplied_session_id` |
+| `verify_archive_manifest` helper returns typed manifest for valid archive | `verify_archive_manifest_returns_typed_manifest_for_valid_archive` |
+| `write_archived_bytes` refuses path traversal | `write_archived_bytes_refuses_path_traversal` (`state_store_unit.rs`) |
+| `write_archived_bytes` refuses absolute path | `write_archived_bytes_refuses_absolute_path` |
+| `write_archived_bytes` refuses backslash separators | `write_archived_bytes_refuses_backslash` |
+| `write_archived_bytes` refuses disallowed prefix | `write_archived_bytes_refuses_disallowed_prefix` |
+| `write_archived_bytes` accepts every Stage 12.14 archive prefix | `write_archived_bytes_accepts_whitelisted_prefixes` |
+| `write_archived_bytes` refuses existing destination unless `overwrite_existing` | `write_archived_bytes_refuses_existing_destination_unless_overwrite` |
+| CLI flag matrix (`--archive-session-dir` xor `--archive-dir + --session-id`, `--dry-run`/`--verify-only` toggles, `--overwrite-existing`, `--include-results`) | `restore_session_archive_flag_parse_smoke` (omni-node) |
+| `--dry-run --verify-only` still catches BLAKE3 mismatch (review fix — verify-only wins) | `dry_run_plus_verify_only_still_catches_blake3_mismatch` |
+| `--dry-run --verify-only` still catches missing archive file (review fix) | `dry_run_plus_verify_only_still_catches_missing_archive_file` |
+| `--dry-run --verify-only` happy path: BLAKE3 walk runs, no destination writes, mode=verify_only | `dry_run_plus_verify_only_accepts_intact_archive_and_writes_nothing` |
+
+**Residual gap (deliberate):** the CLI run-fn `run_restore_session_archive` is not exercised end-to-end (same constraint as Stage 12.10–12.14). The library `restore_session_archive` is exhaustively covered; the CLI is a thin dispatch + event-emission layer on top.

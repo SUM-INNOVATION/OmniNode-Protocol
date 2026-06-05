@@ -665,3 +665,121 @@ fn prune_expired_keeps_best_effort_posture_under_same_failure() {
     let report = store.prune_expired(&now_inside_window()).unwrap();
     assert_eq!(report.removed_sessions, 1);
 }
+
+// ── Stage 12.15 — write_archived_bytes safety contract ─────────
+
+#[test]
+fn write_archived_bytes_refuses_path_traversal() {
+    use omni_contributor::error::StateError;
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    let sid = "aa".repeat(32);
+    let bad = format!("verified/sessions/{sid}/../../etc/passwd");
+    let err = store.write_archived_bytes(&bad, b"hi", false).unwrap_err();
+    assert!(matches!(err, StateError::UnsafeRelativePath { .. }));
+}
+
+#[test]
+fn write_archived_bytes_refuses_absolute_path() {
+    use omni_contributor::error::StateError;
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    let err = store
+        .write_archived_bytes("/etc/passwd", b"hi", false)
+        .unwrap_err();
+    assert!(matches!(err, StateError::UnsafeRelativePath { .. }));
+}
+
+#[test]
+fn write_archived_bytes_refuses_backslash() {
+    use omni_contributor::error::StateError;
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    let sid = "aa".repeat(32);
+    // A Windows-style backslash would let a malformed manifest
+    // forge component aliasing on platforms that treat `\` as a
+    // separator. Stage 12.15 refuses backslash uniformly.
+    let bad = format!("verified\\sessions\\{sid}\\session.json");
+    let err = store.write_archived_bytes(&bad, b"hi", false).unwrap_err();
+    assert!(matches!(err, StateError::UnsafeRelativePath { .. }));
+}
+
+#[test]
+fn write_archived_bytes_refuses_disallowed_prefix() {
+    use omni_contributor::error::StateError;
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    let err = store
+        .write_archived_bytes("config.json", b"hi", false)
+        .unwrap_err();
+    assert!(matches!(err, StateError::DisallowedRelativePath { .. }));
+    // Inside `verified/` but with the wrong second component.
+    let err = store
+        .write_archived_bytes("verified/other/x.json", b"hi", false)
+        .unwrap_err();
+    assert!(matches!(err, StateError::DisallowedRelativePath { .. }));
+    // `seen/` with an unknown namespace.
+    let sid = "aa".repeat(32);
+    let bad = format!("seen/unknown/{sid}");
+    let err = store.write_archived_bytes(&bad, b"hi", false).unwrap_err();
+    assert!(matches!(err, StateError::DisallowedRelativePath { .. }));
+}
+
+#[test]
+fn write_archived_bytes_accepts_whitelisted_prefixes() {
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    let sid = "aa".repeat(32);
+    let pubkey = "bb".repeat(32);
+    let asn = "cd".repeat(32);
+    // Every Stage 12.14 archive prefix should accept.
+    let accepted = [
+        format!("verified/sessions/{sid}/session.json"),
+        format!("verified/sessions/{sid}/joins/{pubkey}.json"),
+        format!("verified/sessions/{sid}/assignments/{asn}.json"),
+        format!("verified/sessions/{sid}/partials/{asn}.json"),
+        format!("verified/sessions/{sid}/aggregated.json"),
+        format!("verified/sessions/{sid}/peer-adverts/{pubkey}.json"),
+        format!("verified/sessions/{sid}/supersessions/{asn}.json"),
+        format!("seen/sessions/{sid}"),
+        format!("seen/aggregates/{sid}"),
+        format!("seen/joins/{sid}--{pubkey}"),
+        format!("seen/assignments/{sid}--{asn}"),
+        format!("seen/partials/{sid}--{asn}"),
+        format!("seen/peer-adverts/{sid}--{pubkey}"),
+        format!("seen/assignment-supersessions/{sid}--{asn}"),
+        format!("results/result-links/{sid}.link.json"),
+    ];
+    for p in &accepted {
+        store
+            .write_archived_bytes(p, b"x", false)
+            .unwrap_or_else(|e| panic!("{p} refused: {e}"));
+    }
+}
+
+#[test]
+fn write_archived_bytes_refuses_existing_destination_unless_overwrite() {
+    use omni_contributor::error::StateError;
+    let d = fresh_dir();
+    let (store, _) =
+        ContributorStateStore::open(d.path(), false, &now_inside_window()).unwrap();
+    let sid = "aa".repeat(32);
+    let rel = format!("verified/sessions/{sid}/session.json");
+    store.write_archived_bytes(&rel, b"first", false).unwrap();
+    let err = store
+        .write_archived_bytes(&rel, b"second", false)
+        .unwrap_err();
+    assert!(matches!(err, StateError::DestinationExists { .. }));
+    // With overwrite_existing=true → succeeds; bytes are
+    // replaced atomically.
+    store
+        .write_archived_bytes(&rel, b"second", true)
+        .unwrap();
+    let on_disk = std::fs::read(d.path().join(&rel)).unwrap();
+    assert_eq!(on_disk, b"second");
+}

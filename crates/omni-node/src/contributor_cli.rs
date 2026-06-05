@@ -203,6 +203,16 @@ enum ContributorCmd {
     /// the source out of the state-dir. No protocol surface; no
     /// chain, mesh, or SNIP wire is touched.
     ArchiveSession(ArchiveSessionArgs),
+
+    /// Stage 12.15 — local archive restore / import. Inverse of
+    /// `archive-session`. Reads
+    /// `<archive-session-dir>/manifest.json` (or
+    /// `<archive-dir>/<session_id>/manifest.json`), validates
+    /// every file against the manifest's BLAKE3 + path
+    /// whitelist + state-dir version compatibility, then
+    /// writes the bytes back into the state-dir. No chain,
+    /// mesh, or SNIP wire touched.
+    RestoreSessionArchive(RestoreSessionArchiveArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2044,6 +2054,71 @@ struct ArchiveSessionArgs {
     no_prune_state_on_start: bool,
 }
 
+// ── Stage 12.15 — restore-session-archive ─────────────────────────────────
+
+#[derive(Args)]
+struct RestoreSessionArchiveArgs {
+    /// Stage 12.7 contributor workflow state directory the
+    /// archive will be restored into.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    /// Path to the archive's session subdirectory — the parent
+    /// that holds `manifest.json` plus the `verified/...` +
+    /// `seen/...` mirror. Mutually exclusive with
+    /// `--archive-dir` / `--session-id`.
+    #[arg(
+        long,
+        conflicts_with_all = ["archive_dir", "session_id"]
+    )]
+    archive_session_dir: Option<PathBuf>,
+
+    /// Archive root. Combined with `--session-id` to resolve
+    /// `<archive-dir>/<session_id>/manifest.json`. Mutually
+    /// exclusive with `--archive-session-dir`.
+    #[arg(long, requires = "session_id")]
+    archive_dir: Option<PathBuf>,
+
+    /// 64-char lowercase hex session_id. Combined with
+    /// `--archive-dir`.
+    #[arg(long, requires = "archive_dir")]
+    session_id: Option<String>,
+
+    /// Parse + validate manifest + per-entry path safety. No
+    /// archive file reads beyond manifest, no destination
+    /// writes. Cheapest mode.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    /// Read + BLAKE3-verify every archived file. No destination
+    /// writes. Proves the archive bytes are intact. If
+    /// `--verify-only` and `--dry-run` are both supplied,
+    /// `--verify-only` wins.
+    #[arg(long, default_value_t = false)]
+    verify_only: bool,
+
+    /// Default `false`. When `false`, restore refuses BEFORE
+    /// writing if any destination file already exists in the
+    /// state-dir. All-or-nothing: ANY pre-existing file fails;
+    /// with this flag, EVERY destination is overwritten.
+    #[arg(long, default_value_t = false)]
+    overwrite_existing: bool,
+
+    /// Default `false`. Skip
+    /// `results/result-links/<posted_id>.link.json` entries
+    /// even if the archive contains them. The Stage 12.14
+    /// archive's `--include-results` flag at archive-time AND
+    /// the Stage 12.15 `--include-results` flag at restore-time
+    /// are independent: the archive may have captured a link
+    /// the operator now wants to skip, or vice versa.
+    #[arg(long, default_value_t = false)]
+    include_results: bool,
+
+    /// Stage 12.7 — opt out of auto-prune on state-dir open.
+    #[arg(long, default_value_t = false)]
+    no_prune_state_on_start: bool,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -2075,6 +2150,7 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::PlanSessionReassign(a) => run_plan_session_reassign(a),
         ContributorCmd::ApplySessionReassign(a) => run_apply_session_reassign(a).await,
         ContributorCmd::ArchiveSession(a) => run_archive_session(a),
+        ContributorCmd::RestoreSessionArchive(a) => run_restore_session_archive(a),
     }
 }
 
@@ -6692,6 +6768,126 @@ mod tests {
         assert!(with_flags.dry_run);
         assert!(!with_flags.move_mode);
     }
+
+    // ── Stage 12.15 — restore-session-archive clap regression ────
+
+    fn parse_restore_session_archive(extra: &[&str]) -> RestoreSessionArchiveArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "restore-session-archive".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::RestoreSessionArchive(a) => a,
+            _ => panic!("expected RestoreSessionArchive"),
+        }
+    }
+
+    #[test]
+    fn restore_session_archive_flag_parse_smoke() {
+        // --archive-session-dir source resolution.
+        let with_session_dir = parse_restore_session_archive(&[
+            "--archive-session-dir",
+            "/tmp/archive/session",
+        ]);
+        assert_eq!(
+            with_session_dir.archive_session_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/archive/session"))
+        );
+        assert!(with_session_dir.archive_dir.is_none());
+        assert!(with_session_dir.session_id.is_none());
+        // Defaults: dry_run / verify_only / overwrite / include all false.
+        assert!(!with_session_dir.dry_run);
+        assert!(!with_session_dir.verify_only);
+        assert!(!with_session_dir.overwrite_existing);
+        assert!(!with_session_dir.include_results);
+
+        // --archive-dir + --session-id source resolution.
+        let with_pair = parse_restore_session_archive(&[
+            "--archive-dir",
+            "/tmp/archive",
+            "--session-id",
+            &"00".repeat(32),
+        ]);
+        assert_eq!(
+            with_pair.archive_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/archive"))
+        );
+        assert_eq!(with_pair.session_id.as_deref(), Some("00".repeat(32).as_str()));
+
+        // --archive-session-dir and --archive-dir conflict at clap
+        // level.
+        let conflict = TestRoot::try_parse_from(&[
+            "omni-node",
+            "restore-session-archive",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--archive-session-dir",
+            "/tmp/archive/session",
+            "--archive-dir",
+            "/tmp/archive",
+            "--session-id",
+            &"00".repeat(32),
+        ]);
+        assert!(
+            conflict.is_err(),
+            "clap must reject --archive-session-dir + --archive-dir conflict"
+        );
+
+        // --archive-dir without --session-id fails (requires
+        // pairing).
+        let no_session = TestRoot::try_parse_from(&[
+            "omni-node",
+            "restore-session-archive",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--archive-dir",
+            "/tmp/archive",
+        ]);
+        assert!(
+            no_session.is_err(),
+            "clap must require --session-id when --archive-dir is set"
+        );
+
+        // --dry-run + --verify-only independently togglable.
+        let dry = parse_restore_session_archive(&[
+            "--archive-session-dir",
+            "/tmp/a/s",
+            "--dry-run",
+        ]);
+        assert!(dry.dry_run);
+        assert!(!dry.verify_only);
+        let vo = parse_restore_session_archive(&[
+            "--archive-session-dir",
+            "/tmp/a/s",
+            "--verify-only",
+        ]);
+        assert!(!vo.dry_run);
+        assert!(vo.verify_only);
+        let both = parse_restore_session_archive(&[
+            "--archive-session-dir",
+            "/tmp/a/s",
+            "--dry-run",
+            "--verify-only",
+        ]);
+        assert!(both.dry_run);
+        assert!(both.verify_only);
+
+        // --overwrite-existing + --include-results toggles.
+        let with_flags = parse_restore_session_archive(&[
+            "--archive-session-dir",
+            "/tmp/a/s",
+            "--overwrite-existing",
+            "--include-results",
+        ]);
+        assert!(with_flags.overwrite_existing);
+        assert!(with_flags.include_results);
+    }
 }
 
 // ── Stage 12.9 — session-status ──────────────────────────────────────────
@@ -8371,6 +8567,151 @@ fn run_archive_session(args: ArchiveSessionArgs) -> Result<()> {
         manifest.files.len(),
         total_bytes,
         manifest_path.display(),
+    );
+    Ok(())
+}
+
+// ── Stage 12.15 — restore-session-archive ─────────────────────────────────
+
+fn run_restore_session_archive(args: RestoreSessionArchiveArgs) -> Result<()> {
+    use omni_contributor::{
+        restore_session_archive, ContributorStateStore, RestoreOptions,
+        RestoreSource,
+    };
+
+    // Resolve the archive source. Clap enforces the mutual
+    // exclusion + the requires-pair (session_id <-> archive_dir);
+    // the run fn just needs to pick one branch.
+    let session_dir_owned: PathBuf;
+    let archive_dir_owned: PathBuf;
+    let session_id_owned: String;
+    let source = if let Some(p) = args.archive_session_dir.as_ref() {
+        session_dir_owned = p.clone();
+        RestoreSource::SessionDir(&session_dir_owned)
+    } else {
+        let archive_dir = args.archive_dir.as_ref().ok_or_else(|| {
+            anyhow!(
+                "restore-session-archive: supply either --archive-session-dir \
+                 OR (--archive-dir + --session-id)"
+            )
+        })?;
+        let session_id = args.session_id.as_ref().ok_or_else(|| {
+            anyhow!(
+                "restore-session-archive: --archive-dir requires --session-id"
+            )
+        })?;
+        archive_dir_owned = archive_dir.clone();
+        session_id_owned = session_id.clone();
+        RestoreSource::ArchiveRoot {
+            archive_dir: &archive_dir_owned,
+            session_id: &session_id_owned,
+        }
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let (store, prune_report) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        !args.no_prune_state_on_start,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    println!(
+        "event=state_store_opened path={} pruned_sessions={} pruned_peer_adverts={} kept={}",
+        args.contributor_state_dir.display(),
+        prune_report.removed_sessions,
+        prune_report.removed_peer_adverts,
+        prune_report.kept
+    );
+
+    let opts = RestoreOptions {
+        source,
+        dry_run: args.dry_run,
+        verify_only: args.verify_only,
+        overwrite_existing: args.overwrite_existing,
+        include_results: args.include_results,
+        now_utc: &now_utc,
+    };
+
+    // Verify the manifest first so the `event=restore_started`
+    // line carries the informational status/coherence fields
+    // even before per-file work.
+    let manifest =
+        omni_contributor::verify_archive_manifest(&opts.source).map_err(|e| {
+            anyhow!("restore-session-archive refused: {e}")
+        })?;
+
+    let mode_tag = if args.verify_only {
+        "verify_only"
+    } else if args.dry_run {
+        "dry_run"
+    } else {
+        "restore"
+    };
+    let archive_dir_for_event = match (&args.archive_session_dir, &args.archive_dir) {
+        (Some(p), _) => p.display().to_string(),
+        (_, Some(p)) => p.display().to_string(),
+        _ => String::from("-"),
+    };
+    println!(
+        "event=restore_started session_id={} mode={mode_tag} \
+         archive_dir={archive_dir_for_event} \
+         overwrite_existing={} include_results={} \
+         session_overall_status={} audit_coherence={}",
+        manifest.session_id,
+        args.overwrite_existing,
+        args.include_results,
+        manifest.session_overall_status,
+        manifest.audit_coherence,
+    );
+
+    let report = restore_session_archive(&store, &opts)
+        .map_err(|e| anyhow!("restore-session-archive refused: {e}"))?;
+
+    // Per-mode per-file emission. The library `restore_session_archive`
+    // doesn't emit; the CLI does so it can produce closed-set
+    // event lines without leaking library-internal state.
+    let session_dir_path = opts.source.session_dir();
+    for entry in &manifest.files {
+        let is_link =
+            entry.source_relative.starts_with("results/result-links/");
+        if is_link && !args.include_results {
+            println!(
+                "event=restore_skipped_result_link session_id={} \
+                 source_relative={} reason=include_results_off",
+                manifest.session_id, entry.source_relative,
+            );
+            continue;
+        }
+        let line = match report.mode {
+            "dry_run" => "event=would_restore_file",
+            "verify_only" => "event=verify_only_file",
+            _ => "event=restore_file",
+        };
+        let destination = store
+            .root()
+            .join(&entry.source_relative)
+            .display()
+            .to_string();
+        println!(
+            "{line} session_id={} source_relative={} blake3_hex={} bytes={} \
+             destination={destination}",
+            manifest.session_id,
+            entry.source_relative,
+            entry.blake3_hex,
+            entry.bytes,
+        );
+    }
+
+    println!(
+        "event=restore_complete session_id={} mode={mode_tag} files={} \
+         files_skipped_results={} bytes={} archive_dir={}",
+        report.session_id,
+        report.files_restored,
+        report.files_skipped_results,
+        report.bytes_restored,
+        session_dir_path.display(),
     );
     Ok(())
 }
