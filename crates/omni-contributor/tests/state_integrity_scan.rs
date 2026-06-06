@@ -26,7 +26,8 @@ use omni_contributor::{
     },
     ArchiveMode, ArchiveOptions, ArchiveStatusRequirement, ContributorSigner,
     ContributorStateStore, CoordinatorSigner, FindingKind, FindingSeverity,
-    ScanOptions, SESSION_SCHEMA_VERSION, STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
+    scan_state_integrity_with_audit_orphans, ScanOptions, SESSION_SCHEMA_VERSION,
+    STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
 };
 
 const COORD_SEED: [u8; 32] = *b"stage12.16-integrity-coord-seed!";
@@ -937,5 +938,112 @@ fn scanner_leaves_expired_session_subtree_on_disk() {
     assert!(
         session_body.is_file(),
         "expired session.json must still be on disk after the scan"
+    );
+}
+
+// ── 14. Stage 12.17 — StraySeenFile emission ──────────────────
+//
+// Three forms of stray-seen the scanner must surface:
+//   (a) a file directly under `seen/` (no namespace dir),
+//   (b) a file under an unknown-namespace dir,
+//   (c) a shape-malformed key inside a valid namespace dir.
+
+#[test]
+fn stray_seen_file_under_seen_root_emits_finding() {
+    let state_dir = fresh_dir();
+    let _store = open_store(state_dir.path());
+    let junk = state_dir.path().join("seen").join("garbage.tmp");
+    std::fs::write(&junk, b"junk").unwrap();
+
+    let store = open_store(state_dir.path());
+    let report = scan_state_integrity(&store, &default_opts(NOW_UTC)).unwrap();
+    let strays: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| {
+            matches!(f.kind, FindingKind::StraySeenFile)
+                && f.path.as_deref() == Some("seen/garbage.tmp")
+        })
+        .collect();
+    assert_eq!(
+        strays.len(),
+        1,
+        "expected one StraySeenFile for seen/garbage.tmp; got {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn stray_seen_file_under_unknown_namespace_emits_finding() {
+    let state_dir = fresh_dir();
+    let _store = open_store(state_dir.path());
+    let unknown_ns = state_dir.path().join("seen").join("unknown-ns");
+    std::fs::create_dir_all(&unknown_ns).unwrap();
+    std::fs::write(unknown_ns.join("whatever"), b"x").unwrap();
+
+    let store = open_store(state_dir.path());
+    let report = scan_state_integrity(&store, &default_opts(NOW_UTC)).unwrap();
+    let strays: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f.kind, FindingKind::StraySeenFile))
+        .filter(|f| {
+            f.path
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("seen/unknown-ns/")
+        })
+        .collect();
+    assert_eq!(
+        strays.len(),
+        1,
+        "expected one StraySeenFile for unknown-ns; got {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn shape_malformed_seen_key_emits_stray_not_stale() {
+    use omni_contributor::StateNamespace;
+    let state_dir = fresh_dir();
+    let store = open_store(state_dir.path());
+    // A "session" marker whose key isn't 64-hex.
+    store
+        .mark_seen(StateNamespace::Sessions, "not_64_hex_at_all")
+        .unwrap();
+
+    let report = scan_state_integrity(&store, &default_opts(NOW_UTC)).unwrap();
+    let strays: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f.kind, FindingKind::StraySeenFile))
+        .collect();
+    let stales: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f.kind, FindingKind::StaleSeenMarker))
+        .collect();
+    assert_eq!(strays.len(), 1, "{:?}", report.findings);
+    assert!(
+        stales.is_empty(),
+        "shape-malformed key must not double-emit StaleSeenMarker; got {:?}",
+        stales
+    );
+}
+
+// ── 15. Stage 12.17 — orphan side-channel ─────────────────────
+
+#[test]
+fn audit_orphan_side_channel_is_empty_on_clean_state() {
+    let state_dir = fresh_dir();
+    let store = open_store(state_dir.path());
+    let _session = seed_aggregated_session(&store);
+    let (_report, orphans) =
+        scan_state_integrity_with_audit_orphans(&store, &default_opts(NOW_UTC))
+            .unwrap();
+    assert!(
+        orphans.is_empty(),
+        "clean state must not surface any orphan ids; got {:?}",
+        orphans
     );
 }

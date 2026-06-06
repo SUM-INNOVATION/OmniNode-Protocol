@@ -40,6 +40,7 @@
 
 pub mod archive;
 pub mod canonical;
+pub mod cleanup;
 pub mod discover;
 pub mod error;
 pub mod handoff;
@@ -72,9 +73,9 @@ pub mod watch;
 
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
-    ArchiveError, CanonicalError, ContributorError, DiscoverError, IntegrityError,
-    PlannerError, RelayError, RepairError, RestoreError, RunnerError, SchemaError,
-    SigningError, SnipError, StatusError, VerifyError,
+    ArchiveError, CanonicalError, CleanupError, ContributorError, DiscoverError,
+    IntegrityError, PlannerError, RelayError, RepairError, RestoreError, RunnerError,
+    SchemaError, SigningError, SnipError, StatusError, VerifyError,
 };
 pub use repair::{
     build_session_repair_plan, build_session_repair_plan_with_reason,
@@ -102,9 +103,18 @@ pub use restore::{
     RestoreReport, RestoreSource,
 };
 pub use integrity::{
-    scan_state_integrity, FindingKind, FindingSeverity, IntegrityFinding,
-    RecommendedAction, ScanOptions, SessionIntegritySummary, StateIntegrityReport,
+    scan_state_integrity, scan_state_integrity_with_audit_orphans, FindingKind,
+    FindingSeverity, IntegrityFinding, RecommendedAction, ScanOptions,
+    SessionIntegritySummary, StateIntegrityReport,
     STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
+};
+pub use cleanup::{
+    apply_state_cleanup, cleanup_plan_hash_hex, plan_state_cleanup,
+    source_integrity_hash_hex, ApplyOptions as CleanupApplyOptions, CleanupAction,
+    CleanupActionKind, CleanupActionOutcome, CleanupReport,
+    PlanOptions as CleanupPlanOptions, QuarantineEntry, QuarantineManifest,
+    StateCleanupPlan, CLEANUP_PLAN_SCHEMA_VERSION,
+    QUARANTINE_MANIFEST_SCHEMA_VERSION,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,

@@ -2549,3 +2549,110 @@ Two further deliberate gaps are documented for operators:
 
 1. **Unparseable verified bodies.** Stage 12.7's parse-only loaders silently skip JSON that fails to parse, so a body whose JSON is structurally broken (e.g. truncated) disappears from the snapshot rather than surfacing as a finding. This is consistent with Stage 12.13's restart-preload behavior; operators who suspect a parse-level corruption should compare disk counts against `session-status`.
 2. **No mutation in v1.** A finding's `recommended_action` is a string label, not an executable command. Stage 12.16 deliberately separates *detection* from *repair* — operators run the suggested Stage 12.10 / 12.11 / 12.14 / 12.15 CLI invocations explicitly.
+
+# Stage 12.17 — local state-dir cleanup planner / applier
+
+## What this stage is, in one sentence
+
+A two-step `plan-state-cleanup` + `apply-state-cleanup` flow that composes Stage 12.16 findings + the Stage 12.13 audit projection into a deterministic JSON plan of closed-set cleanup actions, then walks that plan one action at a time with apply-time drift detection and a Stage 12.14-shaped quarantine — all without touching any protocol surface.
+
+## Why cleanup is a separate command
+
+Stage 12.16's `state-integrity` is read-only by contract. The Stage 12.17 cleanup commands honor that contract by living separately: the planner walks the state-dir to *build* a plan; the applier is the only mutating surface and it always re-runs the integrity scan first for drift detection. The two CLIs both open the store with `auto_prune = false` unconditionally (Stage 12.16 review precedent), so neither command can silently delete the expired/incomplete state the planner is supposed to see.
+
+## Library surface
+
+`omni_contributor::cleanup` ships:
+
+- `pub const CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;` and `pub const QUARANTINE_MANIFEST_SCHEMA_VERSION: u32 = 1;` — closed-evolution per the Stage 12.15 precedent.
+- Closed `CleanupActionKind` enum with 9 variants:
+  - **Tier A** (no quarantine, reversible idempotency-hint edits): `RemoveSeenMarker`, `WriteSeenMarker`, `RemoveSeenFile`.
+  - **Tier B** (quarantine-before-delete): `QuarantineVerifiedFile`, `QuarantineAndUnmarkJoin`, `QuarantineAndUnmarkAssignment`, `QuarantineAndUnmarkSupersession`.
+  - **Tier B, gated**: `QuarantineAndUnmarkPartial` (`--allow-invalid-partial-cleanup`), `QuarantineAndUnmarkOrphanAssignment` (`--allow-orphan-assignments`).
+- `CleanupAction { kind, session_id, path, seen_marker_path, source_finding_kind, source_reason_tag }` with `deny_unknown_fields`.
+- `StateCleanupPlan { schema_version, plan_id, created_at_utc, state_dir, source_integrity_hash, omni_contributor_version, actions, cleanup_plan_hash }`. `plan_id` is the 16-char lowercase hex BLAKE3 prefix of `(state_dir || source_integrity_hash || created_at_utc)`. `source_integrity_hash` is the BLAKE3 of the integrity report's canonical projection with `generated_at_utc` and `state_dir` blanked; apply-time re-projection refuses on mismatch. `cleanup_plan_hash` mirrors Stage 12.11's `repair_plan_hash` recipe (BLAKE3 over the canonical plan with the field cleared).
+- `pub fn plan_state_cleanup(report, audit_orphans, &PlanOptions) -> Result<StateCleanupPlan, CleanupError>` — pure projection over the Stage 12.16 report + the new Stage 12.17 orphan side-channel.
+- `pub fn apply_state_cleanup(store, &StateCleanupPlan, &ApplyOptions) -> Result<CleanupReport, CleanupError>`.
+- `QuarantineManifest` + `QuarantineEntry` — the Stage 12.14-shaped manifest written LAST under `<quarantine-dir>/<plan_id>/quarantine-manifest.json`.
+
+**Scanner extensions (Stage 12.17-additive, no report-schema bump)**:
+
+- `pub fn scan_state_integrity_with_audit_orphans(store, opts) -> Result<(StateIntegrityReport, HashMap<String, Vec<String>>), IntegrityError>` — same report struct as Stage 12.16; the extra map carries the per-session orphan-assignment ids the planner consumes for `QuarantineAndUnmarkOrphanAssignment`.
+- `FindingKind::StraySeenFile` is now actively emitted by a new `scan_stray_seen_files` walker. The walker catches files directly under `seen/`, files under unknown namespace dirs, and shape-malformed keys (non-64-hex or missing `<sid>--` for prefixed namespaces). The reverse `scan_seen_marker_consistency` walk was made shape-strict in tandem so the same file never accumulates both a `StaleSeenMarker` and a `StraySeenFile` finding.
+
+## Safety contract
+
+- **Plan is read-only.** Walks the state-dir via Stage 12.16's scanner; writes only the operator-named `--out` plan file.
+- **Closed mode matrix**: `--dry-run` runs every preflight (plan-hash, drift, gate, orphan-audit re-check, path-safety) without touching the FS. Real apply does the same preflights then mutates.
+- **Path-safety preflight (Stage 12.17 review fix).** Before any IO, the applier validates every action's `path` and `seen_marker_path` against the per-kind whitelist: tier-B + `WriteSeenMarker` paths must start with `verified/sessions/`; `RemoveSeenMarker` / `RemoveSeenFile` paths and `seen_marker_path` fields must start with `seen/`; no path may contain `..` segments, a leading `/`, a backslash, or empty segments. A self-consistent `cleanup_plan_hash` does NOT vouch for path safety — hand-edited plans can recompute the hash trivially — so every path goes through `CleanupError::UnsafePlanPath { path, reason }` validation BEFORE any `std::fs::read` / `std::fs::write` / `remove_verified_relative` / `unmark_seen` call.
+- **Apply ordering (Stage 12.17 review fix — three explicit phases).** A successful apply proceeds Phase A → Phase B → Phase C, and if Phase A or B fails the state-dir is byte-identical to pre-apply:
+  - **Phase A — Quarantine.** For each tier-B action: read source bytes → compute BLAKE3 → write to `<quarantine-dir>/<plan_id>/<source_relative>` → re-read + BLAKE3 verify the quarantine copy. Build `QuarantineEntry` records in memory. **No source removal.**
+  - **Phase B — Manifest.** Write `quarantine-manifest.json` atomically (tempfile + rename) under `<quarantine-dir>/<plan_id>/`. By the time Phase C runs the manifest is durable on disk; a failure here returns `CleanupError::Io` and Phase C is skipped.
+  - **Phase C — State-dir mutation.** Walk every action in plan order: `RemoveSeenMarker` → `unmark_seen`; `RemoveSeenFile` → direct `fs::remove_file`; `WriteSeenMarker` → `mark_seen`; tier-B → `remove_verified_relative` then `unmark_seen` for the matching `seen_marker_path`.
+- **Drift refusal**: `apply_state_cleanup` re-runs `scan_state_integrity_with_audit_orphans` and refuses with `CleanupError::SourceIntegrityDrift { expected, got }` on `source_integrity_hash` mismatch. For every `QuarantineAndUnmarkOrphanAssignment`, the per-session `compute_audit_health` projection is re-run and the orphan id set must equal the planner's — drift surfaces as `CleanupError::OrphanAuditDrift { session_id, plan_count, current_count }`.
+- **Gate refusal**: gated actions are *planned freely* (so the operator can review a complete plan), but **refused at apply time** unless the matching `--allow-…` flag is set. Refusal is `CleanupError::GateRequired { kind, flag }` BEFORE any mutation.
+- **Quarantine collision refusal**: pre-existing `<quarantine-dir>/<plan_id>/` is refused. Operator must pass a fresh directory or clear the subtree.
+- **No `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` bump.** The quarantine subtree lives OUTSIDE the state-dir (operator-supplied path), and the scanner's orphan side-channel is a sibling return value rather than a finding field.
+
+## CLI
+
+```
+omni-node operator contributor plan-state-cleanup \
+  --contributor-state-dir <path>           (required)
+  [--session-id <hex64>]                   (filter session-scoped actions)
+  [--integrity-json <path>]                (consume a pre-baked report; drift warned)
+  --out <path>                             (where the plan JSON lands; atomic write)
+  [--format events|json|pretty]            (default events)
+
+omni-node operator contributor apply-state-cleanup \
+  --contributor-state-dir <path>           (required)
+  --plan <path>                            (plan JSON to apply)
+  --quarantine-dir <path>                  (required even for tier-A-only plans)
+  [--dry-run]                              (validate without mutating)
+  [--allow-invalid-partial-cleanup]        (gate for QuarantineAndUnmarkPartial)
+  [--allow-orphan-assignments]             (gate for orphan-assignment actions)
+  [--purge-stray]                          (skip quarantine for QuarantineVerifiedFile)
+  [--format events|json|pretty]
+```
+
+Closed-set bare-stdout events: `event=cleanup_plan_written`, `event=cleanup_action_planned`, `event=cleanup_plan_built`, `event=cleanup_started`, `event=cleanup_action_applied`, `event=would_apply_action`, `event=cleanup_action_skipped`, `event=cleanup_complete`. Drift / hash / gate / collision refusals all exit non-zero with the typed `CleanupError` message on stderr.
+
+## Out of scope (Stage 12.17)
+
+- **`InvalidSession` / `InvalidAggregate` cleanup.** A session.json removal cascades the whole subtree; an aggregate removal flips the overall status. Both are operator-routed through Stage 12.14 `archive-session --move` or manual triage.
+- **Auto-chain into reassign.** Stage 12.11 `plan-session-reassign` is a separate operator step. Cleanup never invokes it.
+- **Quarantine retention / pruning.** The quarantine subtree is operator-managed metadata. v1 doesn't sweep old subtrees.
+- **First-class quarantine restore via Stage 12.15.** The quarantine manifest is *not* an `ArchiveManifest`; manual `cp` back into the state-dir is the v1 rollback story.
+- **No envelope, no canonical-byte changes, no `schema_version` bump on Stage 12.0–12.16 envelopes, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` bump, no new gossipsub topic, no SNIP / mesh / chain / payment / proof / marketplace surface.**
+
+## Test coverage map
+
+| Concern | Test |
+| --- | --- |
+| Clean state-dir → empty plan | `clean_state_produces_empty_plan` (`state_cleanup_plan.rs`) |
+| Plan hash self-consistency + source-integrity-hash match | `plan_hash_is_self_consistent_and_drift_aware` |
+| Tier A: stale seen marker round-trip | `stale_seen_marker_is_removed_by_cleanup_apply` |
+| Tier A: missing seen marker round-trip | `missing_seen_marker_is_written_by_cleanup_apply` |
+| Tier B: tampered join quarantined + unmarked + post-scan clean | `tampered_join_is_quarantined_and_unmarked` |
+| Tier B: stray verified file quarantine round-trip | `stray_verified_file_quarantine_round_trip` |
+| Source-integrity drift refusal | `apply_refuses_on_source_integrity_drift` |
+| Plan-hash mismatch refusal | `apply_refuses_on_plan_hash_mismatch` |
+| `--allow-invalid-partial-cleanup` gate refusal + accept | `invalid_partial_cleanup_is_gated` |
+| Dry-run writes nothing (state-dir + quarantine) | `dry_run_writes_nothing` |
+| Pre-existing `<quarantine-dir>/<plan_id>/` refusal | `apply_refuses_on_existing_quarantine_dir` |
+| Plan ⇄ JSON round-trip preserves hashes | `plan_json_roundtrip_preserves_hash` |
+| `InvalidSession` finding produces no v1 action | `invalid_session_finding_produces_no_action` |
+| Cleanup doesn't collide with Stage 12.14 archive subtree | `cleanup_quarantine_does_not_collide_with_archive_layout` |
+| Path-traversal refusal in `RemoveSeenFile` (review fix — `UnsafePlanPath`) | `apply_refuses_traversal_path_in_remove_seen_file` |
+| Path-traversal refusal in `RemoveSeenMarker` (review fix) | `apply_refuses_traversal_path_in_remove_seen_marker` |
+| Path-traversal refusal in tier-B `path` (review fix) | `apply_refuses_traversal_path_in_tier_b_action` |
+| Path-traversal refusal in `seen_marker_path` (review fix) | `apply_refuses_traversal_path_in_seen_marker_path_field` |
+| Quarantine-write failure leaves state-dir byte-identical (review fix — Phase A→B→C ordering) | `quarantine_write_failure_leaves_state_dir_untouched` |
+| `StraySeenFile` emission: under `seen/` root | `stray_seen_file_under_seen_root_emits_finding` (`state_integrity_scan.rs`) |
+| `StraySeenFile` emission: unknown namespace dir | `stray_seen_file_under_unknown_namespace_emits_finding` |
+| `StraySeenFile` emission: shape-malformed key (no double-`StaleSeenMarker`) | `shape_malformed_seen_key_emits_stray_not_stale` |
+| Orphan side-channel empty on clean state | `audit_orphan_side_channel_is_empty_on_clean_state` |
+| CLI flag matrix `plan-state-cleanup` (including deliberate rejection of `--no-prune-state-on-start`) | `plan_state_cleanup_flag_parse_smoke` (omni-node) |
+| CLI flag matrix `apply-state-cleanup` (including deliberate rejection of `--no-prune-state-on-start`) | `apply_state_cleanup_flag_parse_smoke` |
+
+**Residual gap (deliberate):** the CLI run-fns `run_plan_state_cleanup` and `run_apply_state_cleanup` aren't exercised end-to-end (same constraint as Stage 12.10–12.16); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.

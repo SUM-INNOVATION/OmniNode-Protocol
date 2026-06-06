@@ -539,6 +539,54 @@ impl ContributorStateStore {
         Ok(dest)
     }
 
+    /// Stage 12.17 — remove one verified file referenced by a
+    /// state-dir-relative path. `source_relative` is validated
+    /// against the Stage 12.14 archive whitelist (no `..`, no
+    /// absolute, no backslash, must match a known prefix), so the
+    /// caller can only delete files the archive format already
+    /// knows how to address.
+    ///
+    /// Idempotent: a missing destination returns `Ok(false)`
+    /// rather than an error; a successful removal returns
+    /// `Ok(true)`. Same NotFound-is-benign rule as
+    /// [`cascade_remove_session_strict`].
+    ///
+    /// Used exclusively by the Stage 12.17 cleanup applier. No
+    /// chain / mesh / SNIP / envelope surface is touched.
+    pub fn remove_verified_relative(
+        &self,
+        source_relative: &str,
+    ) -> Result<bool, StateError> {
+        validate_archive_relative_path(source_relative)?;
+        let dest = self.root.join(source_relative);
+        match fs::remove_file(&dest) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(StateError::Io { path: dest, source }),
+        }
+    }
+
+    /// Stage 12.17 — remove a `seen/<ns>/<id>` marker. Counterpart
+    /// of [`mark_seen`]. Idempotent: a missing marker returns
+    /// `Ok(false)`, a successful removal returns `Ok(true)`.
+    ///
+    /// Used exclusively by the Stage 12.17 cleanup applier after
+    /// the corresponding verified body has been quarantined +
+    /// removed. Markers themselves carry no payload — removing
+    /// one only re-arms watcher dedup for the matching key.
+    pub fn unmark_seen(
+        &self,
+        ns: StateNamespace,
+        id: &str,
+    ) -> Result<bool, StateError> {
+        let path = self.seen_path(ns, id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(StateError::Io { path, source }),
+        }
+    }
+
     fn list_verified_under<T: serde::de::DeserializeOwned>(
         &self,
         session_id: &str,
