@@ -981,3 +981,38 @@ pub enum RestoreError {
     #[error("state error: {0}")]
     State(#[from] StateError),
 }
+
+/// Stage 12.16 — local state-dir integrity scan errors. These are
+/// **scanner-aborting** only: per-artifact problems (a tampered
+/// session, a stale seen marker, a corrupt archive file) are
+/// captured as findings in the
+/// [`crate::integrity::StateIntegrityReport`], not as variants
+/// here. `IntegrityError` is reserved for failures that prevent
+/// the scan from even running (e.g. the state-dir itself
+/// can't be walked).
+#[derive(Debug, thiserror::Error)]
+pub enum IntegrityError {
+    /// The Stage 12.7 `ContributorStateStore` returned an error
+    /// before the scan could start. Wraps the upstream typed
+    /// error (e.g. `StateError::UnsupportedVersion`,
+    /// `StateError::Io`) so operators see the underlying cause.
+    #[error("state error: {0}")]
+    State(#[from] StateError),
+
+    /// `build_session_status_report` failed mid-scan. The
+    /// scanner runs status build per session to drive the
+    /// Stage 12.13 audit projection; a build failure indicates
+    /// the state-dir walked OK but a per-session re-verify
+    /// chain hit an internal error.
+    #[error("status build during integrity scan: {0}")]
+    Status(#[from] StatusError),
+
+    /// Generic FS error encountered during stray-file detection
+    /// or the optional `--include-archives` directory walk.
+    #[error("integrity scan io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}

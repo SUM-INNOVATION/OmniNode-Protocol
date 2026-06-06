@@ -1170,3 +1170,69 @@ systemctl start omni-node-watcher.service
 - `RestoreError::SessionIdMismatch` → the archive directory was renamed and no longer matches the manifest's `session_id`. Rename it back, or use `--archive-dir + --session-id` to be explicit.
 
 The restore command exits **nonzero** on every `RestoreError` variant so automation can detect refusals and trigger triage.
+
+### Stage 12.16 — local state-dir integrity scan
+
+**Use when:** routine health check, suspected disk corruption, after a half-finished repair, or as a CI gate before promoting a state-dir snapshot. The scan is fully read-only — safe to run against a live state-dir while the watcher is up.
+
+**Workflow:**
+
+```sh
+# 1. Quick health check — events stream + exit-code policy.
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state>
+# Exit code: 0 if counts_error == 0, else 1.
+
+# 2. Drill into one session.
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state> \
+  --session-id <session_id> \
+  --format pretty
+
+# 3. Pre-commit / pre-restore: also walk a parallel archive root.
+#    Surfaces ArchiveCoveredSession (Ok), ArchiveManifestMalformed
+#    (Error), ArchiveBlakeMismatch (Error).
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state> \
+  --include-archives /backup/contributor-archive \
+  --format json --json-out /tmp/integrity.json
+
+# 4. CI strict mode: every warning trips the build.
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state> \
+  --fail-on-warn
+```
+
+> **The scan never prunes.** Unlike `session-status` and the other
+> Stage 12.x subcommands, `state-integrity` opens the state-store
+> with auto-prune unconditionally OFF. Expired and incomplete
+> session subtrees survive the open call so the scan can *report*
+> on them rather than silently deleting them. There is therefore
+> no `--no-prune-state-on-start` flag on this subcommand.
+
+**Reading findings:**
+
+Each finding carries closed-set `kind`, `severity`, optional `session_id`, optional `path`, `reason_tag`, and `recommended_action`. The action is a string label, not a command — operators run it explicitly using the existing Stage 12.10 / 12.11 / 12.14 / 12.15 surfaces.
+
+| `recommended_action` | What to run |
+| --- | --- |
+| `run session-status` | `omni-node operator contributor session-status --session-id <id>` to triage further. |
+| `run plan-session-reassign --reason invalid-partial` | Stage 12.11 reassign flow with reason `InvalidPartial`. |
+| `run plan-session-reassign --reason missing-partial` | Stage 12.11 reassign flow with reason `MissingPartial`. |
+| `run archive-session --verify-only` | Stage 12.14 archive in dry-run / verify mode. |
+| `run restore-session-archive --verify-only` | Stage 12.15 restore in `--verify-only` mode. |
+| `delete stale seen marker` | Manual: remove the `seen/<ns>/<key>` file the finding's `path` points to. Safe — seen markers are an idempotency hint, not a protocol artifact. |
+| `clean state-dir orphan replacements before retry` | The Stage 12.13 audit detected orphan replacement assignments; inspect via `session-status` and either repair the supersession or remove the orphans before re-running reassign. |
+| `operator triage required` | The finding does not map cleanly to a one-shot command. Read the `reason_tag` (e.g. `BindingMismatch`, `AggregateExtraPartialFor`) and consult [the Stage 12 protocol doc](./stage12-contributor-protocol.md). |
+
+**Defaults are safe-by-default.** The scan writes nothing to the state-dir or archive-dir, and auto-prune is forced off (see the note above), so a scan against an old or expired tree never changes disk state. `--include-archives` is OFF; without it, the scan does not touch the archive directory at all.
+
+**Two documented gaps in v1:**
+
+- **No mutation.** v1 detects and recommends; it does not execute repairs. Run the suggested CLI invocations explicitly.
+- **Unparseable bodies.** A verified body whose JSON is structurally broken (truncated, garbage prefix) is silently skipped by the Stage 12.7 parse-only loader, matching Stage 12.13's restart-preload behavior. If `sessions_scanned` is lower than expected, compare against `ls verified/sessions/` to spot bodies that fell off the snapshot.
+
+The scan command exits **nonzero** when the configured threshold is tripped so CI gates and cron alerting can detect drift automatically:
+
+- default: exit 1 when `counts_error > 0`
+- `--fail-on-warn`: exit 1 when `counts_warn + counts_error > 0`

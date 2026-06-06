@@ -2465,3 +2465,87 @@ The runbook documents the chained pattern + the "stop the watcher before restori
 | `--dry-run --verify-only` happy path: BLAKE3 walk runs, no destination writes, mode=verify_only | `dry_run_plus_verify_only_accepts_intact_archive_and_writes_nothing` |
 
 **Residual gap (deliberate):** the CLI run-fn `run_restore_session_archive` is not exercised end-to-end (same constraint as Stage 12.10–12.14). The library `restore_session_archive` is exhaustively covered; the CLI is a thin dispatch + event-emission layer on top.
+
+# Stage 12.16 — local state-dir integrity scan + repair suggestions
+
+## What this stage is, in one sentence
+
+A purely read-only scanner that re-runs every Stage 12.3 / 12.11 verifier against the bodies on disk, walks seen markers ↔ verified bodies, reports stray files inside documented subtrees, rolls up the Stage 12.13 audit projection per session, and (optionally) walks a parallel archive directory via Stage 12.15 `restore_session_archive(verify_only=true, dry_run=true)` — emitting one typed `IntegrityFinding` per structural anomaly. The scanner **never writes** to the state-dir or archive directory; v1 emits *suggested* repair commands as closed-set labels but **never executes them**.
+
+## Why integrity scans live outside the protocol surface
+
+A contributor's state-dir is a local cache. Bytes drift from disk corruption, partial restores, half-applied repairs, or operator mistakes — none of which touch a protocol envelope. Stage 12.16 is therefore zero-protocol: no new schema_version, no new omni-net topic, no new SNIP wire, no chain interaction. It is a local diagnostics surface that composes existing parse-only loaders, verifier functions, Stage 12.13 restart-preload, Stage 12.13 audit health, and the Stage 12.15 archive-verify path.
+
+## Library surface
+
+`omni_contributor::integrity::scan_state_integrity(store, opts) -> Result<StateIntegrityReport, IntegrityError>`
+
+- **Inputs**: a `&ContributorStateStore` (the caller controls auto-prune via Stage 12.7 open) and `ScanOptions { session_id_filter, archive_dir, now_utc }`.
+- **Closed discriminators**:
+  - `FindingSeverity` = `{ Ok, Warn, Error }`
+  - `FindingKind` = `{ InvalidSession, InvalidJoin, InvalidAssignment, InvalidPartial, InvalidSupersession, InvalidAggregate, StaleSeenMarker, MissingSeenMarker, StrayVerifiedFile, StraySeenFile, OrphanReplacementAssignments, PartialApplySupersession, ReassignTriagable, NotReassignTriagable, ArchiveManifestMalformed, ArchiveBlakeMismatch, ArchiveCoveredSession }`
+  - `RecommendedAction` = closed-set static-string labels (`run session-status`, `run plan-session-reassign --reason invalid-partial`, `run archive-session --verify-only`, `delete stale seen marker`, `clean state-dir orphan replacements before retry`, `operator triage required`, …).
+- **Report shape**: `StateIntegrityReport { schema_version, generated_at_utc, state_dir, state_version, omni_contributor_version, sessions_scanned, sessions_verified, counts_ok, counts_warn, counts_error, sessions: Vec<SessionIntegritySummary>, findings: Vec<IntegrityFinding> }`. Findings are sorted deterministically by `(session_id, kind, path, reason_tag)`.
+- **Frozen schema constant**: `STATE_INTEGRITY_REPORT_SCHEMA_VERSION = 1`. The report is a snapshot for tooling, not a protocol artifact; future v2 bumps follow the same closed-evolution rule as `STATUS_SCHEMA_VERSION`.
+
+## Safety contract
+
+- **Reads only.** No `write_verified_json`, no `mark_seen`, no `cascade_remove_session`, no archive writes. The scanner uses parse-only loaders (`list_verified_*`, `read_verified_aggregate_for`, `is_seen`) and re-invokes verifier functions on parsed bodies in memory.
+- **No protocol surface bump.** No `schema_version` change anywhere in the contributor envelope set, no new SNIP wire, no chain/payment/marketplace surface.
+- **No execution of repair actions.** Every `recommended_action` is a closed-set label, not an executable; v1 leaves all mutation to the existing Stage 12.10 / 12.11 / 12.14 / 12.15 CLI surfaces.
+- **`--session-id` filter restricts everything session-scoped.** Stage 12.13 rejection-note findings, per-session deep scans, per-session seen-marker walks, and the archive walker all honor the filter. Cross-session structural findings (e.g. a junk file directly under `verified/sessions/`) still surface because no specific session owns them.
+- **Auto-prune is forced OFF.** The CLI opens the state-store with `auto_prune = false` unconditionally so the open call never cascades-removes an expired session subtree before the scan runs. Without this, the Stage 12.7 default would silently delete the very state an integrity scan is supposed to surface. This is enforced in code (the `--no-prune-state-on-start` flag is deliberately absent from this subcommand) and pinned by a CLI clap regression that asserts the flag is rejected.
+
+## CLI
+
+```
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <path>             (required)
+  [--session-id <hex64>]                     (filter to one session)
+  [--include-archives <archive-dir>]         (walk a parallel archive root)
+  [--format events|json|pretty]              (default events)
+  [--json-out <path>]                        (best-effort JSON mirror)
+  [--fail-on-warn]                           (exit 1 when warn+err > 0)
+```
+
+- **Exit code policy**: default = exit 1 when `counts_error > 0`; with `--fail-on-warn`, exit 1 when `counts_warn + counts_error > 0`. Operators who want every warning to break CI opt in explicitly.
+- **stdout posture**: `--format json` puts only the report JSON on stdout (state-store open notices, JSON mirror notices, and warnings go to stderr) so a `jq` pipeline works directly. `events` and `pretty` keep their prose stdout — same convention as `session-status`.
+- **Auto-prune is unconditionally OFF** for this subcommand. Stage 12.7's expiry-driven cascade would silently delete the exact "expired/incomplete session" subtrees an integrity scan should *surface*, so the CLI opens the state-store with `auto_prune = false` regardless of any flag. The `--no-prune-state-on-start` flag that other subcommands expose is deliberately absent here — clap rejects it.
+
+## Out of scope (Stage 12.16)
+
+- **Repair execution.** v1 emits action labels only.
+- **Verifier-result caching.** Each scan re-verifies from scratch; this matches Stage 12.13's restart preload cost profile and stays simple.
+- **Cross-host federation.** The scanner is single-host; it has no mesh, no peer comparison, no chain query.
+- **Schema bump.** No envelope or status / archive / restore report schema_version moves.
+
+## Test coverage map
+
+| Concern | Test |
+| --- | --- |
+| Clean state-dir → zero findings + scanner writes nothing | `clean_state_produces_no_findings_and_writes_nothing` (`state_integrity_scan.rs`) |
+| Tampered session body → `InvalidSession` | `tampered_session_body_emits_invalid_session_finding` |
+| Tampered join body → `InvalidJoin` | `tampered_join_body_emits_invalid_join_finding` |
+| Tampered assignment body → `InvalidAssignment` | `tampered_assignment_body_emits_invalid_assignment_finding` |
+| Tampered partial body → `InvalidPartial` | `tampered_partial_body_emits_invalid_partial_finding` |
+| Tampered aggregate body → `InvalidAggregate` | `tampered_aggregate_body_emits_invalid_aggregate_finding` |
+| Stale seen marker (no body) → `StaleSeenMarker` warn | `stale_seen_marker_without_body_emits_finding` |
+| Missing seen marker (body exists) → `MissingSeenMarker` warn | `missing_seen_marker_with_body_emits_finding` |
+| Stray file inside `verified/sessions/<id>/joins/` → `StrayVerifiedFile` | `stray_verified_file_emits_finding` |
+| `--session-id` filter restricts session-scoped findings | `session_id_filter_restricts_session_scoped_findings` |
+| `--include-archives` clean walk → `ArchiveCoveredSession` Ok, no errors | `clean_archive_dir_via_include_archives_emits_no_archive_findings` |
+| `--include-archives` corrupt archive → `ArchiveBlakeMismatch` error | `corrupt_archive_blake3_emits_archive_blake_mismatch_finding` |
+| `--include-archives` missing manifest → `ArchiveManifestMalformed` error | `missing_archive_manifest_emits_manifest_malformed_finding` |
+| JSON round-trip preserves report | `json_roundtrip_preserves_report` |
+| Findings deterministically ordered across re-runs | `findings_are_deterministically_ordered_across_repeat_runs` |
+| Empty state-dir scans cleanly | `empty_state_dir_produces_clean_report` |
+| Clean supersession seen marker round-trips without false `StaleSeenMarker` (review fix — reverse-walk maps `seen/assignment-supersessions/<sid>--<id>` to the correct `verified/sessions/<sid>/supersessions/<id>.json` path) | `supersession_seen_marker_with_body_emits_no_stale_finding` |
+| Scanner leaves expired session subtree on disk (review fix — CLI opens with `auto_prune = false`) | `scanner_leaves_expired_session_subtree_on_disk` |
+| CLI flag matrix (`--session-id` / `--include-archives` / `--format` / `--json-out` / `--fail-on-warn`) + CLI must reject `--no-prune-state-on-start` (review fix) | `state_integrity_flag_parse_smoke` (omni-node) |
+
+**Residual gap (deliberate):** the CLI run-fn `run_state_integrity` is not exercised end-to-end (same constraint as Stage 12.10–12.15). The library `scan_state_integrity` is exhaustively covered; the CLI is a thin dispatch + renderer layer on top.
+
+Two further deliberate gaps are documented for operators:
+
+1. **Unparseable verified bodies.** Stage 12.7's parse-only loaders silently skip JSON that fails to parse, so a body whose JSON is structurally broken (e.g. truncated) disappears from the snapshot rather than surfacing as a finding. This is consistent with Stage 12.13's restart-preload behavior; operators who suspect a parse-level corruption should compare disk counts against `session-status`.
+2. **No mutation in v1.** A finding's `recommended_action` is a string label, not an executable command. Stage 12.16 deliberately separates *detection* from *repair* — operators run the suggested Stage 12.10 / 12.11 / 12.14 / 12.15 CLI invocations explicitly.

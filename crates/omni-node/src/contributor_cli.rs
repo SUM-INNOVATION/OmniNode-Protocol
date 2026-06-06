@@ -213,6 +213,18 @@ enum ContributorCmd {
     /// writes the bytes back into the state-dir. No chain,
     /// mesh, or SNIP wire touched.
     RestoreSessionArchive(RestoreSessionArchiveArgs),
+
+    /// Stage 12.16 — read-only local state-dir integrity scan.
+    /// Re-runs every Stage 12.3 / 12.11 verifier against the
+    /// bodies on disk, walks seen markers ↔ verified bodies,
+    /// reports stray files inside documented subtrees, rolls up
+    /// the Stage 12.13 audit projection per session, and (with
+    /// `--include-archives`) walks a parallel archive directory
+    /// via Stage 12.15 `restore_session_archive(verify_only)`.
+    /// Emits typed findings; **never writes** to the state-dir
+    /// or archive directory. No protocol surface, no chain /
+    /// mesh / SNIP wire touched.
+    StateIntegrity(StateIntegrityArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2119,6 +2131,65 @@ struct RestoreSessionArchiveArgs {
     no_prune_state_on_start: bool,
 }
 
+// ── Stage 12.16 — state-integrity ─────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum StateIntegrityFormat {
+    /// One closed-set `event=...` line per finding, plus a final
+    /// `event=state_integrity_summary ...` line. Default — matches
+    /// every other Stage 12.x watcher's bare-stdout posture.
+    Events,
+    /// Print the full `StateIntegrityReport` as pretty-printed JSON
+    /// on stdout. Operational chatter (state-store open notice,
+    /// scanner progress) goes to stderr so `jq` works directly.
+    Json,
+    /// Compact terminal-friendly summary + per-severity sections.
+    /// No external TUI deps; just stdout.
+    Pretty,
+}
+
+#[derive(Args)]
+struct StateIntegrityArgs {
+    /// Stage 12.7 contributor workflow state directory the scan
+    /// inspects. Required — the scanner is purely a read-only
+    /// consumer of this tree.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    /// Optional 64-char lowercase hex `session_id` filter. When
+    /// supplied, the scanner restricts session-scoped findings to
+    /// that one session; cross-session walks (stray top-level
+    /// files, archive-only orphans) still run.
+    #[arg(long)]
+    session_id: Option<String>,
+
+    /// Optional sibling archive root. When set, every
+    /// `<archive-dir>/<session_id>/manifest.json` is parsed via
+    /// Stage 12.14 `verify_archive_manifest` and a full BLAKE3
+    /// walk runs via Stage 12.15
+    /// `restore_session_archive(verify_only=true, dry_run=true)`.
+    /// Read-only end-to-end.
+    #[arg(long)]
+    include_archives: Option<PathBuf>,
+
+    /// Output format. Defaults to `events`.
+    #[arg(long, value_enum, default_value_t = StateIntegrityFormat::Events)]
+    format: StateIntegrityFormat,
+
+    /// Optional path to mirror the JSON report. Best-effort
+    /// `std::fs::write`; a failure here logs a stderr warning and
+    /// does not change the exit code (the report is a snapshot,
+    /// not a protocol artifact).
+    #[arg(long)]
+    json_out: Option<PathBuf>,
+
+    /// Default policy: exit 1 when `counts_error > 0`. With this
+    /// flag set, exit 1 when `counts_warn + counts_error > 0`.
+    /// Operators who treat every warn as a CI failure can opt in.
+    #[arg(long, default_value_t = false)]
+    fail_on_warn: bool,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -2151,6 +2222,7 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::ApplySessionReassign(a) => run_apply_session_reassign(a).await,
         ContributorCmd::ArchiveSession(a) => run_archive_session(a),
         ContributorCmd::RestoreSessionArchive(a) => run_restore_session_archive(a),
+        ContributorCmd::StateIntegrity(a) => run_state_integrity(a),
     }
 }
 
@@ -6888,6 +6960,98 @@ mod tests {
         assert!(with_flags.overwrite_existing);
         assert!(with_flags.include_results);
     }
+
+    // ── Stage 12.16 — state-integrity clap regression ────────────
+
+    fn parse_state_integrity(extra: &[&str]) -> StateIntegrityArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "state-integrity".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::StateIntegrity(a) => a,
+            _ => panic!("expected StateIntegrity"),
+        }
+    }
+
+    #[test]
+    fn state_integrity_flag_parse_smoke() {
+        // Defaults: no session_id filter, no include_archives,
+        // format=events, no json_out, fail_on_warn off.
+        let defaults = parse_state_integrity(&[]);
+        assert!(defaults.session_id.is_none());
+        assert!(defaults.include_archives.is_none());
+        assert_eq!(defaults.format, StateIntegrityFormat::Events);
+        assert!(defaults.json_out.is_none());
+        assert!(!defaults.fail_on_warn);
+
+        // --session-id filter.
+        let sid = "ff".repeat(32);
+        let with_sid = parse_state_integrity(&["--session-id", &sid]);
+        assert_eq!(with_sid.session_id.as_deref(), Some(sid.as_str()));
+
+        // --include-archives PATH.
+        let with_archives =
+            parse_state_integrity(&["--include-archives", "/tmp/archive-root"]);
+        assert_eq!(
+            with_archives.include_archives.as_deref(),
+            Some(std::path::Path::new("/tmp/archive-root"))
+        );
+
+        // --format closed enum values.
+        for (raw, expected) in &[
+            ("events", StateIntegrityFormat::Events),
+            ("json", StateIntegrityFormat::Json),
+            ("pretty", StateIntegrityFormat::Pretty),
+        ] {
+            let got = parse_state_integrity(&["--format", raw]);
+            assert_eq!(got.format, *expected, "format={raw} parsed wrong");
+        }
+
+        // --json-out PATH.
+        let with_json = parse_state_integrity(&["--json-out", "/tmp/r.json"]);
+        assert_eq!(
+            with_json.json_out.as_deref(),
+            Some(std::path::Path::new("/tmp/r.json"))
+        );
+
+        // --fail-on-warn toggle.
+        let with_strict = parse_state_integrity(&["--fail-on-warn"]);
+        assert!(with_strict.fail_on_warn);
+
+        // Stage 12.16 review fix: the `--no-prune-state-on-start`
+        // flag is deliberately ABSENT. The scanner is read-only,
+        // so it always opens with auto-prune off; surfacing a
+        // no-op flag would mislead operators.
+        let no_such_flag = TestRoot::try_parse_from(&[
+            "omni-node",
+            "state-integrity",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "state-integrity must not accept --no-prune-state-on-start"
+        );
+
+        // Unknown --format value must be rejected.
+        let bad = TestRoot::try_parse_from(&[
+            "omni-node",
+            "state-integrity",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--format",
+            "yaml",
+        ]);
+        assert!(bad.is_err(), "clap must reject unknown --format value");
+    }
 }
 
 // ── Stage 12.9 — session-status ──────────────────────────────────────────
@@ -8714,4 +8878,208 @@ fn run_restore_session_archive(args: RestoreSessionArchiveArgs) -> Result<()> {
         session_dir_path.display(),
     );
     Ok(())
+}
+
+// ── Stage 12.16 — state-integrity ─────────────────────────────────────────
+
+fn run_state_integrity(args: StateIntegrityArgs) -> Result<()> {
+    use omni_contributor::{
+        scan_state_integrity, ContributorStateStore, ScanOptions,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // JSON mode keeps stdout report-only so `jq` works directly;
+    // events / pretty keep their prose stdout posture.
+    let json_mode = matches!(args.format, StateIntegrityFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    // Stage 12.16 safety contract: the scanner is read-only. We
+    // pass `auto_prune = false` UNCONDITIONALLY so the open call
+    // never cascades-removes an expired session subtree before
+    // the scan runs — exactly the state an integrity scan should
+    // surface, not silently delete.
+    let (store, _prune_report) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        /* auto_prune = */ false,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    log_op(&format!(
+        "event=state_store_opened path={} auto_prune=off",
+        args.contributor_state_dir.display(),
+    ));
+
+    let opts = ScanOptions {
+        session_id_filter: args.session_id.as_deref(),
+        archive_dir: args.include_archives.as_deref(),
+        now_utc: &now_utc,
+    };
+
+    let report = scan_state_integrity(&store, &opts)
+        .map_err(|e| anyhow!("state-integrity scan refused: {e}"))?;
+
+    match args.format {
+        StateIntegrityFormat::Events => render_state_integrity_events(&report),
+        StateIntegrityFormat::Json => render_state_integrity_json(&report)?,
+        StateIntegrityFormat::Pretty => render_state_integrity_pretty(&report),
+    }
+
+    if let Some(path) = args.json_out.as_deref() {
+        match serde_json::to_vec_pretty(&report) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, &bytes) {
+                    eprintln!(
+                        "event=warn context=state_integrity_json_out path={} message={e}",
+                        path.display()
+                    );
+                } else {
+                    log_op(&format!(
+                        "event=state_integrity_json_written path={}",
+                        path.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "event=warn context=state_integrity_json_serialize message={e}"
+                );
+            }
+        }
+    }
+
+    // Exit code policy:
+    //   default       — exit 1 when counts_error > 0
+    //   --fail-on-warn — exit 1 when counts_warn + counts_error > 0
+    let trip = if args.fail_on_warn {
+        report.counts_warn + report.counts_error > 0
+    } else {
+        report.counts_error > 0
+    };
+    if trip {
+        return Err(anyhow!(
+            "state-integrity scan reported counts_warn={} counts_error={}; \
+             {}",
+            report.counts_warn,
+            report.counts_error,
+            if args.fail_on_warn {
+                "--fail-on-warn tripped"
+            } else {
+                "counts_error > 0"
+            }
+        ));
+    }
+    Ok(())
+}
+
+fn render_state_integrity_events(report: &omni_contributor::StateIntegrityReport) {
+    for s in &report.sessions {
+        println!(
+            "event=session_integrity_summary session_id={} overall_status={}",
+            s.session_id, s.overall_status,
+        );
+    }
+    for f in &report.findings {
+        let sid = f.session_id.as_deref().unwrap_or("-");
+        let path = f.path.as_deref().unwrap_or("-");
+        println!(
+            "event=integrity_finding kind={} severity={} session_id={} \
+             path={} reason_tag={} recommended_action={:?}",
+            f.kind.as_str(),
+            f.severity.as_str(),
+            sid,
+            path,
+            f.reason_tag,
+            f.recommended_action.as_str(),
+        );
+    }
+    println!(
+        "event=state_integrity_summary sessions_scanned={} sessions_verified={} \
+         counts_ok={} counts_warn={} counts_error={}",
+        report.sessions_scanned,
+        report.sessions_verified,
+        report.counts_ok,
+        report.counts_warn,
+        report.counts_error,
+    );
+}
+
+fn render_state_integrity_json(
+    report: &omni_contributor::StateIntegrityReport,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(report)
+        .map_err(|e| anyhow!("serialize state integrity report: {e}"))?;
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write state integrity report: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("write trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_state_integrity_pretty(report: &omni_contributor::StateIntegrityReport) {
+    use omni_contributor::FindingSeverity;
+    println!("State integrity report");
+    println!("  generated_at_utc     : {}", report.generated_at_utc);
+    println!("  state_dir            : {}", report.state_dir);
+    println!("  state_version        : {}", report.state_version);
+    println!(
+        "  omni_contributor     : {}",
+        report.omni_contributor_version
+    );
+    println!("  schema_version       : {}", report.schema_version);
+    println!("  sessions_scanned     : {}", report.sessions_scanned);
+    println!("  sessions_verified    : {}", report.sessions_verified);
+    println!(
+        "  counts (ok/warn/err) : {} / {} / {}",
+        report.counts_ok, report.counts_warn, report.counts_error
+    );
+    if !report.sessions.is_empty() {
+        println!();
+        println!("Per-session summaries:");
+        for s in &report.sessions {
+            println!(
+                "  - session_id={} overall_status={}",
+                s.session_id, s.overall_status
+            );
+        }
+    }
+    let section = |label: &str, sev: FindingSeverity| {
+        let filtered: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.severity == sev)
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+        println!();
+        println!("{label}:");
+        for f in filtered {
+            let sid = f.session_id.as_deref().unwrap_or("-");
+            let path = f.path.as_deref().unwrap_or("-");
+            println!(
+                "  - kind={} session_id={} path={} reason_tag={}",
+                f.kind.as_str(),
+                sid,
+                path,
+                f.reason_tag,
+            );
+            println!("      action: {}", f.recommended_action.as_str());
+        }
+    };
+    section("Errors", FindingSeverity::Error);
+    section("Warnings", FindingSeverity::Warn);
+    section("OK findings", FindingSeverity::Ok);
 }
