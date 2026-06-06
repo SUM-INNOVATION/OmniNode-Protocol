@@ -287,15 +287,39 @@ pub struct ScanOptions<'a> {
 }
 
 /// Run the scan. Returns a `StateIntegrityReport`. The store
-/// itself is opened by the caller — Stage 12.7 auto-prune
-/// applies per the caller's `--no-prune-state-on-start` choice.
+/// itself is opened by the caller.
+///
+/// Stage 12.17 additive: the implementation also collects the
+/// per-session orphan-assignment id list out of the audit
+/// projection so the cleanup planner can plan
+/// `QuarantineAndUnmarkOrphanAssignment` actions without
+/// re-running the projection. The map is returned by the
+/// sibling `scan_state_integrity_with_audit_orphans` entry; this
+/// entry stays binary-compatible by discarding it.
 pub fn scan_state_integrity(
     store: &ContributorStateStore,
     opts: &ScanOptions<'_>,
 ) -> Result<StateIntegrityReport, IntegrityError> {
+    let (report, _orphans) = scan_state_integrity_with_audit_orphans(store, opts)?;
+    Ok(report)
+}
+
+/// Stage 12.17 — same as [`scan_state_integrity`] but also
+/// returns a `session_id → orphan_assignment_ids` map derived
+/// from the Stage 12.13
+/// `AuditCoherence::OrphanReplacementAssignments` projection.
+/// The list is the structured side-channel the cleanup planner
+/// consumes; it is **not** part of the public `IntegrityFinding`
+/// surface, so the `STATE_INTEGRITY_REPORT_SCHEMA_VERSION = 1`
+/// contract is preserved.
+pub fn scan_state_integrity_with_audit_orphans(
+    store: &ContributorStateStore,
+    opts: &ScanOptions<'_>,
+) -> Result<(StateIntegrityReport, HashMap<String, Vec<String>>), IntegrityError> {
     let mut findings: Vec<IntegrityFinding> = Vec::new();
     let mut session_summaries: Vec<SessionIntegritySummary> = Vec::new();
     let mut sessions_scanned: u32 = 0;
+    let mut audit_orphans: HashMap<String, Vec<String>> = HashMap::new();
 
     // ── 1. Reuse Stage 12.13 restart preload for the
     //       sessions/joins/assignments/supersessions chain.
@@ -442,6 +466,10 @@ pub fn scan_state_integrity(
                     reason_tag: format!("orphan_count={}", assignment_ids.len()),
                     recommended_action: RecommendedAction::CLEAN_ORPHAN_REPLACEMENTS,
                 });
+                // Stage 12.17 — feed the side-channel the cleanup
+                // planner reads to build per-orphan quarantine
+                // actions without re-running compute_audit_health.
+                audit_orphans.insert(sid.clone(), assignment_ids.clone());
             }
             AuditCoherence::PartialApplySupersession {
                 ref supersession_id,
@@ -485,15 +513,21 @@ pub fn scan_state_integrity(
     // ── 3. Seen-marker ↔ verified-body consistency. ─────────
     scan_seen_marker_consistency(store, opts.session_id_filter, &mut findings)?;
 
-    // ── 4. Stray files inside documented subtrees. ──────────
+    // ── 4. Stray files inside documented `verified/` subtrees. ─
     scan_stray_files(store.root(), opts.session_id_filter, &mut findings)?;
 
-    // ── 5. Optional --include-archives. ─────────────────────
+    // ── 5. Stage 12.17 — stray files / shape-malformed keys
+    //       under `seen/`. Catches files under unknown namespace
+    //       dirs and files whose key shape isn't `<64-hex>` or
+    //       `<64-hex>--<64-hex>` for prefixed namespaces.
+    scan_stray_seen_files(store.root(), opts.session_id_filter, &mut findings)?;
+
+    // ── 6. Optional --include-archives walker. ──────────────
     if let Some(archive_dir) = opts.archive_dir {
         scan_archive_dir(store, archive_dir, opts, &mut findings)?;
     }
 
-    // ── 6. Sort + roll up counts. ───────────────────────────
+    // ── 7. Sort + roll up counts. ───────────────────────────
     findings.sort_by(|a, b| {
         (
             a.session_id.as_deref().unwrap_or(""),
@@ -522,7 +556,7 @@ pub fn scan_state_integrity(
         .count() as u32;
     session_summaries.sort_by(|a, b| a.session_id.cmp(&b.session_id));
 
-    Ok(StateIntegrityReport {
+    let report = StateIntegrityReport {
         schema_version: STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
         generated_at_utc: opts.now_utc.to_string(),
         state_dir: store.root().to_string_lossy().replace('\\', "/"),
@@ -535,7 +569,8 @@ pub fn scan_state_integrity(
         counts_error,
         sessions: session_summaries,
         findings,
-    })
+    };
+    Ok((report, audit_orphans))
 }
 
 // ── Stage 12.13 rejection-note parser ─────────────────────────
@@ -774,17 +809,28 @@ fn scan_seen_marker_consistency(
                 Some(s) => s.to_string(),
                 None => continue,
             };
+            // Stage 12.17 — shape-malformed keys (wrong hex
+            // length, missing `<sid>--` split for prefixed
+            // namespaces) are handled exclusively by
+            // `scan_stray_seen_files`. Skip them here so the
+            // same file doesn't accumulate both a
+            // `StaleSeenMarker` and a `StraySeenFile` finding.
             let (sid_for_marker, body_rel) = if prefixed {
-                match key.split_once("--") {
-                    Some((sid, suffix)) => {
-                        let body_rel = format!(
-                            "verified/sessions/{sid}/{verified_leaf}/{suffix}.json"
-                        );
-                        (Some(sid.to_string()), Some(body_rel))
-                    }
-                    None => (None, None),
+                let (sid, suffix) = match key.split_once("--") {
+                    Some(parts) => parts,
+                    None => continue,
+                };
+                if !is_64_hex(sid) || !is_64_hex(suffix) {
+                    continue;
                 }
+                let body_rel = format!(
+                    "verified/sessions/{sid}/{verified_leaf}/{suffix}.json"
+                );
+                (Some(sid.to_string()), Some(body_rel))
             } else {
+                if !is_64_hex(&key) {
+                    continue;
+                }
                 let body_rel = if verified_leaf == "sessions" {
                     Some(format!("verified/sessions/{key}/session.json"))
                 } else if verified_leaf == "aggregates" {
@@ -974,6 +1020,201 @@ fn walk_session_subtree(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+// ── Stage 12.17 — stray-seen walker + helpers ─────────────────
+
+/// Lowercase-hex / length-64 predicate. Mirrors the
+/// `state::is_blake3_hex` private helper but stays local so the
+/// integrity module doesn't take a new state-module surface.
+fn is_64_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Closed set of namespace dir names valid under `seen/`. Mirrors
+/// the `(seen_dir, verified_leaf, prefixed)` tuple inlined in
+/// [`scan_seen_marker_consistency`].
+const SEEN_NAMESPACES: &[(&str, bool)] = &[
+    ("sessions", false),
+    ("aggregates", false),
+    ("joins", true),
+    ("assignments", true),
+    ("partials", true),
+    ("peer-adverts", true),
+    ("assignment-supersessions", true),
+];
+
+/// Walk `seen/...` and emit `StraySeenFile` for:
+///   1. Any file directly under `seen/` (no namespace dir).
+///   2. Any file under `seen/<unknown-dir>/`.
+///   3. Any file inside a known namespace dir whose key shape
+///      isn't `<64-hex>` (unprefixed namespaces) or
+///      `<64-hex>--<64-hex>` (prefixed namespaces).
+///
+/// Stage 12.16 v1 declared `StraySeenFile` in `FindingKind` but
+/// never emitted it — Stage 12.17 wires the emission so the
+/// cleanup planner has a closed-set finding to act on. The
+/// `scan_seen_marker_consistency` reverse-walk was made
+/// shape-strict in tandem so the same on-disk file never
+/// accumulates both a `StaleSeenMarker` and a `StraySeenFile`
+/// finding.
+fn scan_stray_seen_files(
+    root: &Path,
+    session_filter: Option<&str>,
+    findings: &mut Vec<IntegrityFinding>,
+) -> Result<(), IntegrityError> {
+    let seen_root = root.join("seen");
+    if !seen_root.is_dir() {
+        return Ok(());
+    }
+
+    let namespace_lookup: HashMap<&str, bool> = SEEN_NAMESPACES
+        .iter()
+        .map(|(name, prefixed)| (*name, *prefixed))
+        .collect();
+
+    let top_entries =
+        std::fs::read_dir(&seen_root).map_err(|e| IntegrityError::Io {
+            path: seen_root.clone(),
+            source: e,
+        })?;
+    for top in top_entries {
+        let top = top.map_err(|e| IntegrityError::Io {
+            path: seen_root.clone(),
+            source: e,
+        })?;
+        let top_path = top.path();
+        let top_name = match top_path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if top_path.is_file() {
+            // (1) file directly under seen/ — never valid layout.
+            if session_filter.is_some() {
+                // A file at seen/<name> has no session_id; skip
+                // when a filter is set — operators asking about
+                // one session shouldn't see cross-cutting noise.
+                continue;
+            }
+            findings.push(IntegrityFinding {
+                kind: FindingKind::StraySeenFile,
+                severity: FindingSeverity::Warn,
+                session_id: None,
+                path: Some(format!("seen/{top_name}")),
+                reason_tag: "unexpected_file_under_seen_root".to_string(),
+                recommended_action: RecommendedAction::OPERATOR_TRIAGE_REQUIRED,
+            });
+            continue;
+        }
+        if !top_path.is_dir() {
+            continue;
+        }
+        let prefixed = match namespace_lookup.get(top_name.as_str()) {
+            Some(p) => *p,
+            None => {
+                // (2) unknown namespace dir — every file under it
+                // is stray.
+                walk_unknown_seen_namespace(
+                    root,
+                    &top_path,
+                    &top_name,
+                    session_filter,
+                    findings,
+                )?;
+                continue;
+            }
+        };
+        // (3) known namespace dir — flag shape-violating files.
+        let inner = std::fs::read_dir(&top_path).map_err(|e| IntegrityError::Io {
+            path: top_path.clone(),
+            source: e,
+        })?;
+        for ie in inner {
+            let ie = ie.map_err(|e| IntegrityError::Io {
+                path: top_path.clone(),
+                source: e,
+            })?;
+            let ip = ie.path();
+            if !ip.is_file() {
+                continue;
+            }
+            let key = match ip.file_name().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let (sid_for_filter, shape_ok) = if prefixed {
+                match key.split_once("--") {
+                    Some((sid, suffix)) => {
+                        let ok = is_64_hex(sid) && is_64_hex(suffix);
+                        (Some(sid.to_string()), ok)
+                    }
+                    None => (None, false),
+                }
+            } else {
+                let ok = is_64_hex(&key);
+                (Some(key.clone()), ok)
+            };
+            if shape_ok {
+                continue;
+            }
+            if let Some(filter) = session_filter {
+                if sid_for_filter.as_deref() != Some(filter) {
+                    continue;
+                }
+            }
+            findings.push(IntegrityFinding {
+                kind: FindingKind::StraySeenFile,
+                severity: FindingSeverity::Warn,
+                session_id: sid_for_filter,
+                path: Some(format!("seen/{top_name}/{key}")),
+                reason_tag: "seen_key_shape_violation".to_string(),
+                recommended_action: RecommendedAction::OPERATOR_TRIAGE_REQUIRED,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn walk_unknown_seen_namespace(
+    root: &Path,
+    ns_path: &Path,
+    ns_name: &str,
+    session_filter: Option<&str>,
+    findings: &mut Vec<IntegrityFinding>,
+) -> Result<(), IntegrityError> {
+    if session_filter.is_some() {
+        // Files under an unknown namespace dir have no
+        // session_id; suppress under filter.
+        return Ok(());
+    }
+    let _ = root;
+    let entries = std::fs::read_dir(ns_path).map_err(|e| IntegrityError::Io {
+        path: ns_path.to_path_buf(),
+        source: e,
+    })?;
+    for e in entries {
+        let e = e.map_err(|e| IntegrityError::Io {
+            path: ns_path.to_path_buf(),
+            source: e,
+        })?;
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let key = match p.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        findings.push(IntegrityFinding {
+            kind: FindingKind::StraySeenFile,
+            severity: FindingSeverity::Warn,
+            session_id: None,
+            path: Some(format!("seen/{ns_name}/{key}")),
+            reason_tag: "unknown_seen_namespace".to_string(),
+            recommended_action: RecommendedAction::OPERATOR_TRIAGE_REQUIRED,
+        });
     }
     Ok(())
 }

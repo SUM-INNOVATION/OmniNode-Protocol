@@ -1016,3 +1016,131 @@ pub enum IntegrityError {
         source: std::io::Error,
     },
 }
+
+/// Stage 12.17 — local state-dir cleanup planner / applier
+/// errors. The cleanup flow is a closed-set composition of
+/// Stage 12.16 findings + Stage 12.13 audit projection +
+/// Stage 12.14-shaped quarantine writes; this enum surfaces
+/// the failures specific to that flow.
+///
+/// Per-action failures (one action's apply tripped) are NOT
+/// captured here — they propagate as the variant the failing
+/// primitive returned (`State`, `Status`, `Integrity`, `Io`).
+/// The applier records action-level outcomes in its returned
+/// report.
+#[derive(Debug, thiserror::Error)]
+pub enum CleanupError {
+    /// `scan_state_integrity` itself failed (state-dir won't
+    /// walk, status build crashed, FS error during stray
+    /// detection). Plan-time and apply-time entry both wrap
+    /// this so callers see one consistent surface.
+    #[error("integrity scan during cleanup: {0}")]
+    Integrity(#[from] IntegrityError),
+
+    /// Wraps a status build failure that bubbled up through
+    /// audit re-projection at apply time.
+    #[error("status build during cleanup: {0}")]
+    Status(#[from] StatusError),
+
+    /// State-store primitive (`remove_verified_relative`,
+    /// `unmark_seen`, `write_archived_bytes`) refused.
+    #[error("state error during cleanup: {0}")]
+    State(#[from] StateError),
+
+    /// Apply-time `source_integrity_hash` re-projection
+    /// disagreed with the plan's recorded hash. The state-dir
+    /// has changed between plan and apply; the operator must
+    /// re-plan.
+    #[error(
+        "source integrity drift: plan expected {expected}, current state \
+         hashes to {got}; re-run plan-state-cleanup"
+    )]
+    SourceIntegrityDrift { expected: String, got: String },
+
+    /// The plan file's `cleanup_plan_hash` doesn't match the
+    /// BLAKE3 of the canonical body. The plan was hand-edited
+    /// or corrupted after write.
+    #[error(
+        "plan hash mismatch: stored {stored}, recomputed {recomputed}"
+    )]
+    PlanHashMismatch {
+        stored: String,
+        recomputed: String,
+    },
+
+    /// A gated action (`QuarantineAndUnmarkPartial` /
+    /// `QuarantineAndUnmarkOrphanAssignment`) is present in the
+    /// plan but the operator did not pass the corresponding
+    /// `--allow-…` flag. Plan-time always emits gated actions
+    /// when the finding warrants them; apply-time refuses
+    /// unless the gate flag is present.
+    #[error(
+        "gated action {kind} requires {flag}; pass the flag explicitly to apply"
+    )]
+    GateRequired { kind: String, flag: String },
+
+    /// The audit projection's orphan-assignment set for a
+    /// session changed between plan and apply. Mirrors the
+    /// `SourceIntegrityDrift` posture but at finer granularity:
+    /// the integrity hash may still match if the change is
+    /// confined to non-finding fields, so the apply re-checks
+    /// `compute_audit_health` per gated session and refuses
+    /// when the orphan id set diverges.
+    #[error(
+        "orphan-assignment audit drift for session {session_id}: plan listed \
+         {plan_count} orphans, current projection lists {current_count}; \
+         re-run plan-state-cleanup"
+    )]
+    OrphanAuditDrift {
+        session_id: String,
+        plan_count: u32,
+        current_count: u32,
+    },
+
+    /// A quarantine destination already exists. The applier
+    /// refuses to overwrite — operator must clear the
+    /// quarantine subtree (or pass a fresh `--quarantine-dir`)
+    /// before re-running.
+    #[error("quarantine destination already exists: {path}")]
+    QuarantineCollision { path: std::path::PathBuf },
+
+    /// Malformed plan JSON (schema violation, unknown fields,
+    /// missing required fields).
+    #[error("malformed plan at {path}: {source}")]
+    MalformedPlan {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Plan-schema version is not supported by this binary.
+    /// Stage 12.17 v1 accepts schema_version == 1 only.
+    #[error(
+        "unsupported cleanup plan schema_version: got {got}, this binary supports {expected}"
+    )]
+    UnsupportedPlanVersion { got: u32, expected: u32 },
+
+    /// One of the plan's `path` / `seen_marker_path` strings
+    /// violates the per-kind whitelist (`verified/sessions/...`
+    /// for tier B and `WriteSeenMarker`; `seen/...` for tier A
+    /// stray/remove actions; no `..`, no absolute, no backslash,
+    /// no empty segments). A self-consistent
+    /// `cleanup_plan_hash` does not vouch for path safety —
+    /// hand-edited plans can produce malicious paths whose
+    /// hash recomputes correctly. Apply-time refuses BEFORE
+    /// any IO when this fires.
+    #[error("unsafe path in cleanup plan ({reason}): {path}")]
+    UnsafePlanPath {
+        path: String,
+        reason: &'static str,
+    },
+
+    /// Generic FS error encountered while reading the plan,
+    /// writing quarantine bytes, or walking the state-dir.
+    #[error("cleanup io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}

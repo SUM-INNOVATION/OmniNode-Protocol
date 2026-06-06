@@ -225,6 +225,28 @@ enum ContributorCmd {
     /// or archive directory. No protocol surface, no chain /
     /// mesh / SNIP wire touched.
     StateIntegrity(StateIntegrityArgs),
+
+    /// Stage 12.17 — build a deterministic local state-dir
+    /// cleanup plan from a Stage 12.16 integrity scan. Read-only:
+    /// the planner walks the state-dir, builds a typed
+    /// `StateCleanupPlan` (closed-set actions, BLAKE3-stamped),
+    /// and writes the plan JSON to `--out`. The state-dir is
+    /// **never** mutated. Operator reviews the plan before
+    /// `apply-state-cleanup`. No protocol surface, no chain /
+    /// mesh / SNIP / archive surface touched.
+    PlanStateCleanup(PlanStateCleanupArgs),
+
+    /// Stage 12.17 — apply a previously-built `StateCleanupPlan`.
+    /// Re-runs the integrity scan + drift-checks
+    /// `source_integrity_hash`, re-verifies `cleanup_plan_hash`,
+    /// re-checks per-session orphan-assignment projections for
+    /// gated actions, then walks the actions in plan order.
+    /// Tier-B actions quarantine the bytes (BLAKE3-verified)
+    /// under `<quarantine-dir>/<plan_id>/...` BEFORE removing
+    /// the source; a manifest is written LAST so a partial
+    /// apply leaves it visibly missing. No chain / mesh / SNIP
+    /// surface touched.
+    ApplyStateCleanup(ApplyStateCleanupArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2190,6 +2212,119 @@ struct StateIntegrityArgs {
     fail_on_warn: bool,
 }
 
+// ── Stage 12.17 — plan-state-cleanup ──────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum PlanStateCleanupFormat {
+    /// One `event=cleanup_action_planned` line per action plus a
+    /// final `event=cleanup_plan_built` summary. Default.
+    Events,
+    /// Print the full `StateCleanupPlan` as pretty JSON on
+    /// stdout (operational chatter goes to stderr so `jq` works
+    /// directly).
+    Json,
+    /// Compact terminal-friendly per-action listing.
+    Pretty,
+}
+
+#[derive(Args)]
+struct PlanStateCleanupArgs {
+    /// Stage 12.7 contributor workflow state directory the
+    /// planner walks (via Stage 12.16's scan).
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    /// Optional 64-char lowercase hex `session_id` filter. When
+    /// supplied, session-scoped actions are restricted to that
+    /// one session; cross-session strays (top-level `seen/`
+    /// junk) still plan.
+    #[arg(long)]
+    session_id: Option<String>,
+
+    /// Optional path to a previously-written
+    /// `StateIntegrityReport` JSON. When supplied, the planner
+    /// consumes the supplied report verbatim instead of running
+    /// a fresh scan — useful for CI pipelines that produce the
+    /// report as an artifact. Drift between the supplied report
+    /// and the live state-dir is detected at apply time via
+    /// `source_integrity_hash`.
+    #[arg(long)]
+    integrity_json: Option<PathBuf>,
+
+    /// Path to write the resulting `StateCleanupPlan` JSON.
+    /// Atomic write (temp + rename). Required.
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Output format for the stdout summary. Default `events`.
+    #[arg(long, value_enum, default_value_t = PlanStateCleanupFormat::Events)]
+    format: PlanStateCleanupFormat,
+}
+
+// ── Stage 12.17 — apply-state-cleanup ────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ApplyStateCleanupFormat {
+    /// One `event=cleanup_action_applied` / `event=cleanup_action_skipped`
+    /// line per action + final `event=cleanup_complete`. Default.
+    Events,
+    /// Print the full `CleanupReport` as pretty JSON on stdout.
+    Json,
+    /// Compact terminal-friendly per-action listing.
+    Pretty,
+}
+
+#[derive(Args)]
+struct ApplyStateCleanupArgs {
+    /// Stage 12.7 contributor workflow state directory the
+    /// applier mutates. The applier re-runs Stage 12.16's scan
+    /// for drift detection before any mutation.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    /// Path to the `StateCleanupPlan` JSON to apply.
+    #[arg(long)]
+    plan: PathBuf,
+
+    /// Root under which `<plan_id>/...` quarantine subtree gets
+    /// written. Tier-B actions copy their source bytes here
+    /// BEFORE removing the source. Required even for tier-A-only
+    /// plans (the path is consistent across plans).
+    #[arg(long)]
+    quarantine_dir: PathBuf,
+
+    /// Dry-run: walk the plan and emit `event=would_apply_action`
+    /// lines without touching the FS. Drift / hash / gate checks
+    /// still run.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    /// Required gate for any `QuarantineAndUnmarkPartial` action
+    /// in the plan. Refused otherwise so the operator doesn't
+    /// accidentally pull the rug from a planned Stage 12.11
+    /// reassign.
+    #[arg(long, default_value_t = false)]
+    allow_invalid_partial_cleanup: bool,
+
+    /// Required gate for any
+    /// `QuarantineAndUnmarkOrphanAssignment` action. Apply
+    /// additionally re-runs `compute_audit_health` per gated
+    /// session and refuses on orphan-set drift.
+    #[arg(long, default_value_t = false)]
+    allow_orphan_assignments: bool,
+
+    /// When set, `QuarantineVerifiedFile` actions skip the
+    /// quarantine copy step and just delete the source.
+    /// `QuarantineAndUnmark*` actions still quarantine — only
+    /// the stray-file pathway is relaxed.
+    #[arg(long, default_value_t = false)]
+    purge_stray: bool,
+
+    /// Output format. Default `events`.
+    #[arg(long, value_enum, default_value_t = ApplyStateCleanupFormat::Events)]
+    format: ApplyStateCleanupFormat,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -2223,6 +2358,8 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::ArchiveSession(a) => run_archive_session(a),
         ContributorCmd::RestoreSessionArchive(a) => run_restore_session_archive(a),
         ContributorCmd::StateIntegrity(a) => run_state_integrity(a),
+        ContributorCmd::PlanStateCleanup(a) => run_plan_state_cleanup(a),
+        ContributorCmd::ApplyStateCleanup(a) => run_apply_state_cleanup(a),
     }
 }
 
@@ -7052,6 +7189,141 @@ mod tests {
         ]);
         assert!(bad.is_err(), "clap must reject unknown --format value");
     }
+
+    // ── Stage 12.17 — plan-state-cleanup / apply-state-cleanup ──
+
+    fn parse_plan_state_cleanup(extra: &[&str]) -> PlanStateCleanupArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "plan-state-cleanup".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+            "--out".into(),
+            "/tmp/plan.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::PlanStateCleanup(a) => a,
+            _ => panic!("expected PlanStateCleanup"),
+        }
+    }
+
+    fn parse_apply_state_cleanup(extra: &[&str]) -> ApplyStateCleanupArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "apply-state-cleanup".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+            "--plan".into(),
+            "/tmp/plan.json".into(),
+            "--quarantine-dir".into(),
+            "/tmp/quarantine".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::ApplyStateCleanup(a) => a,
+            _ => panic!("expected ApplyStateCleanup"),
+        }
+    }
+
+    #[test]
+    fn plan_state_cleanup_flag_parse_smoke() {
+        let defaults = parse_plan_state_cleanup(&[]);
+        assert!(defaults.session_id.is_none());
+        assert!(defaults.integrity_json.is_none());
+        assert_eq!(defaults.format, PlanStateCleanupFormat::Events);
+        assert_eq!(defaults.out, std::path::PathBuf::from("/tmp/plan.json"));
+
+        let sid = "aa".repeat(32);
+        let with_sid = parse_plan_state_cleanup(&["--session-id", &sid]);
+        assert_eq!(with_sid.session_id.as_deref(), Some(sid.as_str()));
+
+        let with_integ =
+            parse_plan_state_cleanup(&["--integrity-json", "/tmp/r.json"]);
+        assert_eq!(
+            with_integ.integrity_json.as_deref(),
+            Some(std::path::Path::new("/tmp/r.json"))
+        );
+
+        for (raw, expected) in &[
+            ("events", PlanStateCleanupFormat::Events),
+            ("json", PlanStateCleanupFormat::Json),
+            ("pretty", PlanStateCleanupFormat::Pretty),
+        ] {
+            let got = parse_plan_state_cleanup(&["--format", raw]);
+            assert_eq!(got.format, *expected);
+        }
+
+        // Stage 12.16 review precedent: cleanup CLI does NOT
+        // expose --no-prune-state-on-start (cleanup planner is
+        // read-only and always opens with auto_prune off).
+        let no_such_flag = TestRoot::try_parse_from(&[
+            "omni-node",
+            "plan-state-cleanup",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--out",
+            "/tmp/plan.json",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "plan-state-cleanup must not accept --no-prune-state-on-start"
+        );
+    }
+
+    #[test]
+    fn apply_state_cleanup_flag_parse_smoke() {
+        let defaults = parse_apply_state_cleanup(&[]);
+        assert!(!defaults.dry_run);
+        assert!(!defaults.allow_invalid_partial_cleanup);
+        assert!(!defaults.allow_orphan_assignments);
+        assert!(!defaults.purge_stray);
+        assert_eq!(defaults.format, ApplyStateCleanupFormat::Events);
+
+        let toggled = parse_apply_state_cleanup(&[
+            "--dry-run",
+            "--allow-invalid-partial-cleanup",
+            "--allow-orphan-assignments",
+            "--purge-stray",
+        ]);
+        assert!(toggled.dry_run);
+        assert!(toggled.allow_invalid_partial_cleanup);
+        assert!(toggled.allow_orphan_assignments);
+        assert!(toggled.purge_stray);
+
+        for (raw, expected) in &[
+            ("events", ApplyStateCleanupFormat::Events),
+            ("json", ApplyStateCleanupFormat::Json),
+            ("pretty", ApplyStateCleanupFormat::Pretty),
+        ] {
+            let got = parse_apply_state_cleanup(&["--format", raw]);
+            assert_eq!(got.format, *expected);
+        }
+
+        // Auto-prune flag is deliberately absent on apply too.
+        let no_such_flag = TestRoot::try_parse_from(&[
+            "omni-node",
+            "apply-state-cleanup",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--plan",
+            "/tmp/plan.json",
+            "--quarantine-dir",
+            "/tmp/q",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "apply-state-cleanup must not accept --no-prune-state-on-start"
+        );
+    }
 }
 
 // ── Stage 12.9 — session-status ──────────────────────────────────────────
@@ -9082,4 +9354,317 @@ fn render_state_integrity_pretty(report: &omni_contributor::StateIntegrityReport
     section("Errors", FindingSeverity::Error);
     section("Warnings", FindingSeverity::Warn);
     section("OK findings", FindingSeverity::Ok);
+}
+
+// ── Stage 12.17 — plan-state-cleanup ──────────────────────────────────────
+
+fn run_plan_state_cleanup(args: PlanStateCleanupArgs) -> Result<()> {
+    use omni_contributor::{
+        plan_state_cleanup, scan_state_integrity_with_audit_orphans,
+        source_integrity_hash_hex, CleanupPlanOptions, ContributorStateStore,
+        ScanOptions, StateIntegrityReport,
+    };
+    use std::collections::HashMap;
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode = matches!(args.format, PlanStateCleanupFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    // Stage 12.16 review precedent: cleanup CLIs always open
+    // with auto_prune off so a stale-state snapshot isn't
+    // cascade-removed before the planner sees it.
+    let (store, _) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        /* auto_prune = */ false,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    log_op(&format!(
+        "event=state_store_opened path={} auto_prune=off",
+        args.contributor_state_dir.display(),
+    ));
+
+    // Source the integrity report from either a prebaked JSON
+    // OR a fresh scan. Either way, the orphan side-channel
+    // comes from the live scan (the report alone doesn't
+    // carry orphan assignment_ids).
+    let scan_opts = ScanOptions {
+        session_id_filter: args.session_id.as_deref(),
+        archive_dir: None,
+        now_utc: &now_utc,
+    };
+    let (live_report, live_orphans) =
+        scan_state_integrity_with_audit_orphans(&store, &scan_opts)
+            .map_err(|e| anyhow!("integrity scan during plan-state-cleanup: {e}"))?;
+    let report: StateIntegrityReport = if let Some(path) = args.integrity_json.as_deref() {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read integrity-json: {}", path.display()))?;
+        let parsed: StateIntegrityReport = serde_json::from_slice(&bytes)
+            .with_context(|| {
+                format!("parse integrity-json: {}", path.display())
+            })?;
+        // Drift sanity: if the supplied report disagrees with
+        // the live scan, the plan's source_integrity_hash
+        // would refuse at apply time anyway. Warn now so the
+        // operator sees the mismatch immediately.
+        let live_hash = source_integrity_hash_hex(&live_report);
+        let supplied_hash = source_integrity_hash_hex(&parsed);
+        if live_hash != supplied_hash {
+            eprintln!(
+                "event=warn context=plan_state_cleanup_integrity_drift \
+                 supplied_hash={supplied_hash} live_hash={live_hash} \
+                 message=apply will refuse this plan until state matches the supplied report"
+            );
+        }
+        parsed
+    } else {
+        live_report
+    };
+
+    let orphans: HashMap<String, Vec<String>> = live_orphans;
+    let plan_opts = CleanupPlanOptions {
+        now_utc: &now_utc,
+        session_id_filter: args.session_id.as_deref(),
+    };
+    let plan = plan_state_cleanup(&report, &orphans, &plan_opts)
+        .map_err(|e| anyhow!("build cleanup plan: {e}"))?;
+
+    // Write the plan JSON atomically (temp + rename) — same
+    // posture as the Stage 12.10 plan-session-repair --out.
+    let plan_bytes = serde_json::to_vec_pretty(&plan)
+        .map_err(|e| anyhow!("serialize cleanup plan: {e}"))?;
+    if let Some(parent) = args.out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("create plan parent dir: {}", parent.display())
+            })?;
+        }
+    }
+    let tmp = args.out.with_extension("json.tmp");
+    std::fs::write(&tmp, &plan_bytes)
+        .with_context(|| format!("write cleanup plan tmp: {}", tmp.display()))?;
+    std::fs::rename(&tmp, &args.out)
+        .with_context(|| format!("rename cleanup plan into place: {}", args.out.display()))?;
+    log_op(&format!(
+        "event=cleanup_plan_written path={} actions={} plan_id={}",
+        args.out.display(),
+        plan.actions.len(),
+        plan.plan_id,
+    ));
+
+    match args.format {
+        PlanStateCleanupFormat::Events => render_cleanup_plan_events(&plan),
+        PlanStateCleanupFormat::Json => render_cleanup_plan_json(&plan)?,
+        PlanStateCleanupFormat::Pretty => render_cleanup_plan_pretty(&plan),
+    }
+    Ok(())
+}
+
+fn render_cleanup_plan_events(plan: &omni_contributor::StateCleanupPlan) {
+    for (i, action) in plan.actions.iter().enumerate() {
+        println!(
+            "event=cleanup_action_planned index={} kind={} session_id={} path={} \
+             seen_marker={} source_finding_kind={} source_reason_tag={}",
+            i,
+            action.kind.as_str(),
+            action.session_id.as_deref().unwrap_or("-"),
+            action.path,
+            action.seen_marker_path.as_deref().unwrap_or("-"),
+            action.source_finding_kind,
+            action.source_reason_tag,
+        );
+    }
+    println!(
+        "event=cleanup_plan_built plan_id={} schema_version={} actions={} \
+         source_integrity_hash={} cleanup_plan_hash={}",
+        plan.plan_id,
+        plan.schema_version,
+        plan.actions.len(),
+        plan.source_integrity_hash,
+        plan.cleanup_plan_hash,
+    );
+}
+
+fn render_cleanup_plan_json(plan: &omni_contributor::StateCleanupPlan) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(plan)
+        .map_err(|e| anyhow!("serialize cleanup plan: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write cleanup plan: {e}"))?;
+    handle.write_all(b"\n").map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_cleanup_plan_pretty(plan: &omni_contributor::StateCleanupPlan) {
+    println!("State cleanup plan");
+    println!("  plan_id              : {}", plan.plan_id);
+    println!("  schema_version       : {}", plan.schema_version);
+    println!("  created_at_utc       : {}", plan.created_at_utc);
+    println!("  state_dir            : {}", plan.state_dir);
+    println!("  source_integrity_hash: {}", plan.source_integrity_hash);
+    println!("  cleanup_plan_hash    : {}", plan.cleanup_plan_hash);
+    println!("  action count         : {}", plan.actions.len());
+    if !plan.actions.is_empty() {
+        println!();
+        println!("Actions (in apply order):");
+        for (i, action) in plan.actions.iter().enumerate() {
+            println!(
+                "  {i:>3}. kind={} session={} path={}",
+                action.kind.as_str(),
+                action.session_id.as_deref().unwrap_or("-"),
+                action.path,
+            );
+            if let Some(seen) = &action.seen_marker_path {
+                println!("       seen_marker={seen}");
+            }
+            println!("       source_finding_kind={}", action.source_finding_kind);
+            println!("       source_reason_tag={}", action.source_reason_tag);
+        }
+    }
+}
+
+// ── Stage 12.17 — apply-state-cleanup ────────────────────────────────────
+
+fn run_apply_state_cleanup(args: ApplyStateCleanupArgs) -> Result<()> {
+    use omni_contributor::{
+        apply_state_cleanup, CleanupApplyOptions, ContributorStateStore,
+        StateCleanupPlan,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode = matches!(args.format, ApplyStateCleanupFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    let plan_bytes = std::fs::read(&args.plan)
+        .with_context(|| format!("read plan: {}", args.plan.display()))?;
+    let plan: StateCleanupPlan = serde_json::from_slice(&plan_bytes)
+        .with_context(|| format!("parse plan: {}", args.plan.display()))?;
+
+    let (store, _) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        /* auto_prune = */ false,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    log_op(&format!(
+        "event=state_store_opened path={} auto_prune=off",
+        args.contributor_state_dir.display(),
+    ));
+
+    if !args.quarantine_dir.exists() {
+        std::fs::create_dir_all(&args.quarantine_dir).with_context(|| {
+            format!("create quarantine dir: {}", args.quarantine_dir.display())
+        })?;
+    }
+
+    let opts = CleanupApplyOptions {
+        quarantine_dir: &args.quarantine_dir,
+        dry_run: args.dry_run,
+        allow_invalid_partial_cleanup: args.allow_invalid_partial_cleanup,
+        allow_orphan_assignments: args.allow_orphan_assignments,
+        purge_stray: args.purge_stray,
+        now_utc: &now_utc,
+    };
+    log_op(&format!(
+        "event=cleanup_started plan_id={} mode={} actions={}",
+        plan.plan_id,
+        if args.dry_run { "dry_run" } else { "apply" },
+        plan.actions.len(),
+    ));
+
+    let report = apply_state_cleanup(&store, &plan, &opts)
+        .map_err(|e| anyhow!("apply-state-cleanup refused: {e}"))?;
+
+    match args.format {
+        ApplyStateCleanupFormat::Events => render_cleanup_apply_events(&report),
+        ApplyStateCleanupFormat::Json => render_cleanup_apply_json(&report)?,
+        ApplyStateCleanupFormat::Pretty => render_cleanup_apply_pretty(&report),
+    }
+    Ok(())
+}
+
+fn render_cleanup_apply_events(report: &omni_contributor::CleanupReport) {
+    for outcome in &report.outcomes {
+        let event = match outcome.status.as_str() {
+            "would_apply" => "event=would_apply_action",
+            "skipped_missing" => "event=cleanup_action_skipped",
+            _ => "event=cleanup_action_applied",
+        };
+        println!(
+            "{event} index={} kind={} session_id={} path={} status={}",
+            outcome.action_index,
+            outcome.kind,
+            outcome.session_id.as_deref().unwrap_or("-"),
+            outcome.path,
+            outcome.status,
+        );
+    }
+    println!(
+        "event=cleanup_complete plan_id={} mode={} applied={} dry_run={} \
+         skipped={} quarantine_dir={} manifest={}",
+        report.plan_id,
+        report.mode,
+        report.actions_applied,
+        report.actions_dry_run,
+        report.actions_skipped,
+        report.quarantine_dir,
+        report.quarantine_manifest_relative.as_deref().unwrap_or("-"),
+    );
+}
+
+fn render_cleanup_apply_json(report: &omni_contributor::CleanupReport) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(report)
+        .map_err(|e| anyhow!("serialize cleanup report: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle.write_all(&bytes).map_err(|e| anyhow!("write cleanup report: {e}"))?;
+    handle.write_all(b"\n").map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_cleanup_apply_pretty(report: &omni_contributor::CleanupReport) {
+    println!("State cleanup apply report");
+    println!("  plan_id        : {}", report.plan_id);
+    println!("  mode           : {}", report.mode);
+    println!("  applied        : {}", report.actions_applied);
+    println!("  dry_run        : {}", report.actions_dry_run);
+    println!("  skipped        : {}", report.actions_skipped);
+    println!("  quarantine_dir : {}", report.quarantine_dir);
+    if let Some(m) = &report.quarantine_manifest_relative {
+        println!("  manifest       : {m}");
+    }
+    if !report.outcomes.is_empty() {
+        println!();
+        println!("Outcomes:");
+        for o in &report.outcomes {
+            println!(
+                "  {:>3}. {} session={} path={} status={}",
+                o.action_index,
+                o.kind,
+                o.session_id.as_deref().unwrap_or("-"),
+                o.path,
+                o.status,
+            );
+        }
+    }
 }
