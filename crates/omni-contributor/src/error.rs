@@ -1144,3 +1144,146 @@ pub enum CleanupError {
         source: std::io::Error,
     },
 }
+
+/// Stage 12.18 — local cleanup-quarantine restore errors.
+/// Consumes the existing v1 `QuarantineManifest` written by
+/// Stage 12.17's `apply_state_cleanup`; no manifest schema bump.
+///
+/// Per-entry path / BLAKE3 / destination-existence problems are
+/// fail-fast: the all-or-nothing preflight runs BEFORE any
+/// state-dir write, so a single bad entry refuses the whole
+/// restore without partially mutating the state-dir.
+#[derive(Debug, thiserror::Error)]
+pub enum QuarantineRestoreError {
+    /// The supplied quarantine plan directory does not exist
+    /// on disk.
+    #[error("quarantine plan directory not found: {path}")]
+    QuarantineDirNotFound { path: std::path::PathBuf },
+
+    /// The expected `quarantine-manifest.json` is missing
+    /// from the supplied plan directory. Stage 12.17 writes
+    /// the manifest LAST under the Phase A→B→C ordering, so a
+    /// missing manifest typically means the Stage 12.17 apply
+    /// crashed between Phase A and Phase B.
+    #[error("quarantine-manifest.json missing at {path}")]
+    ManifestMissing { path: std::path::PathBuf },
+
+    /// `quarantine-manifest.json` did not parse as a v1
+    /// `QuarantineManifest`.
+    #[error("malformed quarantine manifest at {path}: {source}")]
+    MalformedManifest {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// `manifest.schema_version` is not
+    /// `QUARANTINE_MANIFEST_SCHEMA_VERSION`. Stage 12.18 v1
+    /// accepts exactly version `1`.
+    #[error(
+        "unsupported quarantine manifest schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedManifestVersion { got: u32, expected: u32 },
+
+    /// `manifest.source_state_version != STATE_VERSION`. Same
+    /// strict-equality posture as Stage 12.15 archive restore.
+    #[error(
+        "incompatible source state-dir version: manifest={manifest} current={current}"
+    )]
+    IncompatibleSourceStateVersion { manifest: u32, current: u32 },
+
+    /// `manifest.plan_id` does not match the
+    /// caller-supplied `plan_id` (via `--quarantine-dir +
+    /// --plan-id`) OR the directory name supplied via
+    /// `--quarantine-plan-dir`. Defends against hand-renamed
+    /// quarantine directories.
+    #[error(
+        "plan_id mismatch: manifest.plan_id={manifest_plan_id} \
+         supplied={supplied_plan_id}"
+    )]
+    PlanIdMismatch {
+        manifest_plan_id: String,
+        supplied_plan_id: String,
+    },
+
+    /// An entry's `source_relative` or `quarantine_relative`
+    /// contains `..`, is absolute, uses a backslash, has an
+    /// empty segment, or fails the closed-set
+    /// `verified/sessions/<64hex>/...` whitelist. Hand-edited
+    /// manifests with malicious paths get this BEFORE any IO.
+    #[error("unsafe relative path in manifest ({reason}): {path}")]
+    UnsafeRelativePath {
+        path: String,
+        reason: &'static str,
+    },
+
+    /// A file named in the manifest does not exist under the
+    /// quarantine plan directory. Restore is fail-fast.
+    #[error("quarantine file missing for manifest entry: {path}")]
+    ManifestFileMissing { path: std::path::PathBuf },
+
+    /// BLAKE3 of the quarantine file did not match the
+    /// manifest's `blake3_hex`. Fail-fast (no retry); operator
+    /// triages the FS / quarantine integrity.
+    #[error(
+        "blake3 mismatch on quarantine file: path={path} expected={expected} got={got}"
+    )]
+    BlakeMismatch {
+        path: std::path::PathBuf,
+        expected: String,
+        got: String,
+    },
+
+    /// All-or-nothing preflight found a destination that
+    /// already exists in the state-dir AND
+    /// `--overwrite-existing` was false. Mirrors Stage 12.15.
+    #[error(
+        "destination already exists: {path} (re-run with --overwrite-existing)"
+    )]
+    DestinationExists { path: std::path::PathBuf },
+
+    /// All-or-nothing preflight found a seen-marker
+    /// destination that is occupied by a non-file (typically
+    /// a directory) so `store.mark_seen` would have failed
+    /// mid-restore. Refused BEFORE any body write so a marker
+    /// problem cannot partially mutate the state-dir.
+    /// `--overwrite-existing` does NOT cover this — marker
+    /// preflight is unconditional whenever
+    /// `restore_seen_markers == true`.
+    #[error("seen marker path blocked at {path}: {reason}")]
+    SeenMarkerPathBlocked {
+        path: std::path::PathBuf,
+        reason: &'static str,
+    },
+
+    /// A `source_finding_kind` in the manifest matched a
+    /// closed-set tag whose restore requires an opt-in flag
+    /// the operator didn't pass (e.g. orphan-assignment
+    /// entries without `--allow-restore-orphan-assignments`).
+    /// Refused BEFORE any FS interaction.
+    #[error("gated restore requires {flag}: source_finding_kind={kind}")]
+    GatedRestoreRequired {
+        kind: &'static str,
+        flag: &'static str,
+    },
+
+    /// An entry's `source_finding_kind` is not in the Stage
+    /// 12.17 closed set. Hand-edited manifest or future-stage
+    /// tag — refused so v1 doesn't silently skip new
+    /// variants.
+    #[error("unknown source_finding_kind in manifest: {kind}")]
+    UnknownFindingKind { kind: String },
+
+    /// Bubbled `StateError` — typically from
+    /// `write_archived_bytes` or `mark_seen`.
+    #[error("state error: {0}")]
+    State(#[from] StateError),
+
+    /// Generic FS error.
+    #[error("quarantine restore io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}

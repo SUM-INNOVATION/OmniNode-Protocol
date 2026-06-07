@@ -2656,3 +2656,91 @@ Closed-set bare-stdout events: `event=cleanup_plan_written`, `event=cleanup_acti
 | CLI flag matrix `apply-state-cleanup` (including deliberate rejection of `--no-prune-state-on-start`) | `apply_state_cleanup_flag_parse_smoke` |
 
 **Residual gap (deliberate):** the CLI run-fns `run_plan_state_cleanup` and `run_apply_state_cleanup` aren't exercised end-to-end (same constraint as Stage 12.10–12.16); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
+
+# Stage 12.18 — local cleanup-quarantine restore
+
+## What this stage is, in one sentence
+
+A `restore-state-cleanup-quarantine` command that consumes the v1 `quarantine-manifest.json` Stage 12.17 produced, BLAKE3-verifies every quarantined body, restores it back into the contributor state-dir, and (by default) restores the matching seen markers — first-class rollback for the cleanup applier.
+
+## Why a restore command is separate from `restore-session-archive`
+
+Stage 12.15's `restore-session-archive` consumes a Stage 12.14 `ArchiveManifest` shaped around session-scoped archives with `--include-results` semantics; Stage 12.17's `QuarantineManifest` is plan-scoped with `source_finding_kind` per entry. The two manifest schemas are distinct closed sets and the per-entry semantics (seen-marker restore vs result-link skip; orphan-assignment gate vs `--include-results` flag) don't align. A separate command keeps each manifest format's policy surface narrow and prevents the operator from accidentally pointing one tool at the other's manifest.
+
+## Library surface
+
+`omni_contributor::cleanup` (extended; no new module):
+
+- `QuarantineRestoreSource<'a> { PlanDir(&Path), QuarantineRoot { quarantine_dir, plan_id } }`. Resolves to a concrete `<plan_id>` directory + an authoritative expected `plan_id` for manifest pinning.
+- `QuarantineRestoreOptions<'a> { source, dry_run, verify_only, overwrite_existing, restore_seen_markers, allow_restore_orphan_assignments, now_utc }`. `verify_only` wins when both `dry_run` and `verify_only` are set (Stage 12.15 precedent).
+- `QuarantineRestoreReport { plan_id, mode, manifest_schema_version, source_state_version, files_restored, seen_markers_restored, bytes_restored, quarantine_dir, outcomes }`. `outcomes: Vec<QuarantineRestoreOutcome>` carries per-entry status (`"applied"` / `"would_apply"` / `"verify_only"`, closed set) + a `seen_marker_written` boolean.
+- `pub fn verify_quarantine_manifest(source) -> Result<QuarantineManifest, QuarantineRestoreError>` — stand-alone manifest parse + schema-version + state-version + plan_id-pinning helper.
+- `pub fn restore_state_cleanup_quarantine(store, opts) -> Result<QuarantineRestoreReport, QuarantineRestoreError>` — the full restorer.
+
+No new `QuarantineManifest` schema. v1 fields (`source_relative`, `quarantine_relative`, `blake3_hex`, `bytes`, `source_finding_kind`, `source_reason_tag`, `session_id`) are sufficient for both body restore (via `store.write_archived_bytes`) and seen-marker restore (via `seen_for_verified` → `parse_seen_relative` → `store.mark_seen`).
+
+## Safety contract
+
+- **Read-only on the quarantine subtree.** The restore reads bytes from `<quarantine-dir>/<plan_id>/` but never modifies it. Operator manages retention manually.
+- **Five explicit phases (A, B, C1, C2, C3)** — mirrors Stage 12.15 plus the Stage 12.18 review-fix split of Phase C:
+  - **Phase A — manifest validation.** Parse JSON; refuse on `UnsupportedManifestVersion` / `IncompatibleSourceStateVersion` / `PlanIdMismatch`. Per-entry path-check (`verified/sessions/<64hex>/...` whitelist) — refuse on `UnsafeRelativePath` BEFORE any IO. Per-entry `source_finding_kind` classification against the closed Stage 12.17 set — refuse on `UnknownFindingKind` (forward-incompatibility signalled loudly). Refuse `orphan_replacement_assignments` entries without `allow_restore_orphan_assignments`.
+  - **Phase B — BLAKE3 verify.** Runs whenever `verify_only || !dry_run`. Every entry's `<quarantine-dir>/<plan_id>/<quarantine_relative>` must exist and its BLAKE3 must equal the manifest's `blake3_hex`; mismatch is fail-fast `BlakeMismatch`. For real restore the verified bytes are kept in memory so Phase C3 writes without re-reading.
+  - **Phase C1 — body destination preflight.** Real-restore only. All-or-nothing existence preflight against `<state-dir>/<source_relative>`; refuse with `DestinationExists` on any pre-existing destination unless `overwrite_existing`.
+  - **Phase C2 — seen-marker destination preflight (Stage 12.18 review fix).** Runs whenever `restore_seen_markers == true`. For every entry whose `source_finding_kind` would restore a marker, the `seen/<ns>/<key>` path is checked: any non-file occupant (typically a directory) refuses the whole restore with `SeenMarkerPathBlocked` BEFORE any body is written. `--overwrite-existing` does NOT cover this — the preflight is unconditional whenever marker restore is on. Existing regular files at the marker path are fine (`mark_seen` is idempotent). Preserves the all-or-nothing invariant even when the marker side is at risk.
+  - **Phase C3 — writes.** Each body via `store.write_archived_bytes` (which independently re-validates the path against the Stage 12.14 archive whitelist), then each matching `seen/<ns>/<key>` marker via `store.mark_seen` when `restore_seen_markers`.
+- **No drift check against state-dir.** The state-dir HAS changed since the quarantine was produced (the cleanup deleted things). v1 does not record a post-cleanup integrity hash to drift-check against; the operator runs `state-integrity` post-restore.
+- **Auto-prune forced OFF.** The CLI opens the state-store with `auto_prune = false` unconditionally (Stage 12.16/12.17 precedent). The `--no-prune-state-on-start` flag is deliberately absent; clap regression pins the rejection.
+
+## CLI
+
+```
+omni-node operator contributor restore-state-cleanup-quarantine \
+  --contributor-state-dir <path>                  (required)
+  [--quarantine-plan-dir <path>]                  (direct <plan_id> dir)
+  [--quarantine-dir <path>]                       (paired form...)
+  [--plan-id <hex16>]                             (...with --quarantine-dir)
+  [--dry-run]                                     (manifest validation only)
+  [--verify-only]                                 (full BLAKE3, no writes)
+  [--overwrite-existing]                          (default off; all-or-nothing)
+  [--no-restore-seen-markers]                     (default ON; flag skips markers)
+  [--allow-restore-orphan-assignments]            (gate for orphan entries)
+  [--format events|json|pretty]                   (default events)
+```
+
+Source-form is `--quarantine-plan-dir` **xor** (`--quarantine-dir + --plan-id`). Clap enforces both the mutual-exclusion and the pair (`--quarantine-dir` requires `--plan-id`).
+
+Closed-set bare-stdout events: `event=state_store_opened`, `event=restore_quarantine_started`, `event=verify_only_quarantine_file`, `event=would_restore_quarantine_file`, `event=restore_quarantine_file`, `event=restore_quarantine_complete`. Any `QuarantineRestoreError` exits nonzero.
+
+## Out of scope (Stage 12.18)
+
+- **Tier-A restoration.** Stage 12.17 Tier-A actions (`RemoveSeenMarker` / `WriteSeenMarker` / `RemoveSeenFile`) had no quarantine payload — v1 cannot restore them. Operator re-runs the watcher or `mark_seen` manually. Documented gap.
+- **`--purge-stray` entry restoration.** Operator opted to purge at cleanup time; the manifest doesn't carry the bytes.
+- **Cross-state-dir restore.** Strict `source_state_version == STATE_VERSION` equality; no migration story.
+- **Manifest schema v2.** v1 is sufficient.
+- **Drift check against post-cleanup state.** Not recorded; operator runs `state-integrity` post-restore.
+- **Auto-deletion of the quarantine subtree post-restore.** Operator-managed.
+- **No envelope, no canonical-byte changes, no `schema_version` bump on Stage 12.0–12.17 envelopes, no `STATE_VERSION` / `QUARANTINE_MANIFEST_SCHEMA_VERSION` / `CLEANUP_PLAN_SCHEMA_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATUS_SCHEMA_VERSION` / `ARCHIVE_MANIFEST_SCHEMA_VERSION` / `NET_SCHEMA_VERSION` bump, no new gossipsub topic, no SNIP / mesh / chain / payment / proof / marketplace surface.**
+
+## Test coverage map
+
+| Concern | Test |
+| --- | --- |
+| `verify_quarantine_manifest` parses a v1 manifest | `verify_quarantine_manifest_parses_v1_manifest` (`state_cleanup_quarantine_restore.rs`) |
+| End-to-end cleanup → restore for a tampered join | `tampered_join_cleanup_then_restore_round_trips` |
+| `--verify-only` on intact quarantine writes nothing | `verify_only_intact_quarantine_writes_nothing` |
+| `--dry-run` writes nothing + emits `would_apply` | `dry_run_writes_nothing_and_status_would_apply` |
+| `--verify-only` wins over `--dry-run` | `verify_only_wins_over_dry_run` |
+| Corrupted quarantine byte → `BlakeMismatch` refusal | `corrupt_quarantine_byte_emits_blake_mismatch` |
+| Path-traversal in manifest → `UnsafeRelativePath` BEFORE IO | `manifest_with_traversal_path_is_refused_before_io` |
+| Schema-version mismatch → `UnsupportedManifestVersion` | `schema_version_mismatch_is_refused` |
+| plan_id mismatch (renamed dir) → `PlanIdMismatch` | `plan_id_mismatch_in_paired_source_is_refused` |
+| Pre-existing destination → `DestinationExists` (state-dir untouched) | `destination_exists_refuses_without_overwrite` |
+| `--overwrite-existing` replaces destination bytes | `overwrite_existing_replaces_destination` |
+| `--no-restore-seen-markers` restores body only | `no_restore_seen_markers_keeps_body_only` |
+| Unknown `source_finding_kind` → `UnknownFindingKind` | `unknown_source_finding_kind_is_refused` |
+| `orphan_replacement_assignments` entry requires gate flag | `orphan_assignment_entry_requires_allow_flag` |
+| Hash-tight rollback: post-restore `source_integrity_hash` equals pre-cleanup | `rollback_restores_pre_cleanup_source_integrity_hash` |
+| Marker preflight refuses BEFORE any body write (review fix — directory at marker path → `SeenMarkerPathBlocked`, state-dir untouched; `--no-restore-seen-markers` escapes the preflight) | `marker_path_blocked_refuses_before_any_body_write` |
+| CLI flag matrix (incl. mutual-exclusion + pair-requires + deliberate rejection of `--no-prune-state-on-start`) | `restore_state_cleanup_quarantine_flag_parse_smoke` (omni-node) |
+
+**Residual gap (deliberate):** the CLI run-fn `run_restore_state_cleanup_quarantine` isn't exercised end-to-end (same constraint as Stage 12.10–12.17); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
