@@ -247,6 +247,17 @@ enum ContributorCmd {
     /// apply leaves it visibly missing. No chain / mesh / SNIP
     /// surface touched.
     ApplyStateCleanup(ApplyStateCleanupArgs),
+
+    /// Stage 12.18 — restore a Stage 12.17 cleanup-quarantine
+    /// subtree back into the contributor state-dir. Consumes
+    /// the v1 `quarantine-manifest.json`, BLAKE3-verifies every
+    /// quarantined file, path-checks every destination, refuses
+    /// any pre-existing destination unless
+    /// `--overwrite-existing`, and (by default) restores the
+    /// matching seen markers. The quarantine subtree is **left
+    /// intact** — operator manages retention. No chain / mesh /
+    /// SNIP / envelope surface touched.
+    RestoreStateCleanupQuarantine(RestoreStateCleanupQuarantineArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2325,6 +2336,85 @@ struct ApplyStateCleanupArgs {
     format: ApplyStateCleanupFormat,
 }
 
+// ── Stage 12.18 — restore-state-cleanup-quarantine ───────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum RestoreQuarantineFormat {
+    /// One `event=restore_quarantine_file` /
+    /// `event=verify_only_quarantine_file` /
+    /// `event=would_restore_quarantine_file` per entry, plus a
+    /// final `event=restore_quarantine_complete`. Default.
+    Events,
+    /// Print the full `QuarantineRestoreReport` as pretty JSON
+    /// on stdout. Operational chatter goes to stderr so `jq`
+    /// works directly.
+    Json,
+    /// Compact terminal-friendly per-entry listing.
+    Pretty,
+}
+
+#[derive(Args)]
+struct RestoreStateCleanupQuarantineArgs {
+    /// Stage 12.7 contributor workflow state directory the
+    /// restore writes back into.
+    #[arg(long)]
+    contributor_state_dir: PathBuf,
+
+    /// Direct path to the `<plan_id>` subdirectory under the
+    /// quarantine tree (i.e. `<quarantine-dir>/<plan_id>/`).
+    /// Mutually exclusive with `--quarantine-dir` /
+    /// `--plan-id`.
+    #[arg(
+        long,
+        conflicts_with_all = ["quarantine_dir", "plan_id"]
+    )]
+    quarantine_plan_dir: Option<PathBuf>,
+
+    /// Quarantine root containing one or more
+    /// `<plan_id>/` subdirectories. Paired with `--plan-id`.
+    #[arg(long, requires = "plan_id")]
+    quarantine_dir: Option<PathBuf>,
+
+    /// 16-char lowercase hex `plan_id`. Paired with
+    /// `--quarantine-dir`.
+    #[arg(long, requires = "quarantine_dir")]
+    plan_id: Option<String>,
+
+    /// Parse + validate the manifest. No quarantine reads, no
+    /// destination writes.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    /// Full BLAKE3 verify of every quarantine file. No
+    /// destination writes. When both `--verify-only` and
+    /// `--dry-run` are passed, `--verify-only` wins (Stage
+    /// 12.15 precedent).
+    #[arg(long, default_value_t = false)]
+    verify_only: bool,
+
+    /// Default `false`. With `false`, any pre-existing
+    /// destination refuses BEFORE any write
+    /// (`DestinationExists`).
+    #[arg(long, default_value_t = false)]
+    overwrite_existing: bool,
+
+    /// Skip seen-marker restoration. Default OFF (markers
+    /// restored automatically when the entry's
+    /// `source_finding_kind` proves a marker was unmarked).
+    #[arg(long, default_value_t = false)]
+    no_restore_seen_markers: bool,
+
+    /// Required gate for any
+    /// `orphan_replacement_assignments` entry. Refused
+    /// without this flag.
+    #[arg(long, default_value_t = false)]
+    allow_restore_orphan_assignments: bool,
+
+    /// Output format. Default `events`.
+    #[arg(long, value_enum, default_value_t = RestoreQuarantineFormat::Events)]
+    format: RestoreQuarantineFormat,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -2360,6 +2450,9 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::StateIntegrity(a) => run_state_integrity(a),
         ContributorCmd::PlanStateCleanup(a) => run_plan_state_cleanup(a),
         ContributorCmd::ApplyStateCleanup(a) => run_apply_state_cleanup(a),
+        ContributorCmd::RestoreStateCleanupQuarantine(a) => {
+            run_restore_state_cleanup_quarantine(a)
+        }
     }
 }
 
@@ -7324,6 +7417,166 @@ mod tests {
             "apply-state-cleanup must not accept --no-prune-state-on-start"
         );
     }
+
+    // ── Stage 12.18 — restore-state-cleanup-quarantine clap regression ──
+
+    fn parse_restore_state_cleanup_quarantine(
+        extra: &[&str],
+    ) -> RestoreStateCleanupQuarantineArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "restore-state-cleanup-quarantine".into(),
+            "--contributor-state-dir".into(),
+            "/tmp/state".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::RestoreStateCleanupQuarantine(a) => a,
+            _ => panic!("expected RestoreStateCleanupQuarantine"),
+        }
+    }
+
+    #[test]
+    fn restore_state_cleanup_quarantine_flag_parse_smoke() {
+        // Defaults: no source set yet, no flags on, format=events.
+        let defaults = parse_restore_state_cleanup_quarantine(&[]);
+        assert!(defaults.quarantine_plan_dir.is_none());
+        assert!(defaults.quarantine_dir.is_none());
+        assert!(defaults.plan_id.is_none());
+        assert!(!defaults.dry_run);
+        assert!(!defaults.verify_only);
+        assert!(!defaults.overwrite_existing);
+        assert!(!defaults.no_restore_seen_markers);
+        assert!(!defaults.allow_restore_orphan_assignments);
+        assert_eq!(defaults.format, RestoreQuarantineFormat::Events);
+
+        // --quarantine-plan-dir resolves directly.
+        let with_plan_dir = parse_restore_state_cleanup_quarantine(&[
+            "--quarantine-plan-dir",
+            "/tmp/q/abc1234567890def",
+        ]);
+        assert_eq!(
+            with_plan_dir.quarantine_plan_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/q/abc1234567890def"))
+        );
+        assert!(with_plan_dir.quarantine_dir.is_none());
+        assert!(with_plan_dir.plan_id.is_none());
+
+        // --quarantine-dir + --plan-id pair.
+        let with_pair = parse_restore_state_cleanup_quarantine(&[
+            "--quarantine-dir",
+            "/tmp/q",
+            "--plan-id",
+            "abc1234567890def",
+        ]);
+        assert_eq!(
+            with_pair.quarantine_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/q"))
+        );
+        assert_eq!(with_pair.plan_id.as_deref(), Some("abc1234567890def"));
+
+        // Mutual-exclusion: --quarantine-plan-dir vs
+        // --quarantine-dir/--plan-id pair is rejected by clap.
+        let conflict = TestRoot::try_parse_from(&[
+            "omni-node",
+            "restore-state-cleanup-quarantine",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--quarantine-plan-dir",
+            "/tmp/q/abc",
+            "--quarantine-dir",
+            "/tmp/q",
+            "--plan-id",
+            "abc1234567890def",
+        ]);
+        assert!(
+            conflict.is_err(),
+            "clap must reject --quarantine-plan-dir + --quarantine-dir conflict"
+        );
+
+        // Pair-requires: --quarantine-dir alone (no --plan-id)
+        // is rejected.
+        let lonely = TestRoot::try_parse_from(&[
+            "omni-node",
+            "restore-state-cleanup-quarantine",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--quarantine-dir",
+            "/tmp/q",
+        ]);
+        assert!(
+            lonely.is_err(),
+            "clap must reject --quarantine-dir without --plan-id"
+        );
+
+        // --dry-run / --verify-only / --overwrite-existing
+        // / --no-restore-seen-markers /
+        // --allow-restore-orphan-assignments toggles.
+        let toggled = parse_restore_state_cleanup_quarantine(&[
+            "--quarantine-plan-dir",
+            "/tmp/q/abc",
+            "--dry-run",
+            "--verify-only",
+            "--overwrite-existing",
+            "--no-restore-seen-markers",
+            "--allow-restore-orphan-assignments",
+        ]);
+        assert!(toggled.dry_run);
+        assert!(toggled.verify_only);
+        assert!(toggled.overwrite_existing);
+        assert!(toggled.no_restore_seen_markers);
+        assert!(toggled.allow_restore_orphan_assignments);
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", RestoreQuarantineFormat::Events),
+            ("json", RestoreQuarantineFormat::Json),
+            ("pretty", RestoreQuarantineFormat::Pretty),
+        ] {
+            let got = parse_restore_state_cleanup_quarantine(&[
+                "--quarantine-plan-dir",
+                "/tmp/q/abc",
+                "--format",
+                raw,
+            ]);
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --format value is rejected.
+        let bad_format = TestRoot::try_parse_from(&[
+            "omni-node",
+            "restore-state-cleanup-quarantine",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--quarantine-plan-dir",
+            "/tmp/q/abc",
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format value"
+        );
+
+        // Auto-prune flag is deliberately absent on this
+        // subcommand (Stage 12.16/12.17 precedent).
+        let no_such_flag = TestRoot::try_parse_from(&[
+            "omni-node",
+            "restore-state-cleanup-quarantine",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--quarantine-plan-dir",
+            "/tmp/q/abc",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "restore-state-cleanup-quarantine must not accept --no-prune-state-on-start"
+        );
+    }
 }
 
 // ── Stage 12.9 — session-status ──────────────────────────────────────────
@@ -9664,6 +9917,185 @@ fn render_cleanup_apply_pretty(report: &omni_contributor::CleanupReport) {
                 o.session_id.as_deref().unwrap_or("-"),
                 o.path,
                 o.status,
+            );
+        }
+    }
+}
+
+// ── Stage 12.18 — restore-state-cleanup-quarantine ───────────────────────
+
+fn run_restore_state_cleanup_quarantine(
+    args: RestoreStateCleanupQuarantineArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        restore_state_cleanup_quarantine, ContributorStateStore,
+        QuarantineRestoreOptions, QuarantineRestoreSource,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode = matches!(args.format, RestoreQuarantineFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    // Resolve the quarantine source. Clap enforces both the
+    // mutual-exclusion (PlanDir xor pair) AND the
+    // pair-requires (quarantine_dir <-> plan_id); the run-fn
+    // just picks the branch.
+    let plan_dir_owned: PathBuf;
+    let quarantine_dir_owned: PathBuf;
+    let plan_id_owned: String;
+    let source = if let Some(p) = args.quarantine_plan_dir.as_ref() {
+        plan_dir_owned = p.clone();
+        QuarantineRestoreSource::PlanDir(&plan_dir_owned)
+    } else {
+        let q = args.quarantine_dir.as_ref().ok_or_else(|| {
+            anyhow!(
+                "restore-state-cleanup-quarantine: supply either \
+                 --quarantine-plan-dir OR (--quarantine-dir + --plan-id)"
+            )
+        })?;
+        let pid = args.plan_id.as_ref().ok_or_else(|| {
+            anyhow!(
+                "restore-state-cleanup-quarantine: --quarantine-dir requires --plan-id"
+            )
+        })?;
+        quarantine_dir_owned = q.clone();
+        plan_id_owned = pid.clone();
+        QuarantineRestoreSource::QuarantineRoot {
+            quarantine_dir: &quarantine_dir_owned,
+            plan_id: &plan_id_owned,
+        }
+    };
+
+    // Stage 12.16/12.17 precedent: cleanup CLIs always open
+    // with auto_prune off so a stale-state snapshot isn't
+    // cascade-removed before the restore writes.
+    let (store, _) = ContributorStateStore::open(
+        &args.contributor_state_dir,
+        /* auto_prune = */ false,
+        &now_utc,
+    )
+    .map_err(|e| anyhow!("open contributor state dir: {e}"))?;
+    log_op(&format!(
+        "event=state_store_opened path={} auto_prune=off",
+        args.contributor_state_dir.display(),
+    ));
+
+    let opts = QuarantineRestoreOptions {
+        source,
+        dry_run: args.dry_run,
+        verify_only: args.verify_only,
+        overwrite_existing: args.overwrite_existing,
+        restore_seen_markers: !args.no_restore_seen_markers,
+        allow_restore_orphan_assignments: args.allow_restore_orphan_assignments,
+        now_utc: &now_utc,
+    };
+
+    let mode_tag = if args.verify_only {
+        "verify_only"
+    } else if args.dry_run {
+        "dry_run"
+    } else {
+        "restore"
+    };
+    log_op(&format!(
+        "event=restore_quarantine_started mode={mode_tag} \
+         overwrite_existing={} restore_seen_markers={} \
+         allow_restore_orphan_assignments={}",
+        args.overwrite_existing,
+        !args.no_restore_seen_markers,
+        args.allow_restore_orphan_assignments,
+    ));
+
+    let report = restore_state_cleanup_quarantine(&store, &opts)
+        .map_err(|e| anyhow!("restore-state-cleanup-quarantine refused: {e}"))?;
+
+    match args.format {
+        RestoreQuarantineFormat::Events => render_restore_quarantine_events(&report),
+        RestoreQuarantineFormat::Json => render_restore_quarantine_json(&report)?,
+        RestoreQuarantineFormat::Pretty => render_restore_quarantine_pretty(&report),
+    }
+    Ok(())
+}
+
+fn render_restore_quarantine_events(
+    report: &omni_contributor::QuarantineRestoreReport,
+) {
+    for o in &report.outcomes {
+        let line = match o.status.as_str() {
+            "verify_only" => "event=verify_only_quarantine_file",
+            "would_apply" => "event=would_restore_quarantine_file",
+            _ => "event=restore_quarantine_file",
+        };
+        println!(
+            "{line} index={} source_relative={} source_finding_kind={} \
+             status={} seen_marker_written={}",
+            o.entry_index,
+            o.source_relative,
+            o.source_finding_kind,
+            o.status,
+            o.seen_marker_written,
+        );
+    }
+    println!(
+        "event=restore_quarantine_complete plan_id={} mode={} files_restored={} \
+         seen_markers_restored={} bytes_restored={} quarantine_dir={}",
+        report.plan_id,
+        report.mode,
+        report.files_restored,
+        report.seen_markers_restored,
+        report.bytes_restored,
+        report.quarantine_dir,
+    );
+}
+
+fn render_restore_quarantine_json(
+    report: &omni_contributor::QuarantineRestoreReport,
+) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(report)
+        .map_err(|e| anyhow!("serialize quarantine restore report: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write quarantine restore report: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_restore_quarantine_pretty(
+    report: &omni_contributor::QuarantineRestoreReport,
+) {
+    println!("Quarantine restore report");
+    println!("  plan_id                : {}", report.plan_id);
+    println!("  mode                   : {}", report.mode);
+    println!("  manifest_schema_version: {}", report.manifest_schema_version);
+    println!("  source_state_version   : {}", report.source_state_version);
+    println!("  files_restored         : {}", report.files_restored);
+    println!("  seen_markers_restored  : {}", report.seen_markers_restored);
+    println!("  bytes_restored         : {}", report.bytes_restored);
+    println!("  quarantine_dir         : {}", report.quarantine_dir);
+    if !report.outcomes.is_empty() {
+        println!();
+        println!("Outcomes:");
+        for o in &report.outcomes {
+            println!(
+                "  {:>3}. status={} kind={} source_relative={} seen_marker={}",
+                o.entry_index,
+                o.status,
+                o.source_finding_kind,
+                o.source_relative,
+                if o.seen_marker_written { "yes" } else { "-" },
             );
         }
     }

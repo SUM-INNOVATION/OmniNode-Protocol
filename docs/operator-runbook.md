@@ -1292,8 +1292,76 @@ omni-node operator contributor state-integrity \
 
 The applier walks three explicit phases — **Phase A** (quarantine the bytes), **Phase B** (write `quarantine-manifest.json` atomically), **Phase C** (remove sources + unmark seen markers). If Phase A or B fails for any reason (BLAKE3 mismatch, FS error, manifest rename failure), Phase C is skipped and the state-dir is byte-identical to pre-apply. The quarantine subtree under `<plan_id>/` may contain partial body copies; the operator deletes it and re-runs the apply.
 
-A successful apply leaves a byte-identical copy of every tier-B source at `<quarantine-dir>/<plan_id>/<source_relative>` together with a `quarantine-manifest.json` listing every entry's BLAKE3 + bytes. To restore a single body, copy it back into the state-dir at the listed `source_relative` path manually (`cp`). Stage 12.15 `restore-session-archive` does **not** consume a quarantine manifest in v1 — its manifest schema is `ArchiveManifest`, not `QuarantineManifest`.
+A successful apply leaves a byte-identical copy of every tier-B source at `<quarantine-dir>/<plan_id>/<source_relative>` together with a `quarantine-manifest.json` listing every entry's BLAKE3 + bytes. For first-class rollback, see the **Stage 12.18 cleanup-quarantine restore** section below. Stage 12.15 `restore-session-archive` does **not** consume a quarantine manifest — its manifest schema is `ArchiveManifest`, not `QuarantineManifest`.
 
 **Defaults are safe-by-default.** Both commands open the state-store with `auto_prune = false` unconditionally — there is no `--no-prune-state-on-start` flag on either command (the Stage 12.16 review-fix precedent). The `--quarantine-dir` flag is *required* even for tier-A-only plans so a plan-id directory is always pinned consistently (no manifest is written when no bytes are quarantined).
 
 **No protocol surface touched.** No envelope, no canonical-byte changes, no `STATE_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
+
+### Stage 12.18 — local cleanup-quarantine restore
+
+**Use when:** Stage 12.17 cleanup ran (intentionally or by mistake) and you want to undo it bit-for-bit. The Stage 12.18 command consumes the `quarantine-manifest.json` Stage 12.17 wrote and reverses every body removal + (by default) every seen-marker unmark. Tier-A actions (`RemoveSeenMarker` / `WriteSeenMarker` / `RemoveSeenFile`) and `--purge-stray` entries are NOT recoverable from the manifest — operator re-runs the watcher or `mark_seen` manually for those.
+
+**Workflow (the rollback loop):**
+
+```sh
+# 1. Inspect: parse + path-check the manifest only.
+omni-node operator contributor restore-state-cleanup-quarantine \
+  --contributor-state-dir <state> \
+  --quarantine-plan-dir /var/lib/omni-node/quarantine/<plan_id> \
+  --dry-run
+
+# 2. Verify-only: BLAKE3 every quarantined byte against the
+#    manifest. Catches bit-rot before any state-dir write.
+omni-node operator contributor restore-state-cleanup-quarantine \
+  --contributor-state-dir <state> \
+  --quarantine-plan-dir /var/lib/omni-node/quarantine/<plan_id> \
+  --verify-only
+
+# 3. Real restore. Tier-B bodies go back to their state-dir
+#    paths AND matching seen markers are written by default.
+omni-node operator contributor restore-state-cleanup-quarantine \
+  --contributor-state-dir <state> \
+  --quarantine-plan-dir /var/lib/omni-node/quarantine/<plan_id>
+
+# 4. Confirm with state-integrity. Pre-cleanup findings are
+#    expected to re-appear (cleanup undid them; restore put
+#    them back).
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state>
+```
+
+**Source-form options:**
+
+- `--quarantine-plan-dir /path/to/<plan_id>` — direct path to the `<plan_id>` subdirectory.
+- `--quarantine-dir /var/lib/omni-node/quarantine --plan-id <hex16>` — paired form, useful when scripting against a known quarantine root. Clap enforces that `--quarantine-dir` requires `--plan-id`.
+
+**Optional flags:**
+
+- `--overwrite-existing` — by default, any pre-existing destination refuses the whole restore (`DestinationExists`). With this flag, every destination is overwritten verbatim.
+- `--no-restore-seen-markers` — restore only the verified bodies; skip writing the seen markers. Useful when you want the watcher to re-process announcements after the restore.
+- `--allow-restore-orphan-assignments` — required to restore any entry whose `source_finding_kind == "orphan_replacement_assignments"`. Restoring re-introduces the Phase-B leftover that integrity-scan will detect; opt-in mirrors Stage 12.17's `--allow-orphan-assignments`.
+
+**Refusal modes (typed `QuarantineRestoreError`):**
+
+- `QuarantineDirNotFound { path }` → bad `--quarantine-plan-dir` / wrong `--plan-id`.
+- `ManifestMissing { path }` → quarantine dir exists but `quarantine-manifest.json` is gone. Usually means Stage 12.17 apply crashed between Phase A and Phase B; nothing to restore.
+- `MalformedManifest { path }` → manifest JSON is broken. Hand-edited or corrupted.
+- `UnsupportedManifestVersion { got, expected }` → manifest came from a future stage; v1 binary refuses.
+- `IncompatibleSourceStateVersion { manifest, current }` → quarantine was produced against a different `STATE_VERSION`. Strict equality; no migration story.
+- `PlanIdMismatch { manifest_plan_id, supplied_plan_id }` → quarantine dir was renamed. Re-supply the correct name OR use the `--quarantine-dir + --plan-id` paired form.
+- `UnsafeRelativePath { path, reason }` → manifest contains a `..` / absolute / backslash / out-of-whitelist path. Refused BEFORE any IO.
+- `ManifestFileMissing { path }` → manifest names a body that's not on disk. Likely a partial copy.
+- `BlakeMismatch { path, expected, got }` → bit-rot in the quarantine subtree. Re-pull from a durable backup or accept the loss.
+- `DestinationExists { path }` → state-dir already has a file at the restore path. Re-run with `--overwrite-existing`.
+- `SeenMarkerPathBlocked { path, reason }` → the seen-marker destination is occupied by a directory (or other non-file). Refused BEFORE any body write so the state-dir is byte-identical to pre-restore. Manually clear the marker path, or pass `--no-restore-seen-markers` to skip marker restoration entirely. `--overwrite-existing` does NOT cover this.
+- `GatedRestoreRequired { kind, flag }` → operator missed `--allow-restore-orphan-assignments` for an orphan entry.
+- `UnknownFindingKind { kind }` → manifest carries a `source_finding_kind` outside the Stage 12.17 closed set. Refused for forward-incompatibility safety.
+
+**Rollback hash invariant:**
+
+When `--no-restore-seen-markers` is NOT passed AND the original cleanup plan contained ONLY tier-B actions (no tier-A), the post-restore `source_integrity_hash` exactly equals the pre-cleanup hash. The restore is a bit-exact undo. Plans containing tier-A actions are partially un-restorable by design — those operations carried no payload to quarantine.
+
+**Defaults are safe-by-default.** Auto-prune is forced OFF unconditionally; the `--no-prune-state-on-start` flag is deliberately absent (Stage 12.16/12.17 precedent). The quarantine subtree is **left intact** after the restore — you manage retention manually.
+
+**No protocol surface touched.** No envelope, no canonical-byte changes, no `STATE_VERSION` / `QUARANTINE_MANIFEST_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.

@@ -1157,3 +1157,469 @@ fn blake3_hex_of(bytes: &[u8]) -> String {
     }
     s
 }
+
+// ── Stage 12.18 — cleanup-quarantine restore ──────────────────
+//
+// Consumes the v1 `QuarantineManifest` Stage 12.17 wrote in
+// Phase B and undoes the cleanup that produced it. Tier-A
+// actions had no payload to quarantine and are deliberately
+// not recoverable (documented gap). Tier-B `--purge-stray`
+// entries are also unrecoverable for the same reason.
+
+use crate::error::QuarantineRestoreError;
+
+/// Closed source for [`restore_state_cleanup_quarantine`]. The
+/// CLI accepts `--quarantine-plan-dir` xor
+/// (`--quarantine-dir + --plan-id`); both shapes resolve to a
+/// concrete `<plan_id>` directory on disk + an authoritative
+/// expected `plan_id` for manifest pinning.
+#[derive(Debug, Clone, Copy)]
+pub enum QuarantineRestoreSource<'a> {
+    /// Direct path to `<quarantine-dir>/<plan_id>/`. The
+    /// directory's basename is the authoritative `plan_id`
+    /// expectation.
+    PlanDir(&'a Path),
+    /// Paired form: `<quarantine-dir>` + `<plan_id>`.
+    QuarantineRoot {
+        quarantine_dir: &'a Path,
+        plan_id: &'a str,
+    },
+}
+
+impl<'a> QuarantineRestoreSource<'a> {
+    pub fn plan_dir(&self) -> PathBuf {
+        match self {
+            Self::PlanDir(p) => p.to_path_buf(),
+            Self::QuarantineRoot {
+                quarantine_dir,
+                plan_id,
+            } => quarantine_dir.join(plan_id),
+        }
+    }
+
+    pub fn expected_plan_id(&self) -> Option<String> {
+        match self {
+            Self::PlanDir(p) => p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string()),
+            Self::QuarantineRoot { plan_id, .. } => Some((*plan_id).to_string()),
+        }
+    }
+}
+
+/// Stage 12.18 restore options. Mirrors Stage 12.15
+/// `RestoreOptions` shape (closed mode matrix; `verify_only`
+/// wins when both `dry_run` and `verify_only` are set).
+#[derive(Debug, Clone)]
+pub struct QuarantineRestoreOptions<'a> {
+    pub source: QuarantineRestoreSource<'a>,
+    pub dry_run: bool,
+    pub verify_only: bool,
+    pub overwrite_existing: bool,
+    /// Default `true` — restore seen markers for entries
+    /// whose `source_finding_kind` proves a marker was
+    /// unmarked.
+    pub restore_seen_markers: bool,
+    /// Gate for `orphan_replacement_assignments` entries.
+    pub allow_restore_orphan_assignments: bool,
+    pub now_utc: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineRestoreOutcome {
+    pub entry_index: u32,
+    pub source_relative: String,
+    pub source_finding_kind: String,
+    /// `"applied"` / `"would_apply"` / `"verify_only"`. Closed.
+    pub status: String,
+    pub seen_marker_written: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineRestoreReport {
+    pub plan_id: String,
+    pub mode: String,
+    pub manifest_schema_version: u32,
+    pub source_state_version: u32,
+    pub files_restored: u32,
+    pub seen_markers_restored: u32,
+    pub bytes_restored: u64,
+    pub quarantine_dir: String,
+    pub outcomes: Vec<QuarantineRestoreOutcome>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RestoreClassification {
+    restores_seen_marker: bool,
+    gate: Option<&'static str>,
+}
+
+/// Closed set of `CleanupAction::source_finding_kind` tags the
+/// Stage 12.17 planner emits.
+fn classify_finding_kind(tag: &str) -> Option<RestoreClassification> {
+    match tag {
+        "stray_verified_file" => Some(RestoreClassification {
+            restores_seen_marker: false,
+            gate: None,
+        }),
+        "invalid_join" | "invalid_assignment" | "invalid_partial"
+        | "invalid_supersession" => Some(RestoreClassification {
+            restores_seen_marker: true,
+            gate: None,
+        }),
+        "orphan_replacement_assignments" => Some(RestoreClassification {
+            restores_seen_marker: true,
+            gate: Some("--allow-restore-orphan-assignments"),
+        }),
+        _ => None,
+    }
+}
+
+/// Parse + validate `quarantine-manifest.json` only. Used as a
+/// stand-alone helper AND as the first step of
+/// [`restore_state_cleanup_quarantine`].
+pub fn verify_quarantine_manifest(
+    source: &QuarantineRestoreSource<'_>,
+) -> Result<QuarantineManifest, QuarantineRestoreError> {
+    let plan_dir = source.plan_dir();
+    if !plan_dir.exists() {
+        return Err(QuarantineRestoreError::QuarantineDirNotFound { path: plan_dir });
+    }
+    let manifest_path = plan_dir.join("quarantine-manifest.json");
+    if !manifest_path.is_file() {
+        return Err(QuarantineRestoreError::ManifestMissing { path: manifest_path });
+    }
+    let bytes = std::fs::read(&manifest_path).map_err(|e| {
+        QuarantineRestoreError::Io {
+            path: manifest_path.clone(),
+            source: e,
+        }
+    })?;
+    let manifest: QuarantineManifest = serde_json::from_slice(&bytes).map_err(|e| {
+        QuarantineRestoreError::MalformedManifest {
+            path: manifest_path.clone(),
+            source: e,
+        }
+    })?;
+    if manifest.schema_version != QUARANTINE_MANIFEST_SCHEMA_VERSION {
+        return Err(QuarantineRestoreError::UnsupportedManifestVersion {
+            got: manifest.schema_version,
+            expected: QUARANTINE_MANIFEST_SCHEMA_VERSION,
+        });
+    }
+    if manifest.source_state_version != STATE_VERSION {
+        return Err(QuarantineRestoreError::IncompatibleSourceStateVersion {
+            manifest: manifest.source_state_version,
+            current: STATE_VERSION,
+        });
+    }
+    if let Some(expected) = source.expected_plan_id() {
+        if manifest.plan_id != expected {
+            return Err(QuarantineRestoreError::PlanIdMismatch {
+                manifest_plan_id: manifest.plan_id.clone(),
+                supplied_plan_id: expected,
+            });
+        }
+    }
+    Ok(manifest)
+}
+
+/// Run the quarantine restore. Five explicit phases — A, B,
+/// then C split into C1/C2/C3:
+///
+/// - **Phase A** — parse + validate the manifest, path-check
+///   every entry, classify each `source_finding_kind` against
+///   the closed set, refuse any unknown tag with
+///   [`QuarantineRestoreError::UnknownFindingKind`], refuse any
+///   gated entry whose flag wasn't passed with
+///   [`QuarantineRestoreError::GatedRestoreRequired`]. NO file
+///   reads, NO writes.
+/// - **Phase B** — when `verify_only || !dry_run`, read each
+///   quarantine file and BLAKE3-verify it against the manifest.
+/// - **Phase C1** — body destination preflight. All-or-nothing:
+///   any pre-existing body destination refuses the whole
+///   restore with [`QuarantineRestoreError::DestinationExists`]
+///   unless `overwrite_existing == true`.
+/// - **Phase C2** — Stage 12.18 review fix — seen-marker
+///   destination preflight. For every entry whose
+///   `source_finding_kind` would restore a marker, the
+///   `seen/<ns>/<key>` path is checked: any non-file occupant
+///   (typically a directory) refuses the whole restore with
+///   [`QuarantineRestoreError::SeenMarkerPathBlocked`] BEFORE
+///   any body is written. `--overwrite-existing` does NOT cover
+///   marker hazards — the preflight is unconditional whenever
+///   `restore_seen_markers == true`. This preserves the
+///   all-or-nothing invariant even when the operator-visible
+///   marker side of the restore is at risk.
+/// - **Phase C3** — writes. Each body lands via
+///   `store.write_archived_bytes` (which independently
+///   re-validates the path against the Stage 12.14 archive
+///   whitelist) and (when `restore_seen_markers`) the matching
+///   `seen/<ns>/<key>` marker lands via `store.mark_seen`.
+///
+/// Per-action gating: an entry tagged
+/// `orphan_replacement_assignments` requires
+/// `allow_restore_orphan_assignments = true` at Phase A.
+/// Partial entries (`invalid_partial`) have no extra gate in
+/// v1.
+pub fn restore_state_cleanup_quarantine(
+    store: &ContributorStateStore,
+    opts: &QuarantineRestoreOptions<'_>,
+) -> Result<QuarantineRestoreReport, QuarantineRestoreError> {
+    let manifest = verify_quarantine_manifest(&opts.source)?;
+    let plan_dir = opts.source.plan_dir();
+
+    let mode = if opts.verify_only {
+        "verify_only"
+    } else if opts.dry_run {
+        "dry_run"
+    } else {
+        "restore"
+    };
+
+    // ── Phase A — per-entry path + finding-kind validation ──
+    for entry in &manifest.files {
+        check_quarantine_relative_path(&entry.source_relative)?;
+        check_quarantine_relative_path(&entry.quarantine_relative)?;
+        let classification = classify_finding_kind(&entry.source_finding_kind)
+            .ok_or_else(|| QuarantineRestoreError::UnknownFindingKind {
+                kind: entry.source_finding_kind.clone(),
+            })?;
+        if let Some(flag) = classification.gate {
+            let allowed = match entry.source_finding_kind.as_str() {
+                "orphan_replacement_assignments" => {
+                    opts.allow_restore_orphan_assignments
+                }
+                _ => false,
+            };
+            if !allowed {
+                return Err(QuarantineRestoreError::GatedRestoreRequired {
+                    kind: "orphan_replacement_assignments",
+                    flag,
+                });
+            }
+        }
+    }
+
+    // ── Phase B — BLAKE3 verify (verify-only or real restore) ──
+    let mut prepared: Vec<(usize, Vec<u8>)> = Vec::new();
+    if opts.verify_only || !opts.dry_run {
+        for (idx, entry) in manifest.files.iter().enumerate() {
+            let quarantine_path = plan_dir.join(&entry.quarantine_relative);
+            if !quarantine_path.is_file() {
+                return Err(QuarantineRestoreError::ManifestFileMissing {
+                    path: quarantine_path,
+                });
+            }
+            let bytes = std::fs::read(&quarantine_path).map_err(|e| {
+                QuarantineRestoreError::Io {
+                    path: quarantine_path.clone(),
+                    source: e,
+                }
+            })?;
+            let got = blake3_hex_of(&bytes);
+            if got != entry.blake3_hex {
+                return Err(QuarantineRestoreError::BlakeMismatch {
+                    path: quarantine_path,
+                    expected: entry.blake3_hex.clone(),
+                    got,
+                });
+            }
+            if !opts.verify_only {
+                prepared.push((idx, bytes));
+            }
+        }
+    }
+
+    // ── Phase C — destination preflight + write ─────────────
+    let mut files_restored = 0u32;
+    let mut bytes_restored = 0u64;
+    let mut seen_markers_restored = 0u32;
+    let mut outcomes: Vec<QuarantineRestoreOutcome> =
+        Vec::with_capacity(manifest.files.len());
+
+    if matches!(mode, "dry_run" | "verify_only") {
+        for (idx, entry) in manifest.files.iter().enumerate() {
+            let status = if opts.verify_only {
+                "verify_only"
+            } else {
+                "would_apply"
+            };
+            outcomes.push(QuarantineRestoreOutcome {
+                entry_index: idx as u32,
+                source_relative: entry.source_relative.clone(),
+                source_finding_kind: entry.source_finding_kind.clone(),
+                status: status.to_string(),
+                seen_marker_written: false,
+            });
+        }
+        return Ok(QuarantineRestoreReport {
+            plan_id: manifest.plan_id,
+            mode: mode.to_string(),
+            manifest_schema_version: manifest.schema_version,
+            source_state_version: manifest.source_state_version,
+            files_restored,
+            seen_markers_restored,
+            bytes_restored,
+            quarantine_dir: plan_dir.to_string_lossy().replace('\\', "/"),
+            outcomes,
+        });
+    }
+
+    // ── Phase C1 — body destination preflight ─────────────
+    // All-or-nothing: any pre-existing destination refuses
+    // the whole restore (unless `overwrite_existing`).
+    if !opts.overwrite_existing {
+        for entry in &manifest.files {
+            let dest = store.root().join(&entry.source_relative);
+            if dest.exists() {
+                return Err(QuarantineRestoreError::DestinationExists { path: dest });
+            }
+        }
+    }
+
+    // ── Phase C2 — seen-marker destination preflight ──────
+    //
+    // Stage 12.18 review fix: marker writes used to happen
+    // after each body write, so a marker hazard (typically a
+    // directory at the seen path) could fail AFTER one or
+    // more bodies had already landed in the state-dir,
+    // breaking the all-or-nothing rollback story. The
+    // preflight here runs BEFORE any body write and refuses
+    // with `SeenMarkerPathBlocked` if any marker destination
+    // is occupied by a non-file. An existing regular file at
+    // the marker path is FINE — `mark_seen` is idempotent
+    // (treats `AlreadyExists` as success).
+    if opts.restore_seen_markers {
+        for entry in &manifest.files {
+            let classification = classify_finding_kind(&entry.source_finding_kind)
+                .expect("validated in Phase A");
+            if !classification.restores_seen_marker {
+                continue;
+            }
+            let seen_rel = match seen_for_verified(&entry.source_relative) {
+                Some(s) => s,
+                None => continue,
+            };
+            let marker_path = store.root().join(&seen_rel);
+            if marker_path.exists() && !marker_path.is_file() {
+                return Err(QuarantineRestoreError::SeenMarkerPathBlocked {
+                    path: marker_path,
+                    reason: "destination is not a regular file",
+                });
+            }
+        }
+    }
+
+    // ── Phase C3 — writes (bodies, then matching markers) ──
+    for (idx, bytes) in prepared {
+        let entry = &manifest.files[idx];
+        store.write_archived_bytes(
+            &entry.source_relative,
+            &bytes,
+            opts.overwrite_existing,
+        )?;
+        files_restored += 1;
+        bytes_restored += entry.bytes;
+
+        let classification = classify_finding_kind(&entry.source_finding_kind)
+            .expect("validated in Phase A");
+        let mut seen_marker_written = false;
+        if opts.restore_seen_markers && classification.restores_seen_marker {
+            if let Some(seen_rel) = seen_for_verified(&entry.source_relative) {
+                if let Some((ns, key)) = parse_seen_relative(&seen_rel) {
+                    store.mark_seen(ns, &key)?;
+                    seen_marker_written = true;
+                    seen_markers_restored += 1;
+                }
+            }
+        }
+
+        outcomes.push(QuarantineRestoreOutcome {
+            entry_index: idx as u32,
+            source_relative: entry.source_relative.clone(),
+            source_finding_kind: entry.source_finding_kind.clone(),
+            status: "applied".to_string(),
+            seen_marker_written,
+        });
+    }
+
+    Ok(QuarantineRestoreReport {
+        plan_id: manifest.plan_id,
+        mode: mode.to_string(),
+        manifest_schema_version: manifest.schema_version,
+        source_state_version: manifest.source_state_version,
+        files_restored,
+        seen_markers_restored,
+        bytes_restored,
+        quarantine_dir: plan_dir.to_string_lossy().replace('\\', "/"),
+        outcomes,
+    })
+}
+
+/// Per-path whitelist: every `source_relative` and
+/// `quarantine_relative` must shape-match
+/// `verified/sessions/<64hex>/...` — the only target subtree
+/// Stage 12.17 cleanup ever quarantines.
+fn check_quarantine_relative_path(rel: &str) -> Result<(), QuarantineRestoreError> {
+    if rel.is_empty() {
+        return Err(QuarantineRestoreError::UnsafeRelativePath {
+            path: rel.to_string(),
+            reason: "empty path",
+        });
+    }
+    if rel.starts_with('/') {
+        return Err(QuarantineRestoreError::UnsafeRelativePath {
+            path: rel.to_string(),
+            reason: "absolute path",
+        });
+    }
+    if rel.contains('\\') {
+        return Err(QuarantineRestoreError::UnsafeRelativePath {
+            path: rel.to_string(),
+            reason: "backslash separator",
+        });
+    }
+    if rel.starts_with("./") || rel.contains("/./") || rel.ends_with("/.") {
+        return Err(QuarantineRestoreError::UnsafeRelativePath {
+            path: rel.to_string(),
+            reason: "dot path segment",
+        });
+    }
+    for segment in rel.split('/') {
+        if segment.is_empty() {
+            return Err(QuarantineRestoreError::UnsafeRelativePath {
+                path: rel.to_string(),
+                reason: "empty path segment",
+            });
+        }
+        if segment == ".." {
+            return Err(QuarantineRestoreError::UnsafeRelativePath {
+                path: rel.to_string(),
+                reason: "parent-directory traversal",
+            });
+        }
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    let ok = matches!(
+        parts.as_slice(),
+        ["verified", "sessions", sid, rest @ ..]
+            if is_64_hex_lower(sid)
+                && !rest.is_empty()
+                && rest.iter().all(|s| !s.is_empty())
+    );
+    if !ok {
+        return Err(QuarantineRestoreError::UnsafeRelativePath {
+            path: rel.to_string(),
+            reason: "path outside verified/sessions/<64hex>/... whitelist",
+        });
+    }
+    Ok(())
+}
+
+fn is_64_hex_lower(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}

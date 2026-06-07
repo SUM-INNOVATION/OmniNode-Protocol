@@ -74,8 +74,9 @@ pub mod watch;
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
     ArchiveError, CanonicalError, CleanupError, ContributorError, DiscoverError,
-    IntegrityError, PlannerError, RelayError, RepairError, RestoreError, RunnerError,
-    SchemaError, SigningError, SnipError, StatusError, VerifyError,
+    IntegrityError, PlannerError, QuarantineRestoreError, RelayError, RepairError,
+    RestoreError, RunnerError, SchemaError, SigningError, SnipError, StatusError,
+    VerifyError,
 };
 pub use repair::{
     build_session_repair_plan, build_session_repair_plan_with_reason,
@@ -110,10 +111,12 @@ pub use integrity::{
 };
 pub use cleanup::{
     apply_state_cleanup, cleanup_plan_hash_hex, plan_state_cleanup,
-    source_integrity_hash_hex, ApplyOptions as CleanupApplyOptions, CleanupAction,
+    restore_state_cleanup_quarantine, source_integrity_hash_hex,
+    verify_quarantine_manifest, ApplyOptions as CleanupApplyOptions, CleanupAction,
     CleanupActionKind, CleanupActionOutcome, CleanupReport,
     PlanOptions as CleanupPlanOptions, QuarantineEntry, QuarantineManifest,
-    StateCleanupPlan, CLEANUP_PLAN_SCHEMA_VERSION,
+    QuarantineRestoreOptions, QuarantineRestoreOutcome, QuarantineRestoreReport,
+    QuarantineRestoreSource, StateCleanupPlan, CLEANUP_PLAN_SCHEMA_VERSION,
     QUARANTINE_MANIFEST_SCHEMA_VERSION,
 };
 pub use planner::{
