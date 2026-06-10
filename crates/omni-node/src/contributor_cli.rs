@@ -258,6 +258,17 @@ enum ContributorCmd {
     /// intact** — operator manages retention. No chain / mesh /
     /// SNIP / envelope surface touched.
     RestoreStateCleanupQuarantine(RestoreStateCleanupQuarantineArgs),
+
+    /// Stage 12.19 — compare two `StateIntegrityReport` JSON
+    /// snapshots and emit a typed `StateIntegrityDiffReport`
+    /// classifying each finding as `new`, `resolved`, or
+    /// `unchanged`. Read-only: no state-store is opened, no
+    /// state-dir bytes are written. The two inputs may come
+    /// from any host as long as their `state_version`
+    /// matches; `--require-state-dir-match` opts in to host
+    /// pinning. No chain / mesh / SNIP / envelope surface
+    /// touched.
+    StateIntegrityDiff(StateIntegrityDiffArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2221,6 +2232,43 @@ struct StateIntegrityArgs {
     /// Operators who treat every warn as a CI failure can opt in.
     #[arg(long, default_value_t = false)]
     fail_on_warn: bool,
+
+    /// Stage 12.19 — diff the LIVE scan against the supplied
+    /// baseline v1 `StateIntegrityReport` JSON. When set, the
+    /// command switches to rendering the diff (not the raw
+    /// report). `--format`, `--json-out`, and the new
+    /// `--fail-on-new` / `--fail-on-new-error` flags then apply
+    /// to the diff output.
+    #[arg(long)]
+    baseline: Option<PathBuf>,
+
+    /// Stage 12.19 — exit 1 when the live scan diff against
+    /// `--baseline` shows ANY new finding (regardless of
+    /// severity). Composes with `--fail-on-warn`: any one
+    /// tripping → exit 1.
+    #[arg(long, default_value_t = false)]
+    fail_on_new: bool,
+
+    /// Stage 12.19 — exit 1 when the live scan diff against
+    /// `--baseline` shows any NEW `error`-severity finding. Less
+    /// strict than `--fail-on-new` — new `warn` findings stay
+    /// green. Recommended CI mode.
+    #[arg(long, default_value_t = false)]
+    fail_on_new_error: bool,
+
+    /// Stage 12.19 — when used with `--baseline`, omit
+    /// `unchanged_findings` from the rendered output. The
+    /// underlying `StateIntegrityDiffReport` still carries
+    /// every finding; `--summary-only` is a presentation flag.
+    #[arg(long, default_value_t = false)]
+    summary_only: bool,
+
+    /// Stage 12.19 — when used with `--baseline`, refuse the
+    /// diff if `baseline.state_dir != current.state_dir`.
+    /// Default OFF — CI baselines are commonly captured on a
+    /// different host than the prod state-dir.
+    #[arg(long, default_value_t = false)]
+    require_state_dir_match: bool,
 }
 
 // ── Stage 12.17 — plan-state-cleanup ──────────────────────────────────────
@@ -2415,6 +2463,78 @@ struct RestoreStateCleanupQuarantineArgs {
     format: RestoreQuarantineFormat,
 }
 
+// ── Stage 12.19 — state-integrity-diff ───────────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum StateIntegrityDiffFormat {
+    /// Per-finding `event=integrity_diff_new` /
+    /// `event=integrity_diff_resolved` / (when not
+    /// `--summary-only`) `event=integrity_diff_unchanged`
+    /// lines + a final `event=state_integrity_diff_summary`
+    /// line. Default.
+    Events,
+    /// Print the full `StateIntegrityDiffReport` as pretty
+    /// JSON on stdout. Operational chatter goes to stderr so
+    /// `jq` works directly.
+    Json,
+    /// Compact terminal-friendly summary + per-bucket
+    /// sections.
+    Pretty,
+}
+
+#[derive(Args)]
+struct StateIntegrityDiffArgs {
+    /// Path to the baseline v1 `StateIntegrityReport` JSON
+    /// (typically produced by an earlier
+    /// `state-integrity --json-out`).
+    #[arg(long)]
+    baseline: PathBuf,
+
+    /// Path to the current v1 `StateIntegrityReport` JSON to
+    /// compare against the baseline.
+    #[arg(long)]
+    current: PathBuf,
+
+    /// Refuse the diff if
+    /// `baseline.state_dir != current.state_dir`. Default OFF
+    /// — CI baselines are commonly captured on a different
+    /// host than the prod state-dir.
+    #[arg(long, default_value_t = false)]
+    require_state_dir_match: bool,
+
+    /// Exit 1 when the diff shows ANY new finding regardless
+    /// of severity. Composes with `--fail-on-new-error`.
+    #[arg(long, default_value_t = false)]
+    fail_on_new: bool,
+
+    /// Exit 1 when the diff shows any NEW `error`-severity
+    /// finding. Recommended CI mode. Composes with
+    /// `--fail-on-new`.
+    #[arg(long, default_value_t = false)]
+    fail_on_new_error: bool,
+
+    /// Omit `unchanged_findings` from the rendered output.
+    /// The underlying `StateIntegrityDiffReport` still
+    /// carries every finding; `--summary-only` is a
+    /// presentation flag.
+    #[arg(long, default_value_t = false)]
+    summary_only: bool,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = StateIntegrityDiffFormat::Events
+    )]
+    format: StateIntegrityDiffFormat,
+
+    /// Optional path to mirror the diff report JSON
+    /// (best-effort `std::fs::write`; failure here logs a
+    /// stderr warning and does not change the exit code).
+    #[arg(long)]
+    json_out: Option<PathBuf>,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -2453,6 +2573,7 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::RestoreStateCleanupQuarantine(a) => {
             run_restore_state_cleanup_quarantine(a)
         }
+        ContributorCmd::StateIntegrityDiff(a) => run_state_integrity_diff(a),
     }
 }
 
@@ -7255,6 +7376,32 @@ mod tests {
         let with_strict = parse_state_integrity(&["--fail-on-warn"]);
         assert!(with_strict.fail_on_warn);
 
+        // Stage 12.19 — new `--baseline`, `--fail-on-new`,
+        // `--fail-on-new-error`, `--summary-only`,
+        // `--require-state-dir-match` flags parse cleanly and
+        // default off.
+        assert!(defaults.baseline.is_none());
+        assert!(!defaults.fail_on_new);
+        assert!(!defaults.fail_on_new_error);
+        assert!(!defaults.summary_only);
+        assert!(!defaults.require_state_dir_match);
+        let with_diff = parse_state_integrity(&[
+            "--baseline",
+            "/tmp/baseline.json",
+            "--fail-on-new",
+            "--fail-on-new-error",
+            "--summary-only",
+            "--require-state-dir-match",
+        ]);
+        assert_eq!(
+            with_diff.baseline.as_deref(),
+            Some(std::path::Path::new("/tmp/baseline.json"))
+        );
+        assert!(with_diff.fail_on_new);
+        assert!(with_diff.fail_on_new_error);
+        assert!(with_diff.summary_only);
+        assert!(with_diff.require_state_dir_match);
+
         // Stage 12.16 review fix: the `--no-prune-state-on-start`
         // flag is deliberately ABSENT. The scanner is read-only,
         // so it always opens with auto-prune off; surfacing a
@@ -7281,6 +7428,129 @@ mod tests {
             "yaml",
         ]);
         assert!(bad.is_err(), "clap must reject unknown --format value");
+    }
+
+    // ── Stage 12.19 — state-integrity-diff clap regression ──
+
+    fn parse_state_integrity_diff(extra: &[&str]) -> StateIntegrityDiffArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "state-integrity-diff".into(),
+            "--baseline".into(),
+            "/tmp/baseline.json".into(),
+            "--current".into(),
+            "/tmp/current.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::StateIntegrityDiff(a) => a,
+            _ => panic!("expected StateIntegrityDiff"),
+        }
+    }
+
+    #[test]
+    fn state_integrity_diff_flag_parse_smoke() {
+        let defaults = parse_state_integrity_diff(&[]);
+        assert_eq!(
+            defaults.baseline,
+            std::path::PathBuf::from("/tmp/baseline.json")
+        );
+        assert_eq!(
+            defaults.current,
+            std::path::PathBuf::from("/tmp/current.json")
+        );
+        assert!(!defaults.require_state_dir_match);
+        assert!(!defaults.fail_on_new);
+        assert!(!defaults.fail_on_new_error);
+        assert!(!defaults.summary_only);
+        assert_eq!(defaults.format, StateIntegrityDiffFormat::Events);
+        assert!(defaults.json_out.is_none());
+
+        // --require-state-dir-match / --fail-on-new /
+        // --fail-on-new-error / --summary-only toggles.
+        let toggled = parse_state_integrity_diff(&[
+            "--require-state-dir-match",
+            "--fail-on-new",
+            "--fail-on-new-error",
+            "--summary-only",
+        ]);
+        assert!(toggled.require_state_dir_match);
+        assert!(toggled.fail_on_new);
+        assert!(toggled.fail_on_new_error);
+        assert!(toggled.summary_only);
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", StateIntegrityDiffFormat::Events),
+            ("json", StateIntegrityDiffFormat::Json),
+            ("pretty", StateIntegrityDiffFormat::Pretty),
+        ] {
+            let got = parse_state_integrity_diff(&["--format", raw]);
+            assert_eq!(got.format, *expected);
+        }
+
+        // --json-out PATH.
+        let with_json =
+            parse_state_integrity_diff(&["--json-out", "/tmp/d.json"]);
+        assert_eq!(
+            with_json.json_out.as_deref(),
+            Some(std::path::Path::new("/tmp/d.json"))
+        );
+
+        // Required-flag refusals: missing --baseline OR --current.
+        let no_baseline = TestRoot::try_parse_from(&[
+            "omni-node",
+            "state-integrity-diff",
+            "--current",
+            "/tmp/c.json",
+        ]);
+        assert!(
+            no_baseline.is_err(),
+            "clap must reject state-integrity-diff without --baseline"
+        );
+        let no_current = TestRoot::try_parse_from(&[
+            "omni-node",
+            "state-integrity-diff",
+            "--baseline",
+            "/tmp/b.json",
+        ]);
+        assert!(
+            no_current.is_err(),
+            "clap must reject state-integrity-diff without --current"
+        );
+
+        // Stage 12.16/12.17 precedent: --no-prune-state-on-start
+        // is deliberately absent. (state-integrity-diff doesn't
+        // open a state-store at all; the flag would be misleading.)
+        let no_such_flag = TestRoot::try_parse_from(&[
+            "omni-node",
+            "state-integrity-diff",
+            "--baseline",
+            "/tmp/b.json",
+            "--current",
+            "/tmp/c.json",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "state-integrity-diff must not accept --no-prune-state-on-start"
+        );
+
+        // Unknown --format value rejected.
+        let bad_format = TestRoot::try_parse_from(&[
+            "omni-node",
+            "state-integrity-diff",
+            "--baseline",
+            "/tmp/b.json",
+            "--current",
+            "/tmp/c.json",
+            "--format",
+            "yaml",
+        ]);
+        assert!(bad_format.is_err(), "clap must reject unknown --format");
     }
 
     // ── Stage 12.17 — plan-state-cleanup / apply-state-cleanup ──
@@ -9451,6 +9721,23 @@ fn run_state_integrity(args: StateIntegrityArgs) -> Result<()> {
     let report = scan_state_integrity(&store, &opts)
         .map_err(|e| anyhow!("state-integrity scan refused: {e}"))?;
 
+    // Stage 12.19 — when `--baseline` is set, switch to diff
+    // mode: read the baseline JSON, diff against the live
+    // scan, render the diff (not the raw report), apply diff
+    // exit-code policy. `--format` / `--json-out` apply to the
+    // diff output. `--fail-on-warn` still applies to the live
+    // scan's counts and composes with the diff exit flags via
+    // OR — any one tripping → exit 1.
+    if let Some(baseline_path) = args.baseline.as_deref() {
+        return run_state_integrity_baseline_diff(
+            &args,
+            &report,
+            baseline_path,
+            &now_utc,
+            log_op,
+        );
+    }
+
     match args.format {
         StateIntegrityFormat::Events => render_state_integrity_events(&report),
         StateIntegrityFormat::Json => render_state_integrity_json(&report)?,
@@ -9499,6 +9786,74 @@ fn run_state_integrity(args: StateIntegrityArgs) -> Result<()> {
             } else {
                 "counts_error > 0"
             }
+        ));
+    }
+    Ok(())
+}
+
+/// Stage 12.19 — live-scan-vs-baseline branch of
+/// `run_state_integrity`. Called when `args.baseline.is_some()`.
+fn run_state_integrity_baseline_diff(
+    args: &StateIntegrityArgs,
+    current_report: &omni_contributor::StateIntegrityReport,
+    baseline_path: &std::path::Path,
+    now_utc: &str,
+    log_op: impl Fn(&str),
+) -> Result<()> {
+    use omni_contributor::{
+        diff_state_integrity_reports, DiffOptions, StateIntegrityReport,
+    };
+
+    let baseline_bytes = std::fs::read(baseline_path).with_context(|| {
+        format!("read baseline json: {}", baseline_path.display())
+    })?;
+    let baseline: StateIntegrityReport = serde_json::from_slice(&baseline_bytes)
+        .with_context(|| {
+            format!("parse baseline json: {}", baseline_path.display())
+        })?;
+
+    let diff_opts = DiffOptions {
+        now_utc,
+        require_state_dir_match: args.require_state_dir_match,
+    };
+    let diff = diff_state_integrity_reports(&baseline, current_report, &diff_opts)
+        .map_err(|e| anyhow!("state-integrity --baseline refused: {e}"))?;
+
+    match args.format {
+        StateIntegrityFormat::Events => {
+            render_state_integrity_diff_events(&diff, args.summary_only)
+        }
+        StateIntegrityFormat::Json => {
+            render_state_integrity_diff_json(&diff, args.summary_only)?
+        }
+        StateIntegrityFormat::Pretty => {
+            render_state_integrity_diff_pretty(&diff, args.summary_only)
+        }
+    }
+
+    if let Some(path) = args.json_out.as_deref() {
+        write_diff_json_mirror(&diff, path, args.summary_only, &log_op);
+    }
+
+    // Exit-code policy: union of the live scan's
+    // `--fail-on-warn` and the diff's `--fail-on-new` /
+    // `--fail-on-new-error`.
+    let scan_trip = if args.fail_on_warn {
+        current_report.counts_warn + current_report.counts_error > 0
+    } else {
+        current_report.counts_error > 0
+    };
+    let diff_trip = (args.fail_on_new && diff.counts.new > 0)
+        || (args.fail_on_new_error && diff.counts.new_error > 0);
+    if scan_trip || diff_trip {
+        return Err(anyhow!(
+            "state-integrity --baseline tripped: scan_trip={scan_trip} \
+             diff_trip={diff_trip} new={} new_error={} counts_warn={} \
+             counts_error={}",
+            diff.counts.new,
+            diff.counts.new_error,
+            current_report.counts_warn,
+            current_report.counts_error,
         ));
     }
     Ok(())
@@ -10096,6 +10451,267 @@ fn render_restore_quarantine_pretty(
                 o.source_finding_kind,
                 o.source_relative,
                 if o.seen_marker_written { "yes" } else { "-" },
+            );
+        }
+    }
+}
+
+// ── Stage 12.19 — state-integrity-diff ───────────────────────────────────
+
+fn run_state_integrity_diff(args: StateIntegrityDiffArgs) -> Result<()> {
+    use omni_contributor::{
+        diff_state_integrity_reports, DiffOptions, StateIntegrityReport,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode = matches!(args.format, StateIntegrityDiffFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    let baseline_bytes = std::fs::read(&args.baseline)
+        .with_context(|| format!("read baseline json: {}", args.baseline.display()))?;
+    let baseline: StateIntegrityReport = serde_json::from_slice(&baseline_bytes)
+        .with_context(|| format!("parse baseline json: {}", args.baseline.display()))?;
+    let current_bytes = std::fs::read(&args.current)
+        .with_context(|| format!("read current json: {}", args.current.display()))?;
+    let current: StateIntegrityReport = serde_json::from_slice(&current_bytes)
+        .with_context(|| format!("parse current json: {}", args.current.display()))?;
+
+    log_op(&format!(
+        "event=state_integrity_diff_started baseline={} current={} \
+         require_state_dir_match={}",
+        args.baseline.display(),
+        args.current.display(),
+        args.require_state_dir_match,
+    ));
+
+    let diff = diff_state_integrity_reports(
+        &baseline,
+        &current,
+        &DiffOptions {
+            now_utc: &now_utc,
+            require_state_dir_match: args.require_state_dir_match,
+        },
+    )
+    .map_err(|e| anyhow!("state-integrity-diff refused: {e}"))?;
+
+    match args.format {
+        StateIntegrityDiffFormat::Events => {
+            render_state_integrity_diff_events(&diff, args.summary_only)
+        }
+        StateIntegrityDiffFormat::Json => {
+            render_state_integrity_diff_json(&diff, args.summary_only)?
+        }
+        StateIntegrityDiffFormat::Pretty => {
+            render_state_integrity_diff_pretty(&diff, args.summary_only)
+        }
+    }
+
+    if let Some(path) = args.json_out.as_deref() {
+        write_diff_json_mirror(&diff, path, args.summary_only, &log_op);
+    }
+
+    let trip = (args.fail_on_new && diff.counts.new > 0)
+        || (args.fail_on_new_error && diff.counts.new_error > 0);
+    if trip {
+        return Err(anyhow!(
+            "state-integrity-diff tripped: new={} new_error={} \
+             (--fail-on-new={} --fail-on-new-error={})",
+            diff.counts.new,
+            diff.counts.new_error,
+            args.fail_on_new,
+            args.fail_on_new_error,
+        ));
+    }
+    Ok(())
+}
+
+fn render_state_integrity_diff_events(
+    diff: &omni_contributor::StateIntegrityDiffReport,
+    summary_only: bool,
+) {
+    for f in &diff.new_findings {
+        println!(
+            "event=integrity_diff_new kind={} severity={} session_id={} \
+             path={} reason_tag={}",
+            f.kind.as_str(),
+            f.severity.as_str(),
+            f.session_id.as_deref().unwrap_or("-"),
+            f.path.as_deref().unwrap_or("-"),
+            f.reason_tag,
+        );
+    }
+    for f in &diff.resolved_findings {
+        println!(
+            "event=integrity_diff_resolved kind={} severity={} session_id={} \
+             path={} reason_tag={}",
+            f.kind.as_str(),
+            f.severity.as_str(),
+            f.session_id.as_deref().unwrap_or("-"),
+            f.path.as_deref().unwrap_or("-"),
+            f.reason_tag,
+        );
+    }
+    if !summary_only {
+        for f in &diff.unchanged_findings {
+            println!(
+                "event=integrity_diff_unchanged kind={} severity={} session_id={} \
+                 path={} reason_tag={}",
+                f.kind.as_str(),
+                f.severity.as_str(),
+                f.session_id.as_deref().unwrap_or("-"),
+                f.path.as_deref().unwrap_or("-"),
+                f.reason_tag,
+            );
+        }
+    }
+    println!(
+        "event=state_integrity_diff_summary new={} resolved={} unchanged={} \
+         new_ok={} new_warn={} new_error={} resolved_ok={} resolved_warn={} \
+         resolved_error={}",
+        diff.counts.new,
+        diff.counts.resolved,
+        diff.counts.unchanged,
+        diff.counts.new_ok,
+        diff.counts.new_warn,
+        diff.counts.new_error,
+        diff.counts.resolved_ok,
+        diff.counts.resolved_warn,
+        diff.counts.resolved_error,
+    );
+}
+
+fn render_state_integrity_diff_json(
+    diff: &omni_contributor::StateIntegrityDiffReport,
+    summary_only: bool,
+) -> Result<()> {
+    use std::io::Write;
+    // Stage 12.19 review fix — `--summary-only` is a CLI
+    // presentation gate that must apply to the JSON stdout
+    // render AND the `--json-out` mirror, not just events /
+    // pretty. The library's `diff_presentation_view` clones
+    // and clears `unchanged_findings` when summary_only is
+    // true (preserving `counts.unchanged` verbatim so scripts
+    // still see the elided count) and borrows otherwise.
+    let view = omni_contributor::diff_presentation_view(diff, summary_only);
+    let bytes = serde_json::to_vec_pretty(view.as_ref())
+        .map_err(|e| anyhow!("serialize diff report: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write diff report: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_state_integrity_diff_pretty(
+    diff: &omni_contributor::StateIntegrityDiffReport,
+    summary_only: bool,
+) {
+    println!("State integrity diff");
+    println!("  generated_at_utc       : {}", diff.generated_at_utc);
+    println!("  schema_version         : {}", diff.schema_version);
+    println!(
+        "  baseline_generated_at  : {}",
+        diff.baseline_generated_at_utc
+    );
+    println!(
+        "  current_generated_at   : {}",
+        diff.current_generated_at_utc
+    );
+    println!(
+        "  omni_contributor_versions: baseline={} current={}",
+        diff.baseline_omni_contributor_version,
+        diff.current_omni_contributor_version,
+    );
+    println!(
+        "  state_version          : baseline={} current={}",
+        diff.baseline_state_version, diff.current_state_version,
+    );
+    println!(
+        "  state_dir              : baseline={} current={}",
+        diff.baseline_state_dir, diff.state_dir,
+    );
+    println!();
+    println!("Counts");
+    println!(
+        "  new      : {} (ok={} warn={} error={})",
+        diff.counts.new,
+        diff.counts.new_ok,
+        diff.counts.new_warn,
+        diff.counts.new_error,
+    );
+    println!(
+        "  resolved : {} (ok={} warn={} error={})",
+        diff.counts.resolved,
+        diff.counts.resolved_ok,
+        diff.counts.resolved_warn,
+        diff.counts.resolved_error,
+    );
+    println!("  unchanged: {}", diff.counts.unchanged);
+
+    let section = |label: &str, findings: &[omni_contributor::IntegrityFinding]| {
+        if findings.is_empty() {
+            return;
+        }
+        println!();
+        println!("{label}:");
+        for f in findings {
+            println!(
+                "  - kind={} severity={} session={} path={} reason_tag={}",
+                f.kind.as_str(),
+                f.severity.as_str(),
+                f.session_id.as_deref().unwrap_or("-"),
+                f.path.as_deref().unwrap_or("-"),
+                f.reason_tag,
+            );
+        }
+    };
+    section("New findings", &diff.new_findings);
+    section("Resolved findings", &diff.resolved_findings);
+    if !summary_only {
+        section("Unchanged findings", &diff.unchanged_findings);
+    }
+}
+
+fn write_diff_json_mirror(
+    diff: &omni_contributor::StateIntegrityDiffReport,
+    path: &std::path::Path,
+    summary_only: bool,
+    log_op: &impl Fn(&str),
+) {
+    // Stage 12.19 review fix — same redaction posture as the
+    // stdout JSON render: `--summary-only` elides
+    // `unchanged_findings` from the mirrored artifact too,
+    // preserving `counts.unchanged`.
+    let view = omni_contributor::diff_presentation_view(diff, summary_only);
+    match serde_json::to_vec_pretty(view.as_ref()) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(path, &bytes) {
+                eprintln!(
+                    "event=warn context=state_integrity_diff_json_out path={} message={e}",
+                    path.display()
+                );
+            } else {
+                log_op(&format!(
+                    "event=state_integrity_diff_json_written path={}",
+                    path.display()
+                ));
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "event=warn context=state_integrity_diff_json_serialize message={e}"
             );
         }
     }
