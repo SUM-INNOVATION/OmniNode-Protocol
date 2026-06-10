@@ -74,9 +74,9 @@ pub mod watch;
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
     ArchiveError, CanonicalError, CleanupError, ContributorError, DiscoverError,
-    IntegrityError, PlannerError, QuarantineRestoreError, RelayError, RepairError,
-    RestoreError, RunnerError, SchemaError, SigningError, SnipError, StatusError,
-    VerifyError,
+    IntegrityDiffError, IntegrityError, PlannerError, QuarantineRestoreError,
+    RelayError, RepairError, RestoreError, RunnerError, SchemaError, SigningError,
+    SnipError, StatusError, VerifyError,
 };
 pub use repair::{
     build_session_repair_plan, build_session_repair_plan_with_reason,
@@ -104,10 +104,11 @@ pub use restore::{
     RestoreReport, RestoreSource,
 };
 pub use integrity::{
-    scan_state_integrity, scan_state_integrity_with_audit_orphans, FindingKind,
+    diff_presentation_view, diff_state_integrity_reports, scan_state_integrity,
+    scan_state_integrity_with_audit_orphans, DiffCounts, DiffOptions, FindingKind,
     FindingSeverity, IntegrityFinding, RecommendedAction, ScanOptions,
-    SessionIntegritySummary, StateIntegrityReport,
-    STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
+    SessionIntegritySummary, StateIntegrityDiffReport, StateIntegrityReport,
+    STATE_INTEGRITY_DIFF_SCHEMA_VERSION, STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
 };
 pub use cleanup::{
     apply_state_cleanup, cleanup_plan_hash_hex, plan_state_cleanup,

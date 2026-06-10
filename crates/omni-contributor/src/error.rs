@@ -1287,3 +1287,94 @@ pub enum QuarantineRestoreError {
         source: std::io::Error,
     },
 }
+
+/// Stage 12.19 — integrity-report diff errors. The differ is a
+/// pure JSON-to-JSON comparison; it never opens a state-store
+/// or writes state-dir bytes. These variants surface schema /
+/// state-version refusals, optional state_dir-pinning refusal,
+/// and the v1 "shouldn't happen" finding-metadata-drift guard.
+#[derive(Debug, thiserror::Error)]
+pub enum IntegrityDiffError {
+    /// The baseline report's `schema_version` is not
+    /// `STATE_INTEGRITY_REPORT_SCHEMA_VERSION`. Stage 12.19 v1
+    /// accepts exactly v1.
+    #[error(
+        "unsupported baseline schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedBaselineSchemaVersion { got: u32, expected: u32 },
+
+    /// Same as above but for the `current` report.
+    #[error(
+        "unsupported current schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedCurrentSchemaVersion { got: u32, expected: u32 },
+
+    /// `baseline.state_version != current.state_version`.
+    /// Cross-state-dir-version diff isn't meaningful without a
+    /// migration story.
+    #[error(
+        "incompatible state-dir version: baseline={baseline} current={current}"
+    )]
+    IncompatibleStateVersion { baseline: u32, current: u32 },
+
+    /// `baseline.state_dir != current.state_dir` AND
+    /// `--require-state-dir-match` was set. CI baselines are
+    /// commonly captured on a different host so this is OFF by
+    /// default; operators who want host pinning opt in.
+    #[error(
+        "state_dir mismatch: baseline={baseline} current={current} \
+         (re-run without --require-state-dir-match to ignore)"
+    )]
+    StateDirMismatch { baseline: String, current: String },
+
+    /// Two findings share the same identity tuple
+    /// `(kind, session_id, path, reason_tag)` but disagree on
+    /// `severity` or `recommended_action`. v1 treats this as a
+    /// structural inconsistency rather than silently collapsing
+    /// it; the closed-set scanner deterministically maps each
+    /// identity to a fixed (severity, action) pair, so a drift
+    /// here means one of the reports was tampered with or
+    /// produced by a non-Stage-12.16 tool.
+    #[error(
+        "finding metadata drift for identity={identity}: \
+         severity baseline={baseline_severity} current={current_severity}; \
+         action baseline={baseline_recommended_action} \
+         current={current_recommended_action}"
+    )]
+    FindingMetadataDrift {
+        identity: String,
+        baseline_severity: String,
+        current_severity: String,
+        baseline_recommended_action: String,
+        current_recommended_action: String,
+    },
+
+    /// Baseline JSON failed to parse as a v1
+    /// `StateIntegrityReport`. Bubbled `serde_json::Error`
+    /// carries column/line.
+    #[error("malformed baseline at {path}: {source}")]
+    MalformedBaseline {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// `current` JSON (typically supplied via
+    /// `state-integrity-diff --current <path>`) failed to parse
+    /// as a v1 `StateIntegrityReport`.
+    #[error("malformed current at {path}: {source}")]
+    MalformedCurrent {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Generic FS error encountered while reading a report
+    /// JSON.
+    #[error("integrity diff io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}

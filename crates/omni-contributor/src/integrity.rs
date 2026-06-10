@@ -1377,3 +1377,300 @@ fn classify_restore_error(
         ),
     }
 }
+
+// ── Stage 12.19 — local integrity-report diff ─────────────────
+//
+// Pure read-only comparison of two `StateIntegrityReport`
+// values. Consumes v1 reports UNCHANGED (no `StateIntegrityReport`
+// schema bump). The diff schema is its own forward-compatible
+// surface tracked by `STATE_INTEGRITY_DIFF_SCHEMA_VERSION`.
+
+use crate::error::IntegrityDiffError;
+
+/// Stage 12.19 — diff report schema version. Bumping this is a
+/// forward-incompatible change. Independent of
+/// `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` — the diff consumes
+/// v1 reports and emits its own report shape.
+pub const STATE_INTEGRITY_DIFF_SCHEMA_VERSION: u32 = 1;
+
+/// Stage 12.19 — diff options.
+#[derive(Debug, Clone, Default)]
+pub struct DiffOptions<'a> {
+    /// RFC 3339 UTC. Stamped into `generated_at_utc`.
+    pub now_utc: &'a str,
+    /// When `true`, refuse with
+    /// [`IntegrityDiffError::StateDirMismatch`] if the two
+    /// reports' `state_dir` strings disagree. Default `false`
+    /// — CI baselines are commonly captured on a different host
+    /// than the prod state-dir.
+    pub require_state_dir_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiffCounts {
+    pub new: u32,
+    pub resolved: u32,
+    pub unchanged: u32,
+
+    pub new_ok: u32,
+    pub new_warn: u32,
+    pub new_error: u32,
+
+    pub resolved_ok: u32,
+    pub resolved_warn: u32,
+    pub resolved_error: u32,
+}
+
+/// Stage 12.19 diff report. Lifts both inputs' provenance into
+/// the output so a captured diff is self-describing — operators
+/// don't need the original reports to interpret it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateIntegrityDiffReport {
+    pub schema_version: u32,
+    pub generated_at_utc: String,
+
+    pub baseline_generated_at_utc: String,
+    pub current_generated_at_utc: String,
+    pub baseline_omni_contributor_version: String,
+    pub current_omni_contributor_version: String,
+    pub baseline_state_version: u32,
+    pub current_state_version: u32,
+    /// `current` report's `state_dir`, forward-slash normalized.
+    pub state_dir: String,
+    /// `baseline` report's `state_dir`. Operators inspect this
+    /// to confirm host pinning when `--require-state-dir-match`
+    /// is OFF.
+    pub baseline_state_dir: String,
+
+    pub counts: DiffCounts,
+
+    /// Findings present in `current` but not `baseline`. Sorted
+    /// by `(session_id, kind, path, reason_tag)` — same key the
+    /// scanner uses, so the diff JSON is byte-stable on
+    /// identical inputs.
+    pub new_findings: Vec<IntegrityFinding>,
+    /// Findings present in `baseline` but not `current`.
+    pub resolved_findings: Vec<IntegrityFinding>,
+    /// Findings present in both, identical on every field.
+    /// CLI `--summary-only` elides this from the rendered
+    /// output but the library helper always populates it.
+    pub unchanged_findings: Vec<IntegrityFinding>,
+}
+
+/// Diff two integrity reports. The `(kind, session_id, path,
+/// reason_tag)` tuple is the bit-exact identity key — the same
+/// composite the scanner sorts by. Findings sharing an identity
+/// but disagreeing on `severity` or `recommended_action` refuse
+/// with [`IntegrityDiffError::FindingMetadataDrift`]; v1 has no
+/// known path that produces such drift (the scanner emits
+/// closed-set discriminators deterministically).
+///
+/// Inputs are consumed by reference; the diff never mutates
+/// either report.
+pub fn diff_state_integrity_reports(
+    baseline: &StateIntegrityReport,
+    current: &StateIntegrityReport,
+    opts: &DiffOptions<'_>,
+) -> Result<StateIntegrityDiffReport, IntegrityDiffError> {
+    if baseline.schema_version != STATE_INTEGRITY_REPORT_SCHEMA_VERSION {
+        return Err(IntegrityDiffError::UnsupportedBaselineSchemaVersion {
+            got: baseline.schema_version,
+            expected: STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
+        });
+    }
+    if current.schema_version != STATE_INTEGRITY_REPORT_SCHEMA_VERSION {
+        return Err(IntegrityDiffError::UnsupportedCurrentSchemaVersion {
+            got: current.schema_version,
+            expected: STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
+        });
+    }
+    if baseline.state_version != current.state_version {
+        return Err(IntegrityDiffError::IncompatibleStateVersion {
+            baseline: baseline.state_version,
+            current: current.state_version,
+        });
+    }
+    if opts.require_state_dir_match && baseline.state_dir != current.state_dir {
+        return Err(IntegrityDiffError::StateDirMismatch {
+            baseline: baseline.state_dir.clone(),
+            current: current.state_dir.clone(),
+        });
+    }
+
+    // Build lookups by identity key. Walking-merge is also OK
+    // (both vectors are pre-sorted by the same key) but a
+    // HashMap keeps the logic obvious for small reports.
+    let baseline_by_key: HashMap<IdentityKey, &IntegrityFinding> = baseline
+        .findings
+        .iter()
+        .map(|f| (identity_key(f), f))
+        .collect();
+    let current_by_key: HashMap<IdentityKey, &IntegrityFinding> = current
+        .findings
+        .iter()
+        .map(|f| (identity_key(f), f))
+        .collect();
+
+    let mut new_findings: Vec<IntegrityFinding> = Vec::new();
+    let mut resolved_findings: Vec<IntegrityFinding> = Vec::new();
+    let mut unchanged_findings: Vec<IntegrityFinding> = Vec::new();
+
+    for (key, current_f) in &current_by_key {
+        match baseline_by_key.get(key) {
+            None => new_findings.push((*current_f).clone()),
+            Some(baseline_f) => {
+                if baseline_f.severity != current_f.severity
+                    || baseline_f.recommended_action != current_f.recommended_action
+                {
+                    return Err(IntegrityDiffError::FindingMetadataDrift {
+                        identity: format_identity(key),
+                        baseline_severity: baseline_f.severity.as_str().to_string(),
+                        current_severity: current_f.severity.as_str().to_string(),
+                        baseline_recommended_action: baseline_f
+                            .recommended_action
+                            .as_str()
+                            .to_string(),
+                        current_recommended_action: current_f
+                            .recommended_action
+                            .as_str()
+                            .to_string(),
+                    });
+                }
+                unchanged_findings.push((*current_f).clone());
+            }
+        }
+    }
+    for (key, baseline_f) in &baseline_by_key {
+        if !current_by_key.contains_key(key) {
+            resolved_findings.push((*baseline_f).clone());
+        }
+    }
+
+    // Deterministic ordering — same key the scanner uses.
+    sort_findings(&mut new_findings);
+    sort_findings(&mut resolved_findings);
+    sort_findings(&mut unchanged_findings);
+
+    let counts = build_counts(&new_findings, &resolved_findings, &unchanged_findings);
+
+    Ok(StateIntegrityDiffReport {
+        schema_version: STATE_INTEGRITY_DIFF_SCHEMA_VERSION,
+        generated_at_utc: opts.now_utc.to_string(),
+        baseline_generated_at_utc: baseline.generated_at_utc.clone(),
+        current_generated_at_utc: current.generated_at_utc.clone(),
+        baseline_omni_contributor_version: baseline
+            .omni_contributor_version
+            .clone(),
+        current_omni_contributor_version: current
+            .omni_contributor_version
+            .clone(),
+        baseline_state_version: baseline.state_version,
+        current_state_version: current.state_version,
+        state_dir: current.state_dir.clone(),
+        baseline_state_dir: baseline.state_dir.clone(),
+        counts,
+        new_findings,
+        resolved_findings,
+        unchanged_findings,
+    })
+}
+
+/// Identity key tuple. Closed-set ordering: `session_id` first
+/// matches the scanner's sort, then `kind`, then `path`, then
+/// `reason_tag`. Stored as owned strings for `HashMap` key use.
+type IdentityKey = (String, &'static str, String, String);
+
+fn identity_key(f: &IntegrityFinding) -> IdentityKey {
+    (
+        f.session_id.clone().unwrap_or_default(),
+        f.kind.as_str(),
+        f.path.clone().unwrap_or_default(),
+        f.reason_tag.clone(),
+    )
+}
+
+fn format_identity(key: &IdentityKey) -> String {
+    let (sid, kind, path, reason_tag) = key;
+    format!(
+        "kind={kind} session_id={} path={} reason_tag={reason_tag}",
+        if sid.is_empty() { "-" } else { sid.as_str() },
+        if path.is_empty() { "-" } else { path.as_str() },
+    )
+}
+
+fn sort_findings(findings: &mut [IntegrityFinding]) {
+    findings.sort_by(|a, b| {
+        (
+            a.session_id.as_deref().unwrap_or(""),
+            a.kind.as_str(),
+            a.path.as_deref().unwrap_or(""),
+            a.reason_tag.as_str(),
+        )
+            .cmp(&(
+                b.session_id.as_deref().unwrap_or(""),
+                b.kind.as_str(),
+                b.path.as_deref().unwrap_or(""),
+                b.reason_tag.as_str(),
+            ))
+    });
+}
+
+/// Stage 12.19 — `--summary-only` presentation helper for
+/// callers (typically the CLI's events / JSON / pretty
+/// renderers and the `--json-out` mirror) that want to
+/// suppress the often-large `unchanged_findings` vector
+/// without losing visibility into the count.
+///
+/// Returns a borrowed view of `diff` when `summary_only ==
+/// false` (zero-copy fast path); returns an owned clone with
+/// `unchanged_findings` cleared when `summary_only == true`.
+/// **`counts.unchanged` is preserved** verbatim in either
+/// case so scripts that scrape the JSON still see the elided
+/// count.
+pub fn diff_presentation_view<'a>(
+    diff: &'a StateIntegrityDiffReport,
+    summary_only: bool,
+) -> std::borrow::Cow<'a, StateIntegrityDiffReport> {
+    if summary_only {
+        let mut owned = diff.clone();
+        owned.unchanged_findings.clear();
+        std::borrow::Cow::Owned(owned)
+    } else {
+        std::borrow::Cow::Borrowed(diff)
+    }
+}
+
+fn build_counts(
+    new_findings: &[IntegrityFinding],
+    resolved_findings: &[IntegrityFinding],
+    unchanged_findings: &[IntegrityFinding],
+) -> DiffCounts {
+    let mut counts = DiffCounts {
+        new: new_findings.len() as u32,
+        resolved: resolved_findings.len() as u32,
+        unchanged: unchanged_findings.len() as u32,
+        new_ok: 0,
+        new_warn: 0,
+        new_error: 0,
+        resolved_ok: 0,
+        resolved_warn: 0,
+        resolved_error: 0,
+    };
+    for f in new_findings {
+        match f.severity {
+            FindingSeverity::Ok => counts.new_ok += 1,
+            FindingSeverity::Warn => counts.new_warn += 1,
+            FindingSeverity::Error => counts.new_error += 1,
+        }
+    }
+    for f in resolved_findings {
+        match f.severity {
+            FindingSeverity::Ok => counts.resolved_ok += 1,
+            FindingSeverity::Warn => counts.resolved_warn += 1,
+            FindingSeverity::Error => counts.resolved_error += 1,
+        }
+    }
+    counts
+}

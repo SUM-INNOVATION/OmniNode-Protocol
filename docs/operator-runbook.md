@@ -1365,3 +1365,58 @@ When `--no-restore-seen-markers` is NOT passed AND the original cleanup plan con
 **Defaults are safe-by-default.** Auto-prune is forced OFF unconditionally; the `--no-prune-state-on-start` flag is deliberately absent (Stage 12.16/12.17 precedent). The quarantine subtree is **left intact** after the restore — you manage retention manually.
 
 **No protocol surface touched.** No envelope, no canonical-byte changes, no `STATE_VERSION` / `QUARANTINE_MANIFEST_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
+
+### Stage 12.19 — local integrity-report diff
+
+**Use when:** you want to gate CI against "did anything new appear in the state-integrity scan since the last known-good baseline?" or forensically compare two captured snapshots from different times. The diff classifies every finding as `new`, `resolved`, or `unchanged` — read-only, no state-dir writes.
+
+**CI gate workflow (live-vs-baseline):**
+
+```sh
+# 1. One-time: capture the baseline.
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state> \
+  --format json \
+  --json-out /etc/omni-node/baseline.integrity.json
+# Commit /etc/omni-node/baseline.integrity.json to the repo
+# (or store it under a build-agent artifact path).
+
+# 2. Each CI run: scan live + diff against baseline.
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state> \
+  --baseline /etc/omni-node/baseline.integrity.json \
+  --fail-on-new-error
+# Exit 1 if any NEW error-severity finding appeared since
+# the baseline. Warnings stay green; existing baseline
+# findings stay green.
+
+# 3. (Forensic, two-JSON form.) Compare two captured
+#    snapshots from different times or hosts.
+omni-node operator contributor state-integrity-diff \
+  --baseline /backup/yesterday.integrity.json \
+  --current /backup/today.integrity.json \
+  --format pretty
+```
+
+**Flag options:**
+
+- `--require-state-dir-match` — defaults OFF. CI baselines are typically captured on a build agent with a different state-dir path than prod. Turn ON for host-pinned baselines.
+- `--fail-on-new` — exit 1 if ANY new finding appears (any severity).
+- `--fail-on-new-error` — exit 1 only when a new `error`-severity finding appears. Recommended CI mode; warnings stay green.
+- Both flags can be set; either tripping → exit 1.
+- `--summary-only` — omit the (often-large) `unchanged_findings` from rendered output. Applies uniformly to **events, pretty, JSON stdout, and `--json-out` mirror** alike (Stage 12.19 review fix routes them all through one redaction helper). `counts.unchanged` is preserved so scripts can still see the elided count. The library's `StateIntegrityDiffReport` returned by `diff_state_integrity_reports` always carries every finding; this is purely a CLI presentation flag.
+
+**Refusal modes (typed `IntegrityDiffError`):**
+
+- `UnsupportedBaselineSchemaVersion { got, expected }` → baseline came from a future stage; v1 binary refuses.
+- `UnsupportedCurrentSchemaVersion { got, expected }` → same for the current report.
+- `IncompatibleStateVersion { baseline, current }` → reports were captured against different `STATE_VERSION` values. Strict equality; no migration story.
+- `StateDirMismatch { baseline, current }` → `state_dir` strings differ AND `--require-state-dir-match` was set. Drop the flag for host-mismatched comparisons.
+- `FindingMetadataDrift { identity, baseline_severity, current_severity, baseline_recommended_action, current_recommended_action }` → two findings share the bit-exact identity tuple `(kind, session_id, path, reason_tag)` but disagree on severity or recommended action. v1 has no scanner path that produces such drift; the refusal indicates one of the reports was hand-edited or produced by a non-Stage-12.16 tool.
+- `MalformedBaseline { path, source }` / `MalformedCurrent { path, source }` → JSON parse failed.
+
+**Rollback hash invariant** (from Stage 12.18): a successful cleanup → quarantine → restore round-trip leaves the post-restore `source_integrity_hash` equal to the pre-cleanup hash. Use Stage 12.19's diff as the CI gate that *verifies* this invariant on every PR.
+
+**Defaults are safe-by-default.** `state-integrity-diff` opens no state-store at all — it's pure JSON-to-JSON. `state-integrity --baseline` preserves the Stage 12.16 auto-prune-off posture (no `--no-prune-state-on-start` flag exposed; pinned by clap regression). The diff output is a v1 `StateIntegrityDiffReport` with its own forward-compatible schema (`STATE_INTEGRITY_DIFF_SCHEMA_VERSION = 1`); the v1 `StateIntegrityReport` it consumes is unchanged.
+
+**No protocol surface touched.** No envelope, no canonical-byte changes, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.

@@ -2744,3 +2744,121 @@ Closed-set bare-stdout events: `event=state_store_opened`, `event=restore_quaran
 | CLI flag matrix (incl. mutual-exclusion + pair-requires + deliberate rejection of `--no-prune-state-on-start`) | `restore_state_cleanup_quarantine_flag_parse_smoke` (omni-node) |
 
 **Residual gap (deliberate):** the CLI run-fn `run_restore_state_cleanup_quarantine` isn't exercised end-to-end (same constraint as Stage 12.10–12.17); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
+
+# Stage 12.19 — local integrity-report diff
+
+## What this stage is, in one sentence
+
+A read-only `diff_state_integrity_reports` helper + two CLI surfaces (`state-integrity-diff` for two-JSON comparison and `state-integrity --baseline` for live-vs-baseline) that classify findings between two `StateIntegrityReport` snapshots as `new`, `resolved`, or `unchanged` — turning Stage 12.16 into a CI-gateable signal.
+
+## Why a separate schema for the diff
+
+Stage 12.16's `StateIntegrityReport` is consumed UNCHANGED. The diff is its own forward-compatible artifact tracked by `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` so future stages can evolve the diff without bumping the v1 scan report. Both surfaces are read-only: no state-dir writes from the diff itself; the only optional write is an operator-named `--json-out` mirror of the diff report.
+
+## Library surface
+
+`omni_contributor::integrity` (extended; no new module):
+
+- `pub const STATE_INTEGRITY_DIFF_SCHEMA_VERSION: u32 = 1;` — independent of `STATE_INTEGRITY_REPORT_SCHEMA_VERSION`.
+- `DiffOptions<'a> { now_utc, require_state_dir_match }`.
+- `DiffCounts { new, resolved, unchanged, new_ok, new_warn, new_error, resolved_ok, resolved_warn, resolved_error }`.
+- `StateIntegrityDiffReport { schema_version, generated_at_utc, baseline_generated_at_utc, current_generated_at_utc, baseline_omni_contributor_version, current_omni_contributor_version, baseline_state_version, current_state_version, state_dir, baseline_state_dir, counts, new_findings, resolved_findings, unchanged_findings }`. All three finding vectors are sorted by the same `(session_id, kind, path, reason_tag)` key the scanner uses → diff JSON is byte-stable on identical inputs.
+- `pub fn diff_state_integrity_reports(baseline, current, opts) -> Result<StateIntegrityDiffReport, IntegrityDiffError>`.
+- `pub fn diff_presentation_view<'a>(diff: &'a StateIntegrityDiffReport, summary_only: bool) -> Cow<'a, StateIntegrityDiffReport>` — Stage 12.19 review-fix helper that implements `--summary-only` redaction in one place. Borrows when `summary_only` is false (zero-copy fast path); clones and clears `unchanged_findings` when true. **`counts.unchanged` is preserved verbatim** so scripts that scrape the JSON still see the elided count. The CLI's events / pretty / JSON stdout renderers AND the `--json-out` mirror all route through this helper, so `--summary-only` is honored uniformly across every output path.
+
+**Identity key**: `(kind, session_id, path, reason_tag)` — bit-exact match required for "unchanged" classification. A finding present in `current` with that tuple but absent from `baseline` is `new`; the reverse is `resolved`.
+
+**Metadata drift refusal**: two findings sharing an identity tuple but disagreeing on `severity` or `recommended_action` refuse with typed `FindingMetadataDrift`. v1 has no known path that produces such drift — the closed-set Stage 12.16 scanner deterministically maps each identity to a fixed `(severity, action)` pair — so the refusal is a "shouldn't happen" guard that surfaces tampered or non-Stage-12.16 reports loudly.
+
+## Safety contract
+
+- **Read-only.** The library function consumes two `&StateIntegrityReport` references; it never opens a state-store and never mutates either input.
+- **`state-integrity-diff` does not open a state-store at all.** Pure JSON-to-JSON.
+- **`state-integrity --baseline` runs the existing scanner first**, then the diff helper. The scanner's Stage 12.16 read-only contract (including the unconditional `auto_prune = false`) is preserved verbatim; `--baseline` only changes the rendering and exit-code path.
+- **Schema-version enforcement.** Both inputs must report `schema_version == STATE_INTEGRITY_REPORT_SCHEMA_VERSION`. Refused with typed `UnsupportedBaselineSchemaVersion` / `UnsupportedCurrentSchemaVersion`.
+- **`state_version` strict equality** between baseline and current. Cross-state-dir-version diff isn't meaningful without a migration story.
+- **`state_dir` drift is informational by default** — recorded in `state_dir` / `baseline_state_dir`. `--require-state-dir-match` makes it a refusal for host-pinned baselines.
+- **`omni_contributor_version` drift is informational.** Recorded in `baseline_omni_contributor_version` / `current_omni_contributor_version`; never a refusal.
+- **`generated_at_utc` is always ignored for finding equality** but recorded in provenance.
+- **`auto-prune posture preserved** on `state-integrity --baseline` (no `--no-prune-state-on-start` flag exposed; pinned by clap regression).
+
+## CLI
+
+Two surfaces backed by the same library helper:
+
+```
+# Two-JSON comparison (forensic):
+omni-node operator contributor state-integrity-diff \
+  --baseline <old.json>                     (required)
+  --current <new.json>                      (required)
+  [--require-state-dir-match]               (refuse on state_dir mismatch)
+  [--fail-on-new]                           (exit 1 if any new finding appears)
+  [--fail-on-new-error]                     (exit 1 if any new error appears)
+  [--summary-only]                          (omit unchanged_findings from output)
+  [--format events|json|pretty]             (default events)
+  [--json-out <path>]                       (best-effort mirror)
+
+# Live scan vs baseline (CI):
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <path>            (required, existing)
+  ...all existing state-integrity flags...
+  [--baseline <path>]                       (NEW — switches to diff mode)
+  [--fail-on-new]                           (NEW)
+  [--fail-on-new-error]                     (NEW)
+  [--summary-only]                          (NEW)
+  [--require-state-dir-match]               (NEW)
+```
+
+When `state-integrity --baseline` is set, the existing `--format` / `--json-out` apply to the diff report (not the raw scan report). `--fail-on-warn` still applies to the live scan's counts and composes with `--fail-on-new` / `--fail-on-new-error` via OR — any one tripping → exit 1.
+
+Closed-set bare-stdout events: `event=state_integrity_diff_started`, `event=integrity_diff_new`, `event=integrity_diff_resolved`, `event=integrity_diff_unchanged` (suppressed by `--summary-only`), `event=state_integrity_diff_summary` (with the full `DiffCounts` shape), `event=state_integrity_diff_json_written` (when `--json-out` succeeds).
+
+### Exit-code policy
+
+| Mode | Trip condition |
+| --- | --- |
+| default (no fail flags) | exit 0 unconditionally |
+| `--fail-on-new` | exit 1 when `counts.new > 0` |
+| `--fail-on-new-error` | exit 1 when `counts.new_error > 0` |
+| both flags set | OR — exit 1 when either trips |
+
+`--fail-on-new-error` is the recommended CI mode for catching regressions without warn-noise sensitivity.
+
+## Out of scope (Stage 12.19)
+
+- **`StateIntegrityReport` v1 schema change.** Consumed as-is.
+- **`drifted_findings` vector.** v1 refuses metadata drift; future stages can promote.
+- **Three-way diff** (baseline vs current vs ancestor).
+- **Fuzzy / semantic match.** The identity key is bit-exact.
+- **Cross-state-version diff.** Strict equality required.
+- **Baseline signing or hash-pinning.**
+- **Watcher / daemon mode.**
+- **Automatic baseline refresh.**
+- **No envelope, no canonical-byte changes, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATUS_SCHEMA_VERSION` / `ARCHIVE_MANIFEST_SCHEMA_VERSION` / `CLEANUP_PLAN_SCHEMA_VERSION` / `QUARANTINE_MANIFEST_SCHEMA_VERSION` / `NET_SCHEMA_VERSION` bump.**
+- **No new gossipsub topic, no SNIP wire change, no chain / payment / staking / slashing / reputation / marketplace / proof surface.**
+
+## Test coverage map
+
+| Concern | Test |
+| --- | --- |
+| Identical reports → empty diff + unchanged populated | `identical_reports_produce_empty_diff_with_full_unchanged` (`state_integrity_diff.rs`) |
+| Empty baseline → everything classified as new | `empty_baseline_classifies_everything_as_new` |
+| Empty current → everything classified as resolved | `empty_current_classifies_everything_as_resolved` |
+| Mixed new + resolved + unchanged | `mixed_diff_populates_all_three_buckets` |
+| Diff output byte-stable on re-runs | `diff_output_is_byte_stable_on_identical_inputs` |
+| Baseline schema_version != 1 → `UnsupportedBaselineSchemaVersion` | `baseline_schema_v2_is_refused` |
+| Current schema_version != 1 → `UnsupportedCurrentSchemaVersion` | `current_schema_v2_is_refused` |
+| `state_version` mismatch → `IncompatibleStateVersion` | `state_version_mismatch_is_refused` |
+| `state_dir` mismatch passes by default; refuses with flag | `state_dir_mismatch_passes_without_flag_and_refuses_with_flag` |
+| `omni_contributor_version` drift is informational | `omni_version_drift_is_informational` |
+| Severity drift → `FindingMetadataDrift` refusal | `finding_severity_drift_is_refused` |
+| Recommended-action drift → `FindingMetadataDrift` refusal | `finding_action_drift_is_refused` |
+| Diff JSON round-trip preserves report | `diff_json_round_trip_preserves_report` |
+| Per-severity sub-counts populated correctly | `diff_counts_split_by_severity` |
+| Live scan against baseline JSON round-trips end-to-end | `live_scan_against_baseline_round_trips_via_json` |
+| `sessions` summary drift doesn't affect finding diff | `session_summary_diff_does_not_affect_finding_diff` |
+| `diff_presentation_view` elides `unchanged_findings` under `--summary-only` while preserving `counts.unchanged` for both JSON stdout and `--json-out` (review fix) | `diff_presentation_view_elides_unchanged_when_summary_only` |
+| CLI flag matrix for `state-integrity-diff` + deliberate rejection of `--no-prune-state-on-start` | `state_integrity_diff_flag_parse_smoke` (omni-node) |
+| Extended CLI flag matrix for `state-integrity --baseline` and related Stage 12.19 flags | `state_integrity_flag_parse_smoke` (omni-node, extended) |
+
+**Residual gap (deliberate):** the CLI run-fns `run_state_integrity_diff` and the `--baseline` branch of `run_state_integrity` aren't exercised end-to-end (same constraint as Stage 12.10–12.18); the library function `diff_state_integrity_reports` is exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
