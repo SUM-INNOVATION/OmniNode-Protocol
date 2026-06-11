@@ -9,8 +9,10 @@
 //! wire, no chain interaction. The signing input mirrors the
 //! Stage 12.0–12.18 envelope pattern:
 //!
-//!     bytes = SIGNED_BASELINE_DOMAIN || bincode1::serialize(canonical_body)
-//!     signature = Ed25519::sign(seed, bytes)
+//! ```text
+//! bytes = SIGNED_BASELINE_DOMAIN || bincode1::serialize(canonical_body)
+//! signature = Ed25519::sign(seed, bytes)
+//! ```
 //!
 //! `canonical_body` excludes `signature_hex` (signing over your
 //! own signature is circular). It embeds the full typed
