@@ -57,6 +57,7 @@ pub mod repair;
 pub mod restore;
 pub mod result;
 pub mod resume;
+pub mod signed_baseline;
 pub mod run;
 pub mod runner;
 pub mod session;
@@ -75,8 +76,8 @@ pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
     ArchiveError, CanonicalError, CleanupError, ContributorError, DiscoverError,
     IntegrityDiffError, IntegrityError, PlannerError, QuarantineRestoreError,
-    RelayError, RepairError, RestoreError, RunnerError, SchemaError, SigningError,
-    SnipError, StatusError, VerifyError,
+    RelayError, RepairError, RestoreError, RunnerError, SchemaError,
+    SignedBaselineError, SigningError, SnipError, StatusError, VerifyError,
 };
 pub use repair::{
     build_session_repair_plan, build_session_repair_plan_with_reason,
@@ -119,6 +120,12 @@ pub use cleanup::{
     QuarantineRestoreOptions, QuarantineRestoreOutcome, QuarantineRestoreReport,
     QuarantineRestoreSource, StateCleanupPlan, CLEANUP_PLAN_SCHEMA_VERSION,
     QUARANTINE_MANIFEST_SCHEMA_VERSION,
+};
+pub use signed_baseline::{
+    read_signed_baseline_from_path, sign_state_integrity_baseline,
+    signed_baseline_signing_input, verify_signed_state_integrity_baseline,
+    write_signed_baseline_atomic, BaselineSignerRole, SignedStateIntegrityBaseline,
+    SIGNED_BASELINE_SCHEMA_VERSION,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,

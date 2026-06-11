@@ -517,6 +517,13 @@ pub const PARTIAL_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-PARTIAL:v1:";
 /// 35 ASCII bytes.
 pub const AGGREGATED_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-AGGREGATED:v1:";
 
+/// Stage 12.20 — domain separator for the local-only signed
+/// integrity-baseline wrapper. Mirrors the existing wire-envelope
+/// convention but is consumed only by `signed_baseline.rs` —
+/// no protocol surface, no gossipsub topic, no SNIP wire.
+pub const SIGNED_BASELINE_DOMAIN: &[u8] =
+    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-BASELINE:v1:";
+
 // --- ExecutionSession ---
 
 #[derive(Debug, Serialize)]

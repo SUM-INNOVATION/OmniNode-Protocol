@@ -1378,3 +1378,79 @@ pub enum IntegrityDiffError {
         source: std::io::Error,
     },
 }
+
+/// Stage 12.20 — signed integrity-baseline errors. The signed
+/// baseline is a local-only wrapper around a v1
+/// `StateIntegrityReport`; this enum covers signing, verifying,
+/// and consuming a wrapper. Wire-protocol surfaces are NOT
+/// affected — Stage 12.20 introduces no new envelope.
+#[derive(Debug, thiserror::Error)]
+pub enum SignedBaselineError {
+    /// Wrapper's `schema_version` is not
+    /// `SIGNED_BASELINE_SCHEMA_VERSION = 1`. v1 binary refuses
+    /// future-stage wrappers.
+    #[error(
+        "unsupported signed-baseline schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedSchemaVersion { got: u32, expected: u32 },
+
+    /// The wrapper's embedded `report.schema_version` is not
+    /// `STATE_INTEGRITY_REPORT_SCHEMA_VERSION = 1`. The
+    /// wrapper might be v1 but the report it carries is from
+    /// a future Stage 12.16 lineage; refuse to deserialize.
+    #[error(
+        "unsupported embedded report schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedReportSchemaVersion { got: u32, expected: u32 },
+
+    /// Bincode encoding of the canonical body failed. Bubbled
+    /// from `CanonicalError`. Should be impossible in practice
+    /// because the canonical body is closed-set.
+    #[error("canonical encoding error: {0}")]
+    Canonical(#[from] CanonicalError),
+
+    /// Hex parse or Ed25519 signing/verification primitive
+    /// returned an error. Bubbled from `SigningError`.
+    #[error("signing error: {0}")]
+    Signing(#[from] SigningError),
+
+    /// Ed25519 verification of the wrapper's `signature_hex`
+    /// against the canonical body and the wrapper's
+    /// `signer_pubkey_hex` returned `Ok(false)` — the
+    /// signature does not match. Refused after the
+    /// `SignerPubkeyMismatch` cheap pre-check.
+    #[error(
+        "signature mismatch: wrapper signature does not verify against embedded pubkey"
+    )]
+    SignatureMismatch,
+
+    /// The `expected_signer_pubkey_hex` the caller passed to
+    /// `verify_signed_state_integrity_baseline` does NOT
+    /// equal the wrapper's `signer_pubkey_hex`. The signature
+    /// might be valid for some other key, but it's not the key
+    /// the verifier was told to trust. Cheap pre-check — runs
+    /// BEFORE crypto verification so a malicious wrapper with a
+    /// forged pubkey can't burn cycles.
+    #[error(
+        "signer pubkey mismatch: expected={expected} got={got} \
+         (the wrapper was signed by a different key than the trust anchor)"
+    )]
+    SignerPubkeyMismatch { expected: String, got: String },
+
+    /// Generic FS error reading the wrapper JSON.
+    #[error("signed-baseline io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Wrapper JSON did not parse as a v1
+    /// `SignedStateIntegrityBaseline`.
+    #[error("malformed signed-baseline at {path}: {source}")]
+    MalformedJson {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}
