@@ -2862,3 +2862,108 @@ Closed-set bare-stdout events: `event=state_integrity_diff_started`, `event=inte
 | Extended CLI flag matrix for `state-integrity --baseline` and related Stage 12.19 flags | `state_integrity_flag_parse_smoke` (omni-node, extended) |
 
 **Residual gap (deliberate):** the CLI run-fns `run_state_integrity_diff` and the `--baseline` branch of `run_state_integrity` aren't exercised end-to-end (same constraint as Stage 12.10–12.18); the library function `diff_state_integrity_reports` is exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
+
+# Stage 12.20 — signed integrity baselines
+
+## What this stage is, in one sentence
+
+A local-only `SignedStateIntegrityBaseline` wrapper around a v1 `StateIntegrityReport`, plus a `sign-state-integrity-baseline` CLI to produce one and `--signed-baseline`/`--baseline-pubkey-hex` flags on the Stage 12.19 diff surfaces to consume one — so operators can prove a baseline was produced by an expected Ed25519 key and detect hand-edited baselines before Stage 12.19 diffing.
+
+## Why a separate wrapper schema
+
+Stage 12.16's `StateIntegrityReport` is consumed UNCHANGED. The signed wrapper is its own forward-compatible artifact tracked by `SIGNED_BASELINE_SCHEMA_VERSION = 1`, independent of every existing schema constant. v1 wrappers wrap v1 reports only; future stages can extend the wrapper without bumping any existing surface. The signing input mirrors the Stage 12.0–12.18 envelope pattern (`SIGNED_BASELINE_DOMAIN || bincode1::serialize(canonical_body)`) so the trust model and review surface are identical to the protocol's existing role-typed signed bodies.
+
+## Library surface
+
+`omni_contributor::signed_baseline` (new module):
+
+- `pub const SIGNED_BASELINE_SCHEMA_VERSION: u32 = 1;`
+- Closed `BaselineSignerRole { Operator, Contributor, Dispatcher, Coordinator }` with `as_str()` for stable wire tags and snake_case serde encoding.
+- `SignedStateIntegrityBaseline { schema_version, signed_at_utc, signer_pubkey_hex, signer_role, report, signature_hex }` with `deny_unknown_fields`. Embeds the full v1 `StateIntegrityReport` so a captured wrapper is self-contained.
+- `pub fn signed_baseline_signing_input(schema_version, signed_at_utc, signer_pubkey_hex, signer_role, report) -> Result<Vec<u8>, SignedBaselineError>` — builds the canonical body (`SIGNED_BASELINE_DOMAIN || bincode1::serialize(canonical_body)`) used by both signer and verifier.
+- `pub fn sign_state_integrity_baseline(report, signer_pubkey_hex, signer_role, signed_at_utc, sign_fn) -> Result<SignedStateIntegrityBaseline, SignedBaselineError>` — the library stays signer-agnostic; the caller supplies a closure that computes the signature. Refuses non-v1 embedded reports.
+- `pub fn verify_signed_state_integrity_baseline(baseline, expected_signer_pubkey_hex) -> Result<(), SignedBaselineError>` — two-step refusal order: cheap `SignerPubkeyMismatch` pre-check, then cryptographic verification. Refuses non-v1 wrapper / non-v1 embedded report at the same gate.
+- `pub fn read_signed_baseline_from_path(path) -> Result<SignedStateIntegrityBaseline, SignedBaselineError>` — convenience FS reader.
+- `pub fn write_signed_baseline_atomic(baseline, out) -> Result<PathBuf, SignedBaselineError>` — atomic tempfile + rename, same posture as Stage 12.17 `plan-state-cleanup --out`.
+
+New typed `SignedBaselineError` covers `UnsupportedSchemaVersion`, `UnsupportedReportSchemaVersion`, `Canonical` (bubbled `CanonicalError`), `Signing` (bubbled `SigningError`), `SignatureMismatch`, `SignerPubkeyMismatch`, `Io`, `MalformedJson`.
+
+`canonical.rs` gains one new constant:
+
+```rust
+pub const SIGNED_BASELINE_DOMAIN: &[u8] =
+    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-BASELINE:v1:";
+```
+
+## Safety contract
+
+- **Trust is opt-in at the verifier.** The wrapper's `signer_pubkey_hex` is forensic context; the trust anchor is the operator-supplied `--baseline-pubkey-hex` (or `expected_signer_pubkey_hex` at the library level). The verifier refuses any wrapper whose embedded pubkey doesn't equal the operator's expectation — even if the signature is cryptographically valid for some other key.
+- **Two-step refusal order**: (1) `SignerPubkeyMismatch` (cheap; no crypto) → (2) `SignatureMismatch` (crypto verify). A malicious wrapper with a forged pubkey never burns crypto cycles.
+- **Schema enforcement** runs before either check: `UnsupportedSchemaVersion` for the wrapper, `UnsupportedReportSchemaVersion` for the embedded report.
+- **Canonical body content**: every field of the wrapper EXCEPT `signature_hex` is part of the canonical body. Tampering with `signed_at_utc`, `signer_role`, `signer_pubkey_hex`, OR any field of the embedded `report` causes `SignatureMismatch`.
+- **Determinism pinned**: same `report` + same seed + same `signed_at_utc` produces byte-identical wrappers across runs (regression `same_inputs_produce_byte_identical_wrapper`).
+- **Read-only**: signing and verifying never open a state-store. The CLI signing subcommand writes only the operator-named `--out` file (atomic). The diff CLIs preserve the Stage 12.16/12.19 read-only contracts verbatim.
+
+## CLI
+
+### Signing subcommand
+
+```
+omni-node operator contributor sign-state-integrity-baseline \
+  --baseline-in <path>                      (required — raw v1 report JSON)
+  --signer-seed <path>                      (required — 32-byte Ed25519 seed)
+  --signer-role operator|contributor|dispatcher|coordinator
+                                            (required — closed enum)
+  --out <path>                              (required — atomic temp+rename)
+  [--format events|json|pretty]             (default events)
+```
+
+Read-only on the state-store side; pure JSON-to-JSON. Auto-prune flag deliberately absent (Stage 12.16/12.17/12.18/12.19 precedent), pinned by clap regression.
+
+### Diff-surface flags
+
+Both `state-integrity --baseline ...` and `state-integrity-diff` gain:
+
+- `--signed-baseline <path>` — Stage 12.20 trust path. Clap-level mutually exclusive with `--baseline`; clap also enforces required-unless-the-other on `state-integrity-diff`.
+- `--baseline-pubkey-hex <hex>` — 64-char lowercase-hex Ed25519 public key the wrapper MUST be signed by. Clap requires it whenever `--signed-baseline` is set. Enforcement of the inverse direction (`--baseline-pubkey-hex` without `--signed-baseline`) is **uniform across both subcommands**: solo `--baseline-pubkey-hex` is rejected at parse time, but `--baseline + --baseline-pubkey-hex` is accepted at parse time (the clap setups' `conflicts_with` / `required_unless_present` interactions short-circuit the `requires` check in either configuration). The runtime backstop in the shared `resolve_diff_baseline` helper emits `event=warn context=baseline_pubkey_hex_unused` on BOTH subcommands so the unused trust anchor is visible to log scrapers before the diff runs.
+
+When `--signed-baseline` resolves at runtime, `verify_signed_state_integrity_baseline(wrapper, expected_pubkey)` runs; refusal short-circuits BEFORE any diff. Closed-set events: `event=signed_baseline_signing_started`, `event=signed_baseline_written`, `event=signed_baseline_verified`, `event=signed_baseline_refused reason=<tag>` (tags: `signer_pubkey_mismatch` / `signature_mismatch` / `unsupported_schema_version` / `unsupported_report_schema_version` / `signing_decode_error` / `canonical_encoding_error` / `other`).
+
+## Out of scope (Stage 12.20)
+
+- **No current-report signing.** v1 signs baselines only.
+- **No `StateIntegrityReport` schema change.** Embedded as v1; refuses non-v1.
+- **No `StateIntegrityDiffReport` signature.** Stage 12.19 diff output is not signed; the trust chain ends at the baseline.
+- **No baseline expiry / `valid_through_utc` field.** v1 wrappers don't expire.
+- **No multi-signature / threshold signatures.** Single Ed25519 signature.
+- **No baseline encryption.** Wrappers are plaintext JSON.
+- **No revocation list.** Operators control trust anchors via `--baseline-pubkey-hex`.
+- **No external signed-baseline registry / publication.** Local-only.
+- **No SNIP / mesh / chain / gossipsub / state-dir mutation.**
+- **No envelope, no canonical-byte changes on Stage 12.0–12.19 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `STATUS_SCHEMA_VERSION` / `ARCHIVE_MANIFEST_SCHEMA_VERSION` / `CLEANUP_PLAN_SCHEMA_VERSION` / `QUARANTINE_MANIFEST_SCHEMA_VERSION` / `NET_SCHEMA_VERSION` bump.**
+
+## Test coverage map
+
+| Concern | Test |
+| --- | --- |
+| Sign + verify happy path | `sign_and_verify_round_trips` (`signed_baseline.rs`) |
+| All four `BaselineSignerRole` variants round-trip | `all_signer_role_variants_round_trip` |
+| `SignerPubkeyMismatch` cheap pre-check (no crypto burn) | `pubkey_mismatch_is_refused_before_crypto` |
+| Signature tamper → `SignatureMismatch` | `signature_tamper_is_refused` |
+| Embedded-report tamper → `SignatureMismatch` (proves report is in canonical body) | `embedded_report_tamper_is_refused` |
+| `signer_role` tamper → `SignatureMismatch` | `signer_role_tamper_is_refused` |
+| `signed_at_utc` tamper → `SignatureMismatch` | `signed_at_utc_tamper_is_refused` |
+| Wrapper `schema_version != 1` → `UnsupportedSchemaVersion` | `wrapper_schema_v2_is_refused` |
+| Embedded `report.schema_version != 1` → `UnsupportedReportSchemaVersion` | `embedded_report_schema_v2_is_refused` |
+| Sign refuses a non-v1 input report | `sign_refuses_non_v1_report` |
+| JSON round-trip preserves signature | `json_round_trip_preserves_signature` |
+| Determinism: same inputs → byte-identical wrapper | `same_inputs_produce_byte_identical_wrapper` |
+| Canonical signing-input byte stability + domain prefix | `signing_input_is_byte_stable_across_recomputation` |
+| Stage 12.19 composition: signed → verify → embedded report diff | `signed_baseline_composes_with_stage_12_19_diff_helper` |
+| Empty-report wrapper round-trips | `empty_report_wrapper_round_trips` |
+| `write_signed_baseline_atomic` round-trips via disk | `write_signed_baseline_atomic_round_trips_via_disk` |
+| CLI flag matrix for `sign-state-integrity-baseline` (all 4 roles, format closed enum, required-flag sweep, unknown-role refusal, deliberate rejection of `--no-prune-state-on-start`) | `sign_state_integrity_baseline_flag_parse_smoke` (omni-node) |
+| Extended `state-integrity` flag matrix gains `--signed-baseline` / `--baseline-pubkey-hex` mutual-exclusion + requires-pair coverage | `state_integrity_flag_parse_smoke` (omni-node, extended) |
+| Extended `state-integrity-diff` flag matrix gains `--signed-baseline` / `--baseline-pubkey-hex` mutual-exclusion + required-unless-present + requires-pair coverage | `state_integrity_diff_flag_parse_smoke` (omni-node, extended) |
+
+**Residual gap (deliberate):** the CLI run-fns `run_sign_state_integrity_baseline` and `resolve_diff_baseline` aren't exercised end-to-end (same constraint as Stage 12.10–12.19); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.

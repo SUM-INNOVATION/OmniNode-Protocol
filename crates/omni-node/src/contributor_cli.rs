@@ -269,6 +269,14 @@ enum ContributorCmd {
     /// pinning. No chain / mesh / SNIP / envelope surface
     /// touched.
     StateIntegrityDiff(StateIntegrityDiffArgs),
+
+    /// Stage 12.20 — sign a v1 `StateIntegrityReport` JSON
+    /// with a 32-byte Ed25519 seed and emit a
+    /// `SignedStateIntegrityBaseline` JSON. Read-only on the
+    /// state-store side; writes only the operator-named
+    /// `--out` file. The signed wrapper is local-only — no
+    /// protocol envelope, no SNIP wire, no chain interaction.
+    SignStateIntegrityBaseline(SignStateIntegrityBaselineArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2238,9 +2246,32 @@ struct StateIntegrityArgs {
     /// command switches to rendering the diff (not the raw
     /// report). `--format`, `--json-out`, and the new
     /// `--fail-on-new` / `--fail-on-new-error` flags then apply
-    /// to the diff output.
-    #[arg(long)]
+    /// to the diff output. Mutually exclusive with Stage 12.20
+    /// `--signed-baseline`.
+    #[arg(long, conflicts_with = "signed_baseline")]
     baseline: Option<PathBuf>,
+
+    /// Stage 12.20 — diff the LIVE scan against the supplied
+    /// `SignedStateIntegrityBaseline` JSON. Mutually exclusive
+    /// with `--baseline`. REQUIRES `--baseline-pubkey-hex` as
+    /// the operator-supplied trust anchor; the wrapper's
+    /// `signer_pubkey_hex` is verified against it BEFORE any
+    /// cryptographic check, and the Ed25519 signature is
+    /// recomputed against the canonical body. Only after both
+    /// pass does the embedded report become the baseline for
+    /// the Stage 12.19 diff flow.
+    #[arg(
+        long,
+        conflicts_with = "baseline",
+        requires = "baseline_pubkey_hex"
+    )]
+    signed_baseline: Option<PathBuf>,
+
+    /// Stage 12.20 — 64-char lowercase-hex Ed25519 public key
+    /// that the signed baseline MUST be signed by. Required
+    /// whenever `--signed-baseline` is used. Ignored otherwise.
+    #[arg(long, requires = "signed_baseline")]
+    baseline_pubkey_hex: Option<String>,
 
     /// Stage 12.19 — exit 1 when the live scan diff against
     /// `--baseline` shows ANY new finding (regardless of
@@ -2486,9 +2517,31 @@ enum StateIntegrityDiffFormat {
 struct StateIntegrityDiffArgs {
     /// Path to the baseline v1 `StateIntegrityReport` JSON
     /// (typically produced by an earlier
-    /// `state-integrity --json-out`).
-    #[arg(long)]
-    baseline: PathBuf,
+    /// `state-integrity --json-out`). Mutually exclusive with
+    /// `--signed-baseline`; exactly one MUST be supplied.
+    #[arg(
+        long,
+        conflicts_with = "signed_baseline",
+        required_unless_present = "signed_baseline"
+    )]
+    baseline: Option<PathBuf>,
+
+    /// Stage 12.20 — path to a `SignedStateIntegrityBaseline`
+    /// JSON. Mutually exclusive with `--baseline`. REQUIRES
+    /// `--baseline-pubkey-hex` as the operator-supplied trust
+    /// anchor.
+    #[arg(
+        long,
+        conflicts_with = "baseline",
+        required_unless_present = "baseline",
+        requires = "baseline_pubkey_hex"
+    )]
+    signed_baseline: Option<PathBuf>,
+
+    /// Stage 12.20 — 64-char lowercase-hex Ed25519 public key
+    /// the signed baseline MUST be signed by.
+    #[arg(long, requires = "signed_baseline")]
+    baseline_pubkey_hex: Option<String>,
 
     /// Path to the current v1 `StateIntegrityReport` JSON to
     /// compare against the baseline.
@@ -2535,6 +2588,82 @@ struct StateIntegrityDiffArgs {
     json_out: Option<PathBuf>,
 }
 
+// ── Stage 12.20 — sign-state-integrity-baseline ──────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum SignStateIntegrityBaselineFormat {
+    /// One `event=signed_baseline_written ...` line on success.
+    Events,
+    /// Print the signed wrapper as pretty JSON on stdout.
+    /// Operational chatter goes to stderr so `jq` works.
+    Json,
+    /// Compact terminal-friendly summary.
+    Pretty,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliBaselineSignerRole {
+    Operator,
+    Contributor,
+    Dispatcher,
+    Coordinator,
+}
+
+impl From<CliBaselineSignerRole> for omni_contributor::BaselineSignerRole {
+    fn from(r: CliBaselineSignerRole) -> Self {
+        match r {
+            CliBaselineSignerRole::Operator => {
+                omni_contributor::BaselineSignerRole::Operator
+            }
+            CliBaselineSignerRole::Contributor => {
+                omni_contributor::BaselineSignerRole::Contributor
+            }
+            CliBaselineSignerRole::Dispatcher => {
+                omni_contributor::BaselineSignerRole::Dispatcher
+            }
+            CliBaselineSignerRole::Coordinator => {
+                omni_contributor::BaselineSignerRole::Coordinator
+            }
+        }
+    }
+}
+
+#[derive(Args)]
+struct SignStateIntegrityBaselineArgs {
+    /// Path to the raw v1 `StateIntegrityReport` JSON to sign.
+    /// Typically the output of a prior
+    /// `state-integrity --json-out`.
+    #[arg(long)]
+    baseline_in: PathBuf,
+
+    /// 32-byte raw Ed25519 seed file. Operators MUST keep this
+    /// distinct from any chain-attestation or protocol-role
+    /// seed — the baseline-signing role is its own key per
+    /// Stage 12.20.
+    #[arg(long)]
+    signer_seed: PathBuf,
+
+    /// Role tag recorded in the wrapper for forensics. Closed
+    /// set: `operator` / `contributor` / `dispatcher` /
+    /// `coordinator`.
+    #[arg(long, value_enum)]
+    signer_role: CliBaselineSignerRole,
+
+    /// Destination for the signed wrapper JSON. Atomic
+    /// tempfile + rename (same posture as Stage 12.17
+    /// `plan-state-cleanup --out`).
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SignStateIntegrityBaselineFormat::Events
+    )]
+    format: SignStateIntegrityBaselineFormat,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -2574,6 +2703,9 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
             run_restore_state_cleanup_quarantine(a)
         }
         ContributorCmd::StateIntegrityDiff(a) => run_state_integrity_diff(a),
+        ContributorCmd::SignStateIntegrityBaseline(a) => {
+            run_sign_state_integrity_baseline(a)
+        }
     }
 }
 
@@ -6938,7 +7070,7 @@ mod tests {
         );
 
         // clap-level conflict: both at once must NOT parse.
-        let conflict = TestRoot::try_parse_from(&[
+        let conflict = TestRoot::try_parse_from([
             "omni-node",
             "plan-session-repair",
             "--contributor-state-dir",
@@ -7053,7 +7185,7 @@ mod tests {
         );
 
         // plan: clap-level mutual exclusion.
-        let conflict = TestRoot::try_parse_from(&[
+        let conflict = TestRoot::try_parse_from([
             "omni-node",
             "plan-session-reassign",
             "--contributor-state-dir",
@@ -7167,7 +7299,7 @@ mod tests {
         // --copy + --move must NOT parse.
         let move_run = parse_archive_session(&["--move"]);
         assert!(move_run.move_mode);
-        let conflict = TestRoot::try_parse_from(&[
+        let conflict = TestRoot::try_parse_from([
             "omni-node",
             "archive-session",
             "--contributor-state-dir",
@@ -7245,7 +7377,7 @@ mod tests {
 
         // --archive-session-dir and --archive-dir conflict at clap
         // level.
-        let conflict = TestRoot::try_parse_from(&[
+        let conflict = TestRoot::try_parse_from([
             "omni-node",
             "restore-session-archive",
             "--contributor-state-dir",
@@ -7264,7 +7396,7 @@ mod tests {
 
         // --archive-dir without --session-id fails (requires
         // pairing).
-        let no_session = TestRoot::try_parse_from(&[
+        let no_session = TestRoot::try_parse_from([
             "omni-node",
             "restore-session-archive",
             "--contributor-state-dir",
@@ -7406,7 +7538,7 @@ mod tests {
         // flag is deliberately ABSENT. The scanner is read-only,
         // so it always opens with auto-prune off; surfacing a
         // no-op flag would mislead operators.
-        let no_such_flag = TestRoot::try_parse_from(&[
+        let no_such_flag = TestRoot::try_parse_from([
             "omni-node",
             "state-integrity",
             "--contributor-state-dir",
@@ -7419,7 +7551,7 @@ mod tests {
         );
 
         // Unknown --format value must be rejected.
-        let bad = TestRoot::try_parse_from(&[
+        let bad = TestRoot::try_parse_from([
             "omni-node",
             "state-integrity",
             "--contributor-state-dir",
@@ -7428,10 +7560,114 @@ mod tests {
             "yaml",
         ]);
         assert!(bad.is_err(), "clap must reject unknown --format value");
+
+        // Stage 12.20 — `--signed-baseline` + `--baseline-pubkey-hex`
+        // are mutually exclusive with `--baseline`. Clap enforces
+        // both the conflict and the requires-pair.
+        assert!(defaults.signed_baseline.is_none());
+        assert!(defaults.baseline_pubkey_hex.is_none());
+        let signed = parse_state_integrity(&[
+            "--signed-baseline",
+            "/tmp/baseline.signed.json",
+            "--baseline-pubkey-hex",
+            &"aa".repeat(32),
+        ]);
+        assert_eq!(
+            signed.signed_baseline.as_deref(),
+            Some(std::path::Path::new("/tmp/baseline.signed.json"))
+        );
+        assert_eq!(
+            signed.baseline_pubkey_hex.as_deref(),
+            Some("aa".repeat(32).as_str())
+        );
+
+        // --signed-baseline without --baseline-pubkey-hex is rejected.
+        let no_pubkey = TestRoot::try_parse_from([
+            "omni-node",
+            "state-integrity",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--signed-baseline",
+            "/tmp/b.signed.json",
+        ]);
+        assert!(
+            no_pubkey.is_err(),
+            "clap must reject --signed-baseline without --baseline-pubkey-hex"
+        );
+
+        // --baseline + --signed-baseline together is rejected.
+        let both = TestRoot::try_parse_from([
+            "omni-node",
+            "state-integrity",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--baseline",
+            "/tmp/raw.json",
+            "--signed-baseline",
+            "/tmp/signed.json",
+            "--baseline-pubkey-hex",
+            &"aa".repeat(32),
+        ]);
+        assert!(
+            both.is_err(),
+            "clap must reject --baseline + --signed-baseline together"
+        );
+
+        // Stage 12.20 review fix — clap's `requires` and
+        // `conflicts_with` interact in a non-obvious way on
+        // both surfaces:
+        //
+        //   - SOLO `--baseline-pubkey-hex` (no --baseline, no
+        //     --signed-baseline) is REJECTED at parse time
+        //     (clap's `requires = "signed_baseline"` fires
+        //     cleanly when --baseline is also absent).
+        //
+        //   - `--baseline + --baseline-pubkey-hex` (without
+        //     --signed-baseline) is ACCEPTED at parse time on
+        //     BOTH state-integrity AND state-integrity-diff.
+        //     The conflicts_with/required_unless_present
+        //     resolution short-circuits the `requires` check
+        //     in either setup. The runtime backstop in
+        //     `resolve_diff_baseline` emits
+        //     `event=warn context=baseline_pubkey_hex_unused`
+        //     uniformly across both subcommands so the
+        //     trust-anchor-was-dropped state is observable.
+        let lonely_pubkey = TestRoot::try_parse_from([
+            "omni-node",
+            "state-integrity",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--baseline-pubkey-hex",
+            &"aa".repeat(32),
+        ]);
+        assert!(
+            lonely_pubkey.is_err(),
+            "clap must reject SOLO --baseline-pubkey-hex (no --baseline, no --signed-baseline)"
+        );
+        let baseline_with_pubkey = TestRoot::try_parse_from([
+            "omni-node",
+            "state-integrity",
+            "--contributor-state-dir",
+            "/tmp/state",
+            "--baseline",
+            "/tmp/baseline.json",
+            "--baseline-pubkey-hex",
+            &"aa".repeat(32),
+        ]);
+        assert!(
+            baseline_with_pubkey.is_ok(),
+            "state-integrity --baseline + --baseline-pubkey-hex parses; runtime warns"
+        );
     }
 
     // ── Stage 12.19 — state-integrity-diff clap regression ──
 
+    /// Helper for the *raw-baseline* default form. Pre-fills
+    /// `--baseline /tmp/baseline.json` and `--current
+    /// /tmp/current.json` so most tests only override the
+    /// behavioral flags. Tests exercising `--signed-baseline`
+    /// build their own argv to avoid clap's mutual-exclusion
+    /// firing on the defaults.
     fn parse_state_integrity_diff(extra: &[&str]) -> StateIntegrityDiffArgs {
         let mut argv: Vec<String> = vec![
             "omni-node".into(),
@@ -7455,9 +7691,11 @@ mod tests {
     fn state_integrity_diff_flag_parse_smoke() {
         let defaults = parse_state_integrity_diff(&[]);
         assert_eq!(
-            defaults.baseline,
-            std::path::PathBuf::from("/tmp/baseline.json")
+            defaults.baseline.as_deref(),
+            Some(std::path::Path::new("/tmp/baseline.json"))
         );
+        assert!(defaults.signed_baseline.is_none());
+        assert!(defaults.baseline_pubkey_hex.is_none());
         assert_eq!(
             defaults.current,
             std::path::PathBuf::from("/tmp/current.json")
@@ -7501,7 +7739,7 @@ mod tests {
         );
 
         // Required-flag refusals: missing --baseline OR --current.
-        let no_baseline = TestRoot::try_parse_from(&[
+        let no_baseline = TestRoot::try_parse_from([
             "omni-node",
             "state-integrity-diff",
             "--current",
@@ -7511,7 +7749,7 @@ mod tests {
             no_baseline.is_err(),
             "clap must reject state-integrity-diff without --baseline"
         );
-        let no_current = TestRoot::try_parse_from(&[
+        let no_current = TestRoot::try_parse_from([
             "omni-node",
             "state-integrity-diff",
             "--baseline",
@@ -7525,7 +7763,7 @@ mod tests {
         // Stage 12.16/12.17 precedent: --no-prune-state-on-start
         // is deliberately absent. (state-integrity-diff doesn't
         // open a state-store at all; the flag would be misleading.)
-        let no_such_flag = TestRoot::try_parse_from(&[
+        let no_such_flag = TestRoot::try_parse_from([
             "omni-node",
             "state-integrity-diff",
             "--baseline",
@@ -7540,7 +7778,7 @@ mod tests {
         );
 
         // Unknown --format value rejected.
-        let bad_format = TestRoot::try_parse_from(&[
+        let bad_format = TestRoot::try_parse_from([
             "omni-node",
             "state-integrity-diff",
             "--baseline",
@@ -7551,6 +7789,293 @@ mod tests {
             "yaml",
         ]);
         assert!(bad_format.is_err(), "clap must reject unknown --format");
+
+        // Stage 12.20 — `--signed-baseline` + `--baseline-pubkey-hex`
+        // mutually exclusive with `--baseline`; clap enforces.
+        // The default-argv helper preloads --baseline, so this
+        // sub-block builds its own argv to avoid the
+        // mutual-exclusion firing on the defaults.
+        let pubkey_hex_owned = "aa".repeat(32);
+        let argv_signed = [
+            "omni-node",
+            "state-integrity-diff",
+            "--signed-baseline",
+            "/tmp/signed.json",
+            "--baseline-pubkey-hex",
+            &pubkey_hex_owned,
+            "--current",
+            "/tmp/current.json",
+        ];
+        let root_signed = TestRoot::try_parse_from(argv_signed)
+            .expect("--signed-baseline + --baseline-pubkey-hex + --current must parse");
+        let signed_args = match root_signed.contributor.cmd {
+            ContributorCmd::StateIntegrityDiff(a) => a,
+            _ => panic!(),
+        };
+        assert!(signed_args.baseline.is_none());
+        assert_eq!(
+            signed_args.signed_baseline.as_deref(),
+            Some(std::path::Path::new("/tmp/signed.json"))
+        );
+        assert_eq!(
+            signed_args.baseline_pubkey_hex.as_deref(),
+            Some("aa".repeat(32).as_str())
+        );
+
+        // Neither --baseline nor --signed-baseline → required-unless-present
+        // refuses.
+        let no_source = TestRoot::try_parse_from([
+            "omni-node",
+            "state-integrity-diff",
+            "--current",
+            "/tmp/c.json",
+        ]);
+        assert!(
+            no_source.is_err(),
+            "clap must require one of --baseline or --signed-baseline"
+        );
+
+        // Both --baseline AND --signed-baseline → conflict refuses.
+        let pubkey = "aa".repeat(32);
+        let both = TestRoot::try_parse_from([
+            "omni-node",
+            "state-integrity-diff",
+            "--baseline",
+            "/tmp/raw.json",
+            "--signed-baseline",
+            "/tmp/signed.json",
+            "--baseline-pubkey-hex",
+            &pubkey,
+            "--current",
+            "/tmp/c.json",
+        ]);
+        assert!(
+            both.is_err(),
+            "clap must reject --baseline + --signed-baseline together"
+        );
+
+        // --signed-baseline without --baseline-pubkey-hex refuses.
+        let no_pubkey = TestRoot::try_parse_from([
+            "omni-node",
+            "state-integrity-diff",
+            "--signed-baseline",
+            "/tmp/signed.json",
+            "--current",
+            "/tmp/c.json",
+        ]);
+        assert!(
+            no_pubkey.is_err(),
+            "clap must reject --signed-baseline without --baseline-pubkey-hex"
+        );
+
+        // --baseline-pubkey-hex without --signed-baseline parses
+        // (clap's `requires` doesn't fire when the wrapping arg
+        // resolves via `required_unless_present`). The runtime
+        // emits a stderr warning when this is detected; v1
+        // doesn't refuse so operators can keep ad-hoc workflows.
+        let lonely_pubkey = TestRoot::try_parse_from([
+            "omni-node",
+            "state-integrity-diff",
+            "--baseline",
+            "/tmp/raw.json",
+            "--baseline-pubkey-hex",
+            &pubkey,
+            "--current",
+            "/tmp/c.json",
+        ]);
+        assert!(
+            lonely_pubkey.is_ok(),
+            "clap accepts --baseline + --baseline-pubkey-hex; the runtime warns instead"
+        );
+    }
+
+    // ── Stage 12.20 — sign-state-integrity-baseline clap regression ──
+
+    /// Build `sign-state-integrity-baseline` argv with the
+    /// supplied `signer_role` value + optional extra trailing
+    /// flags. `signer_role` is NOT part of the defaults so
+    /// each test can override it cleanly (clap would reject
+    /// a duplicate-arg pass).
+    fn parse_sign_state_integrity_baseline(
+        signer_role: &str,
+        extra: &[&str],
+    ) -> SignStateIntegrityBaselineArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "sign-state-integrity-baseline".into(),
+            "--baseline-in".into(),
+            "/tmp/raw.json".into(),
+            "--signer-seed".into(),
+            "/tmp/seed.bin".into(),
+            "--signer-role".into(),
+            signer_role.into(),
+            "--out".into(),
+            "/tmp/signed.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::SignStateIntegrityBaseline(a) => a,
+            _ => panic!("expected SignStateIntegrityBaseline"),
+        }
+    }
+
+    #[test]
+    fn sign_state_integrity_baseline_flag_parse_smoke() {
+        let defaults = parse_sign_state_integrity_baseline("operator", &[]);
+        assert_eq!(defaults.baseline_in, std::path::PathBuf::from("/tmp/raw.json"));
+        assert_eq!(defaults.signer_seed, std::path::PathBuf::from("/tmp/seed.bin"));
+        assert_eq!(defaults.signer_role, CliBaselineSignerRole::Operator);
+        assert_eq!(defaults.out, std::path::PathBuf::from("/tmp/signed.json"));
+        assert_eq!(
+            defaults.format,
+            SignStateIntegrityBaselineFormat::Events
+        );
+
+        // All four roles parse via the closed enum.
+        for (raw, expected) in &[
+            ("operator", CliBaselineSignerRole::Operator),
+            ("contributor", CliBaselineSignerRole::Contributor),
+            ("dispatcher", CliBaselineSignerRole::Dispatcher),
+            ("coordinator", CliBaselineSignerRole::Coordinator),
+        ] {
+            let got = parse_sign_state_integrity_baseline(raw, &[]);
+            assert_eq!(got.signer_role, *expected, "role={raw} parsed wrong");
+        }
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", SignStateIntegrityBaselineFormat::Events),
+            ("json", SignStateIntegrityBaselineFormat::Json),
+            ("pretty", SignStateIntegrityBaselineFormat::Pretty),
+        ] {
+            let got =
+                parse_sign_state_integrity_baseline("operator", &["--format", raw]);
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --signer-role rejected.
+        let bad_role = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-state-integrity-baseline",
+            "--baseline-in",
+            "/tmp/raw.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "validator",
+            "--out",
+            "/tmp/signed.json",
+        ]);
+        assert!(bad_role.is_err(), "clap must reject unknown --signer-role");
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-state-integrity-baseline",
+            "--baseline-in",
+            "/tmp/raw.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "operator",
+            "--out",
+            "/tmp/signed.json",
+            "--format",
+            "yaml",
+        ]);
+        assert!(bad_format.is_err(), "clap must reject unknown --format");
+
+        // Required-flag refusals.
+        for missing in &[
+            "--baseline-in",
+            "--signer-seed",
+            "--signer-role",
+            "--out",
+        ] {
+            let argv: Vec<&str> = [
+                "omni-node",
+                "sign-state-integrity-baseline",
+                "--baseline-in",
+                "/tmp/raw.json",
+                "--signer-seed",
+                "/tmp/seed.bin",
+                "--signer-role",
+                "operator",
+                "--out",
+                "/tmp/signed.json",
+            ]
+            .iter()
+            .copied()
+            .filter(|s| s != missing && !is_value_after(s, missing))
+            .collect();
+            let _ = argv; // verified below via a fresh build
+            let stripped = strip_flag_with_value("sign-state-integrity-baseline", missing);
+            let parsed = TestRoot::try_parse_from(stripped);
+            assert!(
+                parsed.is_err(),
+                "clap must reject sign-state-integrity-baseline without {missing}"
+            );
+        }
+
+        // Auto-prune flag deliberately absent.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-state-integrity-baseline",
+            "--baseline-in",
+            "/tmp/raw.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "operator",
+            "--out",
+            "/tmp/signed.json",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "sign-state-integrity-baseline must not accept --no-prune-state-on-start"
+        );
+    }
+
+    /// Helper used only by the missing-flag refusal sweep above.
+    /// Returns true if `s` is the value that immediately follows
+    /// the flag `flag` in the canonical baseline argv. The sweep
+    /// strips both the flag itself AND its value.
+    fn is_value_after(s: &str, flag: &str) -> bool {
+        match flag {
+            "--baseline-in" => s == "/tmp/raw.json",
+            "--signer-seed" => s == "/tmp/seed.bin",
+            "--signer-role" => s == "operator",
+            "--out" => s == "/tmp/signed.json",
+            _ => false,
+        }
+    }
+
+    /// Build an argv for `sign-state-integrity-baseline` with one
+    /// (flag, value) pair stripped — used to drive the
+    /// missing-flag refusal sweep.
+    fn strip_flag_with_value(subcommand: &str, drop_flag: &str) -> Vec<String> {
+        let full: Vec<(&str, Option<&str>)> = vec![
+            ("--baseline-in", Some("/tmp/raw.json")),
+            ("--signer-seed", Some("/tmp/seed.bin")),
+            ("--signer-role", Some("operator")),
+            ("--out", Some("/tmp/signed.json")),
+        ];
+        let mut out: Vec<String> =
+            vec!["omni-node".to_string(), subcommand.to_string()];
+        for (flag, val) in full {
+            if flag == drop_flag {
+                continue;
+            }
+            out.push(flag.to_string());
+            if let Some(v) = val {
+                out.push(v.to_string());
+            }
+        }
+        out
     }
 
     // ── Stage 12.17 — plan-state-cleanup / apply-state-cleanup ──
@@ -7626,7 +8151,7 @@ mod tests {
         // Stage 12.16 review precedent: cleanup CLI does NOT
         // expose --no-prune-state-on-start (cleanup planner is
         // read-only and always opens with auto_prune off).
-        let no_such_flag = TestRoot::try_parse_from(&[
+        let no_such_flag = TestRoot::try_parse_from([
             "omni-node",
             "plan-state-cleanup",
             "--contributor-state-dir",
@@ -7671,7 +8196,7 @@ mod tests {
         }
 
         // Auto-prune flag is deliberately absent on apply too.
-        let no_such_flag = TestRoot::try_parse_from(&[
+        let no_such_flag = TestRoot::try_parse_from([
             "omni-node",
             "apply-state-cleanup",
             "--contributor-state-dir",
@@ -7750,7 +8275,7 @@ mod tests {
 
         // Mutual-exclusion: --quarantine-plan-dir vs
         // --quarantine-dir/--plan-id pair is rejected by clap.
-        let conflict = TestRoot::try_parse_from(&[
+        let conflict = TestRoot::try_parse_from([
             "omni-node",
             "restore-state-cleanup-quarantine",
             "--contributor-state-dir",
@@ -7769,7 +8294,7 @@ mod tests {
 
         // Pair-requires: --quarantine-dir alone (no --plan-id)
         // is rejected.
-        let lonely = TestRoot::try_parse_from(&[
+        let lonely = TestRoot::try_parse_from([
             "omni-node",
             "restore-state-cleanup-quarantine",
             "--contributor-state-dir",
@@ -7816,7 +8341,7 @@ mod tests {
         }
 
         // Unknown --format value is rejected.
-        let bad_format = TestRoot::try_parse_from(&[
+        let bad_format = TestRoot::try_parse_from([
             "omni-node",
             "restore-state-cleanup-quarantine",
             "--contributor-state-dir",
@@ -7833,7 +8358,7 @@ mod tests {
 
         // Auto-prune flag is deliberately absent on this
         // subcommand (Stage 12.16/12.17 precedent).
-        let no_such_flag = TestRoot::try_parse_from(&[
+        let no_such_flag = TestRoot::try_parse_from([
             "omni-node",
             "restore-state-cleanup-quarantine",
             "--contributor-state-dir",
@@ -9728,13 +10253,21 @@ fn run_state_integrity(args: StateIntegrityArgs) -> Result<()> {
     // diff output. `--fail-on-warn` still applies to the live
     // scan's counts and composes with the diff exit flags via
     // OR — any one tripping → exit 1.
-    if let Some(baseline_path) = args.baseline.as_deref() {
+    if args.baseline.is_some() || args.signed_baseline.is_some() {
+        // Stage 12.20 — load the baseline. `--baseline` and
+        // `--signed-baseline` are clap-level mutually
+        // exclusive; whichever is set determines the loader.
+        // The signed loader runs the
+        // Stage 12.20 verification (pubkey trust anchor +
+        // signature) BEFORE extracting the embedded report.
+        let baseline = resolve_diff_baseline(
+            args.baseline.as_deref(),
+            args.signed_baseline.as_deref(),
+            args.baseline_pubkey_hex.as_deref(),
+            &log_op,
+        )?;
         return run_state_integrity_baseline_diff(
-            &args,
-            &report,
-            baseline_path,
-            &now_utc,
-            log_op,
+            &args, &report, baseline, &now_utc, log_op,
         );
     }
 
@@ -9792,25 +10325,18 @@ fn run_state_integrity(args: StateIntegrityArgs) -> Result<()> {
 }
 
 /// Stage 12.19 — live-scan-vs-baseline branch of
-/// `run_state_integrity`. Called when `args.baseline.is_some()`.
+/// `run_state_integrity`. Called when `args.baseline` OR
+/// Stage 12.20 `args.signed_baseline` is set. The caller has
+/// already resolved the baseline (raw or signed-then-verified)
+/// to a `StateIntegrityReport` via `resolve_diff_baseline`.
 fn run_state_integrity_baseline_diff(
     args: &StateIntegrityArgs,
     current_report: &omni_contributor::StateIntegrityReport,
-    baseline_path: &std::path::Path,
+    baseline: omni_contributor::StateIntegrityReport,
     now_utc: &str,
     log_op: impl Fn(&str),
 ) -> Result<()> {
-    use omni_contributor::{
-        diff_state_integrity_reports, DiffOptions, StateIntegrityReport,
-    };
-
-    let baseline_bytes = std::fs::read(baseline_path).with_context(|| {
-        format!("read baseline json: {}", baseline_path.display())
-    })?;
-    let baseline: StateIntegrityReport = serde_json::from_slice(&baseline_bytes)
-        .with_context(|| {
-            format!("parse baseline json: {}", baseline_path.display())
-        })?;
+    use omni_contributor::{diff_state_integrity_reports, DiffOptions};
 
     let diff_opts = DiffOptions {
         now_utc,
@@ -10475,19 +11001,30 @@ fn run_state_integrity_diff(args: StateIntegrityDiffArgs) -> Result<()> {
         }
     };
 
-    let baseline_bytes = std::fs::read(&args.baseline)
-        .with_context(|| format!("read baseline json: {}", args.baseline.display()))?;
-    let baseline: StateIntegrityReport = serde_json::from_slice(&baseline_bytes)
-        .with_context(|| format!("parse baseline json: {}", args.baseline.display()))?;
+    // Stage 12.20 — `--baseline` and `--signed-baseline` are
+    // clap-level mutually exclusive AND required-unless-the-other.
+    // The signed loader runs the Stage 12.20 verification
+    // (pubkey trust anchor + signature) BEFORE extracting the
+    // embedded report.
+    let baseline = resolve_diff_baseline(
+        args.baseline.as_deref(),
+        args.signed_baseline.as_deref(),
+        args.baseline_pubkey_hex.as_deref(),
+        &log_op,
+    )?;
     let current_bytes = std::fs::read(&args.current)
         .with_context(|| format!("read current json: {}", args.current.display()))?;
     let current: StateIntegrityReport = serde_json::from_slice(&current_bytes)
         .with_context(|| format!("parse current json: {}", args.current.display()))?;
 
     log_op(&format!(
-        "event=state_integrity_diff_started baseline={} current={} \
+        "event=state_integrity_diff_started baseline_source={} current={} \
          require_state_dir_match={}",
-        args.baseline.display(),
+        if args.signed_baseline.is_some() {
+            "signed"
+        } else {
+            "raw"
+        },
         args.current.display(),
         args.require_state_dir_match,
     ));
@@ -10531,6 +11068,98 @@ fn run_state_integrity_diff(args: StateIntegrityDiffArgs) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Stage 12.20 — resolve `--baseline` xor `--signed-baseline`
+/// into a typed `StateIntegrityReport`. Clap has already
+/// enforced that exactly one of the two is set AND that
+/// `--baseline-pubkey-hex` accompanies `--signed-baseline`;
+/// this helper just executes the chosen loader. The signed
+/// loader runs the Stage 12.20 verification (pubkey trust
+/// anchor + signature) BEFORE extracting the embedded report,
+/// so a refused wrapper never reaches the diff helper.
+fn resolve_diff_baseline(
+    raw_path: Option<&std::path::Path>,
+    signed_path: Option<&std::path::Path>,
+    baseline_pubkey_hex: Option<&str>,
+    log_op: &impl Fn(&str),
+) -> Result<omni_contributor::StateIntegrityReport> {
+    use omni_contributor::{
+        read_signed_baseline_from_path, verify_signed_state_integrity_baseline,
+        StateIntegrityReport,
+    };
+
+    if let Some(path) = signed_path {
+        let expected_pubkey = baseline_pubkey_hex.ok_or_else(|| {
+            anyhow!(
+                "--signed-baseline requires --baseline-pubkey-hex (clap should have caught this)"
+            )
+        })?;
+        let wrapper = read_signed_baseline_from_path(path).map_err(|e| {
+            anyhow!("read signed baseline at {}: {e}", path.display())
+        })?;
+        verify_signed_state_integrity_baseline(&wrapper, expected_pubkey).map_err(
+            |e| {
+                // Closed-tag reason for log scrapers.
+                let reason_tag = match &e {
+                    omni_contributor::SignedBaselineError::SignerPubkeyMismatch { .. } => {
+                        "signer_pubkey_mismatch"
+                    }
+                    omni_contributor::SignedBaselineError::SignatureMismatch => {
+                        "signature_mismatch"
+                    }
+                    omni_contributor::SignedBaselineError::UnsupportedSchemaVersion { .. } => {
+                        "unsupported_schema_version"
+                    }
+                    omni_contributor::SignedBaselineError::UnsupportedReportSchemaVersion { .. } => {
+                        "unsupported_report_schema_version"
+                    }
+                    omni_contributor::SignedBaselineError::Signing(_) => {
+                        "signing_decode_error"
+                    }
+                    omni_contributor::SignedBaselineError::Canonical(_) => {
+                        "canonical_encoding_error"
+                    }
+                    _ => "other",
+                };
+                eprintln!(
+                    "event=signed_baseline_refused reason={reason_tag} message={e}"
+                );
+                anyhow!("signed baseline refused: {e}")
+            },
+        )?;
+        log_op(&format!(
+            "event=signed_baseline_verified pubkey={} signer_role={}",
+            wrapper.signer_pubkey_hex,
+            wrapper.signer_role.as_str(),
+        ));
+        Ok(wrapper.report)
+    } else if let Some(path) = raw_path {
+        if baseline_pubkey_hex.is_some() {
+            // Runtime backstop for the clap-edge described in
+            // the test: when --baseline is supplied AND
+            // --baseline-pubkey-hex is also supplied (without
+            // --signed-baseline), clap's `requires` doesn't
+            // refuse because the `required_unless_present`
+            // chain on the baseline flags satisfies clap. Warn
+            // loudly so the operator notices the pubkey is
+            // unused.
+            eprintln!(
+                "event=warn context=baseline_pubkey_hex_unused \
+                 message=--baseline-pubkey-hex was supplied but --signed-baseline is not set; \
+                 the trust anchor is ignored because the raw baseline is unsigned"
+            );
+        }
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read baseline json: {}", path.display()))?;
+        let report: StateIntegrityReport = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse baseline json: {}", path.display()))?;
+        Ok(report)
+    } else {
+        Err(anyhow!(
+            "neither --baseline nor --signed-baseline supplied (clap should have caught this)"
+        ))
+    }
 }
 
 fn render_state_integrity_diff_events(
@@ -10715,4 +11344,118 @@ fn write_diff_json_mirror(
             );
         }
     }
+}
+
+// ── Stage 12.20 — sign-state-integrity-baseline ───────────────────────────
+
+fn run_sign_state_integrity_baseline(
+    args: SignStateIntegrityBaselineArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        sign_state_integrity_baseline, write_signed_baseline_atomic,
+        BaselineSignerRole, ContributorSigner, SignedStateIntegrityBaseline,
+        StateIntegrityReport,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode = matches!(args.format, SignStateIntegrityBaselineFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    log_op("event=signed_baseline_signing_started");
+
+    // Read the raw v1 report.
+    let report_bytes = std::fs::read(&args.baseline_in).with_context(|| {
+        format!("read baseline-in: {}", args.baseline_in.display())
+    })?;
+    let report: StateIntegrityReport = serde_json::from_slice(&report_bytes)
+        .with_context(|| format!("parse baseline-in: {}", args.baseline_in.display()))?;
+
+    // Load the signer. Stage 12.20's CLI uses
+    // `ContributorSigner` as the seed loader since all four
+    // role-typed signers share the same shape; the recorded
+    // `signer_role` tag is independent of the loader type.
+    let signer = ContributorSigner::from_seed_file(&args.signer_seed)
+        .with_context(|| {
+            format!("load signer seed: {}", args.signer_seed.display())
+        })?;
+    let signer_pubkey_hex = signer.pubkey_hex();
+    let role: BaselineSignerRole = args.signer_role.into();
+
+    let signed: SignedStateIntegrityBaseline = sign_state_integrity_baseline(
+        report,
+        &signer_pubkey_hex,
+        role,
+        &now_utc,
+        |msg| signer.sign(msg),
+    )
+    .map_err(|e| anyhow!("sign baseline refused: {e}"))?;
+
+    write_signed_baseline_atomic(&signed, &args.out)
+        .map_err(|e| anyhow!("write signed baseline: {e}"))?;
+    log_op(&format!(
+        "event=signed_baseline_written path={} signer_role={} signer_pubkey={}",
+        args.out.display(),
+        role.as_str(),
+        signer_pubkey_hex,
+    ));
+
+    match args.format {
+        SignStateIntegrityBaselineFormat::Events => {
+            // Already emitted the summary line above.
+        }
+        SignStateIntegrityBaselineFormat::Json => {
+            render_sign_baseline_json(&signed)?;
+        }
+        SignStateIntegrityBaselineFormat::Pretty => {
+            render_sign_baseline_pretty(&signed, &args.out);
+        }
+    }
+    Ok(())
+}
+
+fn render_sign_baseline_json(
+    signed: &omni_contributor::SignedStateIntegrityBaseline,
+) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(signed)
+        .map_err(|e| anyhow!("serialize signed baseline: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write signed baseline: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_sign_baseline_pretty(
+    signed: &omni_contributor::SignedStateIntegrityBaseline,
+    out: &std::path::Path,
+) {
+    println!("Signed integrity baseline");
+    println!("  schema_version  : {}", signed.schema_version);
+    println!("  signed_at_utc   : {}", signed.signed_at_utc);
+    println!("  signer_role     : {}", signed.signer_role.as_str());
+    println!("  signer_pubkey   : {}", signed.signer_pubkey_hex);
+    println!("  signature       : {}", signed.signature_hex);
+    println!("  state_dir       : {}", signed.report.state_dir);
+    println!("  state_version   : {}", signed.report.state_version);
+    println!(
+        "  findings        : {} (ok={} warn={} error={})",
+        signed.report.findings.len(),
+        signed.report.counts_ok,
+        signed.report.counts_warn,
+        signed.report.counts_error,
+    );
+    println!("  out             : {}", out.display());
 }

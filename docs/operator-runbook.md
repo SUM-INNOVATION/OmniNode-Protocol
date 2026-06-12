@@ -1420,3 +1420,77 @@ omni-node operator contributor state-integrity-diff \
 **Defaults are safe-by-default.** `state-integrity-diff` opens no state-store at all — it's pure JSON-to-JSON. `state-integrity --baseline` preserves the Stage 12.16 auto-prune-off posture (no `--no-prune-state-on-start` flag exposed; pinned by clap regression). The diff output is a v1 `StateIntegrityDiffReport` with its own forward-compatible schema (`STATE_INTEGRITY_DIFF_SCHEMA_VERSION = 1`); the v1 `StateIntegrityReport` it consumes is unchanged.
 
 **No protocol surface touched.** No envelope, no canonical-byte changes, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
+
+### Stage 12.20 — signed integrity baselines
+
+**Use when:** your CI gate needs to prove the baseline JSON came from an expected Ed25519 key (and hasn't been hand-edited) before Stage 12.19 diffs it. The wrapper is local-only — no protocol, no SNIP, no chain. Sign the baseline once with an operator-local seed, then point the diff CLI at the signed wrapper plus the operator-supplied trust anchor (the pubkey hex).
+
+**Workflow — signing the baseline:**
+
+```sh
+# 1. Capture a raw v1 baseline as before (Stage 12.16).
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state> \
+  --format json \
+  --json-out /tmp/baseline.json
+
+# 2. Sign with a 32-byte Ed25519 seed file. Operators MUST
+#    use a seed distinct from any chain-attestation or
+#    protocol-role seed — the baseline-signing role is its
+#    own key per Stage 12.20.
+omni-node operator contributor sign-state-integrity-baseline \
+  --baseline-in /tmp/baseline.json \
+  --signer-seed /etc/omni-node/baseline-signer.seed \
+  --signer-role operator \
+  --out /etc/omni-node/baseline.signed.json
+# event=signed_baseline_written path=... signer_role=operator signer_pubkey=<hex>
+```
+
+**Workflow — consuming a signed baseline (CI gate):**
+
+```sh
+# Capture the trust anchor (the signer pubkey) once. This is
+# the same hex string the signing CLI emitted on its
+# event=signed_baseline_written line.
+SIGNER_PUBKEY=<64-hex>
+
+# CI: live scan diff against the signed baseline. The verifier
+# refuses BEFORE any diff if the wrapper isn't signed by the
+# expected pubkey OR if the signature doesn't match.
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state> \
+  --signed-baseline /etc/omni-node/baseline.signed.json \
+  --baseline-pubkey-hex "$SIGNER_PUBKEY" \
+  --fail-on-new-error
+
+# Forensic two-JSON form:
+omni-node operator contributor state-integrity-diff \
+  --signed-baseline /backup/yesterday.baseline.signed.json \
+  --baseline-pubkey-hex "$SIGNER_PUBKEY" \
+  --current /backup/today.baseline.json
+```
+
+**Flag rules (clap-enforced):**
+
+- `--baseline` and `--signed-baseline` are mutually exclusive on both subcommands. `state-integrity-diff` requires exactly one of the two; `state-integrity` requires neither (omit both for the raw scan posture).
+- `--baseline-pubkey-hex` is required whenever `--signed-baseline` is set. Operators never trust the pubkey embedded in the wrapper alone.
+- All four `--signer-role` values are accepted: `operator` / `contributor` / `dispatcher` / `coordinator`. The role tag is recorded for forensics; verifiers don't enforce policy on the role itself — the trust anchor is the pubkey.
+
+**Refusal modes (typed `SignedBaselineError`):**
+
+- `UnsupportedSchemaVersion { got, expected }` → wrapper came from a future stage; v1 binary refuses.
+- `UnsupportedReportSchemaVersion { got, expected }` → embedded report came from a future Stage 12.16 lineage. Refuse to deserialize.
+- `SignerPubkeyMismatch { expected, got }` → the wrapper's `signer_pubkey_hex` doesn't equal `--baseline-pubkey-hex`. Cheap pre-check — no crypto burn.
+- `SignatureMismatch` → the wrapper was hand-edited (any field of the canonical body changed) OR the signature was tampered. Stage 12.20 covers `signer_role`, `signed_at_utc`, `signer_pubkey_hex`, AND every field of the embedded `report` — tampering any of them trips this.
+- `MalformedJson { path, source }` → wrapper JSON parse failed.
+
+**`--baseline-pubkey-hex` enforcement (uniform across both subcommands):**
+
+- **Solo `--baseline-pubkey-hex`** (no `--baseline`, no `--signed-baseline`) is **rejected at parse time on both surfaces** — clap's `requires = "signed_baseline"` constraint fires cleanly when no baseline source is supplied at all.
+- **`--baseline + --baseline-pubkey-hex`** (raw baseline with a trust anchor but no `--signed-baseline`) is **accepted at parse time on both surfaces** — the clap setups' `conflicts_with` / `required_unless_present` interactions short-circuit the `requires` check. The runtime backstop in `resolve_diff_baseline` emits `event=warn context=baseline_pubkey_hex_unused` on both subcommands so the operator notices the trust anchor was silently dropped before they ship the gate. The diff still runs because the raw baseline path doesn't need a trust anchor.
+
+Operators who want a trust-anchored baseline MUST use `--signed-baseline` instead.
+
+**Determinism:** signing the same report + same seed + same `signed_at_utc` produces a byte-identical wrapper — operators can commit a signed baseline to a repository and re-derive it deterministically.
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.19 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
