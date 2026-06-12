@@ -40,11 +40,19 @@ use crate::signing::verify_signature_hex;
 /// only.
 pub const SIGNED_BASELINE_SCHEMA_VERSION: u32 = 1;
 
-/// Closed taxonomy of baseline signer roles. The role tag is
-/// recorded for forensics; verifiers don't enforce policy on
-/// the role itself — the trust anchor is the
+/// Closed taxonomy of integrity-artifact signer roles. The role
+/// tag is recorded for forensics; verifiers don't enforce
+/// policy on the role itself — the trust anchor is the
 /// `signer_pubkey_hex` the caller passes to
-/// [`verify_signed_state_integrity_baseline`].
+/// [`verify_signed_state_integrity_baseline`] (Stage 12.20) or
+/// [`crate::signed_diff::verify_signed_state_integrity_diff`]
+/// (Stage 12.21).
+///
+/// Stage 12.21 — this enum is REUSED by the signed-diff wrapper
+/// as well. The four variants are role names, not artifact-type
+/// names, so the same taxonomy applies to baselines and diffs
+/// alike. The `Baseline` prefix on the type name is a Stage 12.20
+/// artifact; we keep it for back-compat with the public API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BaselineSignerRole {

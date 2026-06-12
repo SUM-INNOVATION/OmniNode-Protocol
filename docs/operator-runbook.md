@@ -1494,3 +1494,79 @@ Operators who want a trust-anchored baseline MUST use `--signed-baseline` instea
 **Determinism:** signing the same report + same seed + same `signed_at_utc` produces a byte-identical wrapper — operators can commit a signed baseline to a repository and re-derive it deterministically.
 
 **No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.19 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
+
+### Stage 12.21 — signed integrity diffs
+
+**Use when:** you want tamper-evident archival evidence of an integrity diff: which baseline was compared, which current report was compared, the exact diff that came out, and which key signed the artifact. Stage 12.20 covers the *baseline* trust path so a CI gate can prove the baseline JSON came from an expected key. Stage 12.21 covers the *diff* trust path so a forensic record of the diff itself can be archived. Both are local-only — no protocol, no SNIP, no chain.
+
+**Workflow — signing a diff:**
+
+```sh
+# 1. Produce a raw v1 diff (Stage 12.19) the normal way.
+omni-node operator contributor state-integrity-diff \
+  --baseline /backup/yesterday.baseline.json \
+  --current /backup/today.baseline.json \
+  --json-out /tmp/diff.json
+
+# 2. Sign with a 32-byte Ed25519 seed file. As with Stage 12.20,
+#    operators MUST use a seed distinct from any chain-attestation
+#    or protocol-role seed — the integrity-artifact signing role
+#    is its own key.
+omni-node operator contributor sign-state-integrity-diff \
+  --diff-in /tmp/diff.json \
+  --signer-seed /etc/omni-node/diff-signer.seed \
+  --signer-role operator \
+  --out /var/audit/2026-06-12.diff.signed.json
+# event=signed_integrity_diff_signing_started
+# event=signed_integrity_diff_written path=... signer_role=operator signer_pubkey=<hex>
+```
+
+**Workflow — verifying an archived signed diff:**
+
+```sh
+# Capture the trust anchor (the signer pubkey) once. This is
+# the same hex string the signing CLI emitted on its
+# event=signed_integrity_diff_written line.
+SIGNER_PUBKEY=<64-hex>
+
+omni-node operator contributor verify-state-integrity-diff-signature \
+  --signed-diff /var/audit/2026-06-12.diff.signed.json \
+  --expected-signer-pubkey-hex "$SIGNER_PUBKEY"
+# event=signed_integrity_diff_verify_started
+# event=signed_integrity_diff_verify_ok path=... signer_role=operator signer_pubkey=<hex>
+```
+
+The verifier opens no state-store and writes nothing. It exits nonzero on any refusal and emits a closed-tag reason line so log scrapers can classify failures:
+
+- `--format events` (default) → one success line OR one `event=signed_integrity_diff_verify_failed reason=<tag>` line + nonzero exit.
+- `--format json` → compact metadata view of the verified wrapper (`schema_version`, `signed_at_utc`, `signer_role`, `signer_pubkey_hex`, `signature_hex`, diff `schema_version` / `generated_at_utc` / `state_dir` / `baseline_state_dir` / `counts`). Operational chatter goes to stderr so `jq` works.
+- `--format pretty` → terminal-friendly summary.
+
+**Flag rules (clap-enforced):**
+
+- `sign-state-integrity-diff` requires `--diff-in`, `--signer-seed`, `--signer-role`, and `--out`. Missing any of them refuses at parse time.
+- `verify-state-integrity-diff-signature` requires `--signed-diff` and `--expected-signer-pubkey-hex`. The wrapper's own `signer_pubkey_hex` field is forensic context only; operators always supply the trust anchor.
+- All four `--signer-role` values are accepted on signing: `operator` / `contributor` / `dispatcher` / `coordinator` — the Stage 12.20 closed enum is REUSED because the variants are role names, not artifact-type names.
+- Neither subcommand exposes `--no-prune-state-on-start` — pinned by clap regression. Neither opens a contributor state-store.
+
+**Refusal modes (typed `SignedIntegrityDiffError`, surfaced as `reason=<tag>`):**
+
+- `signer_pubkey_mismatch` → the wrapper's `signer_pubkey_hex` doesn't equal `--expected-signer-pubkey-hex`. Cheap pre-check — no crypto burn.
+- `signature_mismatch` → the wrapper was hand-edited (any field of the canonical body changed) OR the signature was tampered. Stage 12.21 covers `signer_role`, `signed_at_utc`, `signer_pubkey_hex`, AND every field of the embedded `diff` — tampering any of them trips this.
+- `unsupported_schema_version` → wrapper came from a future stage; v1 binary refuses.
+- `unsupported_diff_schema_version` → embedded diff came from a future Stage 12.19 lineage; refuse to deserialize.
+- `signing` → Ed25519 decode/verify primitive returned an error (malformed hex, bad length, etc.).
+- `canonical` → bincode encoding of the canonical body failed (closed-set struct; should be impossible in practice).
+- `io` → FS read of the wrapper failed (missing file, permissions, etc.).
+- `malformed_json` → wrapper JSON didn't parse as a v1 `SignedStateIntegrityDiff` (likely a hand-edit that broke the structure).
+
+**What's covered by the signature (vs what isn't):**
+
+- **Covered**: wrapper `schema_version`, `signed_at_utc`, `signer_pubkey_hex`, `signer_role`, AND every byte of the embedded `StateIntegrityDiffReport` (counts, all three findings buckets, both inputs' provenance — `baseline_generated_at_utc`, `current_generated_at_utc`, `baseline_state_dir`, `state_dir`, `baseline_state_version`, `current_state_version`, `baseline_omni_contributor_version`, `current_omni_contributor_version`). The wrapper's `signature_hex` is excluded (signing over your own signature is circular).
+- **Not covered** (deliberate v1 scope): no separate signed-baseline-hash field linking back to a specific Stage 12.20 wrapper. The diff body already lifts both inputs' provenance, so the signed diff transitively pins the baseline-vs-current context without a redundant pointer.
+
+**Determinism:** signing the same diff + same seed + same `signed_at_utc` produces a byte-identical wrapper — operators can commit a signed diff to an archive and re-derive it deterministically.
+
+**Composition with Stage 12.20:** the two trust paths are complementary. A typical forensic chain looks like (a) a Stage 12.20 signed baseline captured nightly, (b) the next morning's diff produced via `state-integrity-diff --signed-baseline <a> --baseline-pubkey-hex <anchor> --current <today.json> --json-out /tmp/diff.json`, then (c) the Stage 12.21 signed wrapper around that diff archived to immutable storage. Stage 12.20 proves the baseline JSON came from an expected key; Stage 12.21 proves the diff JSON came from an expected key (often the same key, sometimes a different audit-only key — operators decide).
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.20 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
