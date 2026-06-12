@@ -2967,3 +2967,116 @@ When `--signed-baseline` resolves at runtime, `verify_signed_state_integrity_bas
 | Extended `state-integrity-diff` flag matrix gains `--signed-baseline` / `--baseline-pubkey-hex` mutual-exclusion + required-unless-present + requires-pair coverage | `state_integrity_diff_flag_parse_smoke` (omni-node, extended) |
 
 **Residual gap (deliberate):** the CLI run-fns `run_sign_state_integrity_baseline` and `resolve_diff_baseline` aren't exercised end-to-end (same constraint as Stage 12.10–12.19); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
+
+# Stage 12.21 — signed integrity diffs
+
+## What this stage is, in one sentence
+
+A local-only `SignedStateIntegrityDiff` wrapper around a v1 `StateIntegrityDiffReport`, plus a `sign-state-integrity-diff` CLI to produce one and a `verify-state-integrity-diff-signature` CLI to verify one — so operators can archive tamper-evident evidence of exactly which baseline was compared against which current report and which key signed the resulting diff artifact.
+
+## Why a separate wrapper schema (and why not extend Stage 12.20)
+
+Stage 12.19's `StateIntegrityDiffReport` is consumed UNCHANGED. The signed wrapper is its own forward-compatible artifact tracked by `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION = 1`, independent of every existing schema constant — including `SIGNED_BASELINE_SCHEMA_VERSION`. v1 wrappers wrap v1 diffs only; future stages can extend the wrapper without bumping any existing surface. Stage 12.20's wrapper has a different shape (`report` vs `diff` field) and a different domain separator (`SIGNED_BASELINE_DOMAIN` vs `SIGNED_INTEGRITY_DIFF_DOMAIN`), so reusing it would muddle two distinct trust artifacts. The four-role taxonomy IS shared, though — the `BaselineSignerRole` enum is REUSED verbatim because the variants are role names, not artifact-type names.
+
+The signing input mirrors the Stage 12.0–12.20 envelope pattern (`SIGNED_INTEGRITY_DIFF_DOMAIN || bincode1::serialize(canonical_body)`) so the trust model and review surface are identical to the protocol's existing role-typed signed bodies.
+
+## Library surface
+
+`omni_contributor::signed_diff` (new module):
+
+- `pub const SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION: u32 = 1;`
+- `SignedStateIntegrityDiff { schema_version, signed_at_utc, signer_pubkey_hex, signer_role, diff, signature_hex }` with `deny_unknown_fields`. Embeds the full v1 `StateIntegrityDiffReport` so a captured wrapper is self-contained — no out-of-band diff file is needed at verify time.
+- `pub fn signed_integrity_diff_signing_input(schema_version, signed_at_utc, signer_pubkey_hex, signer_role, diff) -> Result<Vec<u8>, SignedIntegrityDiffError>` — builds the canonical body (`SIGNED_INTEGRITY_DIFF_DOMAIN || bincode1::serialize(canonical_body)`) used by both signer and verifier.
+- `pub fn sign_state_integrity_diff(diff, signer_pubkey_hex, signer_role, signed_at_utc, sign_fn) -> Result<SignedStateIntegrityDiff, SignedIntegrityDiffError>` — the library stays signer-agnostic; the caller supplies a closure that computes the signature. Refuses non-v1 embedded diffs.
+- `pub fn verify_signed_state_integrity_diff(wrapper, expected_signer_pubkey_hex) -> Result<(), SignedIntegrityDiffError>` — two-step refusal order: cheap `SignerPubkeyMismatch` pre-check, then cryptographic verification. Refuses non-v1 wrapper / non-v1 embedded diff at the same gate.
+- `pub fn read_signed_integrity_diff_from_path(path) -> Result<SignedStateIntegrityDiff, SignedIntegrityDiffError>` — convenience FS reader.
+- `pub fn write_signed_integrity_diff_atomic(wrapper, out) -> Result<PathBuf, SignedIntegrityDiffError>` — atomic tempfile + rename, same posture as Stage 12.20 `write_signed_baseline_atomic`.
+
+The four-role taxonomy is the Stage 12.20 `BaselineSignerRole { Operator, Contributor, Dispatcher, Coordinator }` enum — reused verbatim. The `Baseline` prefix on the type name is a Stage 12.20 artifact; the variants themselves are role names, not artifact-type names, so the same taxonomy applies to baselines and diffs alike.
+
+New typed `SignedIntegrityDiffError` covers `UnsupportedSchemaVersion`, `UnsupportedDiffSchemaVersion`, `Canonical` (bubbled `CanonicalError`), `Signing` (bubbled `SigningError`), `SignatureMismatch`, `SignerPubkeyMismatch`, `Io`, `MalformedJson` — mirrors Stage 12.20 `SignedBaselineError` shape verbatim.
+
+`canonical.rs` gains one new constant:
+
+```rust
+pub const SIGNED_INTEGRITY_DIFF_DOMAIN: &[u8] =
+    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-DIFF:v1:";
+```
+
+## Safety contract
+
+- **Trust is opt-in at the verifier.** The wrapper's `signer_pubkey_hex` is forensic context; the trust anchor is the operator-supplied `--expected-signer-pubkey-hex` (or `expected_signer_pubkey_hex` at the library level). The verifier refuses any wrapper whose embedded pubkey doesn't equal the operator's expectation — even if the signature is cryptographically valid for some other key.
+- **Two-step refusal order**: (1) `SignerPubkeyMismatch` (cheap; no crypto) → (2) `SignatureMismatch` (crypto verify). A malicious wrapper with a forged pubkey never burns crypto cycles.
+- **Schema enforcement** runs before either check: `UnsupportedSchemaVersion` for the wrapper, `UnsupportedDiffSchemaVersion` for the embedded diff.
+- **Canonical body content**: every field of the wrapper EXCEPT `signature_hex` is part of the canonical body. Tampering with `signed_at_utc`, `signer_role`, `signer_pubkey_hex`, OR any field of the embedded `diff` causes `SignatureMismatch`. Because the v1 diff already lifts both inputs' provenance (`baseline_generated_at_utc`, `current_generated_at_utc`, `baseline_state_dir`, `state_dir`, etc.) into its own body, the signed wrapper transitively pins the baseline-vs-current context without needing a separate baseline-hash field.
+- **Determinism pinned**: same `diff` + same seed + same `signed_at_utc` produces byte-identical wrappers across runs (regression `same_inputs_produce_byte_identical_wrapper`).
+- **Read-only**: signing and verifying never open a state-store. Both CLI subcommands write only the operator-named `--out` file (signing) or no files at all (verifying). The auto-prune flag is deliberately absent on both subcommands.
+
+## CLI
+
+### Signing subcommand
+
+```
+omni-node operator contributor sign-state-integrity-diff \
+  --diff-in <path>                          (required — raw v1 diff JSON)
+  --signer-seed <path>                      (required — 32-byte Ed25519 seed)
+  --signer-role operator|contributor|dispatcher|coordinator
+                                            (required — closed enum,
+                                             reuses Stage 12.20 enum)
+  --out <path>                              (required — atomic temp+rename)
+  [--format events|json|pretty]             (default events)
+```
+
+Read-only on the state-store side; pure JSON-to-JSON. Auto-prune flag deliberately absent (Stage 12.16/12.17/12.18/12.19/12.20 precedent), pinned by clap regression. Closed-set events on success: `event=signed_integrity_diff_signing_started`, `event=signed_integrity_diff_written`.
+
+### Verifier subcommand
+
+```
+omni-node operator contributor verify-state-integrity-diff-signature \
+  --signed-diff <path>                      (required — wrapper JSON to verify)
+  --expected-signer-pubkey-hex <hex>        (required — 64-char lowercase hex
+                                             Ed25519 public key trust anchor)
+  [--format events|json|pretty]             (default events)
+```
+
+Read-only and state-store-free: opens no contributor state-dir; the Stage 12.7 `--no-prune-state-on-start` flag is deliberately absent and pinned by clap regression. Closed-set events: `event=signed_integrity_diff_verify_started` at start, then on success `event=signed_integrity_diff_verify_ok path=<...> signer_role=<...> signer_pubkey=<...>`; on refusal a nonzero exit + `event=signed_integrity_diff_verify_failed reason=<closed-tag>` (tags: `signer_pubkey_mismatch` / `signature_mismatch` / `unsupported_schema_version` / `unsupported_diff_schema_version` / `signing` / `canonical` / `io` / `malformed_json`).
+
+The verifier's JSON renderer emits a compact metadata view (`schema_version`, `signed_at_utc`, `signer_role`, `signer_pubkey_hex`, `signature_hex`, diff `schema_version` / `generated_at_utc` / `state_dir` / `baseline_state_dir` / `counts`) rather than re-printing the full embedded diff. Verification's job is to attest authenticity, not to mirror the diff bytes; operators who want the embedded diff already have the signed wrapper on disk.
+
+## Out of scope (Stage 12.21)
+
+- **No signed-baseline-hash embedding in the wrapper.** The signed wrapper covers the full embedded diff (which already lifts both inputs' provenance) — adding a separate baseline-hash field would be redundant with the diff's own `baseline_generated_at_utc` / `baseline_state_dir` provenance.
+- **No `state-integrity --baseline ... --sign-diff-out ...` one-shot.** Operators run the diff CLI and the sign CLI as two explicit steps so each artifact is auditable. The signing CLI's input is always a raw v1 `StateIntegrityDiffReport` JSON on disk.
+- **No print of embedded diff JSON in the verifier.** The verifier emits a compact metadata view; operators who want the embedded diff already have the signed wrapper on disk.
+- **No `StateIntegrityDiffReport` schema change.** Embedded as v1; refuses non-v1.
+- **No diff expiry / `valid_through_utc` field.** v1 wrappers don't expire.
+- **No multi-signature / threshold signatures.** Single Ed25519 signature.
+- **No diff encryption.** Wrappers are plaintext JSON.
+- **No revocation list.** Operators control trust anchors via `--expected-signer-pubkey-hex`.
+- **No external signed-diff registry / publication.** Local-only.
+- **No SNIP / mesh / chain / gossipsub / state-dir mutation.**
+- **No envelope, no canonical-byte changes on Stage 12.0–12.20 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `STATUS_SCHEMA_VERSION` / `ARCHIVE_MANIFEST_SCHEMA_VERSION` / `CLEANUP_PLAN_SCHEMA_VERSION` / `QUARANTINE_MANIFEST_SCHEMA_VERSION` / `NET_SCHEMA_VERSION` bump.**
+
+## Test coverage map
+
+| Concern | Test |
+| --- | --- |
+| Sign + verify happy path | `sign_and_verify_round_trips` (`signed_integrity_diff.rs`) |
+| All four `BaselineSignerRole` variants round-trip | `all_signer_role_variants_round_trip` |
+| `SignerPubkeyMismatch` cheap pre-check (no crypto burn) | `pubkey_mismatch_is_refused_before_crypto` |
+| Signature tamper → `SignatureMismatch` | `signature_tamper_is_refused` |
+| Embedded-diff tamper → `SignatureMismatch` (proves diff is in canonical body) | `embedded_diff_tamper_is_refused` |
+| `signer_role` tamper → `SignatureMismatch` | `signer_role_tamper_is_refused` |
+| `signed_at_utc` tamper → `SignatureMismatch` | `signed_at_utc_tamper_is_refused` |
+| Wrapper `schema_version != 1` → `UnsupportedSchemaVersion` | `wrapper_schema_v2_is_refused` |
+| Embedded `diff.schema_version != 1` → `UnsupportedDiffSchemaVersion` | `embedded_diff_schema_v2_is_refused` |
+| Sign refuses a non-v1 input diff | `sign_refuses_non_v1_diff` |
+| JSON round-trip preserves signature | `json_round_trip_preserves_signature` |
+| Determinism: same inputs → byte-identical wrapper | `same_inputs_produce_byte_identical_wrapper` |
+| Canonical signing-input byte stability + domain prefix | `signing_input_is_byte_stable_across_recomputation` |
+| Empty-diff wrapper (baseline == current → all-zero counts) round-trips | `empty_diff_wrapper_round_trips` |
+| `write_signed_integrity_diff_atomic` round-trips via disk | `write_signed_integrity_diff_atomic_round_trips_via_disk` |
+| CLI flag matrix for `sign-state-integrity-diff` (all 4 roles, format closed enum, required-flag sweep, unknown-role refusal, unknown-format refusal, deliberate rejection of `--no-prune-state-on-start`) | `sign_state_integrity_diff_flag_parse_smoke` (omni-node) |
+| CLI flag matrix for `verify-state-integrity-diff-signature` (required-flag refusals, format closed enum, unknown-format refusal, deliberate rejection of `--no-prune-state-on-start`) | `verify_state_integrity_diff_signature_flag_parse_smoke` (omni-node) |
+
+**Residual gap (deliberate):** the CLI run-fns `run_sign_state_integrity_diff` and `run_verify_state_integrity_diff_signature` aren't exercised end-to-end (same constraint as Stage 12.10–12.20); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.

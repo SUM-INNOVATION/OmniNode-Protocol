@@ -277,6 +277,23 @@ enum ContributorCmd {
     /// `--out` file. The signed wrapper is local-only — no
     /// protocol envelope, no SNIP wire, no chain interaction.
     SignStateIntegrityBaseline(SignStateIntegrityBaselineArgs),
+
+    /// Stage 12.21 — sign a v1 `StateIntegrityDiffReport`
+    /// JSON with a 32-byte Ed25519 seed and emit a
+    /// `SignedStateIntegrityDiff` JSON. Read-only on the
+    /// state-store side; writes only the operator-named
+    /// `--out` file. The signed wrapper is local-only — no
+    /// protocol envelope, no SNIP wire, no chain interaction.
+    SignStateIntegrityDiff(SignStateIntegrityDiffArgs),
+
+    /// Stage 12.21 — verify a `SignedStateIntegrityDiff`
+    /// JSON against an operator-supplied trust anchor
+    /// (`--expected-signer-pubkey-hex`). Read-only and
+    /// state-store-free: no contributor state-dir is opened
+    /// and `--no-prune-state-on-start` is deliberately
+    /// absent. No chain / mesh / SNIP / envelope surface
+    /// touched.
+    VerifyStateIntegrityDiffSignature(VerifyStateIntegrityDiffSignatureArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2664,6 +2681,100 @@ struct SignStateIntegrityBaselineArgs {
     format: SignStateIntegrityBaselineFormat,
 }
 
+// ── Stage 12.21 — sign-state-integrity-diff ──────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum SignStateIntegrityDiffFormat {
+    /// One `event=signed_integrity_diff_written ...` line on
+    /// success.
+    Events,
+    /// Print the signed wrapper as pretty JSON on stdout.
+    /// Operational chatter goes to stderr so `jq` works.
+    Json,
+    /// Compact terminal-friendly summary.
+    Pretty,
+}
+
+#[derive(Args)]
+struct SignStateIntegrityDiffArgs {
+    /// Path to the raw v1 `StateIntegrityDiffReport` JSON to
+    /// sign. Typically the output of a prior
+    /// `state-integrity-diff --json-out`.
+    #[arg(long)]
+    diff_in: PathBuf,
+
+    /// 32-byte raw Ed25519 seed file. Operators MUST keep this
+    /// distinct from any chain-attestation or protocol-role
+    /// seed — the integrity-artifact signing role is its own
+    /// key per Stage 12.20.
+    #[arg(long)]
+    signer_seed: PathBuf,
+
+    /// Role tag recorded in the wrapper for forensics. Closed
+    /// set: `operator` / `contributor` / `dispatcher` /
+    /// `coordinator`. Reuses the Stage 12.20
+    /// `BaselineSignerRole` enum per the Stage 12.21 plan —
+    /// the four variants are role names, not artifact-type
+    /// names.
+    #[arg(long, value_enum)]
+    signer_role: CliBaselineSignerRole,
+
+    /// Destination for the signed wrapper JSON. Atomic
+    /// tempfile + rename (same posture as Stage 12.17
+    /// `plan-state-cleanup --out` and Stage 12.20
+    /// `sign-state-integrity-baseline --out`).
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SignStateIntegrityDiffFormat::Events
+    )]
+    format: SignStateIntegrityDiffFormat,
+}
+
+// ── Stage 12.21 — verify-state-integrity-diff-signature ──────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum VerifyStateIntegrityDiffSignatureFormat {
+    /// One `event=signed_integrity_diff_verify_ok ...` line on
+    /// success. On failure, a non-zero exit + an
+    /// `event=signed_integrity_diff_verify_failed reason=...`
+    /// line. Default.
+    Events,
+    /// Print the verified wrapper's metadata as pretty JSON on
+    /// stdout. Operational chatter goes to stderr so `jq`
+    /// works.
+    Json,
+    /// Compact terminal-friendly summary.
+    Pretty,
+}
+
+#[derive(Args)]
+struct VerifyStateIntegrityDiffSignatureArgs {
+    /// Path to a `SignedStateIntegrityDiff` JSON wrapper to
+    /// verify.
+    #[arg(long)]
+    signed_diff: PathBuf,
+
+    /// Operator-supplied trust anchor: 64-char lowercase-hex
+    /// Ed25519 public key the wrapper MUST be signed by.
+    /// Verification refuses with a `signer_pubkey_mismatch`
+    /// pre-check before any crypto burn.
+    #[arg(long)]
+    expected_signer_pubkey_hex: String,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = VerifyStateIntegrityDiffSignatureFormat::Events
+    )]
+    format: VerifyStateIntegrityDiffSignatureFormat,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -2705,6 +2816,12 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         ContributorCmd::StateIntegrityDiff(a) => run_state_integrity_diff(a),
         ContributorCmd::SignStateIntegrityBaseline(a) => {
             run_sign_state_integrity_baseline(a)
+        }
+        ContributorCmd::SignStateIntegrityDiff(a) => {
+            run_sign_state_integrity_diff(a)
+        }
+        ContributorCmd::VerifyStateIntegrityDiffSignature(a) => {
+            run_verify_state_integrity_diff_signature(a)
         }
     }
 }
@@ -8078,6 +8195,280 @@ mod tests {
         out
     }
 
+    // ── Stage 12.21 — sign-state-integrity-diff clap regression ──
+
+    /// Build `sign-state-integrity-diff` argv with the supplied
+    /// `signer_role` value + optional extra trailing flags.
+    /// `signer_role` is NOT part of the defaults so each test
+    /// can override it cleanly (clap would reject a duplicate-
+    /// arg pass).
+    fn parse_sign_state_integrity_diff(
+        signer_role: &str,
+        extra: &[&str],
+    ) -> SignStateIntegrityDiffArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "sign-state-integrity-diff".into(),
+            "--diff-in".into(),
+            "/tmp/diff.json".into(),
+            "--signer-seed".into(),
+            "/tmp/seed.bin".into(),
+            "--signer-role".into(),
+            signer_role.into(),
+            "--out".into(),
+            "/tmp/signed.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::SignStateIntegrityDiff(a) => a,
+            _ => panic!("expected SignStateIntegrityDiff"),
+        }
+    }
+
+    #[test]
+    fn sign_state_integrity_diff_flag_parse_smoke() {
+        let defaults = parse_sign_state_integrity_diff("operator", &[]);
+        assert_eq!(defaults.diff_in, std::path::PathBuf::from("/tmp/diff.json"));
+        assert_eq!(defaults.signer_seed, std::path::PathBuf::from("/tmp/seed.bin"));
+        assert_eq!(defaults.signer_role, CliBaselineSignerRole::Operator);
+        assert_eq!(defaults.out, std::path::PathBuf::from("/tmp/signed.json"));
+        assert_eq!(defaults.format, SignStateIntegrityDiffFormat::Events);
+
+        // All four roles parse via the closed enum (reused from
+        // Stage 12.20 — the four variants are role names, not
+        // artifact-type names).
+        for (raw, expected) in &[
+            ("operator", CliBaselineSignerRole::Operator),
+            ("contributor", CliBaselineSignerRole::Contributor),
+            ("dispatcher", CliBaselineSignerRole::Dispatcher),
+            ("coordinator", CliBaselineSignerRole::Coordinator),
+        ] {
+            let got = parse_sign_state_integrity_diff(raw, &[]);
+            assert_eq!(got.signer_role, *expected, "role={raw} parsed wrong");
+        }
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", SignStateIntegrityDiffFormat::Events),
+            ("json", SignStateIntegrityDiffFormat::Json),
+            ("pretty", SignStateIntegrityDiffFormat::Pretty),
+        ] {
+            let got = parse_sign_state_integrity_diff("operator", &["--format", raw]);
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --signer-role rejected.
+        let bad_role = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-state-integrity-diff",
+            "--diff-in",
+            "/tmp/diff.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "auditor",
+            "--out",
+            "/tmp/signed.json",
+        ]);
+        assert!(
+            bad_role.is_err(),
+            "clap must reject unknown --signer-role for sign-state-integrity-diff"
+        );
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-state-integrity-diff",
+            "--diff-in",
+            "/tmp/diff.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "operator",
+            "--out",
+            "/tmp/signed.json",
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format for sign-state-integrity-diff"
+        );
+
+        // Required-flag refusals.
+        for missing in &[
+            "--diff-in",
+            "--signer-seed",
+            "--signer-role",
+            "--out",
+        ] {
+            let stripped = strip_sign_diff_flag_with_value(missing);
+            let parsed = TestRoot::try_parse_from(stripped);
+            assert!(
+                parsed.is_err(),
+                "clap must reject sign-state-integrity-diff without {missing}"
+            );
+        }
+
+        // Auto-prune flag deliberately absent — `sign-state-
+        // integrity-diff` opens no state-store, so the Stage
+        // 12.7 `--no-prune-state-on-start` flag must NOT be
+        // accepted.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-state-integrity-diff",
+            "--diff-in",
+            "/tmp/diff.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "operator",
+            "--out",
+            "/tmp/signed.json",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "sign-state-integrity-diff must not accept --no-prune-state-on-start"
+        );
+    }
+
+    /// Build an argv for `sign-state-integrity-diff` with one
+    /// (flag, value) pair stripped — drives the missing-flag
+    /// refusal sweep above.
+    fn strip_sign_diff_flag_with_value(drop_flag: &str) -> Vec<String> {
+        let full: Vec<(&str, Option<&str>)> = vec![
+            ("--diff-in", Some("/tmp/diff.json")),
+            ("--signer-seed", Some("/tmp/seed.bin")),
+            ("--signer-role", Some("operator")),
+            ("--out", Some("/tmp/signed.json")),
+        ];
+        let mut out: Vec<String> = vec![
+            "omni-node".to_string(),
+            "sign-state-integrity-diff".to_string(),
+        ];
+        for (flag, val) in full {
+            if flag == drop_flag {
+                continue;
+            }
+            out.push(flag.to_string());
+            if let Some(v) = val {
+                out.push(v.to_string());
+            }
+        }
+        out
+    }
+
+    // ── Stage 12.21 — verify-state-integrity-diff-signature clap regression ──
+
+    fn parse_verify_state_integrity_diff_signature(
+        pubkey: &str,
+        extra: &[&str],
+    ) -> VerifyStateIntegrityDiffSignatureArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "verify-state-integrity-diff-signature".into(),
+            "--signed-diff".into(),
+            "/tmp/signed.json".into(),
+            "--expected-signer-pubkey-hex".into(),
+            pubkey.into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::VerifyStateIntegrityDiffSignature(a) => a,
+            _ => panic!("expected VerifyStateIntegrityDiffSignature"),
+        }
+    }
+
+    #[test]
+    fn verify_state_integrity_diff_signature_flag_parse_smoke() {
+        let pubkey = "ab".repeat(32);
+        let defaults =
+            parse_verify_state_integrity_diff_signature(&pubkey, &[]);
+        assert_eq!(
+            defaults.signed_diff,
+            std::path::PathBuf::from("/tmp/signed.json")
+        );
+        assert_eq!(defaults.expected_signer_pubkey_hex, pubkey);
+        assert_eq!(
+            defaults.format,
+            VerifyStateIntegrityDiffSignatureFormat::Events
+        );
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", VerifyStateIntegrityDiffSignatureFormat::Events),
+            ("json", VerifyStateIntegrityDiffSignatureFormat::Json),
+            ("pretty", VerifyStateIntegrityDiffSignatureFormat::Pretty),
+        ] {
+            let got = parse_verify_state_integrity_diff_signature(
+                &pubkey,
+                &["--format", raw],
+            );
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-state-integrity-diff-signature",
+            "--signed-diff",
+            "/tmp/signed.json",
+            "--expected-signer-pubkey-hex",
+            pubkey.as_str(),
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format for verify-state-integrity-diff-signature"
+        );
+
+        // Required-flag refusals.
+        let missing_signed = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-state-integrity-diff-signature",
+            "--expected-signer-pubkey-hex",
+            pubkey.as_str(),
+        ]);
+        assert!(
+            missing_signed.is_err(),
+            "clap must reject verify-state-integrity-diff-signature without --signed-diff"
+        );
+        let missing_pubkey = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-state-integrity-diff-signature",
+            "--signed-diff",
+            "/tmp/signed.json",
+        ]);
+        assert!(
+            missing_pubkey.is_err(),
+            "clap must reject verify-state-integrity-diff-signature without --expected-signer-pubkey-hex"
+        );
+
+        // Auto-prune flag deliberately absent — verifier opens no
+        // state-store.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-state-integrity-diff-signature",
+            "--signed-diff",
+            "/tmp/signed.json",
+            "--expected-signer-pubkey-hex",
+            pubkey.as_str(),
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "verify-state-integrity-diff-signature must not accept --no-prune-state-on-start"
+        );
+    }
+
     // ── Stage 12.17 — plan-state-cleanup / apply-state-cleanup ──
 
     fn parse_plan_state_cleanup(extra: &[&str]) -> PlanStateCleanupArgs {
@@ -11458,4 +11849,269 @@ fn render_sign_baseline_pretty(
         signed.report.counts_error,
     );
     println!("  out             : {}", out.display());
+}
+
+// ── Stage 12.21 — sign-state-integrity-diff ──────────────────────────────
+
+fn run_sign_state_integrity_diff(
+    args: SignStateIntegrityDiffArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        sign_state_integrity_diff, write_signed_integrity_diff_atomic,
+        BaselineSignerRole, ContributorSigner, SignedStateIntegrityDiff,
+        StateIntegrityDiffReport,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode = matches!(args.format, SignStateIntegrityDiffFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    log_op("event=signed_integrity_diff_signing_started");
+
+    // Read the raw v1 diff report.
+    let diff_bytes = std::fs::read(&args.diff_in).with_context(|| {
+        format!("read diff-in: {}", args.diff_in.display())
+    })?;
+    let diff: StateIntegrityDiffReport = serde_json::from_slice(&diff_bytes)
+        .with_context(|| format!("parse diff-in: {}", args.diff_in.display()))?;
+
+    // Load the signer. Same posture as Stage 12.20: use
+    // `ContributorSigner` as the seed loader since all four
+    // role-typed signers share the same shape; the recorded
+    // `signer_role` tag is independent of the loader type.
+    let signer = ContributorSigner::from_seed_file(&args.signer_seed)
+        .with_context(|| {
+            format!("load signer seed: {}", args.signer_seed.display())
+        })?;
+    let signer_pubkey_hex = signer.pubkey_hex();
+    let role: BaselineSignerRole = args.signer_role.into();
+
+    let signed: SignedStateIntegrityDiff = sign_state_integrity_diff(
+        diff,
+        &signer_pubkey_hex,
+        role,
+        &now_utc,
+        |msg| signer.sign(msg),
+    )
+    .map_err(|e| anyhow!("sign diff refused: {e}"))?;
+
+    write_signed_integrity_diff_atomic(&signed, &args.out)
+        .map_err(|e| anyhow!("write signed diff: {e}"))?;
+    log_op(&format!(
+        "event=signed_integrity_diff_written path={} signer_role={} signer_pubkey={}",
+        args.out.display(),
+        role.as_str(),
+        signer_pubkey_hex,
+    ));
+
+    match args.format {
+        SignStateIntegrityDiffFormat::Events => {
+            // Already emitted the summary line above.
+        }
+        SignStateIntegrityDiffFormat::Json => {
+            render_sign_diff_json(&signed)?;
+        }
+        SignStateIntegrityDiffFormat::Pretty => {
+            render_sign_diff_pretty(&signed, &args.out);
+        }
+    }
+    Ok(())
+}
+
+fn render_sign_diff_json(
+    signed: &omni_contributor::SignedStateIntegrityDiff,
+) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(signed)
+        .map_err(|e| anyhow!("serialize signed diff: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write signed diff: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_sign_diff_pretty(
+    signed: &omni_contributor::SignedStateIntegrityDiff,
+    out: &std::path::Path,
+) {
+    println!("Signed integrity diff");
+    println!("  schema_version  : {}", signed.schema_version);
+    println!("  signed_at_utc   : {}", signed.signed_at_utc);
+    println!("  signer_role     : {}", signed.signer_role.as_str());
+    println!("  signer_pubkey   : {}", signed.signer_pubkey_hex);
+    println!("  signature       : {}", signed.signature_hex);
+    println!("  state_dir       : {}", signed.diff.state_dir);
+    println!(
+        "  baseline_state_dir: {}",
+        signed.diff.baseline_state_dir
+    );
+    println!(
+        "  state_versions  : baseline={} current={}",
+        signed.diff.baseline_state_version,
+        signed.diff.current_state_version,
+    );
+    println!(
+        "  counts          : new={} resolved={} unchanged={}",
+        signed.diff.counts.new,
+        signed.diff.counts.resolved,
+        signed.diff.counts.unchanged,
+    );
+    println!(
+        "  new severity    : ok={} warn={} error={}",
+        signed.diff.counts.new_ok,
+        signed.diff.counts.new_warn,
+        signed.diff.counts.new_error,
+    );
+    println!(
+        "  resolved severity: ok={} warn={} error={}",
+        signed.diff.counts.resolved_ok,
+        signed.diff.counts.resolved_warn,
+        signed.diff.counts.resolved_error,
+    );
+    println!("  out             : {}", out.display());
+}
+
+// ── Stage 12.21 — verify-state-integrity-diff-signature ──────────────────
+
+fn run_verify_state_integrity_diff_signature(
+    args: VerifyStateIntegrityDiffSignatureArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        read_signed_integrity_diff_from_path, verify_signed_state_integrity_diff,
+        SignedIntegrityDiffError,
+    };
+
+    let json_mode =
+        matches!(args.format, VerifyStateIntegrityDiffSignatureFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    log_op("event=signed_integrity_diff_verify_started");
+
+    let wrapper = read_signed_integrity_diff_from_path(&args.signed_diff)
+        .map_err(|e| anyhow!("read signed diff: {e}"))?;
+
+    if let Err(e) = verify_signed_state_integrity_diff(
+        &wrapper,
+        &args.expected_signer_pubkey_hex,
+    ) {
+        let reason_tag = match &e {
+            SignedIntegrityDiffError::UnsupportedSchemaVersion { .. } => {
+                "unsupported_schema_version"
+            }
+            SignedIntegrityDiffError::UnsupportedDiffSchemaVersion { .. } => {
+                "unsupported_diff_schema_version"
+            }
+            SignedIntegrityDiffError::SignerPubkeyMismatch { .. } => {
+                "signer_pubkey_mismatch"
+            }
+            SignedIntegrityDiffError::SignatureMismatch => "signature_mismatch",
+            SignedIntegrityDiffError::Signing(_) => "signing",
+            SignedIntegrityDiffError::Canonical(_) => "canonical",
+            SignedIntegrityDiffError::Io { .. } => "io",
+            SignedIntegrityDiffError::MalformedJson { .. } => "malformed_json",
+        };
+        log_op(&format!(
+            "event=signed_integrity_diff_verify_failed reason={reason_tag} detail={e}"
+        ));
+        bail!("signed diff verification refused: {e}");
+    }
+
+    log_op(&format!(
+        "event=signed_integrity_diff_verify_ok path={} signer_role={} signer_pubkey={}",
+        args.signed_diff.display(),
+        wrapper.signer_role.as_str(),
+        wrapper.signer_pubkey_hex,
+    ));
+
+    match args.format {
+        VerifyStateIntegrityDiffSignatureFormat::Events => {
+            // Already emitted the success line above.
+        }
+        VerifyStateIntegrityDiffSignatureFormat::Json => {
+            render_verify_signed_diff_json(&wrapper)?;
+        }
+        VerifyStateIntegrityDiffSignatureFormat::Pretty => {
+            render_verify_signed_diff_pretty(&wrapper, &args.signed_diff);
+        }
+    }
+    Ok(())
+}
+
+fn render_verify_signed_diff_json(
+    wrapper: &omni_contributor::SignedStateIntegrityDiff,
+) -> Result<()> {
+    use std::io::Write;
+    // Emit a compact metadata view rather than the full embedded
+    // diff per the Stage 12.21 v1 posture: verification's job is
+    // to attest authenticity, not to re-print the diff bytes.
+    let metadata = serde_json::json!({
+        "schema_version": wrapper.schema_version,
+        "signed_at_utc": wrapper.signed_at_utc,
+        "signer_role": wrapper.signer_role.as_str(),
+        "signer_pubkey_hex": wrapper.signer_pubkey_hex,
+        "signature_hex": wrapper.signature_hex,
+        "diff_schema_version": wrapper.diff.schema_version,
+        "diff_generated_at_utc": wrapper.diff.generated_at_utc,
+        "diff_state_dir": wrapper.diff.state_dir,
+        "diff_baseline_state_dir": wrapper.diff.baseline_state_dir,
+        "diff_counts": {
+            "new": wrapper.diff.counts.new,
+            "resolved": wrapper.diff.counts.resolved,
+            "unchanged": wrapper.diff.counts.unchanged,
+        },
+    });
+    let bytes = serde_json::to_vec_pretty(&metadata)
+        .map_err(|e| anyhow!("serialize verify metadata: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write verify metadata: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_verify_signed_diff_pretty(
+    wrapper: &omni_contributor::SignedStateIntegrityDiff,
+    path: &std::path::Path,
+) {
+    println!("Verified signed integrity diff");
+    println!("  path            : {}", path.display());
+    println!("  schema_version  : {}", wrapper.schema_version);
+    println!("  signed_at_utc   : {}", wrapper.signed_at_utc);
+    println!("  signer_role     : {}", wrapper.signer_role.as_str());
+    println!("  signer_pubkey   : {}", wrapper.signer_pubkey_hex);
+    println!("  signature       : {}", wrapper.signature_hex);
+    println!("  state_dir       : {}", wrapper.diff.state_dir);
+    println!(
+        "  baseline_state_dir: {}",
+        wrapper.diff.baseline_state_dir
+    );
+    println!(
+        "  counts          : new={} resolved={} unchanged={}",
+        wrapper.diff.counts.new,
+        wrapper.diff.counts.resolved,
+        wrapper.diff.counts.unchanged,
+    );
 }

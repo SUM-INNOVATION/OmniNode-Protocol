@@ -524,6 +524,13 @@ pub const AGGREGATED_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-AGGREGATED:v1:";
 pub const SIGNED_BASELINE_DOMAIN: &[u8] =
     b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-BASELINE:v1:";
 
+/// Stage 12.21 — domain separator for the local-only signed
+/// integrity-diff wrapper. Same posture as
+/// `SIGNED_BASELINE_DOMAIN`: consumed only by `signed_diff.rs`;
+/// no protocol surface, no gossipsub topic, no SNIP wire.
+pub const SIGNED_INTEGRITY_DIFF_DOMAIN: &[u8] =
+    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-DIFF:v1:";
+
 // --- ExecutionSession ---
 
 #[derive(Debug, Serialize)]
