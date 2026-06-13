@@ -294,6 +294,24 @@ enum ContributorCmd {
     /// absent. No chain / mesh / SNIP / envelope surface
     /// touched.
     VerifyStateIntegrityDiffSignature(VerifyStateIntegrityDiffSignatureArgs),
+
+    /// Stage 12.22 — assemble a local-only
+    /// `IntegrityEvidenceBundle` JSON fingerprinting a chosen
+    /// set of Stage 12.16–12.21 audit artifacts under a single
+    /// `--base-dir`. Byte manifest only: no signature, no
+    /// semantic JSON validation, no recursive directory
+    /// bundling. Read-only on the state-store side; writes only
+    /// the operator-named `--out` file (atomic temp+rename).
+    BuildIntegrityEvidenceBundle(BuildIntegrityEvidenceBundleArgs),
+
+    /// Stage 12.22 — verify a local-only
+    /// `IntegrityEvidenceBundle` JSON by re-hashing each
+    /// referenced artifact file. Collect-all: every entry gets
+    /// a `BundleEntryOutcome`; the verifier never short-circuits
+    /// per entry. Read-only and state-store-free:
+    /// `--no-prune-state-on-start` is deliberately absent. No
+    /// chain / mesh / SNIP / envelope surface touched.
+    VerifyIntegrityEvidenceBundle(VerifyIntegrityEvidenceBundleArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2775,6 +2793,105 @@ struct VerifyStateIntegrityDiffSignatureArgs {
     format: VerifyStateIntegrityDiffSignatureFormat,
 }
 
+// ── Stage 12.22 — build-integrity-evidence-bundle ────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum BuildIntegrityEvidenceBundleFormat {
+    /// One `event=integrity_evidence_bundle_entry_hashed ...`
+    /// line per entry plus a final
+    /// `event=integrity_evidence_bundle_written` summary.
+    /// Default.
+    Events,
+    /// Print the assembled bundle as pretty JSON on stdout.
+    /// Operational chatter goes to stderr so `jq` works.
+    Json,
+    /// Compact terminal-friendly summary.
+    Pretty,
+}
+
+#[derive(Args)]
+struct BuildIntegrityEvidenceBundleArgs {
+    /// Operator-supplied bundle entry — repeatable. Format:
+    /// `<artifact_kind_tag>=<path>`. The kind tag is the
+    /// closed-set wire tag (e.g. `signed_state_integrity_diff`).
+    /// The path is interpreted relative to `--base-dir` if not
+    /// absolute; absolute paths are accepted but must
+    /// canonicalize to a path under `--base-dir` and are
+    /// recorded in their base-dir-relative form. At least one
+    /// `--include` is required.
+    #[arg(long = "include", required = true, value_name = "kind=path")]
+    includes: Vec<String>,
+
+    /// Root directory under which every entry's recorded path
+    /// is resolved. Canonicalized at build time and stored in
+    /// the bundle so the verifier can rebase via its own
+    /// optional `--base-dir` override.
+    #[arg(long)]
+    base_dir: PathBuf,
+
+    /// Destination for the bundle JSON. Atomic tempfile +
+    /// rename (same posture as Stage 12.17 `--out`).
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Optional bundle-level label, capped at 128 UTF-8 bytes.
+    /// Auditor-facing naming only; no semantic meaning to the
+    /// verifier.
+    #[arg(long)]
+    label: Option<String>,
+
+    /// Optional freeform notes, capped at 1024 UTF-8 bytes.
+    #[arg(long)]
+    notes: Option<String>,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = BuildIntegrityEvidenceBundleFormat::Events
+    )]
+    format: BuildIntegrityEvidenceBundleFormat,
+}
+
+// ── Stage 12.22 — verify-integrity-evidence-bundle ───────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum VerifyIntegrityEvidenceBundleFormat {
+    /// One `event=integrity_evidence_bundle_entry_...` line
+    /// per entry plus a final `event=integrity_evidence_bundle_verify_summary`.
+    /// Default.
+    Events,
+    /// Print the full `BundleVerifyReport` as pretty JSON on
+    /// stdout. Operational chatter goes to stderr so `jq`
+    /// works.
+    Json,
+    /// Compact terminal-friendly summary + per-entry lines.
+    Pretty,
+}
+
+#[derive(Args)]
+struct VerifyIntegrityEvidenceBundleArgs {
+    /// Path to the `IntegrityEvidenceBundle` JSON to verify.
+    #[arg(long)]
+    bundle: PathBuf,
+
+    /// Optional override for the bundle's recorded `base_dir`.
+    /// When omitted, the verifier resolves entries against
+    /// `bundle.base_dir` as recorded. Use this when the
+    /// bundle was built on a different host or the artifact
+    /// tree was relocated.
+    #[arg(long)]
+    base_dir: Option<PathBuf>,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = VerifyIntegrityEvidenceBundleFormat::Events
+    )]
+    format: VerifyIntegrityEvidenceBundleFormat,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -2822,6 +2939,12 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         }
         ContributorCmd::VerifyStateIntegrityDiffSignature(a) => {
             run_verify_state_integrity_diff_signature(a)
+        }
+        ContributorCmd::BuildIntegrityEvidenceBundle(a) => {
+            run_build_integrity_evidence_bundle(a)
+        }
+        ContributorCmd::VerifyIntegrityEvidenceBundle(a) => {
+            run_verify_integrity_evidence_bundle(a)
         }
     }
 }
@@ -8469,6 +8592,242 @@ mod tests {
         );
     }
 
+    // ── Stage 12.22 — build-integrity-evidence-bundle clap regression ──
+
+    fn parse_build_integrity_evidence_bundle(
+        extra: &[&str],
+    ) -> BuildIntegrityEvidenceBundleArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "build-integrity-evidence-bundle".into(),
+            "--include".into(),
+            "signed_state_integrity_diff=signed-diff.json".into(),
+            "--base-dir".into(),
+            "/tmp/audit".into(),
+            "--out".into(),
+            "/tmp/bundle.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::BuildIntegrityEvidenceBundle(a) => a,
+            _ => panic!("expected BuildIntegrityEvidenceBundle"),
+        }
+    }
+
+    #[test]
+    fn build_integrity_evidence_bundle_flag_parse_smoke() {
+        let defaults = parse_build_integrity_evidence_bundle(&[]);
+        assert_eq!(defaults.includes.len(), 1);
+        assert_eq!(
+            defaults.includes[0],
+            "signed_state_integrity_diff=signed-diff.json"
+        );
+        assert_eq!(defaults.base_dir, std::path::PathBuf::from("/tmp/audit"));
+        assert_eq!(defaults.out, std::path::PathBuf::from("/tmp/bundle.json"));
+        assert!(defaults.label.is_none());
+        assert!(defaults.notes.is_none());
+        assert_eq!(
+            defaults.format,
+            BuildIntegrityEvidenceBundleFormat::Events
+        );
+
+        // Multiple --include values accumulate.
+        let multi = parse_build_integrity_evidence_bundle(&[
+            "--include",
+            "state_integrity_report=baseline.json",
+            "--include",
+            "archive_manifest=arc/manifest.json",
+        ]);
+        assert_eq!(multi.includes.len(), 3);
+
+        // --label / --notes parse.
+        let with_strings = parse_build_integrity_evidence_bundle(&[
+            "--label",
+            "audit-2026-06-12",
+            "--notes",
+            "captured by CI",
+        ]);
+        assert_eq!(
+            with_strings.label.as_deref(),
+            Some("audit-2026-06-12")
+        );
+        assert_eq!(with_strings.notes.as_deref(), Some("captured by CI"));
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", BuildIntegrityEvidenceBundleFormat::Events),
+            ("json", BuildIntegrityEvidenceBundleFormat::Json),
+            ("pretty", BuildIntegrityEvidenceBundleFormat::Pretty),
+        ] {
+            let got = parse_build_integrity_evidence_bundle(&["--format", raw]);
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "build-integrity-evidence-bundle",
+            "--include",
+            "signed_state_integrity_diff=signed-diff.json",
+            "--base-dir",
+            "/tmp/audit",
+            "--out",
+            "/tmp/bundle.json",
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format for build-integrity-evidence-bundle"
+        );
+
+        // Required-flag refusals: missing --include / --base-dir / --out.
+        for missing in &["--include", "--base-dir", "--out"] {
+            let stripped = strip_bundle_build_flag_with_value(missing);
+            let parsed = TestRoot::try_parse_from(stripped);
+            assert!(
+                parsed.is_err(),
+                "clap must reject build-integrity-evidence-bundle without {missing}"
+            );
+        }
+
+        // Auto-prune flag deliberately absent — pinned by clap
+        // regression so a future operator can't reintroduce
+        // state-store coupling.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "build-integrity-evidence-bundle",
+            "--include",
+            "signed_state_integrity_diff=signed-diff.json",
+            "--base-dir",
+            "/tmp/audit",
+            "--out",
+            "/tmp/bundle.json",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "build-integrity-evidence-bundle must not accept --no-prune-state-on-start"
+        );
+    }
+
+    fn strip_bundle_build_flag_with_value(drop_flag: &str) -> Vec<String> {
+        let full: Vec<(&str, Option<&str>)> = vec![
+            (
+                "--include",
+                Some("signed_state_integrity_diff=signed-diff.json"),
+            ),
+            ("--base-dir", Some("/tmp/audit")),
+            ("--out", Some("/tmp/bundle.json")),
+        ];
+        let mut out: Vec<String> = vec![
+            "omni-node".to_string(),
+            "build-integrity-evidence-bundle".to_string(),
+        ];
+        for (flag, val) in full {
+            if flag == drop_flag {
+                continue;
+            }
+            out.push(flag.to_string());
+            if let Some(v) = val {
+                out.push(v.to_string());
+            }
+        }
+        out
+    }
+
+    // ── Stage 12.22 — verify-integrity-evidence-bundle clap regression ──
+
+    fn parse_verify_integrity_evidence_bundle(
+        extra: &[&str],
+    ) -> VerifyIntegrityEvidenceBundleArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "verify-integrity-evidence-bundle".into(),
+            "--bundle".into(),
+            "/tmp/bundle.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::VerifyIntegrityEvidenceBundle(a) => a,
+            _ => panic!("expected VerifyIntegrityEvidenceBundle"),
+        }
+    }
+
+    #[test]
+    fn verify_integrity_evidence_bundle_flag_parse_smoke() {
+        let defaults = parse_verify_integrity_evidence_bundle(&[]);
+        assert_eq!(defaults.bundle, std::path::PathBuf::from("/tmp/bundle.json"));
+        assert!(defaults.base_dir.is_none());
+        assert_eq!(
+            defaults.format,
+            VerifyIntegrityEvidenceBundleFormat::Events
+        );
+
+        let with_override = parse_verify_integrity_evidence_bundle(&[
+            "--base-dir",
+            "/srv/audit-mirror",
+        ]);
+        assert_eq!(
+            with_override.base_dir,
+            Some(std::path::PathBuf::from("/srv/audit-mirror"))
+        );
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", VerifyIntegrityEvidenceBundleFormat::Events),
+            ("json", VerifyIntegrityEvidenceBundleFormat::Json),
+            ("pretty", VerifyIntegrityEvidenceBundleFormat::Pretty),
+        ] {
+            let got =
+                parse_verify_integrity_evidence_bundle(&["--format", raw]);
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-bundle",
+            "--bundle",
+            "/tmp/bundle.json",
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format for verify-integrity-evidence-bundle"
+        );
+
+        // Required-flag refusal.
+        let missing_bundle = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-bundle",
+        ]);
+        assert!(
+            missing_bundle.is_err(),
+            "clap must reject verify-integrity-evidence-bundle without --bundle"
+        );
+
+        // Auto-prune flag deliberately absent.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-bundle",
+            "--bundle",
+            "/tmp/bundle.json",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "verify-integrity-evidence-bundle must not accept --no-prune-state-on-start"
+        );
+    }
+
     // ── Stage 12.17 — plan-state-cleanup / apply-state-cleanup ──
 
     fn parse_plan_state_cleanup(extra: &[&str]) -> PlanStateCleanupArgs {
@@ -12114,4 +12473,401 @@ fn render_verify_signed_diff_pretty(
         wrapper.diff.counts.resolved,
         wrapper.diff.counts.unchanged,
     );
+}
+
+// ── Stage 12.22 — build-integrity-evidence-bundle ────────────────────────
+
+/// Parse a `--include <kind=path>` value into
+/// `(BundleArtifactKind, PathBuf)`. Split on the FIRST `=` —
+/// everything after that is the path verbatim, so paths
+/// containing `=` are tolerated. Unknown kind tags, missing
+/// `=`, and empty paths refuse with an `anyhow` error that
+/// surfaces as `event=integrity_evidence_bundle_build_failed
+/// reason=invalid_include`.
+fn parse_include_pair(
+    raw: &str,
+) -> Result<(omni_contributor::BundleArtifactKind, std::path::PathBuf)> {
+    let (kind_str, path_str) = raw.split_once('=').ok_or_else(|| {
+        anyhow!(
+            "--include must be `<kind>=<path>` (no `=` in `{raw}`)"
+        )
+    })?;
+    if kind_str.is_empty() {
+        bail!("--include kind tag is empty in `{raw}`");
+    }
+    if path_str.is_empty() {
+        bail!("--include path is empty in `{raw}` (kind={kind_str})");
+    }
+    let kind = omni_contributor::BundleArtifactKind::from_wire_tag(kind_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "--include unknown artifact kind `{kind_str}` \
+                 (closed set: state_integrity_report / \
+                 signed_state_integrity_baseline / state_integrity_diff_report / \
+                 signed_state_integrity_diff / state_cleanup_plan / cleanup_report / \
+                 quarantine_manifest / quarantine_restore_report / \
+                 archive_manifest / other)"
+            )
+        })?;
+    Ok((kind, std::path::PathBuf::from(path_str)))
+}
+
+fn run_build_integrity_evidence_bundle(
+    args: BuildIntegrityEvidenceBundleArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        build_integrity_evidence_bundle, write_integrity_evidence_bundle_atomic,
+        BundleBuilderInput, BundleBuilderOptions, IntegrityEvidenceBundle,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode =
+        matches!(args.format, BuildIntegrityEvidenceBundleFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    log_op(&format!(
+        "event=integrity_evidence_bundle_build_started base_dir={}",
+        args.base_dir.display()
+    ));
+
+    // Parse the --include values into typed pairs up front so
+    // CLI-arg errors refuse before we touch the filesystem.
+    let mut parsed: Vec<(omni_contributor::BundleArtifactKind, std::path::PathBuf)> =
+        Vec::with_capacity(args.includes.len());
+    for raw in &args.includes {
+        let pair = parse_include_pair(raw).map_err(|e| {
+            log_op(&format!(
+                "event=integrity_evidence_bundle_build_failed reason=invalid_include detail={e}"
+            ));
+            anyhow!("invalid --include: {e}")
+        })?;
+        parsed.push(pair);
+    }
+    let inputs: Vec<BundleBuilderInput<'_>> = parsed
+        .iter()
+        .map(|(kind, path)| BundleBuilderInput {
+            artifact_kind: *kind,
+            path: path.as_path(),
+        })
+        .collect();
+
+    let opts = BundleBuilderOptions {
+        now_utc: &now_utc,
+        base_dir: &args.base_dir,
+        label: args.label.as_deref(),
+        notes: args.notes.as_deref(),
+    };
+    let bundle: IntegrityEvidenceBundle = match build_integrity_evidence_bundle(
+        &inputs, &opts,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            let reason = bundle_build_reason_tag(&e);
+            log_op(&format!(
+                "event=integrity_evidence_bundle_build_failed reason={reason} detail={e}"
+            ));
+            bail!("build integrity evidence bundle refused: {e}");
+        }
+    };
+
+    // Per-entry hashed lines AFTER the build succeeds so we
+    // don't half-emit on a partial failure.
+    for entry in &bundle.entries {
+        log_op(&format!(
+            "event=integrity_evidence_bundle_entry_hashed \
+             kind={} path={} bytes={} blake3={}",
+            entry.artifact_kind.as_str(),
+            entry.path,
+            entry.bytes,
+            entry.blake3_hex,
+        ));
+    }
+
+    write_integrity_evidence_bundle_atomic(&bundle, &args.out)
+        .map_err(|e| anyhow!("write integrity evidence bundle: {e}"))?;
+    log_op(&format!(
+        "event=integrity_evidence_bundle_written path={} entry_count={}",
+        args.out.display(),
+        bundle.entries.len(),
+    ));
+
+    match args.format {
+        BuildIntegrityEvidenceBundleFormat::Events => {
+            // Already emitted per-entry + written lines above.
+        }
+        BuildIntegrityEvidenceBundleFormat::Json => {
+            render_build_bundle_json(&bundle)?;
+        }
+        BuildIntegrityEvidenceBundleFormat::Pretty => {
+            render_build_bundle_pretty(&bundle, &args.out);
+        }
+    }
+    Ok(())
+}
+
+fn bundle_build_reason_tag(e: &omni_contributor::EvidenceBundleError) -> &'static str {
+    use omni_contributor::EvidenceBundleError as E;
+    match e {
+        E::UnsupportedSchemaVersion { .. } => "unsupported_schema_version",
+        E::EmptyBundle => "empty_bundle",
+        E::DuplicateEntry { .. } => "duplicate_entry",
+        E::TooManyEntries { .. } => "too_many_entries",
+        E::BundleLabelTooLong { .. } => "bundle_label_too_long",
+        E::NotesTooLong { .. } => "notes_too_long",
+        E::EntryTooLarge { .. } => "entry_too_large",
+        E::EntryNotFound { .. } => "entry_not_found",
+        E::PathOutsideBaseDir { .. } => "path_outside_base_dir",
+        E::InvalidRelativePath { .. } => "invalid_relative_path",
+        E::BaseDirInvalid { .. } => "base_dir_invalid",
+        E::EffectiveBaseDirNotFound { .. } => "effective_base_dir_not_found",
+        E::NonUtf8Path { .. } => "non_utf8_path",
+        E::Io { .. } => "io",
+        E::MalformedJson { .. } => "malformed_json",
+    }
+}
+
+fn render_build_bundle_json(
+    bundle: &omni_contributor::IntegrityEvidenceBundle,
+) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(bundle)
+        .map_err(|e| anyhow!("serialize bundle: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write bundle: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_build_bundle_pretty(
+    bundle: &omni_contributor::IntegrityEvidenceBundle,
+    out: &std::path::Path,
+) {
+    println!("Integrity evidence bundle");
+    println!("  schema_version  : {}", bundle.schema_version);
+    println!("  generated_at_utc: {}", bundle.generated_at_utc);
+    println!(
+        "  omni_contributor_version: {}",
+        bundle.omni_contributor_version
+    );
+    if let Some(label) = &bundle.label {
+        println!("  label           : {label}");
+    }
+    if let Some(notes) = &bundle.notes {
+        println!("  notes           : {notes}");
+    }
+    println!("  base_dir        : {}", bundle.base_dir);
+    println!("  entries         : {}", bundle.entries.len());
+    for entry in &bundle.entries {
+        println!(
+            "    [{}] {} ({} bytes, blake3={})",
+            entry.artifact_kind.as_str(),
+            entry.path,
+            entry.bytes,
+            entry.blake3_hex,
+        );
+    }
+    println!("  out             : {}", out.display());
+}
+
+// ── Stage 12.22 — verify-integrity-evidence-bundle ───────────────────────
+
+fn run_verify_integrity_evidence_bundle(
+    args: VerifyIntegrityEvidenceBundleArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        read_integrity_evidence_bundle_from_path, verify_integrity_evidence_bundle,
+        BundleEntryOutcome, BundleVerifyOptions,
+    };
+
+    let json_mode =
+        matches!(args.format, VerifyIntegrityEvidenceBundleFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    // Start event fires FIRST — before any FS IO. The
+    // `effective_base_dir` isn't known until the bundle is read
+    // AND canonicalized, so it lands on the summary line
+    // instead. Operators always see a start event even when the
+    // bundle is missing / malformed / has an unsupported
+    // schema / fails envelope-level path validation.
+    let override_field = match args.base_dir.as_deref() {
+        Some(p) => format!(" base_dir_override={}", p.display()),
+        None => String::new(),
+    };
+    log_op(&format!(
+        "event=integrity_evidence_bundle_verify_started bundle={}{}",
+        args.bundle.display(),
+        override_field,
+    ));
+
+    let bundle = read_integrity_evidence_bundle_from_path(&args.bundle)
+        .map_err(|e| {
+            // Distinguish io (missing file / permissions) from
+            // malformed_json — both can come out of the bundle
+            // read path and the closed-tag taxonomy carries
+            // both. Using bundle_build_reason_tag keeps the
+            // tagging single-sourced.
+            let reason = bundle_build_reason_tag(&e);
+            log_op(&format!(
+                "event=integrity_evidence_bundle_verify_failed reason={reason} detail={e}"
+            ));
+            anyhow!("read bundle: {e}")
+        })?;
+
+    let opts = BundleVerifyOptions {
+        base_dir_override: args.base_dir.as_deref(),
+    };
+    let report =
+        verify_integrity_evidence_bundle(&bundle, &opts).map_err(|e| {
+            let reason = bundle_build_reason_tag(&e);
+            log_op(&format!(
+                "event=integrity_evidence_bundle_verify_failed reason={reason} detail={e}"
+            ));
+            anyhow!("verify integrity evidence bundle refused: {e}")
+        })?;
+
+    for outcome in &report.entries {
+        let tag = match &outcome.outcome {
+            BundleEntryOutcome::Ok => "ok",
+            BundleEntryOutcome::SizeMismatch { .. } => "size_mismatch",
+            BundleEntryOutcome::HashMismatch { .. } => "hash_mismatch",
+            BundleEntryOutcome::NotFound => "not_found",
+            BundleEntryOutcome::ReadError { .. } => "read_error",
+        };
+        let detail = match &outcome.outcome {
+            BundleEntryOutcome::Ok | BundleEntryOutcome::NotFound => {
+                String::new()
+            }
+            BundleEntryOutcome::SizeMismatch { expected, got } => {
+                format!(" expected_bytes={expected} got_bytes={got}")
+            }
+            BundleEntryOutcome::HashMismatch { expected, got } => {
+                format!(" expected_blake3={expected} got_blake3={got}")
+            }
+            BundleEntryOutcome::ReadError { detail } => {
+                format!(" detail={detail}")
+            }
+        };
+        log_op(&format!(
+            "event=integrity_evidence_bundle_entry_{tag} kind={} path={} resolved_path={}{}",
+            outcome.artifact_kind.as_str(),
+            outcome.path,
+            outcome.resolved_path,
+            detail,
+        ));
+    }
+
+    log_op(&format!(
+        "event=integrity_evidence_bundle_verify_summary \
+         effective_base_dir={} ok={} size_mismatch={} hash_mismatch={} not_found={} read_error={}",
+        report.effective_base_dir,
+        report.counts_ok,
+        report.counts_size_mismatch,
+        report.counts_hash_mismatch,
+        report.counts_not_found,
+        report.counts_read_error,
+    ));
+
+    match args.format {
+        VerifyIntegrityEvidenceBundleFormat::Events => {
+            // Already emitted above.
+        }
+        VerifyIntegrityEvidenceBundleFormat::Json => {
+            render_verify_bundle_json(&report)?;
+        }
+        VerifyIntegrityEvidenceBundleFormat::Pretty => {
+            render_verify_bundle_pretty(&report);
+        }
+    }
+
+    if !report.all_ok() {
+        bail!(
+            "integrity evidence bundle verification failed: \
+             size_mismatch={} hash_mismatch={} not_found={} read_error={}",
+            report.counts_size_mismatch,
+            report.counts_hash_mismatch,
+            report.counts_not_found,
+            report.counts_read_error,
+        );
+    }
+    Ok(())
+}
+
+fn render_verify_bundle_json(
+    report: &omni_contributor::BundleVerifyReport,
+) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(report)
+        .map_err(|e| anyhow!("serialize verify report: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write verify report: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_verify_bundle_pretty(report: &omni_contributor::BundleVerifyReport) {
+    use omni_contributor::BundleEntryOutcome;
+    println!("Integrity evidence bundle verify");
+    println!(
+        "  bundle_schema_version : {}",
+        report.bundle_schema_version
+    );
+    println!(
+        "  bundle_generated_at_utc: {}",
+        report.bundle_generated_at_utc
+    );
+    println!("  effective_base_dir    : {}", report.effective_base_dir);
+    println!(
+        "  counts                : ok={} size_mismatch={} hash_mismatch={} not_found={} read_error={}",
+        report.counts_ok,
+        report.counts_size_mismatch,
+        report.counts_hash_mismatch,
+        report.counts_not_found,
+        report.counts_read_error,
+    );
+    for outcome in &report.entries {
+        let line = match &outcome.outcome {
+            BundleEntryOutcome::Ok => "ok".to_string(),
+            BundleEntryOutcome::SizeMismatch { expected, got } => {
+                format!("size_mismatch expected={expected} got={got}")
+            }
+            BundleEntryOutcome::HashMismatch { .. } => {
+                "hash_mismatch".to_string()
+            }
+            BundleEntryOutcome::NotFound => "not_found".to_string(),
+            BundleEntryOutcome::ReadError { detail } => {
+                format!("read_error detail={detail}")
+            }
+        };
+        println!(
+            "    [{}] {} -> {} [{}]",
+            outcome.artifact_kind.as_str(),
+            outcome.path,
+            outcome.resolved_path,
+            line,
+        );
+    }
 }

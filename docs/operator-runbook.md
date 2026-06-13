@@ -1570,3 +1570,109 @@ The verifier opens no state-store and writes nothing. It exits nonzero on any re
 **Composition with Stage 12.20:** the two trust paths are complementary. A typical forensic chain looks like (a) a Stage 12.20 signed baseline captured nightly, (b) the next morning's diff produced via `state-integrity-diff --signed-baseline <a> --baseline-pubkey-hex <anchor> --current <today.json> --json-out /tmp/diff.json`, then (c) the Stage 12.21 signed wrapper around that diff archived to immutable storage. Stage 12.20 proves the baseline JSON came from an expected key; Stage 12.21 proves the diff JSON came from an expected key (often the same key, sometimes a different audit-only key — operators decide).
 
 **No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.20 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
+
+### Stage 12.22 — local integrity evidence bundles
+
+**Use when:** you've captured a set of Stage 12.16–12.21 audit artifacts (some signed, some not) and want a single tamper-evident pointer file to hand to an auditor. The bundle fingerprints each file by `(artifact_kind, base-dir-relative path, byte_len, blake3_hex)`. It does not re-sign anything; Stage 12.20 baselines and Stage 12.21 diffs already carry their own Ed25519 signatures. It does not parse anything either; the verifier only re-hashes the referenced files and reports per-entry outcomes.
+
+The bundle is local-only — no protocol, no SNIP, no chain.
+
+**Workflow — building a bundle:**
+
+```sh
+# 1. Stage your audit artifacts under one base directory.
+mkdir -p /tmp/audit-2026-06-12 && cd /tmp/audit-2026-06-12
+omni-node operator contributor state-integrity \
+  --contributor-state-dir <state> \
+  --format json --json-out baseline.json
+omni-node operator contributor sign-state-integrity-baseline \
+  --baseline-in baseline.json \
+  --signer-seed /etc/omni-node/baseline-signer.seed \
+  --signer-role operator \
+  --out baseline.signed.json
+omni-node operator contributor state-integrity-diff \
+  --baseline /backup/yesterday.baseline.json \
+  --current baseline.json \
+  --json-out diff.json
+omni-node operator contributor sign-state-integrity-diff \
+  --diff-in diff.json \
+  --signer-seed /etc/omni-node/diff-signer.seed \
+  --signer-role operator \
+  --out diff.signed.json
+
+# 2. Assemble the bundle. --base-dir is required; every
+#    --include path is recorded relative to it.
+omni-node operator contributor build-integrity-evidence-bundle \
+  --base-dir /tmp/audit-2026-06-12 \
+  --include state_integrity_report=baseline.json \
+  --include signed_state_integrity_baseline=baseline.signed.json \
+  --include state_integrity_diff_report=diff.json \
+  --include signed_state_integrity_diff=diff.signed.json \
+  --label "audit-2026-06-12" \
+  --notes "captured by CI run #4231" \
+  --out /var/audit/2026-06-12.bundle.json
+# event=integrity_evidence_bundle_build_started base_dir=/tmp/audit-2026-06-12
+# event=integrity_evidence_bundle_entry_hashed kind=signed_state_integrity_baseline path=baseline.signed.json bytes=2371 blake3=<hex>
+# ... (one line per entry)
+# event=integrity_evidence_bundle_written path=/var/audit/2026-06-12.bundle.json entry_count=4
+```
+
+**Workflow — verifying a bundle:**
+
+```sh
+# Same host, bundle's recorded base_dir still valid:
+omni-node operator contributor verify-integrity-evidence-bundle \
+  --bundle /var/audit/2026-06-12.bundle.json
+# event=integrity_evidence_bundle_verify_started bundle=/var/audit/2026-06-12.bundle.json
+# event=integrity_evidence_bundle_entry_ok kind=signed_state_integrity_baseline path=baseline.signed.json resolved_path=/tmp/audit-2026-06-12/baseline.signed.json
+# ...
+# event=integrity_evidence_bundle_verify_summary effective_base_dir=/tmp/audit-2026-06-12 ok=4 size_mismatch=0 hash_mismatch=0 not_found=0 read_error=0
+
+# Different host or relocated tree (portability lever):
+omni-node operator contributor verify-integrity-evidence-bundle \
+  --bundle /var/audit/2026-06-12.bundle.json \
+  --base-dir /srv/audit-mirror/2026-06-12
+```
+
+The verifier exits 0 iff every entry's outcome is `Ok`. Any non-`Ok` outcome (`SizeMismatch`, `HashMismatch`, `NotFound`, `ReadError`) → exit 1, but the verifier walks every entry first and emits a full summary. **No short-circuit.** Output formats:
+
+- `--format events` (default) → one per-entry event line + a final summary line.
+- `--format json` → full `BundleVerifyReport` to stdout (operational chatter to stderr so `jq` works).
+- `--format pretty` → compact terminal-friendly summary + per-entry listing.
+
+**Flag rules (clap-enforced):**
+
+- `build-integrity-evidence-bundle` requires `--include` (≥1, repeatable), `--base-dir`, and `--out`. `--label` / `--notes` are optional; the closed format enum is required-with-default.
+- `verify-integrity-evidence-bundle` requires `--bundle`. `--base-dir` is optional — when omitted, the verifier resolves entries against the bundle's recorded `base_dir`. When supplied, it overrides.
+- All `--include kind=path` wire tags must come from the closed set (`state_integrity_report` / `signed_state_integrity_baseline` / `state_integrity_diff_report` / `signed_state_integrity_diff` / `state_cleanup_plan` / `cleanup_report` / `quarantine_manifest` / `quarantine_restore_report` / `archive_manifest` / `other`). Unknown tags refuse at CLI parse time with `event=integrity_evidence_bundle_build_failed reason=invalid_include`.
+- Neither subcommand exposes `--no-prune-state-on-start` — pinned by clap regression. Neither opens a contributor state-store.
+
+**Refusal modes (typed `EvidenceBundleError`, surfaced as `reason=<tag>`):**
+
+- `empty_bundle` → no `--include` was supplied (must be at least 1).
+- `duplicate_entry` → two `--include`s collided on `(artifact_kind, path)` after normalization.
+- `too_many_entries` → more than 1024 entries. Cheap operator-typo defense; raise via constant if real-world bundles approach the cap.
+- `bundle_label_too_long` / `notes_too_long` → `--label` exceeded 128 bytes or `--notes` exceeded 1024 bytes (UTF-8).
+- `entry_too_large` → an entry exceeded the 256 MiB per-entry cap. Size check is cheap pre-check; no read attempted.
+- `entry_not_found` → an `--include` pointed at a file that didn't exist at build time.
+- `path_outside_base_dir` → an absolute `--include` path canonicalized to a target outside the canonical `--base-dir`. Refused so recorded paths stay base-dir-rooted.
+- `invalid_relative_path` → a recorded entry path failed the strict relative-path validator. Detail carries the closed reason: `empty` / `absolute` (leading `/`) / `backslash` / `dot_segment` (a `.` segment like `./foo`) / `dotdot_segment` (a `..` traversal like `../outside`) / `empty_segment` (a `//` or trailing `/`). Refused at BUILD time on relative `--include` inputs BEFORE any hashing, and at VERIFY envelope-level on `bundle.entries[].path` BEFORE any per-entry FS work — so a hand-edited bundle pointing outside `base_dir` never opens a single byte.
+- `base_dir_invalid` → `--base-dir` doesn't exist, isn't a directory, or couldn't be canonicalized.
+- `effective_base_dir_not_found` → at verify time, neither the override nor the bundle's recorded `base_dir` exists. Refused at the envelope level so operators don't see N false `NotFound` outcomes from a bad root.
+- `non_utf8_path` → a supplied path is not valid UTF-8.
+- `invalid_include` → `--include` value was malformed (no `=`, unknown kind tag, empty path).
+- `unsupported_schema_version` → bundle JSON came from a future stage; v1 binary refuses.
+- `malformed_json` → bundle JSON couldn't be parsed as a v1 `IntegrityEvidenceBundle`.
+
+**What the bundle covers (vs what it doesn't):**
+
+- **Covered**: `(artifact_kind, base-dir-relative path, byte length, BLAKE3 of file bytes)` for each `--include`-d file, plus the bundle's own `schema_version`, `generated_at_utc`, `omni_contributor_version`, optional `label`, optional `notes`, and canonical `base_dir`.
+- **Not covered** (deliberate v1 scope): no signature over the bundle JSON itself, no semantic validation of the referenced artifact bytes (e.g. the verifier does NOT re-run `verify_signed_state_integrity_baseline` on a signed-baseline entry — operators run Stage 12.20 / 12.21 verifiers separately), no recursive directory bundling, no automatic artifact discovery.
+
+**Symlinks:** symlinks under `--base-dir` are followed at hash time. The recorded `path` is the operator-supplied form, NOT the symlink target. Operators wanting target-pinned paths should pass canonicalized paths themselves.
+
+**Determinism:** same inputs + same `--base-dir` + same `generated_at_utc` + identical file contents produce a byte-identical bundle — operators can commit a bundle to an archive and re-derive it deterministically.
+
+**Composition with Stage 12.20 / 12.21:** the bundle is the outer wrapper. A typical archival chain looks like (a) build daily integrity artifacts (Stage 12.16/12.19) + sign them (Stage 12.20/12.21) under a per-day `--base-dir`, (b) assemble a Stage 12.22 bundle pointing at all of them, (c) archive the bundle JSON to immutable storage. An auditor receiving the bundle + the artifact tree runs `verify-integrity-evidence-bundle` to confirm bytes haven't shifted, then runs Stage 12.20 / 12.21 verifiers on the signed entries to confirm the per-stage Ed25519 signatures still verify against the trust anchors they care about.
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.21 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.

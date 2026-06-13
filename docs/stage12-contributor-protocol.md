@@ -3080,3 +3080,155 @@ The verifier's JSON renderer emits a compact metadata view (`schema_version`, `s
 | CLI flag matrix for `verify-state-integrity-diff-signature` (required-flag refusals, format closed enum, unknown-format refusal, deliberate rejection of `--no-prune-state-on-start`) | `verify_state_integrity_diff_signature_flag_parse_smoke` (omni-node) |
 
 **Residual gap (deliberate):** the CLI run-fns `run_sign_state_integrity_diff` and `run_verify_state_integrity_diff_signature` aren't exercised end-to-end (same constraint as Stage 12.10–12.20); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
+
+# Stage 12.22 — integrity evidence bundles
+
+## What this stage is, in one sentence
+
+A local-only `IntegrityEvidenceBundle` manifest that ties together a chosen set of Stage 12.16–12.21 audit artifacts by `(artifact_kind, base-dir-relative path, byte_len, blake3_hex)` under a single `base_dir`, plus a `build-integrity-evidence-bundle` CLI to assemble one and a `verify-integrity-evidence-bundle` CLI to re-hash + collect outcomes — so an operator can hand a single tamper-evident pointer file to an auditor.
+
+## Why a byte manifest
+
+Stage 12.16–12.21 each emit their own typed artifact: the integrity report, the diff report, the signed baseline, the signed diff, the cleanup plan, the cleanup report, the quarantine manifest, the archive manifest. Each artifact has its own per-stage trust contract (e.g. Stage 12.20 baselines and 12.21 diffs are Ed25519-signed; 12.16/12.17/12.19 reports are unsigned plaintext). An auditor handed a pile of these files needs **one** file to verify the set hasn't been hand-edited or shuffled. Stage 12.22 is that file. It fingerprints — it does not re-sign and does not parse — and exposes a single `verify-integrity-evidence-bundle` CLI that re-hashes every referenced file and collects per-entry outcomes without short-circuiting.
+
+The bundle is its own forward-compatible artifact tracked by `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION = 1`, independent of every existing schema constant. v1 bundles describe v1 artifacts only; future stages can extend the bundle without bumping any existing surface.
+
+## Library surface
+
+`omni_contributor::integrity_evidence_bundle` (new module):
+
+- `pub const INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION: u32 = 1;`
+- `pub const BUNDLE_MAX_ENTRIES: usize = 1024;`
+- `pub const BUNDLE_ENTRY_MAX_BYTES: u64 = 256 * 1024 * 1024;` (256 MiB)
+- `pub const BUNDLE_LABEL_MAX: usize = 128;`
+- `pub const BUNDLE_NOTES_MAX: usize = 1024;`
+- Closed `BundleArtifactKind { StateIntegrityReport, SignedStateIntegrityBaseline, StateIntegrityDiffReport, SignedStateIntegrityDiff, StateCleanupPlan, CleanupReport, QuarantineManifest, QuarantineRestoreReport, ArchiveManifest, Other }` with `as_str()` / `from_wire_tag()` / `Display` and `snake_case` serde. **The `Other` variant** is the explicit escape hatch for files that don't yet have a typed CLI emitter (e.g. a manually-captured `RestoreReport`).
+- `BundleEntry { artifact_kind, path, bytes, blake3_hex }` with `deny_unknown_fields`. `path` is forward-slash-normalized relative to the bundle's `base_dir`.
+- `IntegrityEvidenceBundle { schema_version, generated_at_utc, omni_contributor_version, label?, notes?, base_dir, entries }` with `deny_unknown_fields`. `base_dir` is the canonicalized, forward-slash-normalized absolute path against which every entry is resolved at verify time (unless a `--base-dir` override is supplied).
+- `pub fn build_integrity_evidence_bundle(inputs, opts) -> Result<IntegrityEvidenceBundle, EvidenceBundleError>` — fail-fast builder. Reads each input file, computes `blake3::hash`, refuses on duplicate `(kind, path)`, oversized entries, and over-cap bundles.
+- `pub fn verify_integrity_evidence_bundle(bundle, opts) -> Result<BundleVerifyReport, EvidenceBundleError>` — collect-all verifier. Walks every entry; never short-circuits per entry. Returns a `BundleVerifyReport` carrying per-entry `BundleEntryOutcome` plus aggregate counts and a `all_ok()` helper for the exit-code policy.
+- `pub fn read_integrity_evidence_bundle_from_path(path)` / `pub fn write_integrity_evidence_bundle_atomic(bundle, out)` — convenience FS helpers; the writer uses atomic tempfile + rename (same posture as Stage 12.17/12.20/12.21 writers).
+
+Closed `BundleEntryOutcome { Ok, SizeMismatch { expected, got }, HashMismatch { expected, got }, NotFound, ReadError { detail } }` with `snake_case` serde tagging.
+
+New typed `EvidenceBundleError` covers `UnsupportedSchemaVersion`, `EmptyBundle`, `DuplicateEntry`, `TooManyEntries`, `BundleLabelTooLong`, `NotesTooLong`, `EntryTooLarge`, `EntryNotFound`, `PathOutsideBaseDir`, `InvalidRelativePath`, `BaseDirInvalid`, `EffectiveBaseDirNotFound`, `NonUtf8Path`, `Io`, `MalformedJson`.
+
+### Strict relative-path validator
+
+A private `validate_relative_entry_path(&str)` runs on every recorded entry path — at build time after input resolution AND at verify envelope-level before any per-entry FS work. Closes the v1 path-traversal hole: a hand-edited bundle pointing at `../outside/file` (or a relative `--include` containing `..`) is refused before the verifier opens a single byte. Refusal taxonomy (closed): `empty` / `absolute` (leading `/`) / `backslash` / `dot_segment` / `dotdot_segment` / `empty_segment` (catches `//` and trailing `/`). For relative `--include` inputs the validator runs on the RAW UTF-8 string BEFORE forward-slash normalization, so `a\b.json` refuses with `reason=backslash` instead of silently flipping the separator. For absolute inputs the validator runs as defense-in-depth on the canonicalized + stripped form (canonical paths shouldn't contain `..`/`.`/empty segments, but the check pins any future canonicalize regression).
+
+No new canonical-bytes constant. No new domain separator. **The bundle has no signature in v1** — if review later wants a signature, the natural shape is a Stage 12.20-style sibling `SignedIntegrityEvidenceBundle` wrapping the bundle JSON.
+
+## Path policy (single, locked)
+
+`relative_to_base_dir` only — no policy enum, no `as_supplied` / `absolute` modes in v1.
+
+Build-time resolution rule:
+- If the operator passes an **absolute** input path: it is canonicalized (`std::fs::canonicalize` — symlinks resolved), must start with the canonical `base_dir`, then stripped to record the base-dir-relative form. Otherwise refused with `PathOutsideBaseDir`.
+- If the operator passes a **relative** input path: the recorded form is the operator's string forward-slash-normalized verbatim; the bytes are read from `<base_dir>/<input>`.
+
+Verify-time resolution rule:
+- `effective_base_dir = base_dir_override.unwrap_or(bundle.base_dir)`, canonicalized.
+- Each entry resolves to `<effective_base_dir>/<entry.path>`.
+
+UTF-8 paths only. Non-UTF-8 refuses with `NonUtf8Path`. Matches the Stage 12.14 archive precedent.
+
+## Symlink handling
+
+Symlinks under `--base-dir` are **followed at hash time** (via `std::fs::read`, which dereferences). The recorded `path` is the operator-supplied relative form — NOT the symlink target. Operators wanting target-pinned paths should pass canonicalized paths themselves.
+
+## Safety contract
+
+- **Read-only on the state-store side.** Neither subcommand opens a contributor state-dir. The builder writes only the operator-named `--out` file (atomic temp+rename). The verifier writes nothing.
+- **Bytes-and-presence only.** No semantic validation of any artifact JSON. The `artifact_kind` tag is forensic context, not policy enforcement.
+- **Fail-fast builder; collect-all verifier.** Any builder error refuses the build; the verifier walks every entry and emits per-entry outcomes (`Ok` / `SizeMismatch` / `HashMismatch` / `NotFound` / `ReadError`) plus aggregate counts.
+- **Determinism pinned**: same inputs + same `base_dir` + same `now_utc` + identical file contents produce byte-identical bundles across runs (entries sorted by `(artifact_kind.as_str(), path)`, regression-tested).
+- **No bundle signature.** Stage 12.20/12.21 already sign the artifact bodies they care about.
+- **Auto-prune flag deliberately absent** on both CLI surfaces; pinned by clap regression so a future operator can't reintroduce state-store coupling.
+
+## CLI
+
+### Build subcommand
+
+```
+omni-node operator contributor build-integrity-evidence-bundle \
+  --include <kind=path>                      (required, repeatable, ≥1)
+  --base-dir <path>                          (required)
+  --out <path>                               (required — atomic temp+rename)
+  [--label <string>]                         (≤128 bytes UTF-8)
+  [--notes <string>]                         (≤1024 bytes UTF-8)
+  [--format events|json|pretty]              (default events)
+```
+
+`--include` value: `<kind>=<path>`. Split on the FIRST `=`, so paths containing `=` are tolerated. Kind tag is the closed-set wire tag (`state_integrity_report` / `signed_state_integrity_baseline` / `state_integrity_diff_report` / `signed_state_integrity_diff` / `state_cleanup_plan` / `cleanup_report` / `quarantine_manifest` / `quarantine_restore_report` / `archive_manifest` / `other`). Unknown kind, missing `=`, or empty path refuse with `event=integrity_evidence_bundle_build_failed reason=invalid_include`.
+
+Closed-set bare-stdout events: `event=integrity_evidence_bundle_build_started base_dir=<...>`, one `event=integrity_evidence_bundle_entry_hashed kind=<...> path=<...> bytes=<...> blake3=<...>` per entry (only emitted on a successful build), `event=integrity_evidence_bundle_written path=<...> entry_count=<...>`. Failure: `event=integrity_evidence_bundle_build_failed reason=<closed-tag>` (tags: `empty_bundle` / `duplicate_entry` / `too_many_entries` / `bundle_label_too_long` / `notes_too_long` / `entry_too_large` / `entry_not_found` / `path_outside_base_dir` / `invalid_relative_path` / `base_dir_invalid` / `non_utf8_path` / `io` / `malformed_json` / `invalid_include` / `unsupported_schema_version`).
+
+### Verify subcommand
+
+```
+omni-node operator contributor verify-integrity-evidence-bundle \
+  --bundle <path>                            (required)
+  [--base-dir <path>]                        (optional override; defaults to bundle.base_dir)
+  [--format events|json|pretty]              (default events)
+```
+
+Closed-set bare-stdout events:
+
+- `event=integrity_evidence_bundle_verify_started bundle=<path>[ base_dir_override=<path>]` — fires FIRST, before any FS IO. Always emitted, even when the bundle is missing / malformed / has an unsupported schema / fails envelope-level path validation. The `effective_base_dir` isn't known at this point (the bundle hasn't been read or canonicalized yet) and is reported on the summary line instead.
+- One `event=integrity_evidence_bundle_entry_ok` / `…_entry_size_mismatch` / `…_entry_hash_mismatch` / `…_entry_not_found` / `…_entry_read_error` per entry.
+- Final `event=integrity_evidence_bundle_verify_summary effective_base_dir=<...> ok=<N> size_mismatch=<N> hash_mismatch=<N> not_found=<N> read_error=<N>` — carries the canonicalized base_dir the verifier actually resolved against.
+- Envelope-level failures (bundle missing / malformed JSON / unsupported schema / invalid relative path on any entry / effective base_dir doesn't exist): `event=integrity_evidence_bundle_verify_failed reason=<closed-tag>` + nonzero exit. Bundle-read failures get the precise distinction: `reason=io` for missing/permission denied, `reason=malformed_json` for parse failures (single-sourced via `bundle_build_reason_tag` so the CLI never confuses the two).
+
+**Exit policy**: 0 iff every entry's outcome is `Ok` AND no envelope-level error. Any per-entry non-`Ok` outcome → exit 1.
+
+## Out of scope (Stage 12.22)
+
+- **No bundle signature.** v1 fingerprints bytes; it doesn't re-sign them.
+- **No semantic JSON validation.** `artifact_kind` is forensic context; the verifier doesn't parse the referenced files.
+- **No `as_supplied` / `absolute` path policy.** v1 is `relative_to_base_dir` only.
+- **No per-entry `label` field.** Identity is `(artifact_kind, path)`; bundle-level `label` exists for auditor-facing naming.
+- **No `restore_report` in the closed enum.** No CLI emits a typed `RestoreReport` file today; operators capturing restore output point at `other` until a real artifact lands.
+- **No recursive directory bundling.** Each entry is a single file, explicitly listed via `--include`.
+- **No automatic artifact discovery.** No "walk the state-dir and grab everything that looks like an integrity artifact" pass.
+- **No expiry / `valid_through_utc` field.** v1 bundles don't expire.
+- **No multi-bundle composition.** One bundle is one manifest.
+- **No new canonical bytes, no domain separator, no SNIP / mesh / chain / gossipsub / envelope / state-dir mutation.**
+- **No `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `STATUS_SCHEMA_VERSION` / `ARCHIVE_MANIFEST_SCHEMA_VERSION` / `CLEANUP_PLAN_SCHEMA_VERSION` / `QUARANTINE_MANIFEST_SCHEMA_VERSION` / `NET_SCHEMA_VERSION` bump.**
+
+## Test coverage map
+
+| Concern | Test |
+| --- | --- |
+| Build + verify happy path (3 mixed kinds) | `build_and_verify_happy_path_three_kinds` (`integrity_evidence_bundle.rs`) |
+| Determinism: same inputs → byte-identical bundle | `determinism_same_inputs_produce_byte_identical_bundle` |
+| Sort order: entries in `(kind, path)` order regardless of input order | `entries_sorted_by_kind_then_path` |
+| Empty inputs → `EmptyBundle` | `empty_inputs_refused` |
+| Duplicate `(kind, path)` → `DuplicateEntry` | `duplicate_kind_path_refused` |
+| Same kind / different paths → accepted | `same_kind_different_paths_accepted` |
+| Same path / different kinds → accepted (v1 contract) | `same_path_different_kinds_accepted_in_v1` |
+| `EntryTooLarge` refusal at 256 MiB cap (via sparse file; size check trips before read) | `entry_too_large_refused` |
+| `TooManyEntries` refusal at 1024 cap | `too_many_entries_refused` |
+| `BundleLabelTooLong` / `NotesTooLong` refusals | `bundle_label_too_long_refused`, `notes_too_long_refused` |
+| Absolute input NOT under `--base-dir` → `PathOutsideBaseDir` | `absolute_input_outside_base_dir_refused` |
+| Absolute input UNDER `--base-dir` → recorded base-dir-relative | `absolute_input_under_base_dir_is_recorded_relative` |
+| Verify happy path → all `Ok` | `verify_all_ok_when_nothing_changed` |
+| Hash mismatch on one entry doesn't short-circuit others | `hash_mismatch_does_not_short_circuit_other_entries` |
+| Size mismatch is cheap pre-check (no hash burn) | `size_mismatch_is_reported_without_hash_burn` |
+| Missing entry → `NotFound`; other entries still walked | `missing_entry_is_not_found_without_short_circuit` |
+| Unreadable entry (chmod 000, Unix-only) → `ReadError`; other entries still walked | `unreadable_entry_is_read_error_without_short_circuit` |
+| JSON round-trip preserves bundle | `json_round_trip_preserves_bundle` |
+| Atomic writer round-trips via disk | `write_atomic_round_trips_via_disk` |
+| Wrapper `schema_version != 1` → `UnsupportedSchemaVersion` | `wrapper_schema_v2_refused` |
+| `--base-dir` override at verify time relocates resolution root correctly | `verify_base_dir_override_relocates_resolution_root` |
+| Effective base_dir doesn't exist → envelope-level refusal (no per-entry walk) | `effective_base_dir_not_found_is_envelope_level_refusal` |
+| **Path traversal (build)**: relative input `../outside/file` → `InvalidRelativePath { reason: "dotdot_segment" }` before any hashing | `relative_input_with_dotdot_refused_before_hashing` |
+| **Path traversal (build)**: relative input with backslash / `.` segment / empty segment → `InvalidRelativePath` with the matching closed reason tag | `relative_input_with_backslash_dot_or_empty_segments_refused` |
+| **Path traversal (verify)**: hand-edited bundle entry `../outside/file` → `InvalidRelativePath` at envelope level BEFORE any per-entry walk | `hand_edited_bundle_with_traversal_refused_at_verify_envelope` |
+| Absolute input UNDER `--base-dir` still succeeds after the validator (defense-in-depth check pinned) | `absolute_input_under_base_dir_still_succeeds_after_validator` |
+| **Bundle read: missing file → `Io { NotFound }` (NOT `MalformedJson`)** — pins the library variant the CLI's `reason=io` tag depends on | `bundle_read_missing_file_returns_io_not_malformed_json` |
+| **Bundle read: present-but-unparseable file → `MalformedJson` (NOT `Io`)** — counterpart pin | `bundle_read_invalid_json_returns_malformed_json` |
+| CLI flag matrix for `build-integrity-evidence-bundle` (multi-`--include`, `--label`/`--notes`, format closed enum, required-flag refusal sweep, unknown-format refusal, deliberate rejection of `--no-prune-state-on-start`) | `build_integrity_evidence_bundle_flag_parse_smoke` (omni-node) |
+| CLI flag matrix for `verify-integrity-evidence-bundle` (required `--bundle`, optional `--base-dir` override, format closed enum, unknown-format refusal, deliberate rejection of `--no-prune-state-on-start`) | `verify_integrity_evidence_bundle_flag_parse_smoke` (omni-node) |
+
+**Residual gap (deliberate):** the CLI run-fns `run_build_integrity_evidence_bundle` and `run_verify_integrity_evidence_bundle` aren't exercised end-to-end (same constraint as Stage 12.10–12.21); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer + `--include` parser layer on top.
