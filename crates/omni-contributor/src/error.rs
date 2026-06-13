@@ -1529,3 +1529,127 @@ pub enum SignedIntegrityDiffError {
         source: serde_json::Error,
     },
 }
+
+/// Stage 12.22 — local-only integrity evidence bundle errors.
+/// The bundle is a byte manifest (path + artifact kind + byte
+/// length + BLAKE3 hash for each entry). v1 has no signature,
+/// no semantic JSON validation, and uses a single
+/// `relative_to_base_dir` path policy. Builder is fail-fast;
+/// the verifier is collect-all and uses
+/// `BundleEntryOutcome` per entry instead of bubbling these
+/// errors per file.
+#[derive(Debug, thiserror::Error)]
+pub enum EvidenceBundleError {
+    /// Wrapper's `schema_version` is not
+    /// `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION = 1`. v1
+    /// binary refuses future-stage bundles.
+    #[error(
+        "unsupported integrity-evidence-bundle schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedSchemaVersion { got: u32, expected: u32 },
+
+    /// `build_integrity_evidence_bundle` was called with no
+    /// inputs. v1 deliberately refuses — an empty bundle has
+    /// no auditor value. Easy to relax later if needed.
+    #[error("empty bundle: at least one --include entry is required")]
+    EmptyBundle,
+
+    /// Two inputs share the same `(artifact_kind, path)`
+    /// identity after normalization. Path is the
+    /// base-dir-relative form recorded into the bundle.
+    #[error(
+        "duplicate bundle entry: artifact_kind={artifact_kind} path={path}"
+    )]
+    DuplicateEntry { artifact_kind: String, path: String },
+
+    /// More than `BUNDLE_MAX_ENTRIES` inputs were supplied.
+    /// Cheap defense against operator-typo footguns.
+    #[error("too many bundle entries: got={count} max={max}")]
+    TooManyEntries { count: usize, max: usize },
+
+    /// Bundle-level `--label` exceeded `BUNDLE_LABEL_MAX`
+    /// UTF-8 bytes.
+    #[error("bundle label too long: len={len} max={max}")]
+    BundleLabelTooLong { len: usize, max: usize },
+
+    /// `--notes` exceeded `BUNDLE_NOTES_MAX` UTF-8 bytes.
+    #[error("bundle notes too long: len={len} max={max}")]
+    NotesTooLong { len: usize, max: usize },
+
+    /// An entry's file size exceeded `BUNDLE_ENTRY_MAX_BYTES`.
+    /// v1 cap is 256 MiB (raise via constant if operators hit
+    /// it in practice).
+    #[error("bundle entry too large: path={path} bytes={bytes} max={max}")]
+    EntryTooLarge { path: String, bytes: u64, max: u64 },
+
+    /// An input file did not exist at build time. Builder
+    /// fail-fast (vs verifier collect-all `NotFound` outcome).
+    #[error("bundle entry not found: path={path}")]
+    EntryNotFound { path: std::path::PathBuf },
+
+    /// An absolute input path canonicalized to a target that
+    /// does not have `base_dir` as a prefix. Refused so
+    /// recorded paths stay base-dir-rooted.
+    #[error(
+        "bundle entry path outside base_dir: path={path} base_dir={base_dir}"
+    )]
+    PathOutsideBaseDir {
+        path: std::path::PathBuf,
+        base_dir: std::path::PathBuf,
+    },
+
+    /// A recorded entry path is not a strictly relative,
+    /// base-dir-rooted UTF-8 path. Refused at BOTH build time
+    /// (after the operator's input is resolved) AND verify
+    /// envelope-level (walking `bundle.entries[].path` before
+    /// any FS work). Closed reason set: `empty` / `absolute` /
+    /// `backslash` / `dot_segment` / `dotdot_segment` /
+    /// `empty_segment`. Closes the v1 path-traversal hole: a
+    /// hand-edited bundle pointing at `../outside/file` is
+    /// refused before the verifier opens a single byte.
+    #[error("invalid relative entry path: path={path} reason={reason}")]
+    InvalidRelativePath { path: String, reason: &'static str },
+
+    /// `--base-dir` doesn't exist, isn't a directory, or
+    /// couldn't be canonicalized at build time.
+    #[error("invalid base_dir: path={path} detail={detail}")]
+    BaseDirInvalid {
+        path: std::path::PathBuf,
+        detail: String,
+    },
+
+    /// At verify time, the effective base_dir (override or
+    /// bundle.base_dir) doesn't exist. Refused with no
+    /// per-entry walk so operators don't see N false
+    /// `NotFound` outcomes from a bad root.
+    #[error("effective base_dir not found at verify time: path={path}")]
+    EffectiveBaseDirNotFound { path: std::path::PathBuf },
+
+    /// A path supplied by the operator (input or base_dir)
+    /// is not valid UTF-8. The bundle wire format is
+    /// JSON-encoded UTF-8 strings, so non-UTF-8 paths are
+    /// refused at intake. Matches the Stage 12.14
+    /// `archive_session` precedent.
+    #[error("non-UTF-8 path refused: path={path}")]
+    NonUtf8Path { path: std::path::PathBuf },
+
+    /// Generic FS error during bundle read/write or entry
+    /// read. Verifier collect-all path uses
+    /// `BundleEntryOutcome::ReadError` instead for per-entry
+    /// IO failures.
+    #[error("integrity-evidence-bundle io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Bundle JSON did not parse as a v1
+    /// `IntegrityEvidenceBundle`.
+    #[error("malformed integrity-evidence-bundle at {path}: {source}")]
+    MalformedJson {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}

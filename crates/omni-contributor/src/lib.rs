@@ -46,6 +46,7 @@ pub mod error;
 pub mod handoff;
 pub mod handoff_verify;
 pub mod integrity;
+pub mod integrity_evidence_bundle;
 pub mod job;
 pub mod net;
 pub mod peer_advert;
@@ -76,10 +77,10 @@ pub mod watch;
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
     ArchiveError, CanonicalError, CleanupError, ContributorError, DiscoverError,
-    IntegrityDiffError, IntegrityError, PlannerError, QuarantineRestoreError,
-    RelayError, RepairError, RestoreError, RunnerError, SchemaError,
-    SignedBaselineError, SignedIntegrityDiffError, SigningError, SnipError,
-    StatusError, VerifyError,
+    EvidenceBundleError, IntegrityDiffError, IntegrityError, PlannerError,
+    QuarantineRestoreError, RelayError, RepairError, RestoreError, RunnerError,
+    SchemaError, SignedBaselineError, SignedIntegrityDiffError, SigningError,
+    SnipError, StatusError, VerifyError,
 };
 pub use repair::{
     build_session_repair_plan, build_session_repair_plan_with_reason,
@@ -112,6 +113,15 @@ pub use integrity::{
     FindingSeverity, IntegrityFinding, RecommendedAction, ScanOptions,
     SessionIntegritySummary, StateIntegrityDiffReport, StateIntegrityReport,
     STATE_INTEGRITY_DIFF_SCHEMA_VERSION, STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
+};
+pub use integrity_evidence_bundle::{
+    build_integrity_evidence_bundle, read_integrity_evidence_bundle_from_path,
+    verify_integrity_evidence_bundle, write_integrity_evidence_bundle_atomic,
+    BundleArtifactKind, BundleBuilderInput, BundleBuilderOptions, BundleEntry,
+    BundleEntryOutcome, BundleEntryVerifyOutcome, BundleVerifyReport,
+    IntegrityEvidenceBundle, VerifyOptions as BundleVerifyOptions,
+    BUNDLE_ENTRY_MAX_BYTES, BUNDLE_LABEL_MAX, BUNDLE_MAX_ENTRIES, BUNDLE_NOTES_MAX,
+    INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION,
 };
 pub use cleanup::{
     apply_state_cleanup, cleanup_plan_hash_hex, plan_state_cleanup,
