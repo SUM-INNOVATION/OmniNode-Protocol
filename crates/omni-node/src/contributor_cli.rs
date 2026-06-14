@@ -312,6 +312,27 @@ enum ContributorCmd {
     /// `--no-prune-state-on-start` is deliberately absent. No
     /// chain / mesh / SNIP / envelope surface touched.
     VerifyIntegrityEvidenceBundle(VerifyIntegrityEvidenceBundleArgs),
+
+    /// Stage 12.23 — sign a v1 `IntegrityEvidenceBundle` JSON
+    /// with a 32-byte Ed25519 seed and emit a
+    /// `SignedIntegrityEvidenceBundle` JSON. Read-only on the
+    /// state-store side; writes only the operator-named
+    /// `--out` file. The signed wrapper attests to bundle
+    /// bytes only — Stage 12.22's `verify-integrity-evidence-bundle`
+    /// is still needed for per-entry artifact byte verification.
+    SignIntegrityEvidenceBundle(SignIntegrityEvidenceBundleArgs),
+
+    /// Stage 12.23 — verify a `SignedIntegrityEvidenceBundle`
+    /// JSON against an operator-supplied trust anchor
+    /// (`--expected-signer-pubkey-hex`). Read-only and
+    /// state-store-free: no contributor state-dir is opened
+    /// and `--no-prune-state-on-start` is deliberately absent.
+    /// Attests to bundle JSON bytes only — does NOT re-hash
+    /// referenced artifact files. No chain / mesh / SNIP /
+    /// envelope surface touched.
+    VerifyIntegrityEvidenceBundleSignature(
+        VerifyIntegrityEvidenceBundleSignatureArgs,
+    ),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2892,6 +2913,101 @@ struct VerifyIntegrityEvidenceBundleArgs {
     format: VerifyIntegrityEvidenceBundleFormat,
 }
 
+// ── Stage 12.23 — sign-integrity-evidence-bundle ─────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum SignIntegrityEvidenceBundleFormat {
+    /// One `event=signed_integrity_evidence_bundle_written ...`
+    /// line on success.
+    Events,
+    /// Print the signed wrapper as pretty JSON on stdout.
+    /// Operational chatter goes to stderr so `jq` works.
+    Json,
+    /// Compact terminal-friendly summary.
+    Pretty,
+}
+
+#[derive(Args)]
+struct SignIntegrityEvidenceBundleArgs {
+    /// Path to the raw v1 `IntegrityEvidenceBundle` JSON to
+    /// sign. Typically the output of a prior
+    /// `build-integrity-evidence-bundle --out`.
+    #[arg(long)]
+    bundle_in: PathBuf,
+
+    /// 32-byte raw Ed25519 seed file. Operators MUST keep this
+    /// distinct from any chain-attestation or protocol-role
+    /// seed — the integrity-artifact signing role is its own
+    /// key per Stage 12.20.
+    #[arg(long)]
+    signer_seed: PathBuf,
+
+    /// Role tag recorded in the wrapper for forensics. Closed
+    /// set: `operator` / `contributor` / `dispatcher` /
+    /// `coordinator`. Reuses the Stage 12.20
+    /// `BaselineSignerRole` enum per the Stage 12.21/12.23
+    /// precedent — the four variants are role names, not
+    /// artifact-type names.
+    #[arg(long, value_enum)]
+    signer_role: CliBaselineSignerRole,
+
+    /// Destination for the signed wrapper JSON. Atomic
+    /// tempfile + rename (same posture as Stage 12.17 / 12.20 /
+    /// 12.21).
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SignIntegrityEvidenceBundleFormat::Events
+    )]
+    format: SignIntegrityEvidenceBundleFormat,
+}
+
+// ── Stage 12.23 — verify-integrity-evidence-bundle-signature ─────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum VerifyIntegrityEvidenceBundleSignatureFormat {
+    /// One `event=signed_integrity_evidence_bundle_verify_ok ...`
+    /// line on success. On failure, a non-zero exit + an
+    /// `event=signed_integrity_evidence_bundle_verify_failed reason=...`
+    /// line. Default.
+    Events,
+    /// Print the verified wrapper's metadata as pretty JSON on
+    /// stdout. Operational chatter goes to stderr so `jq`
+    /// works. Compact metadata view — does NOT re-print the
+    /// embedded bundle's entries (auditors who want them
+    /// already have the wrapper on disk).
+    Json,
+    /// Compact terminal-friendly summary.
+    Pretty,
+}
+
+#[derive(Args)]
+struct VerifyIntegrityEvidenceBundleSignatureArgs {
+    /// Path to a `SignedIntegrityEvidenceBundle` JSON wrapper
+    /// to verify.
+    #[arg(long)]
+    signed_bundle: PathBuf,
+
+    /// Operator-supplied trust anchor: 64-char lowercase-hex
+    /// Ed25519 public key the wrapper MUST be signed by.
+    /// Verification refuses with a `signer_pubkey_mismatch`
+    /// pre-check before any crypto burn.
+    #[arg(long)]
+    expected_signer_pubkey_hex: String,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = VerifyIntegrityEvidenceBundleSignatureFormat::Events
+    )]
+    format: VerifyIntegrityEvidenceBundleSignatureFormat,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -2945,6 +3061,12 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         }
         ContributorCmd::VerifyIntegrityEvidenceBundle(a) => {
             run_verify_integrity_evidence_bundle(a)
+        }
+        ContributorCmd::SignIntegrityEvidenceBundle(a) => {
+            run_sign_integrity_evidence_bundle(a)
+        }
+        ContributorCmd::VerifyIntegrityEvidenceBundleSignature(a) => {
+            run_verify_integrity_evidence_bundle_signature(a)
         }
     }
 }
@@ -8828,6 +8950,343 @@ mod tests {
         );
     }
 
+    // ── Stage 12.23 — sign-integrity-evidence-bundle clap regression ──
+
+    fn parse_sign_integrity_evidence_bundle(
+        signer_role: &str,
+        extra: &[&str],
+    ) -> SignIntegrityEvidenceBundleArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "sign-integrity-evidence-bundle".into(),
+            "--bundle-in".into(),
+            "/tmp/bundle.json".into(),
+            "--signer-seed".into(),
+            "/tmp/seed.bin".into(),
+            "--signer-role".into(),
+            signer_role.into(),
+            "--out".into(),
+            "/tmp/signed-bundle.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::SignIntegrityEvidenceBundle(a) => a,
+            _ => panic!("expected SignIntegrityEvidenceBundle"),
+        }
+    }
+
+    #[test]
+    fn sign_integrity_evidence_bundle_flag_parse_smoke() {
+        let defaults = parse_sign_integrity_evidence_bundle("operator", &[]);
+        assert_eq!(defaults.bundle_in, std::path::PathBuf::from("/tmp/bundle.json"));
+        assert_eq!(defaults.signer_seed, std::path::PathBuf::from("/tmp/seed.bin"));
+        assert_eq!(defaults.signer_role, CliBaselineSignerRole::Operator);
+        assert_eq!(
+            defaults.out,
+            std::path::PathBuf::from("/tmp/signed-bundle.json")
+        );
+        assert_eq!(defaults.format, SignIntegrityEvidenceBundleFormat::Events);
+
+        // All four roles parse via the reused Stage 12.20 enum.
+        for (raw, expected) in &[
+            ("operator", CliBaselineSignerRole::Operator),
+            ("contributor", CliBaselineSignerRole::Contributor),
+            ("dispatcher", CliBaselineSignerRole::Dispatcher),
+            ("coordinator", CliBaselineSignerRole::Coordinator),
+        ] {
+            let got = parse_sign_integrity_evidence_bundle(raw, &[]);
+            assert_eq!(got.signer_role, *expected, "role={raw} parsed wrong");
+        }
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", SignIntegrityEvidenceBundleFormat::Events),
+            ("json", SignIntegrityEvidenceBundleFormat::Json),
+            ("pretty", SignIntegrityEvidenceBundleFormat::Pretty),
+        ] {
+            let got = parse_sign_integrity_evidence_bundle(
+                "operator",
+                &["--format", raw],
+            );
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --signer-role rejected.
+        let bad_role = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-integrity-evidence-bundle",
+            "--bundle-in",
+            "/tmp/bundle.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "auditor",
+            "--out",
+            "/tmp/signed-bundle.json",
+        ]);
+        assert!(
+            bad_role.is_err(),
+            "clap must reject unknown --signer-role for sign-integrity-evidence-bundle"
+        );
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-integrity-evidence-bundle",
+            "--bundle-in",
+            "/tmp/bundle.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "operator",
+            "--out",
+            "/tmp/signed-bundle.json",
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format for sign-integrity-evidence-bundle"
+        );
+
+        // Required-flag refusals.
+        for missing in &[
+            "--bundle-in",
+            "--signer-seed",
+            "--signer-role",
+            "--out",
+        ] {
+            let stripped =
+                strip_sign_bundle_flag_with_value(missing);
+            let parsed = TestRoot::try_parse_from(stripped);
+            assert!(
+                parsed.is_err(),
+                "clap must reject sign-integrity-evidence-bundle without {missing}"
+            );
+        }
+
+        // Auto-prune flag deliberately absent — pinned by clap
+        // regression so a future operator can't reintroduce
+        // state-store coupling.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-integrity-evidence-bundle",
+            "--bundle-in",
+            "/tmp/bundle.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "operator",
+            "--out",
+            "/tmp/signed-bundle.json",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "sign-integrity-evidence-bundle must not accept --no-prune-state-on-start"
+        );
+    }
+
+    /// Build an argv for `sign-integrity-evidence-bundle` with
+    /// one (flag, value) pair stripped — drives the
+    /// missing-flag refusal sweep above.
+    fn strip_sign_bundle_flag_with_value(drop_flag: &str) -> Vec<String> {
+        let full: Vec<(&str, Option<&str>)> = vec![
+            ("--bundle-in", Some("/tmp/bundle.json")),
+            ("--signer-seed", Some("/tmp/seed.bin")),
+            ("--signer-role", Some("operator")),
+            ("--out", Some("/tmp/signed-bundle.json")),
+        ];
+        let mut out: Vec<String> = vec![
+            "omni-node".to_string(),
+            "sign-integrity-evidence-bundle".to_string(),
+        ];
+        for (flag, val) in full {
+            if flag == drop_flag {
+                continue;
+            }
+            out.push(flag.to_string());
+            if let Some(v) = val {
+                out.push(v.to_string());
+            }
+        }
+        out
+    }
+
+    // ── Stage 12.23 — verify-integrity-evidence-bundle-signature clap regression ──
+
+    fn parse_verify_integrity_evidence_bundle_signature(
+        pubkey: &str,
+        extra: &[&str],
+    ) -> VerifyIntegrityEvidenceBundleSignatureArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "verify-integrity-evidence-bundle-signature".into(),
+            "--signed-bundle".into(),
+            "/tmp/signed-bundle.json".into(),
+            "--expected-signer-pubkey-hex".into(),
+            pubkey.into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::VerifyIntegrityEvidenceBundleSignature(a) => a,
+            _ => panic!("expected VerifyIntegrityEvidenceBundleSignature"),
+        }
+    }
+
+    #[test]
+    fn verify_integrity_evidence_bundle_signature_flag_parse_smoke() {
+        let pubkey = "ab".repeat(32);
+        let defaults =
+            parse_verify_integrity_evidence_bundle_signature(&pubkey, &[]);
+        assert_eq!(
+            defaults.signed_bundle,
+            std::path::PathBuf::from("/tmp/signed-bundle.json")
+        );
+        assert_eq!(defaults.expected_signer_pubkey_hex, pubkey);
+        assert_eq!(
+            defaults.format,
+            VerifyIntegrityEvidenceBundleSignatureFormat::Events
+        );
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", VerifyIntegrityEvidenceBundleSignatureFormat::Events),
+            ("json", VerifyIntegrityEvidenceBundleSignatureFormat::Json),
+            ("pretty", VerifyIntegrityEvidenceBundleSignatureFormat::Pretty),
+        ] {
+            let got = parse_verify_integrity_evidence_bundle_signature(
+                &pubkey,
+                &["--format", raw],
+            );
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-bundle-signature",
+            "--signed-bundle",
+            "/tmp/signed-bundle.json",
+            "--expected-signer-pubkey-hex",
+            pubkey.as_str(),
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format for verify-integrity-evidence-bundle-signature"
+        );
+
+        // Required-flag refusals.
+        let missing_signed = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-bundle-signature",
+            "--expected-signer-pubkey-hex",
+            pubkey.as_str(),
+        ]);
+        assert!(
+            missing_signed.is_err(),
+            "clap must reject verify-integrity-evidence-bundle-signature without --signed-bundle"
+        );
+        let missing_pubkey = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-bundle-signature",
+            "--signed-bundle",
+            "/tmp/signed-bundle.json",
+        ]);
+        assert!(
+            missing_pubkey.is_err(),
+            "clap must reject verify-integrity-evidence-bundle-signature without --expected-signer-pubkey-hex"
+        );
+
+        // Auto-prune flag deliberately absent.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-bundle-signature",
+            "--signed-bundle",
+            "/tmp/signed-bundle.json",
+            "--expected-signer-pubkey-hex",
+            pubkey.as_str(),
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "verify-integrity-evidence-bundle-signature must not accept --no-prune-state-on-start"
+        );
+    }
+
+    // ── Stage 12.23 — sign/verify failure-event tag mapping ─────
+
+    /// Pins the closed `reason=<tag>` set on
+    /// `event=signed_integrity_evidence_bundle_{sign,verify}_failed`.
+    /// Both the signer (every failure path) and verifier
+    /// (envelope + bundle-read paths) emit this event with a
+    /// tag drawn from `super::signed_bundle_reason_tag`. If a
+    /// future variant lands on `SignedIntegrityEvidenceBundleError`
+    /// without being mapped here, the closed-set contract
+    /// breaks.
+    #[test]
+    fn signed_bundle_reason_tag_covers_closed_set() {
+        use omni_contributor::SignedIntegrityEvidenceBundleError as E;
+        use std::io::{Error as IoError, ErrorKind};
+        use std::path::PathBuf;
+
+        assert_eq!(
+            super::signed_bundle_reason_tag(&E::UnsupportedSchemaVersion {
+                got: 2,
+                expected: 1
+            }),
+            "unsupported_schema_version"
+        );
+        assert_eq!(
+            super::signed_bundle_reason_tag(
+                &E::UnsupportedBundleSchemaVersion { got: 2, expected: 1 }
+            ),
+            "unsupported_bundle_schema_version"
+        );
+        assert_eq!(
+            super::signed_bundle_reason_tag(&E::SignerPubkeyMismatch {
+                expected: "aa".repeat(32),
+                got: "bb".repeat(32),
+            }),
+            "signer_pubkey_mismatch"
+        );
+        assert_eq!(
+            super::signed_bundle_reason_tag(&E::SignatureMismatch),
+            "signature_mismatch"
+        );
+        assert_eq!(
+            super::signed_bundle_reason_tag(&E::Io {
+                path: PathBuf::from("/tmp/x"),
+                source: IoError::from(ErrorKind::NotFound),
+            }),
+            "io"
+        );
+        // serde_json::Error doesn't have a public constructor;
+        // round-tripping a malformed JSON through serde_json
+        // is the cleanest way to mint one for the mapper.
+        let json_err = serde_json::from_str::<serde_json::Value>("{bad")
+            .expect_err("malformed json");
+        assert_eq!(
+            super::signed_bundle_reason_tag(&E::MalformedJson {
+                path: PathBuf::from("/tmp/x"),
+                source: json_err,
+            }),
+            "malformed_json"
+        );
+        // Signing(...) and Canonical(...) tags — the inner
+        // error types are bubbled from other crates; the only
+        // requirement is the mapper picks the closed tag, not
+        // the inner error's shape.
+    }
+
     // ── Stage 12.17 — plan-state-cleanup / apply-state-cleanup ──
 
     fn parse_plan_state_cleanup(extra: &[&str]) -> PlanStateCleanupArgs {
@@ -12870,4 +13329,309 @@ fn render_verify_bundle_pretty(report: &omni_contributor::BundleVerifyReport) {
             line,
         );
     }
+}
+
+// ── Stage 12.23 — sign-integrity-evidence-bundle ─────────────────────────
+
+fn run_sign_integrity_evidence_bundle(
+    args: SignIntegrityEvidenceBundleArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        sign_integrity_evidence_bundle,
+        write_signed_integrity_evidence_bundle_atomic, BaselineSignerRole,
+        ContributorSigner, IntegrityEvidenceBundle,
+        SignedIntegrityEvidenceBundle,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode =
+        matches!(args.format, SignIntegrityEvidenceBundleFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    log_op("event=signed_integrity_evidence_bundle_signing_started");
+
+    // Read the raw v1 bundle. Any FS error here surfaces as
+    // `reason=io` on the closed sign_failed event so log
+    // scrapers can distinguish missing/permission-denied from
+    // malformed-JSON downstream.
+    let bundle_bytes = std::fs::read(&args.bundle_in).map_err(|e| {
+        log_op(&format!(
+            "event=signed_integrity_evidence_bundle_sign_failed reason=io detail={e}"
+        ));
+        anyhow!("read bundle-in {}: {e}", args.bundle_in.display())
+    })?;
+    let bundle: IntegrityEvidenceBundle = serde_json::from_slice(&bundle_bytes)
+        .map_err(|e| {
+            log_op(&format!(
+                "event=signed_integrity_evidence_bundle_sign_failed reason=malformed_json detail={e}"
+            ));
+            anyhow!("parse bundle-in {}: {e}", args.bundle_in.display())
+        })?;
+
+    // Load the signer. Same posture as Stage 12.20/12.21:
+    // `ContributorSigner` is the seed loader since all four
+    // role-typed signers share the same shape; the recorded
+    // `signer_role` tag is independent of the loader type. Any
+    // seed-load failure (FS missing, bad length, hex parse,
+    // etc.) is part of the signing primitive setup → tag as
+    // `signing`.
+    let signer = ContributorSigner::from_seed_file(&args.signer_seed)
+        .map_err(|e| {
+            log_op(&format!(
+                "event=signed_integrity_evidence_bundle_sign_failed reason=signing detail={e}"
+            ));
+            anyhow!("load signer seed {}: {e}", args.signer_seed.display())
+        })?;
+    let signer_pubkey_hex = signer.pubkey_hex();
+    let role: BaselineSignerRole = args.signer_role.into();
+
+    let signed: SignedIntegrityEvidenceBundle =
+        sign_integrity_evidence_bundle(
+            bundle,
+            &signer_pubkey_hex,
+            role,
+            &now_utc,
+            |msg| signer.sign(msg),
+        )
+        .map_err(|e| {
+            let reason = signed_bundle_reason_tag(&e);
+            log_op(&format!(
+                "event=signed_integrity_evidence_bundle_sign_failed reason={reason} detail={e}"
+            ));
+            anyhow!("sign bundle refused: {e}")
+        })?;
+
+    write_signed_integrity_evidence_bundle_atomic(&signed, &args.out)
+        .map_err(|e| {
+            let reason = signed_bundle_reason_tag(&e);
+            log_op(&format!(
+                "event=signed_integrity_evidence_bundle_sign_failed reason={reason} detail={e}"
+            ));
+            anyhow!("write signed bundle: {e}")
+        })?;
+    log_op(&format!(
+        "event=signed_integrity_evidence_bundle_written path={} signer_role={} signer_pubkey={}",
+        args.out.display(),
+        role.as_str(),
+        signer_pubkey_hex,
+    ));
+
+    match args.format {
+        SignIntegrityEvidenceBundleFormat::Events => {
+            // Already emitted the summary line above.
+        }
+        SignIntegrityEvidenceBundleFormat::Json => {
+            render_sign_bundle_json(&signed)?;
+        }
+        SignIntegrityEvidenceBundleFormat::Pretty => {
+            render_sign_bundle_pretty(&signed, &args.out);
+        }
+    }
+    Ok(())
+}
+
+fn render_sign_bundle_json(
+    signed: &omni_contributor::SignedIntegrityEvidenceBundle,
+) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(signed)
+        .map_err(|e| anyhow!("serialize signed bundle: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write signed bundle: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_sign_bundle_pretty(
+    signed: &omni_contributor::SignedIntegrityEvidenceBundle,
+    out: &std::path::Path,
+) {
+    println!("Signed integrity evidence bundle");
+    println!("  schema_version  : {}", signed.schema_version);
+    println!("  signed_at_utc   : {}", signed.signed_at_utc);
+    println!("  signer_role     : {}", signed.signer_role.as_str());
+    println!("  signer_pubkey   : {}", signed.signer_pubkey_hex);
+    println!("  signature       : {}", signed.signature_hex);
+    println!(
+        "  bundle_schema   : {}",
+        signed.bundle.schema_version
+    );
+    println!(
+        "  bundle_generated: {}",
+        signed.bundle.generated_at_utc
+    );
+    println!("  base_dir        : {}", signed.bundle.base_dir);
+    if let Some(label) = &signed.bundle.label {
+        println!("  bundle_label    : {label}");
+    }
+    println!("  entry_count     : {}", signed.bundle.entries.len());
+    println!("  out             : {}", out.display());
+}
+
+// ── Stage 12.23 — verify-integrity-evidence-bundle-signature ─────────────
+
+fn run_verify_integrity_evidence_bundle_signature(
+    args: VerifyIntegrityEvidenceBundleSignatureArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        read_signed_integrity_evidence_bundle_from_path,
+        verify_signed_integrity_evidence_bundle,
+    };
+
+    let json_mode = matches!(
+        args.format,
+        VerifyIntegrityEvidenceBundleSignatureFormat::Json
+    );
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    // Start event fires FIRST — before any FS IO. Mirrors the
+    // Stage 12.22 review fix: operators always see a start
+    // event even when the bundle is missing / malformed /
+    // unsupported schema / fails signature verification.
+    log_op(&format!(
+        "event=signed_integrity_evidence_bundle_verify_started signed_bundle={}",
+        args.signed_bundle.display()
+    ));
+
+    let wrapper = read_signed_integrity_evidence_bundle_from_path(
+        &args.signed_bundle,
+    )
+    .map_err(|e| {
+        // Distinguish io (missing file / permissions) from
+        // malformed_json (parse failure) via the shared closed
+        // mapper, single-sourcing the tag.
+        let reason = signed_bundle_reason_tag(&e);
+        log_op(&format!(
+            "event=signed_integrity_evidence_bundle_verify_failed reason={reason} detail={e}"
+        ));
+        anyhow!("read signed bundle: {e}")
+    })?;
+
+    if let Err(e) = verify_signed_integrity_evidence_bundle(
+        &wrapper,
+        &args.expected_signer_pubkey_hex,
+    ) {
+        let reason = signed_bundle_reason_tag(&e);
+        log_op(&format!(
+            "event=signed_integrity_evidence_bundle_verify_failed reason={reason} detail={e}"
+        ));
+        bail!("signed bundle verification refused: {e}");
+    }
+
+    log_op(&format!(
+        "event=signed_integrity_evidence_bundle_verify_ok path={} signer_role={} signer_pubkey={}",
+        args.signed_bundle.display(),
+        wrapper.signer_role.as_str(),
+        wrapper.signer_pubkey_hex,
+    ));
+
+    match args.format {
+        VerifyIntegrityEvidenceBundleSignatureFormat::Events => {
+            // Already emitted the success line above.
+        }
+        VerifyIntegrityEvidenceBundleSignatureFormat::Json => {
+            render_verify_signed_bundle_json(&wrapper)?;
+        }
+        VerifyIntegrityEvidenceBundleSignatureFormat::Pretty => {
+            render_verify_signed_bundle_pretty(&wrapper, &args.signed_bundle);
+        }
+    }
+    Ok(())
+}
+
+fn signed_bundle_reason_tag(
+    e: &omni_contributor::SignedIntegrityEvidenceBundleError,
+) -> &'static str {
+    use omni_contributor::SignedIntegrityEvidenceBundleError as E;
+    match e {
+        E::UnsupportedSchemaVersion { .. } => "unsupported_schema_version",
+        E::UnsupportedBundleSchemaVersion { .. } => {
+            "unsupported_bundle_schema_version"
+        }
+        E::SignerPubkeyMismatch { .. } => "signer_pubkey_mismatch",
+        E::SignatureMismatch => "signature_mismatch",
+        E::Signing(_) => "signing",
+        E::Canonical(_) => "canonical",
+        E::Io { .. } => "io",
+        E::MalformedJson { .. } => "malformed_json",
+    }
+}
+
+fn render_verify_signed_bundle_json(
+    wrapper: &omni_contributor::SignedIntegrityEvidenceBundle,
+) -> Result<()> {
+    use std::io::Write;
+    // Compact metadata view per locked v1 scope: attest
+    // authenticity, don't mirror the embedded bundle (auditors
+    // who want the full bundle already have it on disk inside
+    // the wrapper).
+    let metadata = serde_json::json!({
+        "schema_version": wrapper.schema_version,
+        "signed_at_utc": wrapper.signed_at_utc,
+        "signer_role": wrapper.signer_role.as_str(),
+        "signer_pubkey_hex": wrapper.signer_pubkey_hex,
+        "signature_hex": wrapper.signature_hex,
+        "bundle_schema_version": wrapper.bundle.schema_version,
+        "bundle_generated_at_utc": wrapper.bundle.generated_at_utc,
+        "bundle_omni_contributor_version": wrapper.bundle.omni_contributor_version,
+        "bundle_label": wrapper.bundle.label,
+        "bundle_base_dir": wrapper.bundle.base_dir,
+        "bundle_entry_count": wrapper.bundle.entries.len(),
+    });
+    let bytes = serde_json::to_vec_pretty(&metadata)
+        .map_err(|e| anyhow!("serialize verify metadata: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write verify metadata: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_verify_signed_bundle_pretty(
+    wrapper: &omni_contributor::SignedIntegrityEvidenceBundle,
+    path: &std::path::Path,
+) {
+    println!("Verified signed integrity evidence bundle");
+    println!("  path            : {}", path.display());
+    println!("  schema_version  : {}", wrapper.schema_version);
+    println!("  signed_at_utc   : {}", wrapper.signed_at_utc);
+    println!("  signer_role     : {}", wrapper.signer_role.as_str());
+    println!("  signer_pubkey   : {}", wrapper.signer_pubkey_hex);
+    println!("  signature       : {}", wrapper.signature_hex);
+    println!(
+        "  bundle_schema   : {}",
+        wrapper.bundle.schema_version
+    );
+    println!(
+        "  bundle_generated: {}",
+        wrapper.bundle.generated_at_utc
+    );
+    println!("  base_dir        : {}", wrapper.bundle.base_dir);
+    if let Some(label) = &wrapper.bundle.label {
+        println!("  bundle_label    : {label}");
+    }
+    println!("  entry_count     : {}", wrapper.bundle.entries.len());
 }

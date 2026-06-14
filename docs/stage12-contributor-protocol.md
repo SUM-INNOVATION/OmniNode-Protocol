@@ -3232,3 +3232,132 @@ Closed-set bare-stdout events:
 | CLI flag matrix for `verify-integrity-evidence-bundle` (required `--bundle`, optional `--base-dir` override, format closed enum, unknown-format refusal, deliberate rejection of `--no-prune-state-on-start`) | `verify_integrity_evidence_bundle_flag_parse_smoke` (omni-node) |
 
 **Residual gap (deliberate):** the CLI run-fns `run_build_integrity_evidence_bundle` and `run_verify_integrity_evidence_bundle` aren't exercised end-to-end (same constraint as Stage 12.10–12.21); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer + `--include` parser layer on top.
+
+# Stage 12.23 — signed integrity evidence bundles
+
+## What this stage is, in one sentence
+
+A local-only `SignedIntegrityEvidenceBundle` wrapper around a v1 `IntegrityEvidenceBundle`, plus a `sign-integrity-evidence-bundle` CLI to produce one and a `verify-integrity-evidence-bundle-signature` CLI to verify the signature — so an operator can attest "this bundle JSON came from a specific Ed25519 key at a specific time" while keeping byte-fingerprint verification (Stage 12.22 `verify-integrity-evidence-bundle`) as a separate step.
+
+Bundle-byte verification and signature verification are deliberately decoupled: an operator who only cares about provenance runs `verify-integrity-evidence-bundle-signature`; an operator who cares about byte integrity runs both.
+
+## Why a separate wrapper schema (and why not extend Stage 12.20/12.21)
+
+Stage 12.22's `IntegrityEvidenceBundle` is consumed UNCHANGED. The signed wrapper is its own forward-compatible artifact tracked by `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION = 1`, independent of every existing schema constant — including `SIGNED_BASELINE_SCHEMA_VERSION` and `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION`. v1 wrappers wrap v1 bundles only. Stage 12.20/12.21 wrappers have different shapes (`report` / `diff` vs `bundle` field) and different domain separators, so reusing them would muddle three distinct trust artifacts. The four-role taxonomy IS shared: `BaselineSignerRole` is reused verbatim — the variants are role names, not artifact-type names, so the same taxonomy applies to baselines, diffs, AND bundles.
+
+The signing input mirrors the Stage 12.0–12.21 envelope pattern (`SIGNED_INTEGRITY_EVIDENCE_BUNDLE_DOMAIN || bincode1::serialize(canonical_body)`) so the trust model and review surface are identical to the protocol's existing role-typed signed bodies.
+
+## Library surface
+
+`omni_contributor::signed_bundle` (new module):
+
+- `pub const SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION: u32 = 1;`
+- `SignedIntegrityEvidenceBundle { schema_version, signed_at_utc, signer_pubkey_hex, signer_role, bundle, signature_hex }` with `deny_unknown_fields`. Embeds the full v1 `IntegrityEvidenceBundle` so a captured wrapper is self-contained — no out-of-band bundle file is needed at verify time.
+- `pub fn signed_integrity_evidence_bundle_signing_input(...)` — builds the canonical body (`SIGNED_INTEGRITY_EVIDENCE_BUNDLE_DOMAIN || bincode1::serialize(canonical_body)`) used by both signer and verifier.
+- `pub fn sign_integrity_evidence_bundle(bundle, signer_pubkey_hex, signer_role, signed_at_utc, sign_fn) -> Result<SignedIntegrityEvidenceBundle, SignedIntegrityEvidenceBundleError>` — the library stays signer-agnostic; the caller supplies a closure that computes the signature. Refuses non-v1 embedded bundles. **Pre-sign validation is deliberately narrow** (only the embedded `bundle.schema_version`): the signer's contract is "sign these bytes". An operator handed a poisoned bundle gets a wrapper that Stage 12.22 `verify_integrity_evidence_bundle` will refuse downstream — keeping the signer narrow matches the Stage 12.20/12.21 posture.
+- `pub fn verify_signed_integrity_evidence_bundle(wrapper, expected_signer_pubkey_hex) -> Result<(), SignedIntegrityEvidenceBundleError>` — two-step refusal order: cheap `SignerPubkeyMismatch` pre-check, then cryptographic verification. Refuses non-v1 wrapper / non-v1 embedded bundle at the same gate.
+- `pub fn read_signed_integrity_evidence_bundle_from_path(path)` / `pub fn write_signed_integrity_evidence_bundle_atomic(wrapper, out)` — convenience FS helpers; the writer uses atomic tempfile + rename (same posture as Stage 12.17/12.20/12.21 writers).
+
+The four-role taxonomy is the Stage 12.20 `BaselineSignerRole { Operator, Contributor, Dispatcher, Coordinator }` enum — reused verbatim.
+
+New typed `SignedIntegrityEvidenceBundleError` covers `UnsupportedSchemaVersion`, `UnsupportedBundleSchemaVersion`, `Canonical` (bubbled `CanonicalError`), `Signing` (bubbled `SigningError`), `SignatureMismatch`, `SignerPubkeyMismatch`, `Io`, `MalformedJson` — mirrors Stage 12.20/12.21 shape verbatim.
+
+`canonical.rs` gains one new constant:
+
+```rust
+pub const SIGNED_INTEGRITY_EVIDENCE_BUNDLE_DOMAIN: &[u8] =
+    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-EVIDENCE-BUNDLE:v1:";
+```
+
+## Safety contract
+
+- **Trust is opt-in at the verifier.** The wrapper's `signer_pubkey_hex` is forensic context; the trust anchor is the operator-supplied `--expected-signer-pubkey-hex`. The verifier refuses any wrapper whose embedded pubkey doesn't equal the operator's expectation — even if the signature is cryptographically valid for some other key.
+- **Two-step refusal order**: (1) `SignerPubkeyMismatch` (cheap; no crypto) → (2) `SignatureMismatch` (crypto verify). A malicious wrapper with a forged pubkey never burns crypto cycles.
+- **Schema enforcement** runs before either check: `UnsupportedSchemaVersion` for the wrapper, `UnsupportedBundleSchemaVersion` for the embedded bundle.
+- **Canonical body content**: every field of the wrapper EXCEPT `signature_hex` is part of the canonical body. Tampering with `signed_at_utc`, `signer_role`, `signer_pubkey_hex`, OR any field of the embedded `bundle` (including any `BundleEntry`'s `artifact_kind` / `path` / `bytes` / `blake3_hex`) causes `SignatureMismatch`. Because the bundle already records per-entry BLAKE3 hashes, the signed wrapper transitively pins the entire artifact tree without needing to re-embed any artifact bytes.
+- **No recursive signature verification.** If the bundle contains a `signed_state_integrity_baseline` or `signed_state_integrity_diff` artifact, this verifier attests to the bundle bytes only — operators run Stage 12.20 / 12.21 verifiers separately if they need that chain. Per locked v1 scope.
+- **No re-hashing of bundled artifact files.** That's Stage 12.22 `verify-integrity-evidence-bundle`'s job.
+- **Determinism pinned**: same `bundle` + same seed + same `signed_at_utc` produces byte-identical wrappers across runs (regression `same_inputs_produce_byte_identical_wrapper`).
+- **Read-only**: signing and verifying never open a state-store. The CLI signing subcommand writes only the operator-named `--out` file (atomic). The verifier writes nothing.
+
+## CLI
+
+### Signing subcommand
+
+```
+omni-node operator contributor sign-integrity-evidence-bundle \
+  --bundle-in <path>                         (required — raw v1 bundle JSON)
+  --signer-seed <path>                       (required — 32-byte Ed25519 seed)
+  --signer-role operator|contributor|dispatcher|coordinator
+                                             (required — closed enum,
+                                              reuses Stage 12.20 enum)
+  --out <path>                               (required — atomic temp+rename)
+  [--format events|json|pretty]              (default events)
+```
+
+Read-only on the state-store side; pure JSON-to-JSON. Auto-prune flag deliberately absent (Stage 12.16/12.17/12.18/12.19/12.20/12.21/12.22 precedent), pinned by clap regression. Closed-set events:
+
+- Start: `event=signed_integrity_evidence_bundle_signing_started` — always emitted before any FS IO so operators always see a start event even on missing/malformed inputs.
+- Success: `event=signed_integrity_evidence_bundle_written path=<...> signer_role=<...> signer_pubkey=<...>`.
+- Failure: `event=signed_integrity_evidence_bundle_sign_failed reason=<closed-tag>` + nonzero exit. Closed tags: `io` (bundle-in FS read failure, seed-file FS read failure, or atomic-write failure), `malformed_json` (bundle-in JSON parse failure or atomic-write serialize failure), `signing` (seed-file decode/setup or Ed25519 primitive failure), `unsupported_bundle_schema_version` (embedded bundle not v1), `canonical` (bincode encoding of the canonical body failed — closed-set struct; should be impossible in practice). Single-sourced via the same closed-tag mapper as the verifier so the two never diverge.
+
+### Verifier subcommand
+
+```
+omni-node operator contributor verify-integrity-evidence-bundle-signature \
+  --signed-bundle <path>                     (required — wrapper JSON to verify)
+  --expected-signer-pubkey-hex <hex>         (required — 64-char lowercase hex
+                                              Ed25519 public key trust anchor)
+  [--format events|json|pretty]              (default events)
+```
+
+Read-only and state-store-free: opens no contributor state-dir; the Stage 12.7 `--no-prune-state-on-start` flag is deliberately absent and pinned by clap regression. Closed-set events:
+
+- `event=signed_integrity_evidence_bundle_verify_started signed_bundle=<path>` — fires FIRST, before any FS IO. Always emitted, even when the bundle is missing / malformed / has an unsupported schema / fails signature verification. Mirrors the Stage 12.22 review-fix posture.
+- Success: `event=signed_integrity_evidence_bundle_verify_ok path=<...> signer_role=<...> signer_pubkey=<...>`.
+- Failure: `event=signed_integrity_evidence_bundle_verify_failed reason=<closed-tag>` + nonzero exit. Closed tags: `unsupported_schema_version` / `unsupported_bundle_schema_version` / `signer_pubkey_mismatch` / `signature_mismatch` / `signing` / `canonical` / `io` / `malformed_json`. Bundle-read failures distinguish `reason=io` (missing file / permissions) from `reason=malformed_json` (parse failure) via a single closed mapper, single-sourced.
+
+The verifier's JSON renderer emits a **compact metadata view** (`schema_version`, `signed_at_utc`, `signer_role`, `signer_pubkey_hex`, `signature_hex`, plus embedded `bundle.schema_version` / `bundle.generated_at_utc` / `bundle.omni_contributor_version` / `bundle.label` / `bundle.base_dir` / `bundle.entries.len()`) rather than re-printing the full embedded bundle's entries. Verification's job is to attest authenticity, not to mirror the bundle bytes; operators who want the embedded bundle already have it on disk inside the wrapper.
+
+## Out of scope (Stage 12.23)
+
+- **No re-hashing of bundled artifact files.** Stage 12.22 `verify-integrity-evidence-bundle`'s job.
+- **No semantic JSON validation of bundled artifacts.** The verifier does not parse the referenced files.
+- **No recursive signature verification of embedded `signed_state_integrity_baseline` / `signed_state_integrity_diff` entries.** Operators run Stage 12.20 / 12.21 verifiers separately if they need that chain.
+- **No pre-sign Stage 12.22 envelope-level validation.** The signer's contract is "sign these bytes"; only the embedded `bundle.schema_version` is gated. Per locked v1 scope.
+- **No `--base-dir` flag on either subcommand.** Base-dir resolution is purely a Stage 12.22 concept; the signed wrapper covers bundle JSON bytes only.
+- **No `--bundle-out` extract flag on the verifier.** Operators can extract the embedded bundle via `--format json` + `jq`.
+- **No wrapper expiry / `valid_through_utc` field.** v1 wrappers don't expire.
+- **No multi-signature / threshold signatures.** Single Ed25519.
+- **No wrapper encryption.** Plaintext JSON.
+- **No revocation list.** Operators control trust anchors via `--expected-signer-pubkey-hex`.
+- **No external signed-bundle registry / publication.** Local-only.
+- **No `IntegrityEvidenceBundle` schema change.** Embedded as v1; refuses non-v1.
+- **No envelope, no canonical-byte changes on Stage 12.0–12.22 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `STATUS_SCHEMA_VERSION` / `ARCHIVE_MANIFEST_SCHEMA_VERSION` / `CLEANUP_PLAN_SCHEMA_VERSION` / `QUARANTINE_MANIFEST_SCHEMA_VERSION` / `NET_SCHEMA_VERSION` bump.**
+
+## Test coverage map
+
+| Concern | Test |
+| --- | --- |
+| Sign + verify happy path | `sign_and_verify_round_trips` (`signed_integrity_evidence_bundle.rs`) |
+| All four `BaselineSignerRole` variants round-trip | `all_signer_role_variants_round_trip` |
+| `SignerPubkeyMismatch` cheap pre-check (no crypto burn) | `pubkey_mismatch_is_refused_before_crypto` |
+| Signature tamper → `SignatureMismatch` | `signature_tamper_is_refused` |
+| **Embedded-bundle tamper → `SignatureMismatch`** (flips an entry's `blake3_hex`, proving every byte of the bundle including per-entry hashes is in the canonical body) | `embedded_bundle_tamper_is_refused` |
+| `signer_role` tamper → `SignatureMismatch` | `signer_role_tamper_is_refused` |
+| `signed_at_utc` tamper → `SignatureMismatch` | `signed_at_utc_tamper_is_refused` |
+| Wrapper `schema_version != 1` → `UnsupportedSchemaVersion` | `wrapper_schema_v2_is_refused` |
+| Embedded `bundle.schema_version != 1` → `UnsupportedBundleSchemaVersion` | `embedded_bundle_schema_v2_is_refused` |
+| Sign refuses a non-v1 input bundle | `sign_refuses_non_v1_bundle` |
+| JSON round-trip preserves signature | `json_round_trip_preserves_signature` |
+| Determinism: same inputs → byte-identical wrapper | `same_inputs_produce_byte_identical_wrapper` |
+| Canonical signing-input byte stability + domain prefix `OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-EVIDENCE-BUNDLE:v1:` | `signing_input_is_byte_stable_across_recomputation` |
+| `write_signed_integrity_evidence_bundle_atomic` round-trips via disk | `write_signed_atomic_round_trips_via_disk` |
+| **Composition with Stage 12.22**: build → sign → verify signature → verify bundle bytes (all four pass without re-hashing artifact files during signature verification) | `signed_wrapper_composes_with_stage_12_22_bundle_verifier` |
+| **Wrapper read: missing file → `Io { NotFound }` (NOT `MalformedJson`)** — pins the library variant the CLI's `reason=io` tag depends on | `signed_bundle_read_missing_file_returns_io_not_malformed_json` |
+| **Wrapper read: present-but-unparseable file → `MalformedJson` (NOT `Io`)** — counterpart pin | `signed_bundle_read_invalid_json_returns_malformed_json` |
+| CLI flag matrix for `sign-integrity-evidence-bundle` (all 4 roles, format closed enum, required-flag sweep, unknown-role refusal, unknown-format refusal, deliberate rejection of `--no-prune-state-on-start`) | `sign_integrity_evidence_bundle_flag_parse_smoke` (omni-node) |
+| CLI flag matrix for `verify-integrity-evidence-bundle-signature` (required `--signed-bundle` + `--expected-signer-pubkey-hex`, format closed enum, unknown-format refusal, deliberate rejection of `--no-prune-state-on-start`) | `verify_integrity_evidence_bundle_signature_flag_parse_smoke` (omni-node) |
+| **Closed-set `reason=<tag>` mapping**: every `SignedIntegrityEvidenceBundleError` variant maps to one of the approved closed tags (`unsupported_schema_version` / `unsupported_bundle_schema_version` / `signer_pubkey_mismatch` / `signature_mismatch` / `io` / `malformed_json`). Pins the contract both signer (every failure path) and verifier (envelope + bundle-read paths) emit on `..._sign_failed` / `..._verify_failed`. | `signed_bundle_reason_tag_covers_closed_set` (omni-node) |
+
+**Residual gap (deliberate):** the CLI run-fns `run_sign_integrity_evidence_bundle` and `run_verify_integrity_evidence_bundle_signature` aren't exercised end-to-end (same constraint as Stage 12.10–12.22); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.

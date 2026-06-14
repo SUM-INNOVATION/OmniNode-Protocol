@@ -59,6 +59,7 @@ pub mod restore;
 pub mod result;
 pub mod resume;
 pub mod signed_baseline;
+pub mod signed_bundle;
 pub mod signed_diff;
 pub mod run;
 pub mod runner;
@@ -79,8 +80,9 @@ pub use error::{
     ArchiveError, CanonicalError, CleanupError, ContributorError, DiscoverError,
     EvidenceBundleError, IntegrityDiffError, IntegrityError, PlannerError,
     QuarantineRestoreError, RelayError, RepairError, RestoreError, RunnerError,
-    SchemaError, SignedBaselineError, SignedIntegrityDiffError, SigningError,
-    SnipError, StatusError, VerifyError,
+    SchemaError, SignedBaselineError, SignedIntegrityDiffError,
+    SignedIntegrityEvidenceBundleError, SigningError, SnipError, StatusError,
+    VerifyError,
 };
 pub use repair::{
     build_session_repair_plan, build_session_repair_plan_with_reason,
@@ -144,6 +146,13 @@ pub use signed_diff::{
     signed_integrity_diff_signing_input, verify_signed_state_integrity_diff,
     write_signed_integrity_diff_atomic, SignedStateIntegrityDiff,
     SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION,
+};
+pub use signed_bundle::{
+    read_signed_integrity_evidence_bundle_from_path,
+    sign_integrity_evidence_bundle, signed_integrity_evidence_bundle_signing_input,
+    verify_signed_integrity_evidence_bundle,
+    write_signed_integrity_evidence_bundle_atomic, SignedIntegrityEvidenceBundle,
+    SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,
