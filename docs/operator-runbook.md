@@ -1676,3 +1676,94 @@ The verifier exits 0 iff every entry's outcome is `Ok`. Any non-`Ok` outcome (`S
 **Composition with Stage 12.20 / 12.21:** the bundle is the outer wrapper. A typical archival chain looks like (a) build daily integrity artifacts (Stage 12.16/12.19) + sign them (Stage 12.20/12.21) under a per-day `--base-dir`, (b) assemble a Stage 12.22 bundle pointing at all of them, (c) archive the bundle JSON to immutable storage. An auditor receiving the bundle + the artifact tree runs `verify-integrity-evidence-bundle` to confirm bytes haven't shifted, then runs Stage 12.20 / 12.21 verifiers on the signed entries to confirm the per-stage Ed25519 signatures still verify against the trust anchors they care about.
 
 **No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.21 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
+
+### Stage 12.23 — signed integrity evidence bundles
+
+**Use when:** you've assembled a Stage 12.22 `IntegrityEvidenceBundle` and want to attest provenance — "this bundle came from a specific Ed25519 key at a specific time" — alongside the byte-fingerprint protection the bundle already provides. The signed wrapper is local-only — no protocol, no SNIP, no chain.
+
+Bundle-byte verification (Stage 12.22 `verify-integrity-evidence-bundle`) and signature verification (Stage 12.23 `verify-integrity-evidence-bundle-signature`) are deliberately decoupled. Run signature verification when you care about WHO produced the bundle; run bundle-byte verification when you care about WHETHER the referenced artifact files still match.
+
+**Workflow — signing a bundle:**
+
+```sh
+# 1. Assemble a v1 bundle as before (Stage 12.22).
+omni-node operator contributor build-integrity-evidence-bundle \
+  --base-dir /tmp/audit-2026-06-14 \
+  --include state_integrity_report=baseline.json \
+  --include signed_state_integrity_baseline=baseline.signed.json \
+  --include state_integrity_diff_report=diff.json \
+  --include signed_state_integrity_diff=diff.signed.json \
+  --label "audit-2026-06-14" \
+  --out /tmp/audit-2026-06-14.bundle.json
+
+# 2. Sign with a 32-byte Ed25519 seed file. Operators MUST
+#    use a seed distinct from any chain-attestation or
+#    protocol-role seed — the integrity-artifact signing role
+#    is its own key per Stage 12.20.
+omni-node operator contributor sign-integrity-evidence-bundle \
+  --bundle-in /tmp/audit-2026-06-14.bundle.json \
+  --signer-seed /etc/omni-node/bundle-signer.seed \
+  --signer-role operator \
+  --out /var/audit/2026-06-14.bundle.signed.json
+# event=signed_integrity_evidence_bundle_signing_started
+# event=signed_integrity_evidence_bundle_written path=... signer_role=operator signer_pubkey=<hex>
+```
+
+On failure the signer emits `event=signed_integrity_evidence_bundle_sign_failed reason=<closed-tag>` + nonzero exit. Closed tags: `io` (bundle-in or seed-file FS read failure, atomic-write failure), `malformed_json` (bundle-in JSON parse failure), `signing` (seed-file decode/setup, Ed25519 primitive failure), `unsupported_bundle_schema_version` (the bundle JSON is from a future Stage 12.22 lineage), `canonical` (bincode encoding of the canonical body failed — closed-set struct; should be impossible in practice). Single-sourced via the same closed-tag mapper as the verifier.
+
+**Workflow — verifying a signed bundle:**
+
+```sh
+# Capture the trust anchor once. Same hex string the signing
+# CLI emitted on its event=signed_integrity_evidence_bundle_written
+# line.
+SIGNER_PUBKEY=<64-hex>
+
+omni-node operator contributor verify-integrity-evidence-bundle-signature \
+  --signed-bundle /var/audit/2026-06-14.bundle.signed.json \
+  --expected-signer-pubkey-hex "$SIGNER_PUBKEY"
+# event=signed_integrity_evidence_bundle_verify_started signed_bundle=/var/audit/2026-06-14.bundle.signed.json
+# event=signed_integrity_evidence_bundle_verify_ok path=... signer_role=operator signer_pubkey=<hex>
+```
+
+The verifier opens no state-store and writes nothing. It exits nonzero on any refusal and emits a closed-tag reason line so log scrapers can classify failures. Output formats:
+
+- `--format events` (default) → start line + one success/failure line.
+- `--format json` → compact metadata view of the verified wrapper (`schema_version`, `signed_at_utc`, `signer_role`, `signer_pubkey_hex`, `signature_hex`, plus embedded `bundle.schema_version` / `bundle.generated_at_utc` / `bundle.omni_contributor_version` / `bundle.label` / `bundle.base_dir` / `bundle.entries.len()`). Operational chatter goes to stderr so `jq` works. Does NOT re-print the bundle's full entry list — auditors who want the entries already have the wrapper on disk.
+- `--format pretty` → terminal-friendly summary.
+
+**Flag rules (clap-enforced):**
+
+- `sign-integrity-evidence-bundle` requires `--bundle-in`, `--signer-seed`, `--signer-role`, and `--out`. Missing any refuses at parse time.
+- `verify-integrity-evidence-bundle-signature` requires `--signed-bundle` and `--expected-signer-pubkey-hex`. The wrapper's own `signer_pubkey_hex` field is forensic context only; operators always supply the trust anchor.
+- All four `--signer-role` values are accepted: `operator` / `contributor` / `dispatcher` / `coordinator` — the Stage 12.20 closed enum is REUSED because the variants are role names, not artifact-type names.
+- Neither subcommand exposes `--no-prune-state-on-start` — pinned by clap regression. Neither opens a contributor state-store.
+- Neither subcommand exposes `--base-dir` — that's a Stage 12.22 concept; this verifier only attests to bundle JSON bytes.
+
+**Refusal modes (typed `SignedIntegrityEvidenceBundleError`, surfaced as `reason=<tag>`):**
+
+- `signer_pubkey_mismatch` → the wrapper's `signer_pubkey_hex` doesn't equal `--expected-signer-pubkey-hex`. Cheap pre-check — no crypto burn.
+- `signature_mismatch` → the wrapper was hand-edited (any field of the canonical body changed) OR the signature was tampered. Stage 12.23 covers `signer_role`, `signed_at_utc`, `signer_pubkey_hex`, AND every byte of the embedded `bundle` (every `BundleEntry`'s `artifact_kind` / `path` / `bytes` / `blake3_hex`, plus `bundle.schema_version` / `generated_at_utc` / `omni_contributor_version` / `label` / `notes` / `base_dir`) — tampering any of them trips this.
+- `unsupported_schema_version` → wrapper came from a future stage; v1 binary refuses.
+- `unsupported_bundle_schema_version` → embedded bundle came from a future Stage 12.22 lineage; refuse to deserialize.
+- `signing` → Ed25519 decode/verify primitive returned an error (malformed hex, bad length, etc.).
+- `canonical` → bincode encoding of the canonical body failed (closed-set struct; should be impossible in practice).
+- `io` → FS read of the wrapper failed (missing file, permissions, etc.).
+- `malformed_json` → wrapper JSON didn't parse as a v1 `SignedIntegrityEvidenceBundle`.
+
+**What the signature covers (vs what it doesn't):**
+
+- **Covered**: every field of the wrapper EXCEPT `signature_hex` — `schema_version`, `signed_at_utc`, `signer_pubkey_hex`, `signer_role`, AND every byte of the embedded `IntegrityEvidenceBundle` (including per-entry `blake3_hex` fingerprints). Because the bundle already records per-entry BLAKE3 hashes, the signature transitively pins the entire artifact tree without re-embedding any artifact bytes.
+- **Not covered** (deliberate v1 scope): the artifact files the bundle references. Re-hashing them is Stage 12.22 `verify-integrity-evidence-bundle`'s job — operators run that separately if they care about byte integrity. Recursive verification of embedded `signed_state_integrity_baseline` / `signed_state_integrity_diff` artifacts is also out-of-scope — operators run Stage 12.20 / 12.21 verifiers separately.
+
+**Determinism:** signing the same bundle + same seed + same `signed_at_utc` produces a byte-identical wrapper — operators can commit a signed bundle to an archive and re-derive it deterministically.
+
+**Composition with Stage 12.20 / 12.21 / 12.22:** four trust paths, each with its own verifier, chained for full forensic confidence:
+
+1. **Stage 12.20 / 12.21** — verify the per-artifact Ed25519 signatures on `signed_state_integrity_baseline` / `signed_state_integrity_diff` entries against their respective trust anchors.
+2. **Stage 12.22** — re-hash every artifact file the bundle references; refuse on any byte drift.
+3. **Stage 12.23** — verify the Ed25519 signature on the bundle wrapper itself against the operator's trust anchor. Confirms the bundle hasn't been hand-edited and came from the expected key.
+
+A typical archival chain: (a) build daily integrity artifacts (Stage 12.16/12.19), (b) sign them (Stage 12.20/12.21), (c) assemble a Stage 12.22 bundle, (d) wrap it with a Stage 12.23 signature, (e) archive the signed bundle JSON to immutable storage. An auditor receiving the signed bundle runs Stage 12.23 verify first (cheapest — bundle JSON only); then Stage 12.22 verify (re-hashes all referenced files); then Stage 12.20/12.21 verify on each signed entry (re-checks each artifact's own signature).
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.22 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.

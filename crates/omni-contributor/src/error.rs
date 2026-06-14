@@ -1653,3 +1653,86 @@ pub enum EvidenceBundleError {
         source: serde_json::Error,
     },
 }
+
+/// Stage 12.23 — local-only signed integrity-evidence-bundle
+/// errors. Mirrors the Stage 12.20 `SignedBaselineError` and
+/// Stage 12.21 `SignedIntegrityDiffError` shape verbatim — same
+/// two-step refusal posture (cheap `SignerPubkeyMismatch`
+/// pre-check, then crypto verify), same schema-gate-first
+/// posture, same FS/JSON path-carrying IO errors.
+///
+/// The wrapper attests to the embedded `IntegrityEvidenceBundle`
+/// bytes only. Re-hashing the bundle's referenced artifact
+/// files is Stage 12.22's
+/// `verify_integrity_evidence_bundle` job; this verifier does
+/// NOT do that work.
+#[derive(Debug, thiserror::Error)]
+pub enum SignedIntegrityEvidenceBundleError {
+    /// Wrapper's `schema_version` is not
+    /// `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION = 1`.
+    /// v1 binary refuses future-stage wrappers.
+    #[error(
+        "unsupported signed-integrity-evidence-bundle schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedSchemaVersion { got: u32, expected: u32 },
+
+    /// The wrapper's embedded `bundle.schema_version` is not
+    /// `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION = 1`. The
+    /// wrapper might be v1 but the bundle it carries is from a
+    /// future Stage 12.22 lineage; refuse to deserialize.
+    #[error(
+        "unsupported embedded bundle schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedBundleSchemaVersion { got: u32, expected: u32 },
+
+    /// Bincode encoding of the canonical body failed. Bubbled
+    /// from `CanonicalError`. Should be impossible in practice
+    /// because the canonical body is closed-set.
+    #[error("canonical encoding error: {0}")]
+    Canonical(#[from] CanonicalError),
+
+    /// Hex parse or Ed25519 signing/verification primitive
+    /// returned an error. Bubbled from `SigningError`.
+    #[error("signing error: {0}")]
+    Signing(#[from] SigningError),
+
+    /// Ed25519 verification of the wrapper's `signature_hex`
+    /// against the canonical body and the wrapper's
+    /// `signer_pubkey_hex` returned `Ok(false)` — the
+    /// signature does not match. Refused after the
+    /// `SignerPubkeyMismatch` cheap pre-check.
+    #[error(
+        "signature mismatch: wrapper signature does not verify against embedded pubkey"
+    )]
+    SignatureMismatch,
+
+    /// The `expected_signer_pubkey_hex` the caller passed to
+    /// `verify_signed_integrity_evidence_bundle` does NOT equal
+    /// the wrapper's `signer_pubkey_hex`. Cheap pre-check —
+    /// runs BEFORE crypto verification so a malicious wrapper
+    /// with a forged pubkey can't burn cycles.
+    #[error(
+        "signer pubkey mismatch: expected={expected} got={got} \
+         (the wrapper was signed by a different key than the trust anchor)"
+    )]
+    SignerPubkeyMismatch { expected: String, got: String },
+
+    /// Generic FS error reading the wrapper JSON.
+    #[error("signed-integrity-evidence-bundle io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Wrapper JSON did not parse as a v1
+    /// `SignedIntegrityEvidenceBundle`.
+    #[error(
+        "malformed signed-integrity-evidence-bundle at {path}: {source}"
+    )]
+    MalformedJson {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}
