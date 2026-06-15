@@ -1767,3 +1767,130 @@ The verifier opens no state-store and writes nothing. It exits nonzero on any re
 A typical archival chain: (a) build daily integrity artifacts (Stage 12.16/12.19), (b) sign them (Stage 12.20/12.21), (c) assemble a Stage 12.22 bundle, (d) wrap it with a Stage 12.23 signature, (e) archive the signed bundle JSON to immutable storage. An auditor receiving the signed bundle runs Stage 12.23 verify first (cheapest — bundle JSON only); then Stage 12.22 verify (re-hashes all referenced files); then Stage 12.20/12.21 verify on each signed entry (re-checks each artifact's own signature).
 
 **No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.22 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
+
+### Stage 12.24 — local integrity-evidence chain verification
+
+**Use when:** an auditor receives a signed bundle and wants to run the full Stage 12.20–12.23 verification chain in ONE command. The chain verifier composes signed-bundle signature verify (Stage 12.23), bundle byte verify (Stage 12.22), and optional per-signed-child signature verify (Stage 12.20 / 12.21) into a single read-only operation.
+
+**Workflow — full chain verify (every anchor supplied):**
+
+```sh
+# Capture the three trust anchors once.
+BUNDLE_PUBKEY=<64-hex>      # Stage 12.23 bundle signer
+BASELINE_PUBKEY=<64-hex>    # Stage 12.20 baseline signer
+DIFF_PUBKEY=<64-hex>        # Stage 12.21 diff signer
+
+omni-node operator contributor verify-integrity-evidence-chain \
+  --signed-bundle /var/audit/2026-06-15.bundle.signed.json \
+  --expected-bundle-signer-pubkey-hex "$BUNDLE_PUBKEY" \
+  --expected-baseline-signer-pubkey-hex "$BASELINE_PUBKEY" \
+  --expected-diff-signer-pubkey-hex "$DIFF_PUBKEY"
+# event=integrity_evidence_chain_verify_started signed_bundle=... expected_baseline_pubkey=set expected_diff_pubkey=set
+# event=integrity_evidence_chain_signed_bundle_ok signer_role=operator signer_pubkey=<64-hex>
+# event=integrity_evidence_chain_bundle_byte_resolved effective_base_dir=...
+# event=integrity_evidence_chain_bundle_byte_entry_ok kind=signed_state_integrity_baseline path=baseline.signed.json resolved_path=...
+# event=integrity_evidence_chain_bundle_byte_entry_ok kind=signed_state_integrity_diff path=diff.signed.json resolved_path=...
+# event=integrity_evidence_chain_child_ok kind=signed_state_integrity_baseline path=baseline.signed.json resolved_path=...
+# event=integrity_evidence_chain_child_ok kind=signed_state_integrity_diff path=diff.signed.json resolved_path=...
+# event=integrity_evidence_chain_verify_summary bundle_signature=ok bundle_byte_counts={ok=2 size_mismatch=0 hash_mismatch=0 not_found=0 read_error=0} child_counts={ok=2 skipped=0 failed=0}
+```
+
+**Workflow — verify only the bundle anchor (signed children skipped):**
+
+```sh
+# Omitted child anchors record Skipped — NOT silent passes.
+# Auditors see exactly which gates were skipped on the events
+# output AND in the JSON report.
+omni-node operator contributor verify-integrity-evidence-chain \
+  --signed-bundle /var/audit/2026-06-15.bundle.signed.json \
+  --expected-bundle-signer-pubkey-hex "$BUNDLE_PUBKEY"
+# event=integrity_evidence_chain_child_skipped kind=signed_state_integrity_baseline ...
+# event=integrity_evidence_chain_child_skipped kind=signed_state_integrity_diff ...
+# event=integrity_evidence_chain_verify_summary ... child_counts={ok=0 skipped=2 failed=0}
+# exit 0 — skipped children DON'T fail the exit code
+```
+
+**Workflow — verify bundle + diff but not baseline:**
+
+```sh
+omni-node operator contributor verify-integrity-evidence-chain \
+  --signed-bundle /var/audit/2026-06-15.bundle.signed.json \
+  --expected-bundle-signer-pubkey-hex "$BUNDLE_PUBKEY" \
+  --expected-diff-signer-pubkey-hex "$DIFF_PUBKEY"
+# baseline children → Skipped; diff children → Ok or Failed
+```
+
+**Workflow — relocated artifact tree (Stage 12.22 portability lever) + JSON archive:**
+
+```sh
+omni-node operator contributor verify-integrity-evidence-chain \
+  --signed-bundle /var/audit/2026-06-15.bundle.signed.json \
+  --expected-bundle-signer-pubkey-hex "$BUNDLE_PUBKEY" \
+  --expected-baseline-signer-pubkey-hex "$BASELINE_PUBKEY" \
+  --expected-diff-signer-pubkey-hex "$DIFF_PUBKEY" \
+  --base-dir /srv/audit-mirror/2026-06-15 \
+  --json-out /var/audit/2026-06-15.chain.json
+# event=integrity_evidence_chain_json_written path=/var/audit/2026-06-15.chain.json
+```
+
+The `--json-out` write is **best-effort**: failure logs `event=integrity_evidence_chain_json_write_failed reason=<io|malformed_json>` and does NOT change exit code.
+
+**Output formats:**
+
+- `--format events` (default) → one per-step event line + a final summary line.
+- `--format json` → full `IntegrityEvidenceChainReport` to stdout (operational chatter to stderr so `jq` works). Includes the embedded Stage 12.22 `BundleVerifyReport` and every per-child outcome.
+- `--format pretty` → compact terminal-friendly summary + per-section listing.
+
+**Exit policy:**
+
+- Exit 0 iff: signed-bundle signature verified Ok AND every bundle-byte entry was Ok AND no signed-child signature failed.
+- **`Skipped` child outcomes DON'T fail the exit.** They represent deliberate operator choice — explicit `--expected-*-signer-pubkey-hex` omission.
+- Any envelope-level refusal (signed-bundle gate fails, Stage 12.22 base_dir missing, traversal path in embedded bundle) → exit nonzero, `event=integrity_evidence_chain_verify_failed reason=<closed-tag>`.
+
+**Flag rules (clap-enforced):**
+
+- `verify-integrity-evidence-chain` requires `--signed-bundle` and `--expected-bundle-signer-pubkey-hex`. The bundle signer trust anchor is non-negotiable.
+- `--expected-baseline-signer-pubkey-hex` and `--expected-diff-signer-pubkey-hex` are independent optional gates. Pass either, both, or neither.
+- `--base-dir` is optional — when omitted, the chain resolves entries against the bundle's recorded `base_dir`. When supplied, it overrides.
+- `--json-out` is optional, best-effort.
+- Subcommand does not expose `--no-prune-state-on-start` — pinned by clap regression. Does not open a contributor state-store.
+- Pubkey hex format is NOT validated at clap parse time — the verifier surfaces typed errors (`signer_pubkey_mismatch`, `signing`) consistently with Stage 12.20–12.23.
+
+**Refusal modes (envelope-level — emitted as `event=integrity_evidence_chain_verify_failed reason=<tag>` + nonzero exit):**
+
+Closed reason tags carry a `signed_bundle_` or `bundle_byte_` prefix so the closed-set taxonomy stays self-disambiguating:
+
+- `signed_bundle_io` / `signed_bundle_malformed_json` / `signed_bundle_unsupported_schema_version` / `signed_bundle_unsupported_bundle_schema_version` / `signed_bundle_signer_pubkey_mismatch` / `signed_bundle_signature_mismatch` / `signed_bundle_signing` / `signed_bundle_canonical` — Stage 12.23 envelope refusal on the outermost wrapper.
+- `bundle_byte_unsupported_schema_version` / `bundle_byte_effective_base_dir_not_found` / `bundle_byte_invalid_relative_path` / etc. — Stage 12.22 envelope refusal on the embedded bundle. Per-entry outcomes are NOT here — they're inside the report's `bundle_byte_verify` field.
+
+**Per-child refusal tags (inside `chain_child_failed` events, unprefixed because the surrounding `kind=...` field disambiguates):**
+
+- For `signed_state_integrity_baseline` children: `io` (file missing / permissions) / `malformed_json` (parse fail) / `unsupported_schema_version` (wrapper schema) / `unsupported_report_schema_version` (embedded report schema) / `signer_pubkey_mismatch` (anchor mismatch) / `signature_mismatch` (crypto verify failed) / `signing` (decode error) / `canonical` (closed-set struct encoding).
+- For `signed_state_integrity_diff` children: same except `unsupported_diff_schema_version` instead of `unsupported_report_schema_version`.
+
+**Independent forensic facts (collect-all semantics):**
+
+Bundle-byte verify and child-signature verify are independent. A signed-baseline entry can simultaneously:
+
+- Have `bundle_byte_verify` outcome `HashMismatch` (the bytes on disk differ from what the bundle recorded), AND
+- Have `child_signatures` outcome `Ok` (the wrapper as it stands on disk is still validly signed by the expected key)
+
+These are different forensic facts — the file has drifted from what the bundle attested, but the file the bundle attested to was authentically signed at bundle-build time. Auditors should see BOTH views. The chain verifier deliberately runs child signature verify even when bundle-byte said the bytes are wrong — a `HashMismatch` doesn't stop the child verifier from attempting to parse and verify whatever bytes ARE there.
+
+**Composition with Stage 12.20 / 12.21 / 12.22 / 12.23:**
+
+Stage 12.24 is the equivalent of running these four commands in sequence — but as a single composed operation that produces a unified report:
+
+```sh
+# Equivalent multi-command form (pre-Stage 12.24):
+omni-node operator contributor verify-integrity-evidence-bundle-signature ...   # Stage 12.23
+omni-node operator contributor verify-integrity-evidence-bundle ...             # Stage 12.22
+omni-node operator contributor verify-signed-state-integrity-baseline ...       # Stage 12.20 (per signed-baseline entry)
+omni-node operator contributor verify-state-integrity-diff-signature ...        # Stage 12.21 (per signed-diff entry)
+```
+
+Stage 12.24 collapses these into one invocation, with consistent exit-code semantics and a single tamper-evident JSON report that aggregates every gate's outcome. The individual stages remain available — operators who want fine-grained control (e.g. different log destinations per gate) can still run them separately.
+
+**Determinism:** same inputs (signed bundle, anchors, `--base-dir`) + same `generated_at_utc` + same on-disk artifact files produce a byte-identical chain report — operators can commit a chain report to an archive and re-derive it deterministically.
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.23 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.

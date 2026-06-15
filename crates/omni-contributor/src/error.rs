@@ -1736,3 +1736,64 @@ pub enum SignedIntegrityEvidenceBundleError {
         source: serde_json::Error,
     },
 }
+
+/// Stage 12.24 — local-only integrity-evidence-chain envelope
+/// errors. The chain verifier is a pure composition of Stage
+/// 12.20–12.23 verifiers, so envelope-level failures from the
+/// outer gates bubble through `From` and the CLI prefixes the
+/// reason tag with `signed_bundle_` / `bundle_byte_` to keep
+/// the closed-set taxonomy self-disambiguating.
+///
+/// Per-entry / per-child verification outcomes are NOT here —
+/// they live inside `IntegrityEvidenceChainReport` as
+/// `BundleEntryOutcome` and `ChainChildEntryOutcome` so the
+/// collect-all contract is preserved after the outer gates
+/// pass.
+#[derive(Debug, thiserror::Error)]
+pub enum ChainVerifyError {
+    /// Chain report `schema_version` is not
+    /// `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION = 1`.
+    /// v1 binary refuses future-stage chain reports on
+    /// deserialization (round-trip use; the verifier itself
+    /// always produces v1).
+    #[error(
+        "unsupported integrity-evidence-chain-report schema_version: got={got} expected={expected}"
+    )]
+    UnsupportedChainSchemaVersion { got: u32, expected: u32 },
+
+    /// Outermost-gate refusal: Stage 12.23 signed-bundle
+    /// wrapper read / parse / schema / pubkey / signature
+    /// failed. Bubbled with `From`; the chain CLI prefixes the
+    /// closed reason tag with `signed_bundle_`.
+    #[error("signed-bundle envelope refusal: {0}")]
+    SignedBundle(#[from] SignedIntegrityEvidenceBundleError),
+
+    /// Stage 12.22 envelope refusal on the embedded bundle:
+    /// effective base_dir doesn't exist, an entry path failed
+    /// strict relative-path validation, or wrapper schema
+    /// mismatched. Per-entry `BundleEntryOutcome` results are
+    /// NOT here — they're inside the report's
+    /// `bundle_byte_verify` field.
+    #[error("bundle-byte envelope refusal: {0}")]
+    BundleByte(#[from] EvidenceBundleError),
+
+    /// Optional `--json-out` write failed. Best-effort posture;
+    /// the CLI surfaces this as a warn event without changing
+    /// exit code, but the library still bubbles it so non-CLI
+    /// callers can react.
+    #[error("integrity-evidence-chain io error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `serde_json::to_vec_pretty` failed on the chain report
+    /// during the optional `--json-out` write.
+    #[error("malformed integrity-evidence-chain at {path}: {source}")]
+    MalformedJson {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+}

@@ -333,6 +333,17 @@ enum ContributorCmd {
     VerifyIntegrityEvidenceBundleSignature(
         VerifyIntegrityEvidenceBundleSignatureArgs,
     ),
+
+    /// Stage 12.24 — chain-verify a
+    /// `SignedIntegrityEvidenceBundle` end-to-end: outer
+    /// signature gate (Stage 12.23), bundle byte verification
+    /// (Stage 12.22), and optional per-signed-child signature
+    /// verification (Stage 12.20 / 12.21). Read-only and
+    /// state-store-free; the only write is the optional
+    /// `--json-out` mirror (best-effort). Omitted child anchors
+    /// record `Skipped` outcomes — NOT silent passes. No chain
+    /// / mesh / SNIP / envelope surface touched.
+    VerifyIntegrityEvidenceChain(VerifyIntegrityEvidenceChainArgs),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -3008,6 +3019,71 @@ struct VerifyIntegrityEvidenceBundleSignatureArgs {
     format: VerifyIntegrityEvidenceBundleSignatureFormat,
 }
 
+// ── Stage 12.24 — verify-integrity-evidence-chain ────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum VerifyIntegrityEvidenceChainFormat {
+    /// Per-step bare-stdout events: started → signed_bundle_ok
+    /// → bundle_byte_entry_* per Stage 12.22 entry →
+    /// child_{ok,skipped,failed} per signed child → final
+    /// verify_summary. Default.
+    Events,
+    /// Print the full `IntegrityEvidenceChainReport` as pretty
+    /// JSON on stdout. Operational chatter goes to stderr so
+    /// `jq` works.
+    Json,
+    /// Compact terminal-friendly summary + per-section
+    /// listing.
+    Pretty,
+}
+
+#[derive(Args)]
+struct VerifyIntegrityEvidenceChainArgs {
+    /// Path to the Stage 12.23
+    /// `SignedIntegrityEvidenceBundle` JSON to chain-verify.
+    #[arg(long)]
+    signed_bundle: PathBuf,
+
+    /// REQUIRED 64-char lowercase-hex Ed25519 public key the
+    /// outermost signed-bundle wrapper MUST be signed by.
+    #[arg(long)]
+    expected_bundle_signer_pubkey_hex: String,
+
+    /// Optional Stage 12.20 trust anchor — gates verification
+    /// of every `signed_state_integrity_baseline` child entry.
+    /// When omitted, baseline children record `Skipped`.
+    #[arg(long)]
+    expected_baseline_signer_pubkey_hex: Option<String>,
+
+    /// Optional Stage 12.21 trust anchor — gates verification
+    /// of every `signed_state_integrity_diff` child entry.
+    /// When omitted, diff children record `Skipped`.
+    #[arg(long)]
+    expected_diff_signer_pubkey_hex: Option<String>,
+
+    /// Optional override for the embedded bundle's recorded
+    /// `base_dir`. Same posture as Stage 12.22's verifier:
+    /// when omitted, the chain resolves entries against the
+    /// bundle's recorded `base_dir`.
+    #[arg(long)]
+    base_dir: Option<PathBuf>,
+
+    /// Optional best-effort mirror of the chain report JSON.
+    /// Failure here logs a warn event and does NOT change exit
+    /// code (same posture as Stage 12.19
+    /// `state-integrity-diff --json-out`).
+    #[arg(long)]
+    json_out: Option<PathBuf>,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = VerifyIntegrityEvidenceChainFormat::Events
+    )]
+    format: VerifyIntegrityEvidenceChainFormat,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -3067,6 +3143,9 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         }
         ContributorCmd::VerifyIntegrityEvidenceBundleSignature(a) => {
             run_verify_integrity_evidence_bundle_signature(a)
+        }
+        ContributorCmd::VerifyIntegrityEvidenceChain(a) => {
+            run_verify_integrity_evidence_chain(a)
         }
     }
 }
@@ -9287,6 +9366,286 @@ mod tests {
         // the inner error's shape.
     }
 
+    // ── Stage 12.24 — verify-integrity-evidence-chain clap regression ──
+
+    fn parse_verify_integrity_evidence_chain(
+        pubkey: &str,
+        extra: &[&str],
+    ) -> VerifyIntegrityEvidenceChainArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "verify-integrity-evidence-chain".into(),
+            "--signed-bundle".into(),
+            "/tmp/signed-bundle.json".into(),
+            "--expected-bundle-signer-pubkey-hex".into(),
+            pubkey.into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::VerifyIntegrityEvidenceChain(a) => a,
+            _ => panic!("expected VerifyIntegrityEvidenceChain"),
+        }
+    }
+
+    #[test]
+    fn verify_integrity_evidence_chain_flag_parse_smoke() {
+        let pubkey = "ab".repeat(32);
+        let defaults =
+            parse_verify_integrity_evidence_chain(&pubkey, &[]);
+        assert_eq!(
+            defaults.signed_bundle,
+            std::path::PathBuf::from("/tmp/signed-bundle.json")
+        );
+        assert_eq!(defaults.expected_bundle_signer_pubkey_hex, pubkey);
+        assert!(defaults.expected_baseline_signer_pubkey_hex.is_none());
+        assert!(defaults.expected_diff_signer_pubkey_hex.is_none());
+        assert!(defaults.base_dir.is_none());
+        assert!(defaults.json_out.is_none());
+        assert_eq!(
+            defaults.format,
+            VerifyIntegrityEvidenceChainFormat::Events
+        );
+
+        // Optional child anchors parse independently.
+        let baseline_pk = "cd".repeat(32);
+        let with_baseline = parse_verify_integrity_evidence_chain(
+            &pubkey,
+            &[
+                "--expected-baseline-signer-pubkey-hex",
+                &baseline_pk,
+            ],
+        );
+        assert_eq!(
+            with_baseline.expected_baseline_signer_pubkey_hex.as_deref(),
+            Some(baseline_pk.as_str())
+        );
+        assert!(with_baseline.expected_diff_signer_pubkey_hex.is_none());
+
+        let diff_pk = "ef".repeat(32);
+        let with_both = parse_verify_integrity_evidence_chain(
+            &pubkey,
+            &[
+                "--expected-baseline-signer-pubkey-hex",
+                &baseline_pk,
+                "--expected-diff-signer-pubkey-hex",
+                &diff_pk,
+            ],
+        );
+        assert_eq!(
+            with_both.expected_baseline_signer_pubkey_hex.as_deref(),
+            Some(baseline_pk.as_str())
+        );
+        assert_eq!(
+            with_both.expected_diff_signer_pubkey_hex.as_deref(),
+            Some(diff_pk.as_str())
+        );
+
+        // --base-dir and --json-out parse.
+        let with_paths = parse_verify_integrity_evidence_chain(
+            &pubkey,
+            &[
+                "--base-dir",
+                "/srv/audit-mirror",
+                "--json-out",
+                "/var/audit/chain.json",
+            ],
+        );
+        assert_eq!(
+            with_paths.base_dir,
+            Some(std::path::PathBuf::from("/srv/audit-mirror"))
+        );
+        assert_eq!(
+            with_paths.json_out,
+            Some(std::path::PathBuf::from("/var/audit/chain.json"))
+        );
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", VerifyIntegrityEvidenceChainFormat::Events),
+            ("json", VerifyIntegrityEvidenceChainFormat::Json),
+            ("pretty", VerifyIntegrityEvidenceChainFormat::Pretty),
+        ] {
+            let got = parse_verify_integrity_evidence_chain(
+                &pubkey,
+                &["--format", raw],
+            );
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-chain",
+            "--signed-bundle",
+            "/tmp/signed-bundle.json",
+            "--expected-bundle-signer-pubkey-hex",
+            pubkey.as_str(),
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format for verify-integrity-evidence-chain"
+        );
+
+        // Required-flag refusals.
+        let missing_signed = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-chain",
+            "--expected-bundle-signer-pubkey-hex",
+            pubkey.as_str(),
+        ]);
+        assert!(
+            missing_signed.is_err(),
+            "clap must reject verify-integrity-evidence-chain without --signed-bundle"
+        );
+        let missing_pubkey = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-chain",
+            "--signed-bundle",
+            "/tmp/signed-bundle.json",
+        ]);
+        assert!(
+            missing_pubkey.is_err(),
+            "clap must reject verify-integrity-evidence-chain without --expected-bundle-signer-pubkey-hex"
+        );
+
+        // Auto-prune flag deliberately absent.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-chain",
+            "--signed-bundle",
+            "/tmp/signed-bundle.json",
+            "--expected-bundle-signer-pubkey-hex",
+            pubkey.as_str(),
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "verify-integrity-evidence-chain must not accept --no-prune-state-on-start"
+        );
+    }
+
+    /// Pins the closed `reason=<tag>` sets for per-child
+    /// signature verify outcomes. The chain verifier hand-
+    /// dispatches `SignedBaselineError` and
+    /// `SignedIntegrityDiffError` through
+    /// `baseline_child_reason_tag` / `diff_child_reason_tag`
+    /// in `integrity_evidence_chain.rs`. If a future variant
+    /// lands on either error without a mapping the closed set
+    /// breaks; this regression catches that.
+    #[test]
+    fn chain_child_reason_tag_covers_closed_sets() {
+        use omni_contributor::{
+            baseline_child_reason_tag, diff_child_reason_tag,
+            SignedBaselineError, SignedIntegrityDiffError,
+        };
+        use std::io::{Error as IoError, ErrorKind};
+        use std::path::PathBuf;
+
+        // ── Baseline child mapper ───────────────────────
+        assert_eq!(
+            baseline_child_reason_tag(
+                &SignedBaselineError::UnsupportedSchemaVersion {
+                    got: 2,
+                    expected: 1
+                }
+            ),
+            "unsupported_schema_version"
+        );
+        assert_eq!(
+            baseline_child_reason_tag(
+                &SignedBaselineError::UnsupportedReportSchemaVersion {
+                    got: 2,
+                    expected: 1
+                }
+            ),
+            "unsupported_report_schema_version"
+        );
+        assert_eq!(
+            baseline_child_reason_tag(&SignedBaselineError::SignerPubkeyMismatch {
+                expected: "aa".repeat(32),
+                got: "bb".repeat(32),
+            }),
+            "signer_pubkey_mismatch"
+        );
+        assert_eq!(
+            baseline_child_reason_tag(&SignedBaselineError::SignatureMismatch),
+            "signature_mismatch"
+        );
+        assert_eq!(
+            baseline_child_reason_tag(&SignedBaselineError::Io {
+                path: PathBuf::from("/tmp/x"),
+                source: IoError::from(ErrorKind::NotFound),
+            }),
+            "io"
+        );
+        let json_err = serde_json::from_str::<serde_json::Value>("{bad")
+            .expect_err("malformed json");
+        assert_eq!(
+            baseline_child_reason_tag(&SignedBaselineError::MalformedJson {
+                path: PathBuf::from("/tmp/x"),
+                source: json_err,
+            }),
+            "malformed_json"
+        );
+
+        // ── Diff child mapper ───────────────────────────
+        assert_eq!(
+            diff_child_reason_tag(
+                &SignedIntegrityDiffError::UnsupportedSchemaVersion {
+                    got: 2,
+                    expected: 1
+                }
+            ),
+            "unsupported_schema_version"
+        );
+        assert_eq!(
+            diff_child_reason_tag(
+                &SignedIntegrityDiffError::UnsupportedDiffSchemaVersion {
+                    got: 2,
+                    expected: 1
+                }
+            ),
+            "unsupported_diff_schema_version"
+        );
+        assert_eq!(
+            diff_child_reason_tag(
+                &SignedIntegrityDiffError::SignerPubkeyMismatch {
+                    expected: "aa".repeat(32),
+                    got: "bb".repeat(32),
+                }
+            ),
+            "signer_pubkey_mismatch"
+        );
+        assert_eq!(
+            diff_child_reason_tag(&SignedIntegrityDiffError::SignatureMismatch),
+            "signature_mismatch"
+        );
+        assert_eq!(
+            diff_child_reason_tag(&SignedIntegrityDiffError::Io {
+                path: PathBuf::from("/tmp/x"),
+                source: IoError::from(ErrorKind::NotFound),
+            }),
+            "io"
+        );
+        let json_err2 = serde_json::from_str::<serde_json::Value>("{bad")
+            .expect_err("malformed json");
+        assert_eq!(
+            diff_child_reason_tag(&SignedIntegrityDiffError::MalformedJson {
+                path: PathBuf::from("/tmp/x"),
+                source: json_err2,
+            }),
+            "malformed_json"
+        );
+        // Signing / Canonical variants — bubbled from other
+        // crates; the only requirement is the mapper picks the
+        // closed tag, not the inner shape.
+    }
+
     // ── Stage 12.17 — plan-state-cleanup / apply-state-cleanup ──
 
     fn parse_plan_state_cleanup(extra: &[&str]) -> PlanStateCleanupArgs {
@@ -13634,4 +13993,359 @@ fn render_verify_signed_bundle_pretty(
         println!("  bundle_label    : {label}");
     }
     println!("  entry_count     : {}", wrapper.bundle.entries.len());
+}
+
+// ── Stage 12.24 — verify-integrity-evidence-chain ────────────────────────
+
+fn run_verify_integrity_evidence_chain(
+    args: VerifyIntegrityEvidenceChainArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        verify_integrity_evidence_chain,
+        write_integrity_evidence_chain_report_atomic, BundleEntryOutcome,
+        ChainStepOutcome, ChainVerifyError, ChainVerifyOptions,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode =
+        matches!(args.format, VerifyIntegrityEvidenceChainFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    // Start event fires FIRST — before any FS IO. Mirrors the
+    // Stage 12.22/12.23 review-fix posture so operators always
+    // see a start event even on missing/malformed wrappers.
+    // The `set` / absent markers let log scrapers see exactly
+    // which optional gates were enabled without leaking the
+    // pubkey hex on the start line.
+    let override_field = match args.base_dir.as_deref() {
+        Some(p) => format!(" base_dir_override={}", p.display()),
+        None => String::new(),
+    };
+    let baseline_marker = if args.expected_baseline_signer_pubkey_hex.is_some() {
+        " expected_baseline_pubkey=set"
+    } else {
+        ""
+    };
+    let diff_marker = if args.expected_diff_signer_pubkey_hex.is_some() {
+        " expected_diff_pubkey=set"
+    } else {
+        ""
+    };
+    log_op(&format!(
+        "event=integrity_evidence_chain_verify_started signed_bundle={}{}{}{}",
+        args.signed_bundle.display(),
+        override_field,
+        baseline_marker,
+        diff_marker,
+    ));
+
+    let opts = ChainVerifyOptions {
+        now_utc: &now_utc,
+        signed_bundle_path: &args.signed_bundle,
+        expected_bundle_signer_pubkey_hex: &args.expected_bundle_signer_pubkey_hex,
+        base_dir_override: args.base_dir.as_deref(),
+        expected_baseline_signer_pubkey_hex: args
+            .expected_baseline_signer_pubkey_hex
+            .as_deref(),
+        expected_diff_signer_pubkey_hex: args
+            .expected_diff_signer_pubkey_hex
+            .as_deref(),
+    };
+    let report = match verify_integrity_evidence_chain(&opts) {
+        Ok(r) => r,
+        Err(e) => {
+            let reason = chain_envelope_reason_tag(&e);
+            log_op(&format!(
+                "event=integrity_evidence_chain_verify_failed reason={reason} detail={e}"
+            ));
+            bail!("chain verification refused: {e}");
+        }
+    };
+
+    // Bundle-signature step — always Ok if we got here, since
+    // the library short-circuits on signed-bundle envelope
+    // failure. Emit the explicit OK event so log scrapers see
+    // every step. The chain report carries the verified
+    // wrapper's `signer_role` / `signer_pubkey_hex` as minimal
+    // metadata (v1 does NOT embed the full Stage 12.23
+    // wrapper); surface them on this line so the event stream
+    // is self-describing on signer identity — the start line
+    // only carries `expected_*_pubkey=set` markers and
+    // deliberately doesn't leak the pubkey.
+    if matches!(report.bundle_signature, ChainStepOutcome::Ok) {
+        log_op(&format!(
+            "event=integrity_evidence_chain_signed_bundle_ok signer_role={} signer_pubkey={}",
+            report.bundle_signer_role.as_str(),
+            report.bundle_signer_pubkey_hex,
+        ));
+    }
+
+    log_op(&format!(
+        "event=integrity_evidence_chain_bundle_byte_resolved effective_base_dir={}",
+        report.effective_base_dir
+    ));
+
+    for outcome in &report.bundle_byte_verify.entries {
+        let tag = match &outcome.outcome {
+            BundleEntryOutcome::Ok => "ok",
+            BundleEntryOutcome::SizeMismatch { .. } => "size_mismatch",
+            BundleEntryOutcome::HashMismatch { .. } => "hash_mismatch",
+            BundleEntryOutcome::NotFound => "not_found",
+            BundleEntryOutcome::ReadError { .. } => "read_error",
+        };
+        let detail = match &outcome.outcome {
+            BundleEntryOutcome::Ok | BundleEntryOutcome::NotFound => {
+                String::new()
+            }
+            BundleEntryOutcome::SizeMismatch { expected, got } => {
+                format!(" expected_bytes={expected} got_bytes={got}")
+            }
+            BundleEntryOutcome::HashMismatch { expected, got } => {
+                format!(" expected_blake3={expected} got_blake3={got}")
+            }
+            BundleEntryOutcome::ReadError { detail } => {
+                format!(" detail={detail}")
+            }
+        };
+        log_op(&format!(
+            "event=integrity_evidence_chain_bundle_byte_entry_{tag} kind={} path={} resolved_path={}{}",
+            outcome.artifact_kind.as_str(),
+            outcome.path,
+            outcome.resolved_path,
+            detail,
+        ));
+    }
+
+    for child in &report.child_signatures {
+        match &child.signature_outcome {
+            ChainStepOutcome::Ok => {
+                log_op(&format!(
+                    "event=integrity_evidence_chain_child_ok kind={} path={} resolved_path={}",
+                    child.artifact_kind.as_str(),
+                    child.path,
+                    child.resolved_path,
+                ));
+            }
+            ChainStepOutcome::Skipped => {
+                log_op(&format!(
+                    "event=integrity_evidence_chain_child_skipped kind={} path={} resolved_path={}",
+                    child.artifact_kind.as_str(),
+                    child.path,
+                    child.resolved_path,
+                ));
+            }
+            ChainStepOutcome::Failed { reason, detail } => {
+                log_op(&format!(
+                    "event=integrity_evidence_chain_child_failed kind={} path={} resolved_path={} reason={reason} detail={detail}",
+                    child.artifact_kind.as_str(),
+                    child.path,
+                    child.resolved_path,
+                ));
+            }
+        }
+    }
+
+    log_op(&format!(
+        "event=integrity_evidence_chain_verify_summary \
+         bundle_signature=ok \
+         bundle_byte_counts={{ok={} size_mismatch={} hash_mismatch={} not_found={} read_error={}}} \
+         child_counts={{ok={} skipped={} failed={}}}",
+        report.bundle_byte_verify.counts_ok,
+        report.bundle_byte_verify.counts_size_mismatch,
+        report.bundle_byte_verify.counts_hash_mismatch,
+        report.bundle_byte_verify.counts_not_found,
+        report.bundle_byte_verify.counts_read_error,
+        report.counts_child_ok,
+        report.counts_child_skipped,
+        report.counts_child_failed,
+    ));
+
+    // Optional best-effort --json-out write. Failure logs a
+    // warn event and DOES NOT change exit code.
+    if let Some(out) = args.json_out.as_deref() {
+        match write_integrity_evidence_chain_report_atomic(&report, out) {
+            Ok(_) => {
+                log_op(&format!(
+                    "event=integrity_evidence_chain_json_written path={}",
+                    out.display()
+                ));
+            }
+            Err(e) => {
+                let reason = match &e {
+                    ChainVerifyError::MalformedJson { .. } => "malformed_json",
+                    _ => "io",
+                };
+                log_op(&format!(
+                    "event=integrity_evidence_chain_json_write_failed reason={reason} detail={e}"
+                ));
+            }
+        }
+    }
+
+    match args.format {
+        VerifyIntegrityEvidenceChainFormat::Events => {
+            // Already emitted above.
+        }
+        VerifyIntegrityEvidenceChainFormat::Json => {
+            render_verify_chain_json(&report)?;
+        }
+        VerifyIntegrityEvidenceChainFormat::Pretty => {
+            render_verify_chain_pretty(&report);
+        }
+    }
+
+    if !report.all_required_ok() {
+        bail!(
+            "integrity-evidence-chain verification failed: \
+             bundle_byte size_mismatch={} hash_mismatch={} not_found={} read_error={} \
+             child_failed={}",
+            report.bundle_byte_verify.counts_size_mismatch,
+            report.bundle_byte_verify.counts_hash_mismatch,
+            report.bundle_byte_verify.counts_not_found,
+            report.bundle_byte_verify.counts_read_error,
+            report.counts_child_failed,
+        );
+    }
+    Ok(())
+}
+
+/// Closed-set envelope-level reason tag for the chain CLI.
+/// Prefixes inner Stage 12.22/12.23 tags with `signed_bundle_`
+/// / `bundle_byte_` so the closed-set taxonomy stays
+/// self-disambiguating.
+fn chain_envelope_reason_tag(e: &omni_contributor::ChainVerifyError) -> String {
+    use omni_contributor::ChainVerifyError as E;
+    match e {
+        E::UnsupportedChainSchemaVersion { .. } => {
+            "unsupported_chain_schema_version".to_string()
+        }
+        E::SignedBundle(inner) => {
+            format!("signed_bundle_{}", signed_bundle_reason_tag(inner))
+        }
+        E::BundleByte(inner) => {
+            format!("bundle_byte_{}", bundle_build_reason_tag(inner))
+        }
+        E::Io { .. } => "io".to_string(),
+        E::MalformedJson { .. } => "malformed_json".to_string(),
+    }
+}
+
+fn render_verify_chain_json(
+    report: &omni_contributor::IntegrityEvidenceChainReport,
+) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(report)
+        .map_err(|e| anyhow!("serialize chain report: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write chain report: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_verify_chain_pretty(
+    report: &omni_contributor::IntegrityEvidenceChainReport,
+) {
+    use omni_contributor::{BundleEntryOutcome, ChainStepOutcome};
+    println!("Integrity evidence chain verify");
+    println!(
+        "  schema_version       : {}",
+        report.schema_version
+    );
+    println!(
+        "  generated_at_utc     : {}",
+        report.generated_at_utc
+    );
+    println!(
+        "  signed_bundle_path   : {}",
+        report.signed_bundle_path
+    );
+    println!(
+        "  effective_base_dir   : {}",
+        report.effective_base_dir
+    );
+    println!(
+        "  bundle_signature     : {}",
+        match &report.bundle_signature {
+            ChainStepOutcome::Ok => "ok".to_string(),
+            ChainStepOutcome::Skipped => "skipped".to_string(),
+            ChainStepOutcome::Failed { reason, .. } => {
+                format!("failed reason={reason}")
+            }
+        }
+    );
+    println!(
+        "  bundle_signer_role   : {}",
+        report.bundle_signer_role.as_str()
+    );
+    println!(
+        "  bundle_signer_pubkey : {}",
+        report.bundle_signer_pubkey_hex
+    );
+    println!(
+        "  bundle_byte_counts   : ok={} size_mismatch={} hash_mismatch={} not_found={} read_error={}",
+        report.bundle_byte_verify.counts_ok,
+        report.bundle_byte_verify.counts_size_mismatch,
+        report.bundle_byte_verify.counts_hash_mismatch,
+        report.bundle_byte_verify.counts_not_found,
+        report.bundle_byte_verify.counts_read_error,
+    );
+    println!(
+        "  child_counts         : ok={} skipped={} failed={}",
+        report.counts_child_ok,
+        report.counts_child_skipped,
+        report.counts_child_failed,
+    );
+    for outcome in &report.bundle_byte_verify.entries {
+        let line = match &outcome.outcome {
+            BundleEntryOutcome::Ok => "ok".to_string(),
+            BundleEntryOutcome::SizeMismatch { expected, got } => {
+                format!("size_mismatch expected={expected} got={got}")
+            }
+            BundleEntryOutcome::HashMismatch { .. } => "hash_mismatch".to_string(),
+            BundleEntryOutcome::NotFound => "not_found".to_string(),
+            BundleEntryOutcome::ReadError { detail } => {
+                format!("read_error detail={detail}")
+            }
+        };
+        println!(
+            "    byte  [{}] {} -> {} [{}]",
+            outcome.artifact_kind.as_str(),
+            outcome.path,
+            outcome.resolved_path,
+            line,
+        );
+    }
+    for child in &report.child_signatures {
+        let line = match &child.signature_outcome {
+            ChainStepOutcome::Ok => "ok".to_string(),
+            ChainStepOutcome::Skipped => "skipped".to_string(),
+            ChainStepOutcome::Failed { reason, .. } => {
+                format!("failed reason={reason}")
+            }
+        };
+        println!(
+            "    child [{}] {} -> {} [{}]",
+            child.artifact_kind.as_str(),
+            child.path,
+            child.resolved_path,
+            line,
+        );
+    }
+    println!(
+        "  all_required_ok      : {}",
+        report.all_required_ok()
+    );
 }
