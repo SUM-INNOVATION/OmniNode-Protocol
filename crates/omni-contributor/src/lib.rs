@@ -47,6 +47,7 @@ pub mod handoff;
 pub mod handoff_verify;
 pub mod integrity;
 pub mod integrity_evidence_bundle;
+pub mod integrity_evidence_chain;
 pub mod job;
 pub mod net;
 pub mod peer_advert;
@@ -77,10 +78,10 @@ pub mod watch;
 
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
-    ArchiveError, CanonicalError, CleanupError, ContributorError, DiscoverError,
-    EvidenceBundleError, IntegrityDiffError, IntegrityError, PlannerError,
-    QuarantineRestoreError, RelayError, RepairError, RestoreError, RunnerError,
-    SchemaError, SignedBaselineError, SignedIntegrityDiffError,
+    ArchiveError, CanonicalError, ChainVerifyError, CleanupError, ContributorError,
+    DiscoverError, EvidenceBundleError, IntegrityDiffError, IntegrityError,
+    PlannerError, QuarantineRestoreError, RelayError, RepairError, RestoreError,
+    RunnerError, SchemaError, SignedBaselineError, SignedIntegrityDiffError,
     SignedIntegrityEvidenceBundleError, SigningError, SnipError, StatusError,
     VerifyError,
 };
@@ -124,6 +125,13 @@ pub use integrity_evidence_bundle::{
     IntegrityEvidenceBundle, VerifyOptions as BundleVerifyOptions,
     BUNDLE_ENTRY_MAX_BYTES, BUNDLE_LABEL_MAX, BUNDLE_MAX_ENTRIES, BUNDLE_NOTES_MAX,
     INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+};
+pub use integrity_evidence_chain::{
+    baseline_child_reason_tag, diff_child_reason_tag,
+    verify_integrity_evidence_chain,
+    write_integrity_evidence_chain_report_atomic, ChainChildEntryOutcome,
+    ChainStepOutcome, ChainVerifyOptions, IntegrityEvidenceChainReport,
+    INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION,
 };
 pub use cleanup::{
     apply_state_cleanup, cleanup_plan_hash_hex, plan_state_cleanup,

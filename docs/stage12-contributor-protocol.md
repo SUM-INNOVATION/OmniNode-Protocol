@@ -3361,3 +3361,142 @@ The verifier's JSON renderer emits a **compact metadata view** (`schema_version`
 | **Closed-set `reason=<tag>` mapping**: every `SignedIntegrityEvidenceBundleError` variant maps to one of the approved closed tags (`unsupported_schema_version` / `unsupported_bundle_schema_version` / `signer_pubkey_mismatch` / `signature_mismatch` / `io` / `malformed_json`). Pins the contract both signer (every failure path) and verifier (envelope + bundle-read paths) emit on `..._sign_failed` / `..._verify_failed`. | `signed_bundle_reason_tag_covers_closed_set` (omni-node) |
 
 **Residual gap (deliberate):** the CLI run-fns `run_sign_integrity_evidence_bundle` and `run_verify_integrity_evidence_bundle_signature` aren't exercised end-to-end (same constraint as Stage 12.10–12.22); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
+
+# Stage 12.24 — integrity-evidence chain verification
+
+## What this stage is, in one sentence
+
+A local-only `IntegrityEvidenceChainReport` produced by a `verify-integrity-evidence-chain` CLI that composes Stage 12.20–12.23 verifiers into a single read-only operation: (1) signed-bundle signature gate, (2) bundle byte verification (Stage 12.22), (3) optional per-signed-child signature verification — so an auditor runs ONE command to walk the full trust chain rooted at a signed bundle, with explicit `Skipped` outcomes when an expected pubkey flag is omitted.
+
+## Why a separate report schema (and why not extend Stage 12.22/12.23)
+
+Stage 12.22's `IntegrityEvidenceBundle` and Stage 12.23's `SignedIntegrityEvidenceBundle` are consumed UNCHANGED. The chain report is its own forward-compatible artifact tracked by `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION = 1`, independent of every existing schema constant. v1 chain reports describe one bundle level only — no recursion. The report is plain JSON; **no new signing in v1** (a signed-chain-report wrapper would be a future-stage conversation following the Stage 12.20/12.21/12.23 pattern).
+
+## Library surface
+
+`omni_contributor::integrity_evidence_chain` (new module):
+
+- `pub const INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION: u32 = 1;`
+- Closed `ChainStepOutcome { Ok, Skipped, Failed { reason, detail } }` with `snake_case` serde tagging via `#[serde(tag = "status")]`. **`Skipped`** is NOT a pass — it surfaces in the report so auditors see exactly what wasn't verified.
+- `ChainChildEntryOutcome { artifact_kind, path, resolved_path, signature_outcome }` with `deny_unknown_fields`. Only emitted for `signed_state_integrity_baseline` / `signed_state_integrity_diff` entries; other kinds are bundle-byte-only and don't appear here.
+- `IntegrityEvidenceChainReport { schema_version, generated_at_utc, omni_contributor_version, signed_bundle_path, effective_base_dir, bundle_signature, bundle_signer_role, bundle_signer_pubkey_hex, bundle_byte_verify, child_signatures, counts_child_ok, counts_child_skipped, counts_child_failed }` with `deny_unknown_fields`. **Embeds the full Stage 12.22 `BundleVerifyReport`** so auditors get every per-entry outcome without re-running. **Does NOT embed the full `SignedIntegrityEvidenceBundle` wrapper** — only `signed_bundle_path`, `bundle_signature` step outcome, and the verified wrapper's `bundle_signer_role` (Stage 12.20 `BaselineSignerRole`) + `bundle_signer_pubkey_hex` (64-char lowercase hex) as minimal signer metadata. The CLI's `..._signed_bundle_ok` event consumes these two fields directly so the event stream stays self-describing on signer identity (the start line only carries `expected_*_pubkey=set` markers and deliberately doesn't leak the pubkey). Keeps the report compact.
+- `pub fn verify_integrity_evidence_chain(opts: &ChainVerifyOptions) -> Result<IntegrityEvidenceChainReport, ChainVerifyError>` — pure composition: read + verify Stage 12.23 wrapper FIRST (short-circuit on envelope refusal), then Stage 12.22 byte verify (short-circuit on envelope refusal), then collect-all over signed children.
+- `pub fn write_integrity_evidence_chain_report_atomic(report, out)` — atomic temp+rename writer for the optional `--json-out` flag (best-effort posture; matches Stage 12.17/12.20/12.21/12.22/12.23 writers).
+- `IntegrityEvidenceChainReport::all_required_ok()` — true iff `bundle_signature == Ok` AND `bundle_byte_verify.all_ok()` AND `counts_child_failed == 0`. **`Skipped` child outcomes DON'T fail** — they're operator-choice informational.
+
+The library reuses `verify_signed_integrity_evidence_bundle` (Stage 12.23), `verify_integrity_evidence_bundle` (Stage 12.22), `verify_signed_state_integrity_baseline` (Stage 12.20), and `verify_signed_state_integrity_diff` (Stage 12.21) directly — no duplicated logic.
+
+New typed `ChainVerifyError` covers `UnsupportedChainSchemaVersion`, `SignedBundle(#[from] SignedIntegrityEvidenceBundleError)`, `BundleByte(#[from] EvidenceBundleError)`, `Io`, `MalformedJson` (the last two only fire on the optional `--json-out` write).
+
+Two public per-child reason-tag mappers (`baseline_child_reason_tag` / `diff_child_reason_tag`) for `SignedBaselineError` / `SignedIntegrityDiffError` — pinned by regression so future variants can't silently fall through the closed-set contract.
+
+No new canonical-bytes constant. No new domain separator. No signing input.
+
+## Trust model
+
+- **Outermost gate is short-circuit.** If the Stage 12.23 signed-bundle wrapper doesn't verify (missing file, schema mismatch, forged pubkey, bad signature), the chain stops here and no per-entry / per-child events fire. Refusal bubbles as `ChainVerifyError::SignedBundle`.
+- **Bundle byte verify runs after signed-bundle OK.** Stage 12.22 envelope-level refusals (`EffectiveBaseDirNotFound`, `InvalidRelativePath`, schema) bubble as `ChainVerifyError::BundleByte`; no child-signature events fire.
+- **Child-signature verify is collect-all.** Per-entry bundle-byte failures DON'T stop child verifies — a `HashMismatch` on bytes plus a separately-verifiable signature on those bytes are independent forensic facts. Auditors should see both views.
+- **Omitted child anchor records `Skipped`.** When the operator doesn't supply `expected_baseline_signer_pubkey_hex` / `expected_diff_signer_pubkey_hex`, the corresponding children record `ChainStepOutcome::Skipped` — NOT silent pass. Skipped outcomes DO NOT fail the exit-code check.
+- **Single trust anchor per child kind in v1.** Multiple signers per kind out of scope.
+- **No recursive chain walking.** A bundle entry that is itself a signed bundle (currently recorded under `Other`) is NOT re-verified.
+- **No re-hashing of artifact files during child signature verify.** Stage 12.20/12.21 verifiers already cover the canonical body bytes via `bincode1::serialize` of the typed struct.
+- **No state-store opened.** No `--no-prune-state-on-start` flag exposed.
+- **Optional `--json-out` is the only write** (best-effort, atomic temp+rename). Failure logs a warning event and doesn't change exit.
+- **Determinism pinned**: same inputs (signed bundle, anchors, base_dir, `now_utc`) + same on-disk artifact files → byte-identical chain report.
+
+## CLI
+
+```
+omni-node operator contributor verify-integrity-evidence-chain \
+  --signed-bundle <path>                                   (required)
+  --expected-bundle-signer-pubkey-hex <hex>                (required)
+  [--expected-baseline-signer-pubkey-hex <hex>]            (optional gate)
+  [--expected-diff-signer-pubkey-hex <hex>]                (optional gate)
+  [--base-dir <path>]                                      (Stage 12.22 override)
+  [--json-out <path>]                                      (optional report mirror)
+  [--format events|json|pretty]                            (default events)
+```
+
+Read-only and state-store-free: opens no contributor state-dir; the Stage 12.7 `--no-prune-state-on-start` flag is deliberately absent and pinned by clap regression. No `--base-dir` validation at parse time (consistent with Stage 12.20–12.23 pubkey-hex handling — the verifier surfaces typed errors instead).
+
+Closed-set events:
+
+- **Start (FIRST, before any FS IO — mirrors the Stage 12.22/12.23 review-fix posture)**:
+  `event=integrity_evidence_chain_verify_started signed_bundle=<path>[ base_dir_override=<path>][ expected_baseline_pubkey=set][ expected_diff_pubkey=set]`
+  
+  The `set` / absent markers let log scrapers see exactly which optional gates were enabled without leaking the pubkey hex on the start line.
+
+- **Bundle signature gate**:
+  - Success: `event=integrity_evidence_chain_signed_bundle_ok signer_role=<...> signer_pubkey=<...>` — the verified wrapper's role + pubkey come from the chain report's `bundle_signer_role` / `bundle_signer_pubkey_hex` fields.
+  - Envelope refusal: `event=integrity_evidence_chain_verify_failed reason=signed_bundle_<inner-tag>` + nonzero exit; no further events.
+
+- **Bundle byte verify** (only emitted on signed-bundle OK):
+  - Resolution: `event=integrity_evidence_chain_bundle_byte_resolved effective_base_dir=<...>`
+  - Per entry: one of `event=integrity_evidence_chain_bundle_byte_entry_{ok|size_mismatch|hash_mismatch|not_found|read_error} kind=<...> path=<...> resolved_path=<...>[ ...detail]`
+  - Envelope refusal: `event=integrity_evidence_chain_verify_failed reason=bundle_byte_<inner-tag>` + nonzero exit; no child events.
+
+- **Child signature verify** (only emitted on bundle-byte non-envelope completion):
+  - Per child: `event=integrity_evidence_chain_child_{ok|skipped|failed} kind=<...> path=<...> resolved_path=<...>[ reason=<tag>][ detail=<...>]`
+  - `skipped` carries no `reason` (the operator just didn't pass the corresponding flag).
+
+- **Summary** (always on the success path):
+  `event=integrity_evidence_chain_verify_summary bundle_signature=ok bundle_byte_counts={ok=<N> size_mismatch=<N> hash_mismatch=<N> not_found=<N> read_error=<N>} child_counts={ok=<N> skipped=<N> failed=<N>}`
+
+- **JSON-out write events** (when `--json-out` supplied):
+  - Success: `event=integrity_evidence_chain_json_written path=<...>`
+  - Failure: warning event `event=integrity_evidence_chain_json_write_failed reason=<io|malformed_json> detail=<...>` (best-effort — does NOT change exit code).
+
+**Closed-tag taxonomy for `chain_verify_failed`** (envelope-level only):
+
+- `signed_bundle_io`, `signed_bundle_malformed_json`, `signed_bundle_unsupported_schema_version`, `signed_bundle_unsupported_bundle_schema_version`, `signed_bundle_signer_pubkey_mismatch`, `signed_bundle_signature_mismatch`, `signed_bundle_signing`, `signed_bundle_canonical`
+- `bundle_byte_unsupported_schema_version`, `bundle_byte_effective_base_dir_not_found`, `bundle_byte_invalid_relative_path`, etc. (every `EvidenceBundleError` envelope variant; per-entry outcomes are NOT here)
+- `unsupported_chain_schema_version` (only fires on round-trip parse of a future-stage report)
+
+**Per-child reason tags** (inside `chain_child_failed` events) — unprefixed because the surrounding `kind=...` field disambiguates:
+
+- For baseline children: `io`, `malformed_json`, `unsupported_schema_version`, `unsupported_report_schema_version`, `signer_pubkey_mismatch`, `signature_mismatch`, `signing`, `canonical`
+- For diff children: `io`, `malformed_json`, `unsupported_schema_version`, `unsupported_diff_schema_version`, `signer_pubkey_mismatch`, `signature_mismatch`, `signing`, `canonical`
+
+**Exit policy**:
+- 0 iff `bundle_signature == Ok` AND `bundle_byte_verify.all_ok()` AND `counts_child_failed == 0`.
+- `Skipped` child outcomes DON'T fail the exit. They're informational only.
+- Optional `--json-out` write failure DOESN'T affect exit (best-effort).
+
+## Out of scope (Stage 12.24)
+
+- **No new signing.** Chain report is plain JSON; no Ed25519 signature on the chain artifact itself.
+- **No recursive chain walking.** Bundle entries under `Other` (e.g. a signed bundle itself) are NOT re-verified by this chain.
+- **No new `BundleArtifactKind` variant.** Per locked v1 scope, `signed_integrity_evidence_bundle` becoming a typed kind is a future-stage decision.
+- **No multi-anchor child verification.** Single `expected_baseline_signer_pubkey_hex` / `expected_diff_signer_pubkey_hex` in v1.
+- **No semantic JSON validation of raw unsigned artifacts** (`state_integrity_report`, `state_integrity_diff_report`, `cleanup_report`, `quarantine_manifest`, `archive_manifest`, `quarantine_restore_report`). Bundle-byte verify already covers their bytes.
+- **No state-store mutation.** Read-only across the whole chain. Optional `--json-out` is the only write.
+- **No `--no-prune-state-on-start` flag.** Pinned by clap regression.
+- **No envelope, no canonical-byte changes, no `STATE_VERSION` / `STATE_INTEGRITY_*` / `SIGNED_*` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `STATUS_*` / `ARCHIVE_*` / `CLEANUP_*` / `QUARANTINE_*` / `NET_*` bump.**
+- **No chain / SNIP / mesh / gossipsub / payment / proof / marketplace / reputation surface.**
+- **No expiry / `valid_through_utc` field on the report.** v1 reports are point-in-time only.
+
+## Test coverage map
+
+| Concern | Test |
+| --- | --- |
+| Happy path: all three anchors supplied → `all_required_ok()` true; every signed child Ok | `chain_happy_path_all_three_anchors` (`integrity_evidence_chain.rs`) |
+| Skip on omitted child anchors → every signed child records `Skipped`; `all_required_ok()` still true | `chain_skip_when_child_anchors_omitted` |
+| Signed-bundle pubkey mismatch → `ChainVerifyError::SignedBundle(SignerPubkeyMismatch)`; no bundle-byte or child events | `chain_signed_bundle_pubkey_mismatch_short_circuits` |
+| **Bundle-byte hash_mismatch on a signed child STILL runs child signature verify** (independent forensic facts) | `chain_bundle_byte_hash_mismatch_still_runs_child_verify` |
+| Bundle-byte envelope refusal (effective base_dir absent) → `ChainVerifyError::BundleByte(EffectiveBaseDirNotFound)`; no child events | `chain_bundle_byte_effective_base_dir_not_found_is_envelope` |
+| Bundle-byte envelope refusal (traversal path in embedded bundle) → `ChainVerifyError::BundleByte(InvalidRelativePath)` BEFORE per-entry walk | `chain_bundle_byte_invalid_relative_path_is_envelope` |
+| Child baseline signer mismatch → child `Failed { reason: "signer_pubkey_mismatch" }`; OTHER children still walked | `chain_child_baseline_signer_mismatch_does_not_short_circuit` |
+| Child file missing → both bundle-byte `NotFound` AND child `Failed { reason: "io" }` recorded (proves independent views) | `chain_child_file_missing_yields_both_bundle_byte_and_child_io` |
+| Child malformed JSON → child `Failed { reason: "malformed_json" }` | `chain_child_malformed_json_recorded_as_failed_with_tag` |
+| All-Skipped scenario (no anchors, bundle has signed children) → all children Skipped; exit 0 | `chain_all_signed_children_skipped_when_no_anchors` |
+| Bundle with zero signed children → child counts all zero; child anchors silently unused | `chain_bundle_with_zero_signed_children_passes_cleanly` |
+| **Determinism**: same inputs + same `now_utc` → byte-identical report | `chain_report_is_byte_identical_on_repeat_runs` |
+| JSON round-trip preserves report | `chain_report_json_round_trip_preserves_report` |
+| `all_required_ok()` semantics: skipped children DON'T fail the helper | `all_required_ok_is_true_with_skipped_children_only` |
+| **Verified Stage 12.23 wrapper's `signer_role` + `signer_pubkey_hex` flow into the chain report** as `bundle_signer_role` / `bundle_signer_pubkey_hex` — pins the contract the CLI's `..._signed_bundle_ok` event depends on for signer-identity disclosure without embedding the full wrapper | `chain_report_records_verified_bundle_signer_metadata` |
+| `write_integrity_evidence_chain_report_atomic` round-trips via disk | `write_chain_report_atomic_round_trips_via_disk` |
+| CLI flag matrix for `verify-integrity-evidence-chain` (required + 4 optional flags, format closed enum + unknown-format refusal, deliberate rejection of `--no-prune-state-on-start`) | `verify_integrity_evidence_chain_flag_parse_smoke` (omni-node) |
+| **Closed-set per-child reason-tag mapping**: every `SignedBaselineError` / `SignedIntegrityDiffError` variant maps to one of the closed tags. Pins the contract so future variants can't silently fall through. | `chain_child_reason_tag_covers_closed_sets` (omni-node) |
+
+**Residual gap (deliberate):** the CLI run-fn `run_verify_integrity_evidence_chain` isn't exercised end-to-end (same constraint as Stage 12.10–12.23); the library function is exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
