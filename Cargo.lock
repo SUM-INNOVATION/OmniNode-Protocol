@@ -2723,6 +2723,7 @@ dependencies = [
  "bs58",
  "chrono",
  "libp2p-identity",
+ "omni-contributor",
  "omni-store",
  "omni-types",
  "serde",

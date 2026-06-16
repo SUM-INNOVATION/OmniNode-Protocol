@@ -2658,3 +2658,134 @@ An operator reviewing a Stage 12.25 signed chain report has, in one file:
 If the operator wants to **re-verify the chain**, they run Stage 12.24 `verify-integrity-evidence-chain` against the original `signed_bundle_path` (which is recorded in the chain report). The Stage 12.25 wrapper does NOT do this — the two operations are decoupled.
 
 **No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.24 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / chain / payment / proof / marketplace surface.
+
+### Stage 13.0 — chain anchoring for integrity evidence
+
+**Use when:** you've produced a Stage 12.25 `SignedIntegrityEvidenceChainReport` and want SUM Chain to attest its existence — "this specific signed evidence artifact existed on disk and was submitted by its signer at this time" — without putting the full JSON wrapper on-chain. The chain stores a 32-byte BLAKE3 hash of the **raw on-disk wrapper bytes** + a small metadata digest (~70 bytes) under a 64-byte Ed25519 signature; the full forensic record stays local.
+
+**Stage 13.0 ships a stub chain client only.** No real SUM Chain RPC is wired up — `submit-integrity-evidence-anchor` writes to a local on-disk anchor registry under `--anchor-registry-dir` and emits a deterministic stub `tx_id`. Stage 13.1 (deferred) replaces the stub with the real SUM Chain submission path after chain-team review of the wire spec frozen in `docs/stage13-evidence-anchor-spec.md`.
+
+**Same-key submitter rule.** The Ed25519 seed supplied via `--submitter-seed` MUST derive the same public key embedded in the Stage 12.25 wrapper (`signer_pubkey_hex`). Stage 13.0 only allows the artifact signer to anchor their own artifact; relay / separate-submitter flows are deferred.
+
+**Workflow — submit:**
+
+```sh
+# Stage 12.25 wrapper produced by sign-integrity-evidence-chain-report:
+#   /var/omni-evidence/2026-06-15.chain.signed.json
+# Anchor registry directory (DEDICATED — NOT the Stage 12.7 contributor --state-dir):
+#   /var/omni-anchors/
+
+omni-node operator evidence-anchor submit-integrity-evidence-anchor \
+  --signed-chain-report /var/omni-evidence/2026-06-15.chain.signed.json \
+  --submitter-seed /etc/omni-node/chain-report-signer.seed \
+  --anchor-registry-dir /var/omni-anchors \
+  --json-out /var/omni-evidence/2026-06-15.chain.anchor.json
+# event=integrity_evidence_anchor_submit_started signed_chain_report=...
+# event=integrity_evidence_anchor_submit_ok artifact_hash_hex=<hex> signer_pubkey_hex=<hex> \
+#       tx_id=anchor-00000000-<hash-prefix> anchor_schema_version=1 \
+#       artifact_schema_version=1 artifact_kind=signed_integrity_evidence_chain_report
+# event=integrity_evidence_anchor_json_written path=/var/omni-evidence/2026-06-15.chain.anchor.json
+```
+
+The submitter command is **gated behind `--features submit`**, mirroring every other chain-touching operator subcommand. Without the feature, the command is absent from `--help` entirely and the binary contains no anchor-submit code path.
+
+**Pre-submit gates (in order):**
+
+1. Read the **raw on-disk bytes** of `--signed-chain-report` (these are exactly what gets hashed into the anchor).
+2. Parse the wrapper to extract metadata: `schema_version`, `signer_pubkey_hex`, `signed_at_utc`.
+3. **Verify the wrapper signature** under its embedded `signer_pubkey_hex`. We refuse to anchor a wrapper that fails its own signature check (`wrapper_signature_invalid`).
+4. Read the 32-byte `--submitter-seed` file and check the derived pubkey equals the wrapper's `signer_pubkey_hex` (same-key submitter rule → `submitter_pubkey_mismatch` on divergence).
+5. Compute `artifact_hash = blake3(raw_bytes)` — binds the chain record to the exact byte sequence the operator holds. Any whitespace, key-ordering, or formatting change in the on-disk file produces a different anchor.
+6. Build the digest, sign canonical bytes with the submitter seed, submit through the stub chain client, persist the record under `<anchor-registry-dir>/<artifact_hash_hex>.json` + update `<anchor-registry-dir>/tx_index.json` atomically.
+
+**Workflow — query (registry-backed):**
+
+```sh
+# By artifact hash:
+omni-node operator evidence-anchor query-integrity-evidence-anchor \
+  --anchor-registry-dir /var/omni-anchors \
+  --artifact-hash-hex <64-hex>
+# By tx_id:
+omni-node operator evidence-anchor query-integrity-evidence-anchor \
+  --anchor-registry-dir /var/omni-anchors \
+  --tx-id anchor-00000000-<hash-prefix>
+# event=integrity_evidence_anchor_query_started ...
+# event=integrity_evidence_anchor_query_ok artifact_hash_hex=<hex> tx_id=... \
+#       local_status=submitted chain_status=submitted transitioned=false
+```
+
+The query command opens **only** the anchor registry — no Stage 12.7 contributor state-store is touched. Status mirrors the Stage 5 chain v1 five-state model (`submitted | included | finalized | failed | unknown`); Stage 13.0's stub client defaults to `submitted` until per-`tx_id` overrides are configured by Stage 13.1.
+
+**Workflow — verify (registry-backed — the primary verification command):**
+
+```sh
+omni-node operator evidence-anchor verify-integrity-evidence-anchor \
+  --signed-chain-report /var/omni-evidence/2026-06-15.chain.signed.json \
+  --anchor-registry-dir /var/omni-anchors \
+  [--tx-id anchor-00000000-<hash-prefix>]
+# event=integrity_evidence_anchor_verify_started ...
+# event=integrity_evidence_anchor_verify_ok artifact_hash_hex=<hex> signer_pubkey_hex=<hex> \
+#       tx_id=anchor-... local_status=submitted anchor_schema_version=1 \
+#       artifact_schema_version=1 artifact_kind=signed_integrity_evidence_chain_report
+```
+
+Lookup semantics:
+
+- If `--tx-id` is **absent** (default): recompute `artifact_hash = blake3(raw_bytes)`, look up by hash. Registry miss → `anchor_not_found`.
+- If `--tx-id` is **supplied**: look up by `tx_id` via `tx_index.json`. The recorded `digest.artifact_hash` MUST equal the recomputed hash; mismatches refuse with `artifact_hash_mismatch`.
+
+This command proves: "this on-disk artifact corresponds to a recorded anchor in the registry that was authored by the artifact signer." It does NOT prove on-chain inclusion (Stage 13.0 has no real chain) — that's a Stage 13.1 deliverable.
+
+**Workflow — verify-file (standalone JSON — secondary):**
+
+```sh
+omni-node operator evidence-anchor verify-integrity-evidence-anchor-file \
+  --signed-chain-report /var/omni-evidence/2026-06-15.chain.signed.json \
+  --anchor-json       /var/omni-evidence/2026-06-15.chain.anchor.json
+# event=integrity_evidence_anchor_verify_file_started ...
+# event=integrity_evidence_anchor_verify_file_ok artifact_hash_hex=<hex> signer_pubkey_hex=<hex> ...
+```
+
+The standalone-JSON command does **not** consult the registry — it only proves the anchor JSON is internally consistent with the local on-disk wrapper bytes. Useful for offline forensic review or vetting an anchor JSON received out-of-band before importing it.
+
+**`--anchor-registry-dir` is NOT `--state-dir`.** The anchor registry lives under a dedicated directory (typical convention: `/var/omni-anchors/`). It is distinct from the Stage 12.7 contributor `--state-dir` and from the Stage 5 attestation `--registry-path`. The flag name + dedicated directory make the boundary unambiguous.
+
+**Refusal modes (typed `EvidenceAnchorError`, surfaced as `reason=<tag>`):**
+
+- `wrapper_signature_invalid` — the Stage 12.25 wrapper's own signature did not verify under its embedded `signer_pubkey_hex`. Surfaced before any chain interaction. We do not anchor unverifiable artifacts.
+- `submitter_pubkey_mismatch` — `--submitter-seed` derived pubkey ≠ wrapper `signer_pubkey_hex`. Same-key submitter rule.
+- `submitter_signature_invalid` — anchor wire payload's `submitter_signature` did not verify under `digest.signer_pubkey`. Trips on tampered anchor JSON.
+- `artifact_hash_mismatch` — recomputed `blake3(raw_bytes)` ≠ the recorded / anchor `digest.artifact_hash`. Trips when the on-disk wrapper file has been re-formatted, re-pretty-printed, or otherwise mutated after submit.
+- `anchored_signer_pubkey_mismatch` — verify-time same-key binding: the stored / supplied anchor's `digest.signer_pubkey` does not equal the parsed Stage 12.25 wrapper's `signer_pubkey_hex`. Defends against a hand-edited registry record or a tampered standalone anchor that reuses the artifact hash but swaps in a different signer pubkey (with a valid signature by that other key).
+- `anchor_not_found` — registry lookup miss (no record for the supplied `--artifact-hash-hex` / `--tx-id`).
+- `unsupported_anchor_schema_version` — wire payload `anchor_schema_version` ≠ 1.
+- `unsupported_artifact_schema_version` — wrapper `schema_version` outside the supported set (Stage 13.0 supports only v1 wrappers).
+- `unsupported_artifact_kind` — wire payload `artifact_kind` not in the closed enum (Stage 13.0 ships one variant; new kinds require an `anchor_schema_version` bump).
+- `malformed_seed_file` — `--submitter-seed` file did not parse / was not exactly 32 bytes.
+- `malformed_json` — wrapper JSON or anchor JSON parse failure.
+- `malformed_signed_at_utc` — wrapper's `signed_at_utc` field did not parse as RFC 3339.
+- `chain_client` — stub chain-client failure (rare; configurable in tests).
+- `io` — FS / registry IO failure.
+
+**What the chain attests (vs what it does not):**
+
+- **Attested**: existence of `(artifact_hash, signer_pubkey, signed_at, artifact_kind, anchor_schema_version, artifact_schema_version)`. The chain proves the operator submitted a commitment to this exact byte sequence at this time, under this signing key.
+- **NOT attested**: semantic correctness of the underlying integrity evidence. Stage 12.20-12.25's gates remain the source of truth for whether the evidence describes a successful verification — chain inclusion does not certify gate outcomes. Re-running `verify-integrity-evidence-chain` against the wrapper's `signed_bundle_path` is unchanged and unaffected by Stage 13.0.
+
+**The chain-anchor pipeline (terminating in Stage 13.0):**
+
+```sh
+# 1-6: Stage 12.20-12.25 (forensic chain — see above)
+# 7. Stage 13.0 — submit chain anchor (stub client)
+omni-node operator evidence-anchor submit-integrity-evidence-anchor \
+  --signed-chain-report /var/omni-evidence/2026-06-15.chain.signed.json \
+  --submitter-seed     /etc/omni-node/chain-report-signer.seed \
+  --anchor-registry-dir /var/omni-anchors \
+  --json-out           /var/omni-evidence/2026-06-15.chain.anchor.json
+```
+
+**Determinism:** Anchoring the same on-disk wrapper bytes with the same submitter seed produces a byte-identical `IntegrityEvidenceAnchorTxData` payload — operators can commit the anchor JSON to an archive alongside the wrapper bytes and re-derive it.
+
+**Deferred to Stage 13.1:** real SUM Chain RPC submission path; block-height confirmation polling beyond the stub; aggregation forms (anchor-bundles / anchor-chains). The wire spec frozen in `docs/stage13-evidence-anchor-spec.md` is the contract Stage 13.1 implements against.
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module — no other constants change.

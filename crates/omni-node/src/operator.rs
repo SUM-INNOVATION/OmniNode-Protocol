@@ -685,6 +685,18 @@ enum OperatorCmd {
     /// Off-chain only. Reachable on the default build. AttestationOnly
     /// evidence mode only in 12.0.
     Contributor(crate::contributor_cli::ContributorArgs),
+
+    /// Stage 13.0 — chain-anchor surface for Stage 12.25
+    /// `SignedIntegrityEvidenceChainReport` artifacts. Stub
+    /// chain client only (no real SUM Chain RPC); Stage 13.1
+    /// swaps in the real adapter.
+    ///
+    /// Boxed to keep `OperatorCmd`'s largest-variant size from
+    /// growing past its existing footprint — the EvidenceAnchor
+    /// subcommand's args struct carries clap-parsed PathBufs and
+    /// strings that would otherwise dominate the enum's stack
+    /// size.
+    EvidenceAnchor(Box<crate::evidence_anchor_cli::EvidenceAnchorArgs>),
 }
 
 #[derive(Args)]
@@ -1005,6 +1017,18 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
             // catch-all variant; the bare-stdout output keys are
             // emitted directly by the sub-dispatch.
             crate::contributor_cli::dispatch(a)
+                .await
+                .map_err(|e| OperatorError::ContributorWorkflow(e.to_string()))?;
+        }
+        OperatorCmd::EvidenceAnchor(a) => {
+            // Stage 13.0 — chain-anchor surface for Stage 12.25
+            // signed-chain-report artifacts. Bare-stdout event=...
+            // lines are emitted directly by the sub-dispatch; any
+            // crate-level anyhow::Error is flattened into
+            // ContributorWorkflow (Stage 12 already routes generic
+            // off-chain refusals through that variant). Args are
+            // boxed at the enum level; unwrap here.
+            crate::evidence_anchor_cli::dispatch(*a)
                 .await
                 .map_err(|e| OperatorError::ContributorWorkflow(e.to_string()))?;
         }
@@ -1771,6 +1795,7 @@ fn subcommand_name(c: &OperatorCmd) -> &'static str {
         OperatorCmd::Registry(_) => "registry",
         OperatorCmd::VerifyProof(_) => "verify-proof",
         OperatorCmd::Contributor(_) => "contributor",
+        OperatorCmd::EvidenceAnchor(_) => "evidence-anchor",
     }
 }
 

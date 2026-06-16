@@ -250,3 +250,143 @@ pub enum ProofPipelineError {
     #[error("proof artifact publish failure: {0}")]
     Artifact(#[from] ProofArtifactError),
 }
+
+// ── Stage 13.0: integrity-evidence chain anchoring ────────────────────────────
+
+/// Failure produced by [`crate::evidence_anchor`] — the chain-
+/// anchoring surface for Stage 12.25 signed-chain-report
+/// artifacts.
+///
+/// Closed reason-tag set; the
+/// [`crate::evidence_anchor::evidence_anchor_reason_tag`] mapper
+/// is the single source of truth for the stable strings that
+/// flow into `event=...` lines.
+///
+/// Intentionally **not** `Clone` (`io::Error` is not `Clone`).
+/// Mirrors the Stage 12.20+ closed-error posture.
+#[derive(Debug, thiserror::Error)]
+pub enum EvidenceAnchorError {
+    /// Wire payload's `anchor_schema_version` is not the locked
+    /// v1 constant. Surfaced before any crypto burn.
+    #[error("unsupported anchor schema version: got {got}, expected {expected}")]
+    UnsupportedAnchorSchemaVersion { got: u32, expected: u32 },
+
+    /// Wrapper's `artifact_schema_version` is outside the
+    /// supported set for the declared `artifact_kind`.
+    #[error("unsupported artifact schema version for {kind}: got {got}, expected {expected}")]
+    UnsupportedArtifactSchemaVersion {
+        kind: &'static str,
+        got: u32,
+        expected: u32,
+    },
+
+    /// Wrapper's `artifact_kind` is not in the closed set this
+    /// build understands. Defense-in-depth; serde already
+    /// refuses unknown variants at parse time.
+    #[error("unsupported artifact kind: {kind}")]
+    UnsupportedArtifactKind { kind: String },
+
+    /// Stage 12.25 wrapper's own Ed25519 signature did not
+    /// verify under its embedded `signer_pubkey_hex`. We do not
+    /// anchor unverifiable artifacts.
+    #[error("wrapper signature invalid (Stage 12.25 wrapper failed verify before anchoring)")]
+    WrapperSignatureInvalid,
+
+    /// Cheap pre-check: `--submitter-seed`-derived pubkey does
+    /// not equal the wrapper's `signer_pubkey_hex`. Same-key-
+    /// submitter rule (Stage 13.0). Surfaced before crypto.
+    #[error(
+        "submitter pubkey mismatch: seed derives {derived_pubkey_hex}, wrapper signed by {wrapper_pubkey_hex}"
+    )]
+    SubmitterPubkeyMismatch {
+        derived_pubkey_hex: String,
+        wrapper_pubkey_hex: String,
+    },
+
+    /// Anchor `submitter_signature` did not verify under
+    /// `digest.signer_pubkey`.
+    #[error("submitter signature invalid")]
+    SubmitterSignatureInvalid,
+
+    /// Recomputed `blake3(raw_bytes)` did not match the
+    /// anchor's `digest.artifact_hash`. Returned by the verify
+    /// commands when the artifact bytes have diverged from what
+    /// was anchored.
+    #[error("artifact hash mismatch: recomputed {recomputed_hex}, anchored {anchored_hex}")]
+    ArtifactHashMismatch {
+        recomputed_hex: String,
+        anchored_hex: String,
+    },
+
+    /// Same-key submitter rule enforced at verify time: the
+    /// stored / supplied anchor's `digest.signer_pubkey` does
+    /// not equal the parsed Stage 12.25 wrapper's
+    /// `signer_pubkey_hex`. Defends against a hand-edited
+    /// registry record or a tampered standalone anchor that
+    /// re-uses the artifact hash but swaps in a different
+    /// signer pubkey (with a valid signature by that other
+    /// key). The wrapper's pubkey is the source of truth — the
+    /// chain anchor MUST be authored by the same key that
+    /// signed the artifact.
+    #[error(
+        "anchored signer pubkey mismatch: wrapper signed by {wrapper_pubkey_hex}, \
+         anchor records {anchored_pubkey_hex}"
+    )]
+    AnchoredSignerPubkeyMismatch {
+        wrapper_pubkey_hex: String,
+        anchored_pubkey_hex: String,
+    },
+
+    /// Registry lookup miss (no record for the supplied
+    /// `--artifact-hash-hex` / `--tx-id`).
+    #[error("anchor not found in registry: {selector}")]
+    AnchorNotFound { selector: String },
+
+    /// Failed to read the submitter seed file or it was not
+    /// exactly 32 bytes long. Mirrors Stage 12 seed-handling
+    /// refusal posture.
+    #[error("malformed submitter seed file at {path}: {reason}")]
+    MalformedSeedFile {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+
+    /// JSON parse failure on the Stage 12.25 wrapper file or a
+    /// free-floating anchor file.
+    #[error("malformed JSON at {path}: {source}")]
+    MalformedJson {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Time string in the wrapper could not be parsed as RFC
+    /// 3339 / could not be converted to a Unix timestamp.
+    #[error("malformed signed_at_utc {raw:?}: {reason}")]
+    MalformedSignedAtUtc { raw: String, reason: String },
+
+    /// Canonical bytes serialization failed (bincode-1).
+    /// Mirrors the Stage 6 error shape.
+    #[error("anchor canonical-bytes serialization failed: {0}")]
+    CanonicalSerialization(String),
+
+    /// Ed25519 signing / pubkey decode failure.
+    #[error("anchor Ed25519 signing failure: {0}")]
+    Signing(String),
+
+    /// Chain client failure during submit / query.
+    #[error("chain client failure: {0}")]
+    ChainClient(#[from] ChainClientError),
+
+    /// FS IO failure. Path-attached for clean operator messages.
+    #[error("anchor I/O error at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Stage 13.0 result alias. Distinct from earlier-stage aliases
+/// so the evidence-anchor surface stays in its own typed lane.
+pub type EvidenceAnchorResult<T> = std::result::Result<T, EvidenceAnchorError>;

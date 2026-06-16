@@ -26,3 +26,11 @@ tracing         = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Stage 13.0 integration tests build real Stage 12.25
+# `SignedIntegrityEvidenceChainReport` wrappers as anchor inputs
+# so the chain-anchor surface can be exercised end-to-end against
+# the same wrapper bytes the CLI sees. Dev-only — `omni-contributor`
+# never enters the production graph of `omni-zkml`.
+omni-contributor = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

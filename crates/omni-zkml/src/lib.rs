@@ -48,6 +48,7 @@ pub mod attestation;
 pub mod chain;
 pub mod chain_wire;
 pub mod error;
+pub mod evidence_anchor;
 pub mod orchestration;
 pub mod proof;
 pub mod registry;
@@ -69,8 +70,20 @@ pub use chain_wire::{
 };
 pub use error::{
     AttestationError, AttestationResult, ChainClientError, ChainWireError, ChainWireResult,
-    ProofArtifactError, ProofBackendError, ProofPipelineError, ProofVerifierError, RegistryError,
-    RegistryResult, Result, SignerError,
+    EvidenceAnchorError, EvidenceAnchorResult, ProofArtifactError, ProofBackendError,
+    ProofPipelineError, ProofVerifierError, RegistryError, RegistryResult, Result, SignerError,
+};
+pub use evidence_anchor::{
+    anchor_hex_lower, anchor_signer_pubkey_bytes, anchor_signing_input_bytes,
+    anchor_signing_input_for_digest, build_anchor_digest, canonical_anchor_bytes,
+    evidence_anchor_reason_tag, local_status_from_chain, parse_anchor_hex_32,
+    query_evidence_anchor_workflow, sign_anchor_digest, submit_evidence_anchor_workflow,
+    verify_anchor_against_registry, verify_anchor_file_against_artifact_bytes,
+    verify_anchor_tx_data, AnchorRecord, AnchorSelector, AnchorStatus, AnchorSubmissionReceipt,
+    AnchoredArtifactKind, EvidenceAnchorChainClient, IntegrityEvidenceAnchorDigest,
+    IntegrityEvidenceAnchorTxData, LocalAnchorStatus, LocalEvidenceAnchorRegistry,
+    QueryAnchorOutcome, StubEvidenceAnchorChainClient, VerifiedWrapperMetadata,
+    EVIDENCE_ANCHOR_DOMAIN, INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION,
 };
 pub use proof::{
     check_mainnet_eligible, mainnet_vk_hash, produce_proof_artifact, AllowlistEntry,
