@@ -942,9 +942,674 @@ release log.
 
 ---
 
-## Phase 5 — Contributor protocol supersession / reassign workflow
+## Phase 5 — Contributor operations
 
-Walkthrough for operators driving Stage 12.11–12.13 contributor-protocol sessions. For the technical reference (verifier semantics, schema versions, canonical bytes) see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md). This section is the **playbook**.
+Operator-side playbook for the Stage 12 contributor subsystem of `omni-node`. For the engineering reference (schemas, canonical bytes, verifier semantics, halt findings, byte-stability guarantees), see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md). This section is the **playbook** — what to run, why, and what to look at when things break.
+
+### Stage 12 — production posture
+
+Stage 12 ships a complete local contributor operations subsystem under `omni-node operator contributor`. **43 subcommands** across Stage 12.0–12.25. State mutation is local and operator-directed: mutating commands (`run-job`, the `watch-*` daemons writing results / verified bodies, `archive-session --move`, `apply-state-cleanup`, `restore-session-archive`, `restore-state-cleanup-quarantine`) are explicit operator actions, and state-store opens are explicit via `--contributor-state-dir` (with auto-prune-on-open unless `--no-prune-state-on-start` is set). No command makes a chain transaction; nothing is published to a chain registry. Every signed artifact is **operator-local provenance**, not external attestation.
+
+The lifecycle splits into five phases:
+
+| Phase | Stages | Commands | Use |
+| --- | --- | --- | --- |
+| **Dispatch & run** | 12.0–12.1 | `validate-job`, `run-job`, `verify-result`, `post-job`, `watch-jobs`, `publish-result-link` | Run a single inference job end-to-end. |
+| **Mesh announcement** | 12.2 | `announce-job`, `watch-network-jobs`, `announce-result`, `watch-network-results` | Discover jobs / publish results on libp2p gossipsub. |
+| **Pooled-memory sessions** | 12.3–12.5 | `open-session`, `join-session`, `assign-work`, `run-assignment`, `aggregate-session`, `watch-sessions`, `send-handoff`, `advertise-peer`, `watch-peer-adverts` | Multi-contributor cooperation on one inference job. |
+| **Session lifecycle** | 12.8–12.13 | `plan-session-assignments`, `assign-session-plan`, `session-status`, `plan-session-repair`, `apply-session-repair`, `plan-session-reassign`, `apply-session-reassign` | Plan, monitor, repair, and reassign pooled-memory sessions. |
+| **State-dir archive & forensic record** | 12.14–12.25 | `archive-session`, `restore-session-archive`, `state-integrity`, `plan-state-cleanup`, `apply-state-cleanup`, `restore-state-cleanup-quarantine`, `state-integrity-diff`, sign/verify families | Capture, sign, and verify operator-local forensic records of state-dir contents. |
+
+**What to run nightly vs on-demand**
+
+- **Long-running daemons** (24/7 supervisor): `watch-jobs` or `watch-network-jobs` (job pickup), `watch-sessions` (mesh subscription), `watch-peer-adverts` (peer routing cache), `watch-network-results` (result-link mirror).
+- **Nightly batch** (cron / systemd timer): baseline-only forensic-record path is Stage 12.16 `state-integrity --json-out` → Stage 12.20 `sign-state-integrity-baseline` → Stage 12.22 `build-integrity-evidence-bundle` (including the baseline and signed-baseline as `--include` entries) → Stage 12.23 `sign-integrity-evidence-bundle` → Stage 12.24 `verify-integrity-evidence-chain --json-out` → Stage 12.25 `sign-integrity-evidence-chain-report`. Produces one tamper-evident operator-local forensic record per night. For a diff-included variant, insert Stage 12.19 `state-integrity-diff --json-out` (against a previous baseline) and Stage 12.21 `sign-state-integrity-diff` between the baseline-sign and the bundle-build, and add the diff and signed-diff to the bundle's `--include` list. Stage 12.24 is the load-bearing step that produces the chain-report JSON Stage 12.25 signs — skipping it leaves nothing for `sign-integrity-evidence-chain-report` to consume.
+- **Ad-hoc** (on demand): everything in the "Dispatch & run" + "Pooled-memory sessions" + "Session lifecycle" rows. Operators run these explicitly when they want to dispatch a job, open a session, or triage a stuck session.
+
+**Shared flags across the subsystem**
+
+A handful of flags appear on multiple subcommands and carry the same meaning everywhere:
+
+- `--contributor-state-dir <path>` — Stage 12.7 single-source-of-truth local state directory. Auto-prunes expired sessions on open unless `--no-prune-state-on-start` is set. Opt-in on Stage 12.0–12.6; required on most Stage 12.8+ commands.
+- `--no-prune-state-on-start` — disable auto-prune for forensic / triage runs. Stage 12.16+ verifier-side commands deliberately **reject** this flag because they don't open a state-dir; the rejection is pinned by clap regression.
+- `--net-identity-file <path>` — Stage 12.6 persistent libp2p keypair. Same path across restarts → stable `PeerId`. Missing → ephemeral identity (pre-12.6 behavior).
+- `--snip-binary <bin>` / `--snip-seed <path>` — SNIP V2 adapter plumbing. Required when a command publishes or fetches SNIP content.
+- `--peer-wait-secs <N>` / `--mesh-stabilize-ms <N>` — Stage 12.2+ mesh-publish defaults. A fresh `OmniNet` silently drops `publish` on an empty mesh; these flags wait for at least one peer + a mesh stabilize period before publishing.
+- `--format events|json|pretty` — Stage 12.9+ standardized output format. `events` = bare-stdout `event=...` key-value lines, `json` = single pretty JSON document on stdout (chatter to stderr so `jq` works), `pretty` = terminal-friendly summary.
+
+**Seed file hygiene**
+
+Every signing role uses a **separate 32-byte raw Ed25519 seed file**. Stage 12.0 establishes the contributor seed; subsequent stages add coordinator, dispatcher, baseline-signer, diff-signer, bundle-signer, chain-report-signer roles. **Do NOT reuse seeds across roles** — the integrity-artifact signing roles are deliberately distinct from chain-attestation and protocol-role seeds. Smaller blast radius if compromised.
+
+### Stage 12.0 — Contributor Inference Node protocol
+
+**Use when:** running a single inference job end-to-end (validate, run, verify a `ContributorResult`). This is the building block every other contributor command composes.
+
+**Commands:** `validate-job`, `run-job`, `verify-result`.
+
+**Workflow:**
+
+```sh
+# 1. Validate a job's schema + dispatcher signature.
+omni-node operator contributor validate-job --job ./job.json
+
+# 2. Run inference with a stub runner (deterministic, for tests) or external.
+omni-node operator contributor run-job \
+  --job ./job.json \
+  --out ./result.json \
+  --runner stub --stub-response ./response.bin \
+  --seed-file ./contributor.seed
+
+# 3. Verify the result against the job (does NOT trust result.job_snip_root implicitly).
+omni-node operator contributor verify-result --job ./job.json --result ./result.json
+```
+
+**Key flags:**
+
+- `--runner stub|external` — `stub` reads a fixed response from disk (deterministic; for tests). `external` invokes a subprocess that does the real inference — no framework runtime lives in `omni-node` itself.
+- `--external-command <bin>` — required with `--runner external`. The subprocess gets `--manifest <path>` + `--input <path>` (+ `--activation-out <path>` on Stage 12.4 wired runners) and writes a `deny_unknown_fields` JSON envelope to stdout.
+- `--seed-file <path>` — 32-byte raw Ed25519 contributor seed. DISTINCT from any chain-attestation seed.
+
+**Cost guardrails:** none at this stage. `watch-jobs` (Stage 12.1) and `watch-network-jobs` (Stage 12.2) add required cost caps; one-off `run-job` invocations are at operator discretion.
+
+**Verifier semantics:** `verify-result` runs the full 10-step `verify_result` pipeline (schemas, hash recomputation, expiry, dispatcher signature, model/input agreement, SNIP fetch + BLAKE3 check, accounting checks, contributor signature, evidence-mode check). Off-chain only.
+
+**Output:** bare-stdout `event=...` lines with a final `event=verify_result overall_ok=true|false`. Automation should grep the final line.
+
+**No protocol surface touched.** No chain wire, no on-chain proof verification, `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty. AttestationOnly evidence mode only.
+
+For canonical-bytes encoding, signature recipes, and reserved future-stage strings, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.0.
+
+### Stage 12.1 — filesystem-based job discovery
+
+**Use when:** running a long-lived pickup loop against jobs posted to a directory. Extends Stage 12.0 with a SNIP-published `PostedJob` envelope, a `FilesystemSource` `JobSource`, and a long-running `watch-jobs` subcommand. SNIP V2 roots are content-addressed, so filesystem watching replaces an index-polling story until Stage 12.2 ships gossipsub.
+
+**Commands:** `post-job`, `watch-jobs`, `publish-result-link`.
+
+**Workflow:**
+
+```sh
+# Dispatcher side — publish a job + a PostedJob envelope.
+omni-node operator contributor post-job \
+  --job ./job.json --posted-out ./posted.json \
+  --seed-file ./dispatcher.seed \
+  --snip-binary sum-node
+
+# Contributor side — long-running pickup loop with REQUIRED cost caps.
+omni-node operator contributor watch-jobs \
+  --source fs --jobs-dir /var/lib/omni-node/posted-jobs \
+  --max-input-tokens 200000 \
+  --max-output-tokens 1000000 \
+  --max-total-base-units 1200000 \
+  --runner external --external-command /usr/local/bin/my-inference-runner \
+  --seed-file ./contributor.seed \
+  --result-out-dir /var/lib/omni-node/results \
+  --publish-result-link --snip-binary sum-node
+
+# Contributor side — manually publish a PostedResultLink for one result.
+omni-node operator contributor publish-result-link \
+  --result ./result.json --posted-job ./posted.json \
+  --link-out ./link.json \
+  --seed-file ./contributor.seed --snip-binary sum-node
+```
+
+**Required cost caps on `watch-jobs`:** `--max-input-tokens`, `--max-output-tokens`, `--max-total-base-units` are all **required with no defaults**. A conservative default that fits a dev box is dangerous for a production contributor and vice-versa; the operator must make an explicit cap decision before any pickup happens. Caps are applied AFTER fetching the job from SNIP but BEFORE invoking the runner — a runner is never invoked for a job that would exceed any cap.
+
+**Allow-lists:** `--accept-model-hash <hex64>` and `--accept-tokenizer-hash <hex64>` are repeatable. Empty allow-list = accept any. Operators running known-tokenizer pipelines should pin both.
+
+**Post-run verifier:** every accepted result re-runs `verify_result` against the SNIP adapter before write-out. A failure writes `<result-out-dir>/<job_id>.rejected.json` with a structured `rejected_reason` and skips the optional `--publish-result-link` step. This catches orchestrator/runner schema drift before another party's verifier sees the result.
+
+**Operational tips:** `--max-polls <N>` is primarily for tests / smoke runs. Production typically omits it and lets the loop run until `--max-jobs` is reached or the process supervisor sends SIGTERM. There is no persistent dedup state across `watch-jobs` restarts — the in-memory `seen` set is rebuilt on every start. Rely on `expires_at_utc` + `--max-jobs` to bound work.
+
+**No protocol surface touched.** SNIP-only; no chain wire, no lease/claim primitives. Two contributors pointing at the same directory will both pick the same job and both produce results; dispatchers reading results choose which to trust.
+
+For full schema definitions of `PostedJob` / `PostedResultLink` and the per-step verification pipeline, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.1.
+
+### Stage 12.2 — contributor mesh network relay
+
+**Use when:** running gossipsub-based discovery instead of filesystem polling. Two new signed network announcements (`NetworkPostedJobAnnouncement`, `NetworkPostedResultAnnouncement`) carry SNIP pointers across libp2p. SNIP still stores everything; the mesh just announces what to fetch.
+
+**Commands:** `announce-job`, `watch-network-jobs`, `announce-result`, `watch-network-results`.
+
+**Workflow:**
+
+```sh
+# Dispatcher side — announce an already-published PostedJob to the mesh.
+omni-node operator contributor announce-job \
+  --posted-job ./posted.json \
+  --seed-file ./dispatcher.seed \
+  --include-tokenizer-hash \
+  --listen-port 4001 --peer /ip4/<bootstrap>/tcp/4001/p2p/<peer-id> \
+  --snip-binary sum-node
+
+# Contributor side — same pickup loop as Stage 12.1 but driven by mesh announcements.
+omni-node operator contributor watch-network-jobs \
+  --max-input-tokens 200000 --max-output-tokens 1000000 --max-total-base-units 1200000 \
+  --runner external --external-command /usr/local/bin/my-inference-runner \
+  --seed-file ./contributor.seed \
+  --result-out-dir /var/lib/omni-node/results \
+  --listen-port 4001 --peer /ip4/<bootstrap>/tcp/4001/p2p/<peer-id> \
+  --publish-result-link --snip-binary sum-node
+
+# Contributor side — announce a result link.
+omni-node operator contributor announce-result \
+  --posted-result-link ./link.json \
+  --seed-file ./contributor.seed \
+  --listen-port 4001 --peer /ip4/<bootstrap>/tcp/4001/p2p/<peer-id>
+
+# Consumer side — passive watcher that mirrors result-link JSONs to disk.
+omni-node operator contributor watch-network-results \
+  --result-out-dir /var/lib/omni-node/result-links \
+  --listen-port 4001 --peer /ip4/<bootstrap>/tcp/4001/p2p/<peer-id> \
+  --snip-binary sum-node
+```
+
+**Mesh topics (frozen):**
+
+- `omni/contributor/job/v1` — job announcements
+- `omni/contributor/result/v1` — result announcements
+
+Both carry the Stage 12.2-pre topic-safety lift, so unknown topics fail loudly with a typed `UnknownTopic` error instead of silently routing to `TOPIC_TEST`.
+
+**Announcer signature is REQUIRED on both announcement types** — different from `PostedJob.poster_signature_hex` (which is legitimately optional for local-CLI handoffs). The inner envelope's own signature (`PostedResultLink.contributor_signature_hex`) is still verified after SNIP fetch.
+
+**Bootstrap connectivity:** A bare `OmniNet::new()` is not yet connected to any peer, so `publish` on an empty mesh is a silent drop. Every `announce-*` and `watch-network-*` subcommand waits for at least one `PeerDiscovered` or `PeerConnected` event before publishing, with a `--peer-wait-secs <N>` (default 30) timeout. `--mesh-stabilize-ms <N>` (default 500) gives gossipsub a chance to form the topic mesh after the first peer event.
+
+**`watch-network-results` filtering:** repeat `--posted-id <hex64>` to subscribe only to results for specific posted jobs. Empty filter = accept any.
+
+**No protocol surface touched.** No persistent job/result dedup across restarts. No lease/claim primitives. No reputation. No real-network CI test (would need bootstrap infrastructure).
+
+For full schemas + the announcement-then-fetch validation pipeline, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.2.
+
+### Stage 12.3 — multi-contributor pooled-memory sessions
+
+**Use when:** multiple contributors cooperate on one inference job under a signed session envelope. Each participant signs a partial; one coordinator signs the aggregate. Inter-stage handoff at this stage uses SNIP (latency-tolerant); live tensor handoff is Stage 12.4.
+
+**Commands:** `open-session`, `join-session`, `assign-work`, `run-assignment`, `aggregate-session`, `watch-sessions`.
+
+**Workflow (1-of-N pipeline via SNIP):**
+
+```sh
+# 1. Coordinator opens a session bound to a previously posted job.
+omni-node operator contributor open-session \
+  --posted-job ./posted.json \
+  --coordinator-seed ./coord.seed \
+  --expires-at-utc 2026-06-30T00:00:00Z \
+  --net-identity-file ./omni-net.key --listen-port 4001 --peer /ip4/.../
+
+# 2. Each contributor joins the session, advertising RAM + token caps.
+omni-node operator contributor join-session \
+  --execution-session-snip-root 0x... \
+  --contributor-seed ./contrib.seed \
+  --available-ram-bytes 17179869184 \
+  --max-input-tokens 200000 --max-output-tokens 1000000 \
+  --supported-work-unit-kind prefill-tokens --supported-work-unit-kind decode-tokens \
+  --runner-kind "llama-3-70b-q4" \
+  --net-identity-file ./omni-net.key --listen-port 4001 --peer /ip4/.../
+
+# 3. Coordinator assigns each stage. Spec file is hand-edited at 12.3;
+#    Stage 12.8 ships a planner that generates it from verified joins.
+omni-node operator contributor assign-work \
+  --execution-session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --assignments-file ./assignments.json
+
+# 4. Each contributor runs its assignment + publishes a signed partial.
+omni-node operator contributor run-assignment \
+  --assignment-snip-root 0x... \
+  --execution-session-snip-root 0x... \
+  --contributor-seed ./contrib.seed \
+  --runner external --external-command /usr/local/bin/my-stage-runner \
+  --net-identity-file ./omni-net.key
+
+# 5. Coordinator aggregates the partials into a final ContributorResult.
+omni-node operator contributor aggregate-session \
+  --execution-session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --final-result-snip-root 0x... \
+  --join-snip-root 0x... --assignment-snip-root 0x... --partial-snip-root 0x... \
+  --join-snip-root 0x... --assignment-snip-root 0x... --partial-snip-root 0x...
+
+# Long-running mesh watcher — verifies + writes session/join/assign/partial/aggregate
+# announcements to --out-dir (or to a Stage 12.7 state-dir).
+omni-node operator contributor watch-sessions \
+  --out-dir /var/lib/omni-node/contrib-state/verified/sessions \
+  --listen-port 4001 --peer /ip4/.../ \
+  --net-identity-file ./omni-net.key
+```
+
+**Roles (separate seeds):**
+
+- **Coordinator** — signs `ExecutionSession`, every `WorkAssignment`, and the `AggregatedContributorResult`. Does not need to run inference.
+- **Contributor** — signs `ContributorJoin` and each `PartialContributorResult`.
+- **Coordinator-as-contributor** — same operator can hold both keys; protocol doesn't care, but reuse the same seed and you lose blast-radius separation.
+
+**Accounting rule (important):** the final `ContributorResult.measured_accounting.total_base_units` is the **job-level** input + output token count (same as Stage 12.0). It is NOT a sum of partial totals — that would inflate to N× the real cost for N stages. Partials carry their own `stage_contributions` for future reward-split policies; the verifier checks structure but does not require numerical equality with the final.
+
+**Topology constraint (v1):** the verifier enforces strict linear topology — `aggregate.partial_refs` must cover every assignment exactly once, and aggregating without a partial for some assignment refuses with `AggregateMissingPartialFor`. Replacement / supersession is Stage 12.11.
+
+**Mesh topics:** `omni/contributor/session/{open,join,assign,partial,aggregated,peer-advert}/v1`.
+
+**No protocol surface touched.** No live tensor transport (Stage 12.4). No auto-selection policy. No sybil / anti-spam beyond required signatures.
+
+For envelope schemas + the per-stage verifier helpers, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.3.
+
+### Stage 12.4 — live tensor / activation transport
+
+**Use when:** the SNIP round-trip latency in Stage 12.3's pipeline is too slow. Stage 12.4 adds a direct peer-to-peer activation handoff over `omni-net`'s tensor request/response codec. SNIP keeps its role as durable backup / fallback.
+
+**Commands:** `run-assignment` (extended with handoff flags), `send-handoff` (diagnostic).
+
+**Workflow (live downstream handoff):**
+
+```sh
+# Receiver — wait for upstream activation, then run.
+omni-node operator contributor run-assignment \
+  --assignment-snip-root 0x... \
+  --execution-session-snip-root 0x... \
+  --contributor-seed ./contrib.seed \
+  --runner external --external-command /usr/local/bin/my-stage-runner \
+  --activation-in-mode live \
+  --upstream-from-assignment-snip-root 0x... \
+  --upstream-wait-secs 60 \
+  --downstream-to-assignment-snip-root 0x... \
+  --downstream-to-peer /ip4/<peer-ip>/tcp/4001/p2p/<peer-id> \
+  --activation-out-mode both \
+  --net-identity-file ./omni-net.key --listen-port 4001 --peer /ip4/<bootstrap>/
+
+# Diagnostic — send a single activation file out of band.
+omni-node operator contributor send-handoff \
+  --execution-session-snip-root 0x... \
+  --from-assignment-snip-root 0x... --to-assignment-snip-root 0x... \
+  --from-contributor-seed ./contrib.seed \
+  --activation-file ./activation.bin \
+  --dtype f16 --shape 1,4096 \
+  --to-peer /ip4/<peer-ip>/tcp/4001/p2p/<peer-id>
+```
+
+**Activation modes:**
+
+| `--activation-out-mode` | Live send | SNIP publish | Default |
+| --- | --- | --- | --- |
+| `snip` | no | yes (12.3 behavior) | when no downstream peer supplied |
+| `live` | yes | no | — |
+| `both` | yes | yes | when downstream peer + assignment supplied |
+| `none` | no | no | — |
+
+`--activation-in-mode live` reads upstream activations from the live mesh (waits up to `--upstream-wait-secs`); `none` means this is the first stage. SNIP-side `activation-in-mode snip` is NOT implemented in v1 — operators wiring SNIP fallback extract bytes off the upstream partial out-of-band.
+
+**Bounds (schema-enforced):** single chunk ≤ 64 MiB, total ≤ 16 GiB, max 256 chunks per stream, shape rank ≤ 8. Override the chunk size with `--handoff-chunk-max-bytes <N>` if your receiver has tighter memory limits.
+
+**Two-step integrity check on receive:** signature → BLAKE3 hash → byte-length. A failing signature is rejected before reassembly; a failing hash after reassembly is `TensorHashMismatch`; a length mismatch is `ByteLenMismatch`. The outer `TensorRequest` fields are routing-only — the verifier never trusts them.
+
+**Topology constraint:** `to.stage_index == from.stage_index + 1` (strict linear, v1). Non-linear / branching pipelines are Stage 12.4+ scope.
+
+**PeerId hint:** `--downstream-to-peer` accepts either a bare PeerId base58 or a multiaddr whose last `/p2p/<peer-id>` component is the destination. Stage 12.5 ships signed peer advertisements so you don't have to wire this manually.
+
+**No protocol surface touched.** No model-specific tensor semantics. Bytes are opaque. AttestationOnly only.
+
+For envelope schema + the two-step integrity check details, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.4.
+
+### Stage 12.5 — signed contributor peer advertisement / session routing
+
+**Use when:** running a multi-contributor session and wanting `run-assignment` to resolve downstream peers automatically instead of you wiring `--downstream-to-peer` manually. Each contributor publishes a signed, session-scoped peer advertisement; `run-assignment` looks it up from the local routing cache.
+
+**Commands:** `advertise-peer`, `watch-peer-adverts`, `run-assignment --resolve-downstream-peer-from-session`.
+
+**Workflow:**
+
+```sh
+# 1. Each contributor advertises its libp2p PeerId for one session.
+#    PeerId comes from OmniNet::local_peer_id() — no --libp2p-peer-id flag,
+#    so operators can't lie about what node they're running.
+omni-node operator contributor advertise-peer \
+  --execution-session-snip-root 0x... \
+  --join-snip-root 0x... \
+  --contributor-seed ./contrib.seed \
+  --net-identity-file ./omni-net.key \
+  --listen-multiaddr /ip4/<external-ip>/udp/4001/quic-v1 \
+  --max-handoff-chunk-bytes 33554432 \
+  --supported-dtype f16 --supported-dtype bf16 \
+  --expires-in-secs 3600 \
+  --publish-announcement
+
+# 2. Long-running passive watcher — drains advertisement announcements,
+#    verifies inner contributor signatures, matches against verified joins.
+omni-node operator contributor watch-peer-adverts \
+  --out-dir /var/lib/omni-node/contrib-state/verified/sessions \
+  --joins-dir /var/lib/omni-node/contrib-state/verified/sessions \
+  --net-identity-file ./omni-net.key
+
+# 3. run-assignment resolves the downstream peer from the cache.
+omni-node operator contributor run-assignment \
+  --assignment-snip-root 0x... \
+  --execution-session-snip-root 0x... \
+  --downstream-to-assignment-snip-root 0x... \
+  --peer-advert-dir /var/lib/omni-node/contrib-state/verified/sessions \
+  --joins-dir /var/lib/omni-node/contrib-state/verified/sessions \
+  --resolve-downstream-peer-from-session \
+  --contributor-seed ./contrib.seed \
+  --runner external --external-command /usr/local/bin/my-stage-runner
+```
+
+**Freshness:** advertisements are ≤ 24h by schema validation. PeerIds regenerate on every `omni-net` restart UNLESS you supply `--net-identity-file` (Stage 12.6). Without persistent identity, expect to re-run `advertise-peer` after every restart.
+
+**Routing cache resolution outcomes:**
+
+- `Found(ResolvedPeerRoute { ... })` — happy path
+- `NoAdvertisement` — nothing cached for this `(session_id, contributor_pubkey)` key
+- `AllExpired { newest_expires_at }` — advertisement exists but past expiry
+- `LiveHandoffNotSupported` — advertisement's `supports_live_handoff` is false
+- `DtypeNotSupported { requested, supported }` — your `--downstream-resolve-dtype` isn't in the advertised list
+
+**Trust boundary:** `watch-peer-adverts` and `run-assignment` BOTH re-verify joins from the `--joins-dir` (running `verify_execution_session` on the sibling `session.json` followed by `verify_contributor_join`). A forged local join file cannot make a forged peer advert pass the matching-join gate.
+
+**Precedence:** `--downstream-to-peer` still works and TAKES PRECEDENCE if both flags are supplied. Use this for one-off overrides.
+
+**No protocol surface touched.** No registry, no marketplace. Two parallel sessions for the same `posted_id` cache their own advertisements independently. Reputation / scoring is out of scope.
+
+For envelope schema + the advertisement processor pipeline, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.5.
+
+### Stage 12.6 — persistent libp2p mesh identity
+
+**Use when:** running a contributor across restarts and you want peer advertisements to survive the freshness window. Stage 12.6 adds `--net-identity-file <path>` to every contributor subcommand that opens `OmniNet`.
+
+**Commands:** none new — `--net-identity-file <path>` is a flag on every contributor subcommand that opens `OmniNet` (every announce-*, watch-*, open-session, join-session, assign-work, run-assignment, aggregate-session, send-handoff, advertise-peer, watch-peer-adverts).
+
+**Workflow:**
+
+```sh
+# First run creates ./omni-net.key at 0600 with a fresh libp2p keypair.
+omni-node operator contributor advertise-peer \
+  --net-identity-file ./omni-net.key \
+  --execution-session-snip-root 0x... \
+  --join-snip-root 0x... \
+  --contributor-seed ./contributor.seed \
+  --max-handoff-chunk-bytes 33554432 \
+  --supported-dtype f16 \
+  --expires-in-secs 3600 \
+  --publish-announcement
+
+# Restart omni-node; re-run with the SAME --net-identity-file → same PeerId.
+# Previously-published peer advertisements remain valid until expires_at_utc.
+```
+
+**Failure posture (intentional):**
+
+| Condition | Behavior |
+| --- | --- |
+| Missing file | Auto-create at `0o600` (Unix) on first use. No separate `init-net-identity` command. |
+| Existing file with malformed bytes | Typed `IdentityError::Decode`. Loader does NOT silently fall back or overwrite. |
+| Existing file with world/group-readable perms (Unix) | Typed `IdentityError::PermissionsTooBroad { mode }`. File is NOT modified. |
+| Non-regular file (directory, symlink loop) | Typed `IdentityError::NotARegularFile`. |
+
+**Role separation:** the libp2p mesh transport identity is NOT the contributor signing identity. `--contributor-seed` / `--coordinator-seed` / `--dispatcher-seed` stay on their own files; `--net-identity-file` is a separate role. Don't reuse a contributor seed as a `--net-identity-file`.
+
+**Rotation:** delete the identity file and re-run with the same path. A fresh keypair is auto-created; the next `advertise-peer` publishes a new advertisement with the new PeerId.
+
+**Advertisements stay short-lived.** Stage 12.6 stabilizes the PeerId across restart but does NOT make advertisements permanent. The ≤ 24h schema cap stays. Operators wanting continuous routing across the freshness boundary re-run `advertise-peer` manually before expiry. Auto-refresh is intentionally deferred.
+
+For the failure-mode error taxonomy + multi-binary identity-file precedent, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.6.
+
+### Stage 12.7 — local contributor workflow state persistence
+
+**Use when:** running ANY long-running contributor command and you want restart-resumable dedup + verified-bodies cache. Stage 12.7 adds `--contributor-state-dir <path>` to every restart-sensitive subcommand, backed by a versioned, atomic-write JSON tree.
+
+**Commands:** none new — `--contributor-state-dir <path>` is a flag on `watch-jobs`, `watch-network-jobs`, `watch-network-results`, `watch-sessions`, `watch-peer-adverts`, `run-assignment` (when `--resolve-downstream-peer-from-session` is set).
+
+**Layout:**
+
+```text
+<state-dir>/
+  meta/state_version.json
+  seen/posted-jobs/<posted_id>                            # dedup markers (0-byte)
+  seen/network-job-announcements/<posted_id>
+  seen/sessions/<session_id>
+  seen/joins/<session_id>--<contributor_pubkey>
+  seen/assignments/<session_id>--<assignment_id>
+  seen/partials/<session_id>--<assignment_id>
+  seen/aggregates/<session_id>
+  seen/peer-adverts/<session_id>--<contributor_pubkey>
+  verified/sessions/<session_id>/session.json             # full verified bodies
+  verified/sessions/<session_id>/joins/<pubkey>.json
+  verified/sessions/<session_id>/assignments/<id>.json
+  verified/sessions/<session_id>/partials/<id>.json
+  verified/sessions/<session_id>/aggregated.json
+  verified/sessions/<session_id>/peer-adverts/<pubkey>.json
+  results/contributor-results/<job_id>.json
+  results/contributor-results/<job_id>.rejected.json
+  results/result-links/<posted_id>.link.json
+```
+
+**Workflow (canonical single-state-dir setup):**
+
+```sh
+# One state directory drives every restart-resumable command.
+omni-node operator contributor watch-sessions \
+  --net-identity-file ./omni-net.key \
+  --contributor-state-dir ./contrib-state \
+  --out-dir ./contrib-state/verified/sessions \
+  --listen-port 4001 --peer /ip4/.../
+
+omni-node operator contributor watch-peer-adverts \
+  --net-identity-file ./omni-net.key \
+  --contributor-state-dir ./contrib-state \
+  --out-dir ./contrib-state/verified/sessions \
+  --joins-dir ./contrib-state/verified/sessions
+
+omni-node operator contributor run-assignment \
+  --net-identity-file ./omni-net.key \
+  --contributor-state-dir ./contrib-state \
+  --resolve-downstream-peer-from-session \
+  ...
+```
+
+`--out-dir` points INTO the state-dir's `verified/sessions` subtree on purpose — a single directory serves both the operator-facing "I want to inspect verified envelopes" use case and the state-store's restart-resume use case.
+
+**Auto-prune:** `ContributorStateStore::open` auto-prunes by default — any verified session whose `expires_at_utc` has passed is removed (with cascade through joins/assignments/partials/aggregate/peer-adverts + every matching `seen/` marker). Pass `--no-prune-state-on-start` to disable for forensic re-runs.
+
+**Conflict policy (run-assignment):** when `--resolve-downstream-peer-from-session` is set, supplying `--contributor-state-dir` together with the legacy `--peer-advert-dir` or `--joins-dir` flags refuses with `StateError::AmbiguousSource { legacy_flag }`. The point of the state-dir is to BE the single source of truth.
+
+**Versioning + atomic writes:** `meta/state_version.json` carries the current `STATE_VERSION` (`2` as of Stage 12.16's lift). Restore (Stage 12.15) and diff (Stage 12.19) enforce strict equality against the binary's `STATE_VERSION` — an archive or report produced by a different state-version refuses cleanly with a typed error. Every write goes through tempfile-in-same-directory + `fs::rename`, so a torn write never appears at the final path. `mark_seen` is idempotent.
+
+**Safety properties:**
+
+- No private key material in the state-dir. Contributor seed and libp2p identity stay on their own files.
+- Schema-versioned, not chain-anchored. The state-dir is a local cache; nothing trusts it as evidence. Verification of restored bodies still re-runs the Stage 12.3 / 12.4 / 12.5 verifiers.
+- Inspectable. Everything is pretty-printed JSON; `cat` and `jq` freely.
+- Concurrent-safe (single-host). Don't run two `omni-node` processes against the same state-dir.
+
+**Gradual migration from pre-12.7 layouts:** the `verified/sessions/<id>/...` subtree under the state-dir is the same per-session shape as the pre-12.7 `--out-dir <X>` tree. Pointing `--contributor-state-dir <X>` at an existing flat `<X>/<id>/...` tree does NOT migrate it. Either (a) start fresh with a new path and let the new envelopes populate naturally, or (b) `mv <X>/<id> <X>/verified/sessions/<id>` for each per-session subdirectory in place.
+
+For the loader pipeline + Stage 12.7-on-Stage-12.8/12.9 trust-boundary defense in depth, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.7.
+
+### Stage 12.8 — local pooled-session assignment planner
+
+**Use when:** running a pooled-memory session and you want the assignment shape generated from the state-dir's verified joins + peer adverts instead of hand-edited spec files.
+
+**Commands:** `plan-session-assignments`, `assign-session-plan`.
+
+**Workflow:**
+
+```sh
+# 1. Open the session (12.3) + receive joins + accept peer adverts (12.5).
+omni-node operator contributor open-session ...
+omni-node operator contributor watch-sessions \
+  --net-identity-file ./omni-net.key \
+  --contributor-state-dir ./contrib-state \
+  --out-dir ./contrib-state/verified/sessions ...
+
+# 2. Plan the assignments locally (no network, no SNIP).
+omni-node operator contributor plan-session-assignments \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64> \
+  --strategy sequential-layers \
+  --layer-count 32 \
+  --out ./plan.json
+
+# 3. Review ./plan.json. Optionally dry-run (locally signs + schema-validates each entry).
+omni-node operator contributor assign-session-plan \
+  --plan ./plan.json \
+  --session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --dry-run
+
+# 4. Publish each assignment (signed + SNIP-published + mesh-broadcast).
+omni-node operator contributor assign-session-plan \
+  --plan ./plan.json \
+  --session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --contributor-state-dir ./contrib-state \
+  --net-identity-file ./omni-net.key
+```
+
+**Strategies (closed enum, v1):**
+
+- `single-contributor` — one contributor handles the entire work envelope.
+- `sequential-layers` (default) — equal layer split, remainder absorbed by the last stage. With `--model-plan <path>`: one stage per model-plan entry, round-robin across the sorted eligible set.
+- `round-robin` — `stage_index N → eligible[N mod eligible.len()]`. Without `--model-plan`, requires `--layer-count N` and emits N single-layer stages cycling through the eligible set.
+
+**Eligibility filter (pass/fail, NOT ranking):**
+
+- `--min-available-ram-bytes <u64>` — floor (default 0). Two contributors that both clear the floor are interchangeable to the planner.
+- `--require-live-routing` — require a non-expired peer advertisement for `(session_id, contributor_pubkey_hex)` with `supports_live_handoff == true` AND advertised dtype containing `--required-dtype`.
+
+**Determinism:** after eligibility filtering, contributors are sorted by `contributor_pubkey_hex` (lexicographic ASCII on the lowercase hex). Re-running with the same inputs (and the same `now_utc` if any advert sits on the eligibility boundary) yields byte-identical output including `plan_hash`.
+
+**Why no RAM-weighting:** a planner that ranks contributors by RAM is a scheduler; a planner that signs winner declarations is a marketplace. Both are deliberately outside Stage 12.8's posture.
+
+**`--max-assignments` semantics:** never silently truncating. Refuses with `PlannerError::MaxAssignmentsTooSmall` if the cap would leave the work envelope incomplete.
+
+**Trust boundary:** the planner re-runs `verify_execution_session`, `verify_contributor_join`, and `verify_peer_advertisement_body` on every artifact loaded from the state-dir before feeding it to the strategy. `assign-session-plan` re-fetches and re-verifies the session from SNIP at publish time, then re-derives every signature. The on-disk plan is a SUGGESTION, not a trust anchor — `assign-session-plan` recomputes `plan_hash` on read and refuses on drift.
+
+**Session expiry:** both subcommands refuse to operate when `now_utc >= session.expires_at_utc`. `--no-prune-state-on-start` cannot reach a signed `WorkAssignment` against a stale session.
+
+**No protocol surface touched.** `AssignmentPlan` is unsigned, local-only. Stage 12.3 `assign-work` still works for hand-edited spec files; Stage 12.8 is the planner ergonomics layer on top.
+
+For the strategies' work-envelope coverage rules + the model-plan shape, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.8.
+
+### Stage 12.9 — local pooled-session progress monitor
+
+**Use when:** inspecting whether a pooled session is complete, stuck, expired, or has tampered artifacts. Read-only — never signed, never SNIP-published, never network-visible.
+
+**Commands:** `session-status`.
+
+**Workflow:**
+
+```sh
+# Events output (default) — grep-friendly bare-stdout key=value lines.
+omni-node operator contributor session-status \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64>
+
+# JSON for a dashboard scraper (single document on stdout, chatter to stderr).
+omni-node operator contributor session-status \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64> \
+  --format json \
+  --json-out ./status.json
+
+# In a CI gate (exit nonzero unless CompletePartials or Aggregated).
+omni-node operator contributor session-status \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64> \
+  --fail-on-incomplete
+```
+
+**`SessionOverallStatus` decision tree (first match wins):**
+
+1. `NoSession` — no `session.json` for the requested id.
+2. `InvalidState` — any chain-link body failed individual re-verification, OR `verify_aggregated_result` rejected an aggregate that exists.
+3. `Aggregated` — `aggregate_present && aggregate_valid`.
+4. `ExpiredIncomplete` — `now_utc >= session.expires_at_utc` AND not aggregated.
+5. `NoAssignments` — session valid, zero valid assignments.
+6. `CompletePartials` — every valid assignment has exactly one valid partial; no aggregate yet.
+7. `InProgress` — otherwise.
+
+**`--fail-on-incomplete` exit codes:**
+
+| `overall_status` | Exit code |
+| --- | --- |
+| `Aggregated` / `CompletePartials` | 0 |
+| Everything else | 1 |
+
+Without `--fail-on-incomplete`, every status exits 0 so dashboard scrapers can run unconditionally.
+
+**Counts policy:** counts are **valid-only**. Tampered artifacts surface as `notes` + `InvalidState` overall, not as inflated counts.
+
+**Trust boundary:** state-dir loaders are parse-only (Stage 12.7 review). `session-status` re-runs `verify_execution_session`, `verify_contributor_join`, `verify_work_assignment`, `verify_partial_result`, `verify_peer_advertisement_body`, and `verify_aggregated_result` before counting anything. A failed `verify_execution_session` is **fail-closed** — returns a minimal `InvalidState` report carrying no session-derived fields, with a single `notes` entry naming the verifier so operators can find the bad file.
+
+**Audit ergonomics (Stage 12.13 lift):** the events output includes an `event=audit_health session_id=... coherence=<state> recommended_action="..."` summary line. The closed-set coherence values (`coherent`, `orphan_replacement_assignments`, `partial_apply_supersession`, `reassign_triagable`, `invalid_state`, etc.) and the recommended-action strings are stable and grep-friendly.
+
+**No protocol surface touched.** `SessionStatusReport` is unsigned, local-only. Two operators on different machines will see different reports for the same session, and that's correct — each describes its local state-dir.
+
+For the per-`overall_status` recommended-action strings + the Stage 12.13 audit-health closed set, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.9 + Stage 12.13.
+
+### Stage 12.10 — local pooled-session repair planner
+
+**Use when:** `session-status` reports `InProgress` with N missing partials and you want to nudge contributors via a re-broadcast (without changing the assignment IDs or coordinator signatures).
+
+**Commands:** `plan-session-repair`, `apply-session-repair`.
+
+**Workflow:**
+
+```sh
+# 1. Inspect.
+omni-node operator contributor session-status \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64>
+# → InProgress, 2 missing partials.
+
+# 2. Plan the repair (no network, no SNIP).
+omni-node operator contributor plan-session-repair \
+  --contributor-state-dir ./contrib-state \
+  --session-id <hex64> \
+  --build-status \
+  --out ./repair-plan.json
+
+# 3. Review ./repair-plan.json. Optionally dry-run.
+omni-node operator contributor apply-session-repair \
+  --repair-plan ./repair-plan.json \
+  --session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --contributor-state-dir ./contrib-state \
+  --dry-run
+
+# 4. Apply.
+omni-node operator contributor apply-session-repair \
+  --repair-plan ./repair-plan.json \
+  --session-snip-root 0x... \
+  --coordinator-seed ./coord.seed \
+  --contributor-state-dir ./contrib-state \
+  --net-identity-file ./omni-net.key
+```
+
+**Strategy (v1, closed enum):** `reannounce-missing`. The applier re-publishes the on-disk assignment JSON bytes VERBATIM. SNIP is content-addressed → returned root equals the original publish's root. The `assignment_id`, the coordinator signature, and the SNIP root are all preserved across re-announce. Only the network announcement is fresh.
+
+**`--build-status` xor `--status-report <path>`:** clap-enforced mutual exclusion. `--build-status` reads the state-dir directly; `--status-report` lets you re-use a saved `SessionStatusReport`.
+
+**Refused status branches** (`plan-session-repair`):
+
+| Status | Error |
+| --- | --- |
+| `NoSession` | `RepairError::SessionNotPresent` |
+| `NoAssignments` / `CompletePartials` / `Aggregated` | `RepairError::NothingToRepair` |
+| `InvalidState` | `RepairError::InvalidState` (clean tampered artifacts first; no `--allow-invalid-state` flag) |
+| `ExpiredIncomplete` | `RepairError::SessionExpired` (extend the session via `open-session` first if you mean it) |
+
+Only `InProgress` produces a non-empty plan.
+
+**Trust boundary at apply time:** the applier (a) recomputes `repair_plan_hash` and refuses on drift, (b) recomputes `source_status_hash` from the CURRENT state-dir and refuses on drift (a partial may have arrived between plan and apply), (c) re-runs the eligibility check on the current status, (d) re-fetches and re-verifies the session via `--session-snip-root`, (e) re-verifies each referenced assignment from the state-dir before any SNIP write. The on-disk plan is a SUGGESTION.
+
+**`--no-publish-announcements` is SNIP-only:** when set, the applier skips the entire omni-net layer (no mesh open, no peer wait, no propagation sleep, no shutdown). Useful for triage on a machine with no peers.
+
+**Halt-finding context:** v1 deliberately ships ONLY `reannounce-missing`. `ReassignMissing` would require a supersession envelope; that landed in Stage 12.11 and is exercised through `plan-session-reassign` / `apply-session-reassign` (see the next section).
+
+**Byte preservation on reannounce:** the aggregate verifier sees exactly one assignment per id — the same one it would have seen if the contributor had never lost the original announcement.
+
+**No protocol surface touched.** `SessionRepairPlan` is unsigned, local-only. No new gossipsub topic. No state-dir mutation on apply.
+
+For the `source_status_hash` projection rules + the `--no-prune-state-on-start` interaction with apply-time eligibility checks, see [`stage12-contributor-protocol.md`](./stage12-contributor-protocol.md) Stage 12.10.
 
 ### When to use which `--reason`
 
