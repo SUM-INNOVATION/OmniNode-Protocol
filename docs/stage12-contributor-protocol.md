@@ -3627,3 +3627,9 @@ The verifier's JSON renderer emits a **compact metadata view** — wrapper-level
 | **Closed-set `reason=<tag>` mapping**: every `SignedIntegrityEvidenceChainReportError` variant maps to one of the approved closed tags. Pins the contract both signer and verifier emit on `..._sign_failed` / `..._verify_failed`. | `signed_chain_report_reason_tag_covers_closed_set` (omni-node) |
 
 **Residual gap (deliberate):** the CLI run-fns `run_sign_integrity_evidence_chain_report` and `run_verify_integrity_evidence_chain_report_signature` aren't exercised end-to-end (same constraint as Stage 12.10–12.24); the library functions are exhaustively covered and the CLI is a thin dispatch + renderer layer on top.
+
+## Forward link — Stage 13.0 chain anchoring
+
+Stage 13.0 takes a Stage 12.25 `SignedIntegrityEvidenceChainReport` (the terminal artifact of the six-stage forensic chain above) and anchors a commitment to SUM Chain. The anchor commits to `(blake3(raw_wrapper_bytes), signer_pubkey, signed_at_utc)` — the full wrapper JSON stays local. Stage 13.0 freezes the on-chain wire spec and ships a stub chain client; Stage 13.1 (deferred) replaces the stub with the real SUM Chain submission path.
+
+**Stage 13.0 is additive only — no Stage 12.0-12.25 schema constant changes, no new Stage 12 surface.** The chain-anchor surface lives in `omni-zkml::evidence_anchor` with its own dedicated `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant; see [`docs/stage13-evidence-anchor-spec.md`](stage13-evidence-anchor-spec.md) for the wire contract and [`docs/operator-runbook.md`](operator-runbook.md) §Stage 13.0 for the operator workflow.

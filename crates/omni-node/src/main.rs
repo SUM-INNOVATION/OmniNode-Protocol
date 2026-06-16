@@ -27,6 +27,7 @@ use omni_store::{OmniStore, FetchOutcome, decode_announcement};
 use omni_types::config::{NetConfig, StoreConfig};
 
 mod contributor_cli;
+mod evidence_anchor_cli;
 mod operator;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
