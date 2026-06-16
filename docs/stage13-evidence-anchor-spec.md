@@ -1,13 +1,15 @@
 # Stage 13.0 — Chain Anchoring for Integrity Evidence (Wire Spec)
 
-**Status:** Stage 13.0 frozen — spec + stub implementation. Chain-team review precedes Stage 13.1's real SUM Chain submission path. No real RPC submission in Stage 13.0; the local stub client persists records to `--anchor-registry-dir` and emits deterministic stub `tx_id`s.
+**Status:** Stage 13.0 frozen — spec + stub implementation. The chain-team review packet that gates the real SUM Chain submission path lives at [`docs/stage13.1-chain-adapter-review.md`](stage13.1-chain-adapter-review.md); a follow-on adapter stage builds against the answers returned in that packet's decision form. No real RPC submission in Stage 13.0; the local stub client persists records to `--anchor-registry-dir` and emits deterministic stub `tx_id`s.
 
-**Scope of this document:** the on-chain wire payload, canonical signing bytes, schema constants, refusal taxonomy, and forward-compatibility constraints that Stage 13.1 must implement against.
+**Scope of this document:** the on-chain wire payload, canonical signing bytes, schema constants, refusal taxonomy, and forward-compatibility constraints that the future SUM Chain adapter must implement against.
 
 **Co-references:**
 - [`docs/operator-runbook.md`](operator-runbook.md) §Stage 13.0 — operator workflow.
 - [`docs/stage12-contributor-protocol.md`](stage12-contributor-protocol.md) §Forward link — what Stage 12 ships and what Stage 13 layers on top.
+- [`docs/stage13.1-chain-adapter-review.md`](stage13.1-chain-adapter-review.md) — chain-team review packet (Stage 13.1).
 - `crates/omni-zkml/src/evidence_anchor/` — reference implementation.
+- `crates/omni-zkml/tests/fixtures/evidence_anchor_wire_vectors.json` — three deterministic wire vectors the chain team rebuilds for byte-parity assertion.
 
 ## Goal
 
