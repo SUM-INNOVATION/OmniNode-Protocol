@@ -541,6 +541,17 @@ pub const SIGNED_INTEGRITY_DIFF_DOMAIN: &[u8] =
 pub const SIGNED_INTEGRITY_EVIDENCE_BUNDLE_DOMAIN: &[u8] =
     b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-EVIDENCE-BUNDLE:v1:";
 
+/// Stage 12.25 — domain separator for the local-only signed
+/// integrity-evidence-chain-report wrapper. Same posture as
+/// the Stage 12.20/12.21/12.23 sibling domains: consumed only
+/// by `signed_chain.rs`; no protocol surface, no gossipsub
+/// topic, no SNIP wire. Distinct from `SIGNED_BASELINE_DOMAIN`,
+/// `SIGNED_INTEGRITY_DIFF_DOMAIN`, and
+/// `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_DOMAIN` so the four
+/// signed-artifact families can't be cross-substituted.
+pub const SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_DOMAIN: &[u8] =
+    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-EVIDENCE-CHAIN-REPORT:v1:";
+
 // --- ExecutionSession ---
 
 #[derive(Debug, Serialize)]

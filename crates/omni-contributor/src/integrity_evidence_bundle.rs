@@ -1,10 +1,10 @@
 //! Stage 12.22 — local-only integrity evidence bundle manifest.
 //!
-//! Ties together a chosen set of Stage 12.16–12.21 audit
+//! Ties together a chosen set of Stage 12.16–12.21 forensic
 //! artifacts by `(artifact_kind, base-dir-relative path,
 //! byte_len, blake3_hex)` under a single `base_dir`, so an
-//! operator can hand a single tamper-evident pointer file to an
-//! auditor.
+//! operator can capture a single tamper-evident forensic record
+//! over a curated set of evidence artifacts.
 //!
 //! The bundle is a **byte manifest**. It does not embed the
 //! artifact bytes themselves — it only fingerprints them. There
@@ -190,7 +190,7 @@ pub struct IntegrityEvidenceBundle {
     pub generated_at_utc: String,
     pub omni_contributor_version: String,
     /// Operator-supplied bundle-level label, ≤
-    /// `BUNDLE_LABEL_MAX` UTF-8 bytes. Auditor-facing naming
+    /// `BUNDLE_LABEL_MAX` UTF-8 bytes. Operator-facing naming
     /// only; no semantic meaning to the verifier.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub label: Option<String>,

@@ -35,7 +35,7 @@
 //!   bundle-byte failures DON'T stop child verifies — a
 //!   `HashMismatch` on bytes + a separately-verifiable
 //!   signature on those bytes are independent forensic facts.
-//!   Auditors should see both.
+//!   Operators should see both.
 //! - **Omitted child anchor records `Skipped`.** When the
 //!   operator does not supply `expected_baseline_signer_pubkey_hex`
 //!   or `expected_diff_signer_pubkey_hex`, the corresponding
@@ -98,7 +98,7 @@ pub enum ChainStepOutcome {
     /// Operator did NOT supply the corresponding expected
     /// pubkey flag; the child signature check was deliberately
     /// skipped. **NOT a pass** — surfaces in the report so
-    /// auditors see exactly what wasn't verified.
+    /// operators see exactly what wasn't verified.
     Skipped,
     /// Step failed; `reason` is the closed-set tag from the
     /// underlying verifier's mapper, `detail` is the typed
@@ -145,7 +145,7 @@ pub struct IntegrityEvidenceChainReport {
     /// Verified Stage 12.23 wrapper's `signer_role` —
     /// surfaced into the chain report so the CLI's
     /// `..._signed_bundle_ok` event can carry signer
-    /// identity, and so auditors reading the JSON / pretty
+    /// identity, and so operators reading the JSON / pretty
     /// renderers see who signed the bundle without opening
     /// the wrapper file. v1 deliberately does NOT embed the
     /// full wrapper.
@@ -157,7 +157,7 @@ pub struct IntegrityEvidenceChainReport {
     /// without embedding the full wrapper.
     pub bundle_signer_pubkey_hex: String,
     /// Stage 12.22 bundle byte verification — embedded in full
-    /// so auditors get every per-entry outcome without
+    /// so operators get every per-entry outcome without
     /// re-running.
     pub bundle_byte_verify: BundleVerifyReport,
     /// Per-signed-child signature outcomes. Excludes entries

@@ -344,6 +344,27 @@ enum ContributorCmd {
     /// record `Skipped` outcomes — NOT silent passes. No chain
     /// / mesh / SNIP / envelope surface touched.
     VerifyIntegrityEvidenceChain(VerifyIntegrityEvidenceChainArgs),
+
+    /// Stage 12.25 — sign a v1 `IntegrityEvidenceChainReport`
+    /// JSON with a 32-byte Ed25519 seed and emit a
+    /// `SignedIntegrityEvidenceChainReport` JSON. Read-only on
+    /// the state-store side; writes only the operator-named
+    /// `--out` file. Attests to chain-report bytes only — does
+    /// NOT re-run any Stage 12.24 gates.
+    SignIntegrityEvidenceChainReport(SignIntegrityEvidenceChainReportArgs),
+
+    /// Stage 12.25 — verify a
+    /// `SignedIntegrityEvidenceChainReport` JSON against an
+    /// operator-supplied trust anchor
+    /// (`--expected-signer-pubkey-hex`). Read-only and
+    /// state-store-free: no contributor state-dir is opened
+    /// and `--no-prune-state-on-start` is deliberately absent.
+    /// Attests to chain-report JSON bytes only — does NOT
+    /// re-run any Stage 12.24 gates. No chain / mesh / SNIP /
+    /// envelope surface touched.
+    VerifyIntegrityEvidenceChainReportSignature(
+        VerifyIntegrityEvidenceChainReportSignatureArgs,
+    ),
 }
 
 // ── validate-job ──────────────────────────────────────────────────────────
@@ -2867,7 +2888,7 @@ struct BuildIntegrityEvidenceBundleArgs {
     out: PathBuf,
 
     /// Optional bundle-level label, capped at 128 UTF-8 bytes.
-    /// Auditor-facing naming only; no semantic meaning to the
+    /// Operator-facing naming only; no semantic meaning to the
     /// verifier.
     #[arg(long)]
     label: Option<String>,
@@ -2989,7 +3010,7 @@ enum VerifyIntegrityEvidenceBundleSignatureFormat {
     /// Print the verified wrapper's metadata as pretty JSON on
     /// stdout. Operational chatter goes to stderr so `jq`
     /// works. Compact metadata view — does NOT re-print the
-    /// embedded bundle's entries (auditors who want them
+    /// embedded bundle's entries (operators who want them
     /// already have the wrapper on disk).
     Json,
     /// Compact terminal-friendly summary.
@@ -3084,6 +3105,102 @@ struct VerifyIntegrityEvidenceChainArgs {
     format: VerifyIntegrityEvidenceChainFormat,
 }
 
+// ── Stage 12.25 — sign-integrity-evidence-chain-report ───────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum SignIntegrityEvidenceChainReportFormat {
+    /// One `event=signed_integrity_evidence_chain_report_written ...`
+    /// line on success.
+    Events,
+    /// Print the signed wrapper as pretty JSON on stdout.
+    /// Operational chatter goes to stderr so `jq` works.
+    Json,
+    /// Compact terminal-friendly summary.
+    Pretty,
+}
+
+#[derive(Args)]
+struct SignIntegrityEvidenceChainReportArgs {
+    /// Path to the raw v1 `IntegrityEvidenceChainReport` JSON
+    /// to sign. Typically the output of a prior
+    /// `verify-integrity-evidence-chain --json-out`.
+    #[arg(long)]
+    chain_report_in: PathBuf,
+
+    /// 32-byte raw Ed25519 seed file. Operators MUST keep this
+    /// distinct from any chain-attestation or protocol-role
+    /// seed — the integrity-artifact signing role is its own
+    /// key per Stage 12.20.
+    #[arg(long)]
+    signer_seed: PathBuf,
+
+    /// Role tag recorded in the wrapper for forensics. Closed
+    /// set: `operator` / `contributor` / `dispatcher` /
+    /// `coordinator`. Reuses the Stage 12.20
+    /// `BaselineSignerRole` enum per the Stage 12.21/12.23/12.25
+    /// precedent — the four variants are role names, not
+    /// artifact-type names.
+    #[arg(long, value_enum)]
+    signer_role: CliBaselineSignerRole,
+
+    /// Destination for the signed wrapper JSON. Atomic
+    /// tempfile + rename (same posture as Stage 12.17 / 12.20 /
+    /// 12.21 / 12.23).
+    #[arg(long)]
+    out: PathBuf,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SignIntegrityEvidenceChainReportFormat::Events
+    )]
+    format: SignIntegrityEvidenceChainReportFormat,
+}
+
+// ── Stage 12.25 — verify-integrity-evidence-chain-report-signature ───────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum VerifyIntegrityEvidenceChainReportSignatureFormat {
+    /// One `event=signed_integrity_evidence_chain_report_verify_ok ...`
+    /// line on success. On failure, a non-zero exit + an
+    /// `event=signed_integrity_evidence_chain_report_verify_failed reason=...`
+    /// line. Default.
+    Events,
+    /// Print the verified wrapper's metadata as pretty JSON on
+    /// stdout. Operational chatter goes to stderr so `jq`
+    /// works. Compact metadata view — does NOT re-print the
+    /// embedded chain report's per-entry or per-child lists
+    /// (operators who want them already have the wrapper on
+    /// disk).
+    Json,
+    /// Compact terminal-friendly summary.
+    Pretty,
+}
+
+#[derive(Args)]
+struct VerifyIntegrityEvidenceChainReportSignatureArgs {
+    /// Path to a `SignedIntegrityEvidenceChainReport` JSON
+    /// wrapper to verify.
+    #[arg(long)]
+    signed_chain_report: PathBuf,
+
+    /// Operator-supplied trust anchor: 64-char lowercase-hex
+    /// Ed25519 public key the wrapper MUST be signed by.
+    /// Verification refuses with a `signer_pubkey_mismatch`
+    /// pre-check before any crypto burn.
+    #[arg(long)]
+    expected_signer_pubkey_hex: String,
+
+    /// Output format. Default `events`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = VerifyIntegrityEvidenceChainReportSignatureFormat::Events
+    )]
+    format: VerifyIntegrityEvidenceChainReportSignatureFormat,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub async fn dispatch(args: ContributorArgs) -> Result<()> {
@@ -3146,6 +3263,12 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
         }
         ContributorCmd::VerifyIntegrityEvidenceChain(a) => {
             run_verify_integrity_evidence_chain(a)
+        }
+        ContributorCmd::SignIntegrityEvidenceChainReport(a) => {
+            run_sign_integrity_evidence_chain_report(a)
+        }
+        ContributorCmd::VerifyIntegrityEvidenceChainReportSignature(a) => {
+            run_verify_integrity_evidence_chain_report_signature(a)
         }
     }
 }
@@ -9646,6 +9769,357 @@ mod tests {
         // closed tag, not the inner shape.
     }
 
+    // ── Stage 12.25 — sign-integrity-evidence-chain-report clap regression ──
+
+    fn parse_sign_integrity_evidence_chain_report(
+        signer_role: &str,
+        extra: &[&str],
+    ) -> SignIntegrityEvidenceChainReportArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "sign-integrity-evidence-chain-report".into(),
+            "--chain-report-in".into(),
+            "/tmp/chain-report.json".into(),
+            "--signer-seed".into(),
+            "/tmp/seed.bin".into(),
+            "--signer-role".into(),
+            signer_role.into(),
+            "--out".into(),
+            "/tmp/signed-chain.json".into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::SignIntegrityEvidenceChainReport(a) => a,
+            _ => panic!("expected SignIntegrityEvidenceChainReport"),
+        }
+    }
+
+    #[test]
+    fn sign_integrity_evidence_chain_report_flag_parse_smoke() {
+        let defaults =
+            parse_sign_integrity_evidence_chain_report("operator", &[]);
+        assert_eq!(
+            defaults.chain_report_in,
+            std::path::PathBuf::from("/tmp/chain-report.json")
+        );
+        assert_eq!(defaults.signer_seed, std::path::PathBuf::from("/tmp/seed.bin"));
+        assert_eq!(defaults.signer_role, CliBaselineSignerRole::Operator);
+        assert_eq!(
+            defaults.out,
+            std::path::PathBuf::from("/tmp/signed-chain.json")
+        );
+        assert_eq!(
+            defaults.format,
+            SignIntegrityEvidenceChainReportFormat::Events
+        );
+
+        // All four roles parse via the reused Stage 12.20 enum.
+        for (raw, expected) in &[
+            ("operator", CliBaselineSignerRole::Operator),
+            ("contributor", CliBaselineSignerRole::Contributor),
+            ("dispatcher", CliBaselineSignerRole::Dispatcher),
+            ("coordinator", CliBaselineSignerRole::Coordinator),
+        ] {
+            let got = parse_sign_integrity_evidence_chain_report(raw, &[]);
+            assert_eq!(got.signer_role, *expected, "role={raw} parsed wrong");
+        }
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            ("events", SignIntegrityEvidenceChainReportFormat::Events),
+            ("json", SignIntegrityEvidenceChainReportFormat::Json),
+            ("pretty", SignIntegrityEvidenceChainReportFormat::Pretty),
+        ] {
+            let got = parse_sign_integrity_evidence_chain_report(
+                "operator",
+                &["--format", raw],
+            );
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --signer-role rejected.
+        let bad_role = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-integrity-evidence-chain-report",
+            "--chain-report-in",
+            "/tmp/chain-report.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "rogue_role",
+            "--out",
+            "/tmp/signed-chain.json",
+        ]);
+        assert!(
+            bad_role.is_err(),
+            "clap must reject unknown --signer-role for sign-integrity-evidence-chain-report"
+        );
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-integrity-evidence-chain-report",
+            "--chain-report-in",
+            "/tmp/chain-report.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "operator",
+            "--out",
+            "/tmp/signed-chain.json",
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format for sign-integrity-evidence-chain-report"
+        );
+
+        // Required-flag refusals.
+        for missing in &[
+            "--chain-report-in",
+            "--signer-seed",
+            "--signer-role",
+            "--out",
+        ] {
+            let stripped = strip_sign_chain_report_flag_with_value(missing);
+            let parsed = TestRoot::try_parse_from(stripped);
+            assert!(
+                parsed.is_err(),
+                "clap must reject sign-integrity-evidence-chain-report without {missing}"
+            );
+        }
+
+        // Auto-prune flag deliberately absent — pinned by clap
+        // regression so a future operator can't reintroduce
+        // state-store coupling.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "sign-integrity-evidence-chain-report",
+            "--chain-report-in",
+            "/tmp/chain-report.json",
+            "--signer-seed",
+            "/tmp/seed.bin",
+            "--signer-role",
+            "operator",
+            "--out",
+            "/tmp/signed-chain.json",
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "sign-integrity-evidence-chain-report must not accept --no-prune-state-on-start"
+        );
+    }
+
+    /// Build an argv for `sign-integrity-evidence-chain-report`
+    /// with one (flag, value) pair stripped — drives the
+    /// missing-flag refusal sweep above.
+    fn strip_sign_chain_report_flag_with_value(drop_flag: &str) -> Vec<String> {
+        let full: Vec<(&str, Option<&str>)> = vec![
+            ("--chain-report-in", Some("/tmp/chain-report.json")),
+            ("--signer-seed", Some("/tmp/seed.bin")),
+            ("--signer-role", Some("operator")),
+            ("--out", Some("/tmp/signed-chain.json")),
+        ];
+        let mut out: Vec<String> = vec![
+            "omni-node".to_string(),
+            "sign-integrity-evidence-chain-report".to_string(),
+        ];
+        for (flag, val) in full {
+            if flag == drop_flag {
+                continue;
+            }
+            out.push(flag.to_string());
+            if let Some(v) = val {
+                out.push(v.to_string());
+            }
+        }
+        out
+    }
+
+    // ── Stage 12.25 — verify-integrity-evidence-chain-report-signature clap regression ──
+
+    fn parse_verify_integrity_evidence_chain_report_signature(
+        pubkey: &str,
+        extra: &[&str],
+    ) -> VerifyIntegrityEvidenceChainReportSignatureArgs {
+        let mut argv: Vec<String> = vec![
+            "omni-node".into(),
+            "verify-integrity-evidence-chain-report-signature".into(),
+            "--signed-chain-report".into(),
+            "/tmp/signed-chain.json".into(),
+            "--expected-signer-pubkey-hex".into(),
+            pubkey.into(),
+        ];
+        for s in extra {
+            argv.push((*s).to_string());
+        }
+        let root = TestRoot::try_parse_from(&argv).expect("parse");
+        match root.contributor.cmd {
+            ContributorCmd::VerifyIntegrityEvidenceChainReportSignature(a) => a,
+            _ => panic!(
+                "expected VerifyIntegrityEvidenceChainReportSignature"
+            ),
+        }
+    }
+
+    #[test]
+    fn verify_integrity_evidence_chain_report_signature_flag_parse_smoke() {
+        let pubkey = "ab".repeat(32);
+        let defaults =
+            parse_verify_integrity_evidence_chain_report_signature(&pubkey, &[]);
+        assert_eq!(
+            defaults.signed_chain_report,
+            std::path::PathBuf::from("/tmp/signed-chain.json")
+        );
+        assert_eq!(defaults.expected_signer_pubkey_hex, pubkey);
+        assert_eq!(
+            defaults.format,
+            VerifyIntegrityEvidenceChainReportSignatureFormat::Events
+        );
+
+        // --format closed enum.
+        for (raw, expected) in &[
+            (
+                "events",
+                VerifyIntegrityEvidenceChainReportSignatureFormat::Events,
+            ),
+            (
+                "json",
+                VerifyIntegrityEvidenceChainReportSignatureFormat::Json,
+            ),
+            (
+                "pretty",
+                VerifyIntegrityEvidenceChainReportSignatureFormat::Pretty,
+            ),
+        ] {
+            let got = parse_verify_integrity_evidence_chain_report_signature(
+                &pubkey,
+                &["--format", raw],
+            );
+            assert_eq!(got.format, *expected);
+        }
+
+        // Unknown --format rejected.
+        let bad_format = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-chain-report-signature",
+            "--signed-chain-report",
+            "/tmp/signed-chain.json",
+            "--expected-signer-pubkey-hex",
+            pubkey.as_str(),
+            "--format",
+            "yaml",
+        ]);
+        assert!(
+            bad_format.is_err(),
+            "clap must reject unknown --format for verify-integrity-evidence-chain-report-signature"
+        );
+
+        // Required-flag refusals.
+        let missing_signed = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-chain-report-signature",
+            "--expected-signer-pubkey-hex",
+            pubkey.as_str(),
+        ]);
+        assert!(
+            missing_signed.is_err(),
+            "clap must reject verify-integrity-evidence-chain-report-signature without --signed-chain-report"
+        );
+        let missing_pubkey = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-chain-report-signature",
+            "--signed-chain-report",
+            "/tmp/signed-chain.json",
+        ]);
+        assert!(
+            missing_pubkey.is_err(),
+            "clap must reject verify-integrity-evidence-chain-report-signature without --expected-signer-pubkey-hex"
+        );
+
+        // Auto-prune flag deliberately absent.
+        let no_such_flag = TestRoot::try_parse_from([
+            "omni-node",
+            "verify-integrity-evidence-chain-report-signature",
+            "--signed-chain-report",
+            "/tmp/signed-chain.json",
+            "--expected-signer-pubkey-hex",
+            pubkey.as_str(),
+            "--no-prune-state-on-start",
+        ]);
+        assert!(
+            no_such_flag.is_err(),
+            "verify-integrity-evidence-chain-report-signature must not accept --no-prune-state-on-start"
+        );
+    }
+
+    /// Pins the closed `reason=<tag>` set on
+    /// `event=signed_integrity_evidence_chain_report_{sign,verify}_failed`.
+    /// Mirrors the Stage 12.23
+    /// `signed_bundle_reason_tag_covers_closed_set` precedent
+    /// so a future variant on
+    /// `SignedIntegrityEvidenceChainReportError` without a
+    /// mapping breaks the closed-set contract loudly.
+    #[test]
+    fn signed_chain_report_reason_tag_covers_closed_set() {
+        use omni_contributor::SignedIntegrityEvidenceChainReportError as E;
+        use std::io::{Error as IoError, ErrorKind};
+        use std::path::PathBuf;
+
+        assert_eq!(
+            super::signed_chain_report_reason_tag(&E::UnsupportedSchemaVersion {
+                got: 2,
+                expected: 1
+            }),
+            "unsupported_schema_version"
+        );
+        assert_eq!(
+            super::signed_chain_report_reason_tag(
+                &E::UnsupportedChainReportSchemaVersion {
+                    got: 2,
+                    expected: 1
+                }
+            ),
+            "unsupported_chain_report_schema_version"
+        );
+        assert_eq!(
+            super::signed_chain_report_reason_tag(&E::SignerPubkeyMismatch {
+                expected: "aa".repeat(32),
+                got: "bb".repeat(32),
+            }),
+            "signer_pubkey_mismatch"
+        );
+        assert_eq!(
+            super::signed_chain_report_reason_tag(&E::SignatureMismatch),
+            "signature_mismatch"
+        );
+        assert_eq!(
+            super::signed_chain_report_reason_tag(&E::Io {
+                path: PathBuf::from("/tmp/x"),
+                source: IoError::from(ErrorKind::NotFound),
+            }),
+            "io"
+        );
+        let json_err = serde_json::from_str::<serde_json::Value>("{bad")
+            .expect_err("malformed json");
+        assert_eq!(
+            super::signed_chain_report_reason_tag(&E::MalformedJson {
+                path: PathBuf::from("/tmp/x"),
+                source: json_err,
+            }),
+            "malformed_json"
+        );
+        // Signing(...) and Canonical(...) tags — the inner
+        // error types are bubbled from other crates; the only
+        // requirement is the mapper picks the closed tag, not
+        // the inner error's shape.
+    }
+
     // ── Stage 12.17 — plan-state-cleanup / apply-state-cleanup ──
 
     fn parse_plan_state_cleanup(extra: &[&str]) -> PlanStateCleanupArgs {
@@ -13940,7 +14414,7 @@ fn render_verify_signed_bundle_json(
 ) -> Result<()> {
     use std::io::Write;
     // Compact metadata view per locked v1 scope: attest
-    // authenticity, don't mirror the embedded bundle (auditors
+    // authenticity, don't mirror the embedded bundle (operators
     // who want the full bundle already have it on disk inside
     // the wrapper).
     let metadata = serde_json::json!({
@@ -14347,5 +14821,376 @@ fn render_verify_chain_pretty(
     println!(
         "  all_required_ok      : {}",
         report.all_required_ok()
+    );
+}
+
+// ── Stage 12.25 — sign-integrity-evidence-chain-report ───────────────────
+
+fn run_sign_integrity_evidence_chain_report(
+    args: SignIntegrityEvidenceChainReportArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        sign_integrity_evidence_chain_report,
+        write_signed_integrity_evidence_chain_report_atomic, BaselineSignerRole,
+        ContributorSigner, IntegrityEvidenceChainReport,
+        SignedIntegrityEvidenceChainReport,
+    };
+
+    let now_utc =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let json_mode =
+        matches!(args.format, SignIntegrityEvidenceChainReportFormat::Json);
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    log_op("event=signed_integrity_evidence_chain_report_signing_started");
+
+    // Read the raw v1 chain report. FS error → reason=io;
+    // closed-tag mapping matches the Stage 12.23 pattern.
+    let chain_bytes = std::fs::read(&args.chain_report_in).map_err(|e| {
+        log_op(&format!(
+            "event=signed_integrity_evidence_chain_report_sign_failed reason=io detail={e}"
+        ));
+        anyhow!("read chain-report-in {}: {e}", args.chain_report_in.display())
+    })?;
+    let chain_report: IntegrityEvidenceChainReport =
+        serde_json::from_slice(&chain_bytes).map_err(|e| {
+            log_op(&format!(
+                "event=signed_integrity_evidence_chain_report_sign_failed reason=malformed_json detail={e}"
+            ));
+            anyhow!(
+                "parse chain-report-in {}: {e}",
+                args.chain_report_in.display()
+            )
+        })?;
+
+    // Load the signer. Seed-load failures tag as `signing`
+    // since signer setup is part of the signing primitive.
+    let signer = ContributorSigner::from_seed_file(&args.signer_seed)
+        .map_err(|e| {
+            log_op(&format!(
+                "event=signed_integrity_evidence_chain_report_sign_failed reason=signing detail={e}"
+            ));
+            anyhow!("load signer seed {}: {e}", args.signer_seed.display())
+        })?;
+    let signer_pubkey_hex = signer.pubkey_hex();
+    let role: BaselineSignerRole = args.signer_role.into();
+
+    let signed: SignedIntegrityEvidenceChainReport =
+        sign_integrity_evidence_chain_report(
+            chain_report,
+            &signer_pubkey_hex,
+            role,
+            &now_utc,
+            |msg| signer.sign(msg),
+        )
+        .map_err(|e| {
+            let reason = signed_chain_report_reason_tag(&e);
+            log_op(&format!(
+                "event=signed_integrity_evidence_chain_report_sign_failed reason={reason} detail={e}"
+            ));
+            anyhow!("sign chain report refused: {e}")
+        })?;
+
+    write_signed_integrity_evidence_chain_report_atomic(&signed, &args.out)
+        .map_err(|e| {
+            let reason = signed_chain_report_reason_tag(&e);
+            log_op(&format!(
+                "event=signed_integrity_evidence_chain_report_sign_failed reason={reason} detail={e}"
+            ));
+            anyhow!("write signed chain report: {e}")
+        })?;
+    log_op(&format!(
+        "event=signed_integrity_evidence_chain_report_written path={} signer_role={} signer_pubkey={}",
+        args.out.display(),
+        role.as_str(),
+        signer_pubkey_hex,
+    ));
+
+    match args.format {
+        SignIntegrityEvidenceChainReportFormat::Events => {
+            // Already emitted the summary line above.
+        }
+        SignIntegrityEvidenceChainReportFormat::Json => {
+            render_sign_chain_report_json(&signed)?;
+        }
+        SignIntegrityEvidenceChainReportFormat::Pretty => {
+            render_sign_chain_report_pretty(&signed, &args.out);
+        }
+    }
+    Ok(())
+}
+
+fn render_sign_chain_report_json(
+    signed: &omni_contributor::SignedIntegrityEvidenceChainReport,
+) -> Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(signed)
+        .map_err(|e| anyhow!("serialize signed chain report: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write signed chain report: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_sign_chain_report_pretty(
+    signed: &omni_contributor::SignedIntegrityEvidenceChainReport,
+    out: &std::path::Path,
+) {
+    println!("Signed integrity evidence chain report");
+    println!("  schema_version       : {}", signed.schema_version);
+    println!("  signed_at_utc        : {}", signed.signed_at_utc);
+    println!(
+        "  signer_role          : {}",
+        signed.signer_role.as_str()
+    );
+    println!("  signer_pubkey        : {}", signed.signer_pubkey_hex);
+    println!("  signature            : {}", signed.signature_hex);
+    println!(
+        "  chain_schema_version : {}",
+        signed.chain_report.schema_version
+    );
+    println!(
+        "  chain_generated_at   : {}",
+        signed.chain_report.generated_at_utc
+    );
+    println!(
+        "  signed_bundle_path   : {}",
+        signed.chain_report.signed_bundle_path
+    );
+    println!(
+        "  effective_base_dir   : {}",
+        signed.chain_report.effective_base_dir
+    );
+    println!(
+        "  bundle_signer_role   : {}",
+        signed.chain_report.bundle_signer_role.as_str()
+    );
+    println!(
+        "  bundle_signer_pubkey : {}",
+        signed.chain_report.bundle_signer_pubkey_hex
+    );
+    println!(
+        "  bundle_byte_counts   : ok={} size_mismatch={} hash_mismatch={} not_found={} read_error={}",
+        signed.chain_report.bundle_byte_verify.counts_ok,
+        signed.chain_report.bundle_byte_verify.counts_size_mismatch,
+        signed.chain_report.bundle_byte_verify.counts_hash_mismatch,
+        signed.chain_report.bundle_byte_verify.counts_not_found,
+        signed.chain_report.bundle_byte_verify.counts_read_error,
+    );
+    println!(
+        "  child_counts         : ok={} skipped={} failed={}",
+        signed.chain_report.counts_child_ok,
+        signed.chain_report.counts_child_skipped,
+        signed.chain_report.counts_child_failed,
+    );
+    println!("  out                  : {}", out.display());
+}
+
+// ── Stage 12.25 — verify-integrity-evidence-chain-report-signature ───────
+
+fn run_verify_integrity_evidence_chain_report_signature(
+    args: VerifyIntegrityEvidenceChainReportSignatureArgs,
+) -> Result<()> {
+    use omni_contributor::{
+        read_signed_integrity_evidence_chain_report_from_path,
+        verify_signed_integrity_evidence_chain_report,
+    };
+
+    let json_mode = matches!(
+        args.format,
+        VerifyIntegrityEvidenceChainReportSignatureFormat::Json
+    );
+    let log_op = |msg: &str| {
+        if json_mode {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+
+    // Start event fires FIRST — before any FS IO. Mirrors the
+    // Stage 12.22/12.23/12.24 review-fix posture: operators
+    // always see a start event even on missing/malformed
+    // wrappers / unsupported schemas / signature failures.
+    log_op(&format!(
+        "event=signed_integrity_evidence_chain_report_verify_started signed_chain_report={}",
+        args.signed_chain_report.display()
+    ));
+
+    let wrapper = read_signed_integrity_evidence_chain_report_from_path(
+        &args.signed_chain_report,
+    )
+    .map_err(|e| {
+        let reason = signed_chain_report_reason_tag(&e);
+        log_op(&format!(
+            "event=signed_integrity_evidence_chain_report_verify_failed reason={reason} detail={e}"
+        ));
+        anyhow!("read signed chain report: {e}")
+    })?;
+
+    if let Err(e) = verify_signed_integrity_evidence_chain_report(
+        &wrapper,
+        &args.expected_signer_pubkey_hex,
+    ) {
+        let reason = signed_chain_report_reason_tag(&e);
+        log_op(&format!(
+            "event=signed_integrity_evidence_chain_report_verify_failed reason={reason} detail={e}"
+        ));
+        bail!("signed chain report verification refused: {e}");
+    }
+
+    log_op(&format!(
+        "event=signed_integrity_evidence_chain_report_verify_ok path={} signer_role={} signer_pubkey={}",
+        args.signed_chain_report.display(),
+        wrapper.signer_role.as_str(),
+        wrapper.signer_pubkey_hex,
+    ));
+
+    match args.format {
+        VerifyIntegrityEvidenceChainReportSignatureFormat::Events => {
+            // Already emitted the success line above.
+        }
+        VerifyIntegrityEvidenceChainReportSignatureFormat::Json => {
+            render_verify_signed_chain_report_json(&wrapper)?;
+        }
+        VerifyIntegrityEvidenceChainReportSignatureFormat::Pretty => {
+            render_verify_signed_chain_report_pretty(
+                &wrapper,
+                &args.signed_chain_report,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn signed_chain_report_reason_tag(
+    e: &omni_contributor::SignedIntegrityEvidenceChainReportError,
+) -> &'static str {
+    use omni_contributor::SignedIntegrityEvidenceChainReportError as E;
+    match e {
+        E::UnsupportedSchemaVersion { .. } => "unsupported_schema_version",
+        E::UnsupportedChainReportSchemaVersion { .. } => {
+            "unsupported_chain_report_schema_version"
+        }
+        E::SignerPubkeyMismatch { .. } => "signer_pubkey_mismatch",
+        E::SignatureMismatch => "signature_mismatch",
+        E::Signing(_) => "signing",
+        E::Canonical(_) => "canonical",
+        E::Io { .. } => "io",
+        E::MalformedJson { .. } => "malformed_json",
+    }
+}
+
+fn render_verify_signed_chain_report_json(
+    wrapper: &omni_contributor::SignedIntegrityEvidenceChainReport,
+) -> Result<()> {
+    use std::io::Write;
+    // Compact metadata view per locked v1 scope: attest
+    // authenticity, don't mirror the embedded chain report's
+    // full per-entry / per-child lists.
+    let metadata = serde_json::json!({
+        "schema_version": wrapper.schema_version,
+        "signed_at_utc": wrapper.signed_at_utc,
+        "signer_role": wrapper.signer_role.as_str(),
+        "signer_pubkey_hex": wrapper.signer_pubkey_hex,
+        "signature_hex": wrapper.signature_hex,
+        "chain_report_schema_version": wrapper.chain_report.schema_version,
+        "chain_report_generated_at_utc": wrapper.chain_report.generated_at_utc,
+        "chain_report_signed_bundle_path": wrapper.chain_report.signed_bundle_path,
+        "chain_report_effective_base_dir": wrapper.chain_report.effective_base_dir,
+        "chain_report_bundle_signer_role": wrapper.chain_report.bundle_signer_role.as_str(),
+        "chain_report_bundle_signer_pubkey_hex": wrapper.chain_report.bundle_signer_pubkey_hex,
+        "chain_report_bundle_byte_counts": {
+            "ok": wrapper.chain_report.bundle_byte_verify.counts_ok,
+            "size_mismatch": wrapper.chain_report.bundle_byte_verify.counts_size_mismatch,
+            "hash_mismatch": wrapper.chain_report.bundle_byte_verify.counts_hash_mismatch,
+            "not_found": wrapper.chain_report.bundle_byte_verify.counts_not_found,
+            "read_error": wrapper.chain_report.bundle_byte_verify.counts_read_error,
+        },
+        "chain_report_child_counts": {
+            "ok": wrapper.chain_report.counts_child_ok,
+            "skipped": wrapper.chain_report.counts_child_skipped,
+            "failed": wrapper.chain_report.counts_child_failed,
+        },
+    });
+    let bytes = serde_json::to_vec_pretty(&metadata)
+        .map_err(|e| anyhow!("serialize verify metadata: {e}"))?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(&bytes)
+        .map_err(|e| anyhow!("write verify metadata: {e}"))?;
+    handle
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("trailing newline: {e}"))?;
+    Ok(())
+}
+
+fn render_verify_signed_chain_report_pretty(
+    wrapper: &omni_contributor::SignedIntegrityEvidenceChainReport,
+    path: &std::path::Path,
+) {
+    println!("Verified signed integrity evidence chain report");
+    println!("  path                 : {}", path.display());
+    println!("  schema_version       : {}", wrapper.schema_version);
+    println!("  signed_at_utc        : {}", wrapper.signed_at_utc);
+    println!(
+        "  signer_role          : {}",
+        wrapper.signer_role.as_str()
+    );
+    println!(
+        "  signer_pubkey        : {}",
+        wrapper.signer_pubkey_hex
+    );
+    println!("  signature            : {}", wrapper.signature_hex);
+    println!(
+        "  chain_schema_version : {}",
+        wrapper.chain_report.schema_version
+    );
+    println!(
+        "  chain_generated_at   : {}",
+        wrapper.chain_report.generated_at_utc
+    );
+    println!(
+        "  signed_bundle_path   : {}",
+        wrapper.chain_report.signed_bundle_path
+    );
+    println!(
+        "  effective_base_dir   : {}",
+        wrapper.chain_report.effective_base_dir
+    );
+    println!(
+        "  bundle_signer_role   : {}",
+        wrapper.chain_report.bundle_signer_role.as_str()
+    );
+    println!(
+        "  bundle_signer_pubkey : {}",
+        wrapper.chain_report.bundle_signer_pubkey_hex
+    );
+    println!(
+        "  bundle_byte_counts   : ok={} size_mismatch={} hash_mismatch={} not_found={} read_error={}",
+        wrapper.chain_report.bundle_byte_verify.counts_ok,
+        wrapper.chain_report.bundle_byte_verify.counts_size_mismatch,
+        wrapper.chain_report.bundle_byte_verify.counts_hash_mismatch,
+        wrapper.chain_report.bundle_byte_verify.counts_not_found,
+        wrapper.chain_report.bundle_byte_verify.counts_read_error,
+    );
+    println!(
+        "  child_counts         : ok={} skipped={} failed={}",
+        wrapper.chain_report.counts_child_ok,
+        wrapper.chain_report.counts_child_skipped,
+        wrapper.chain_report.counts_child_failed,
     );
 }
