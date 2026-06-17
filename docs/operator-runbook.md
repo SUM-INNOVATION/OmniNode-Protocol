@@ -2927,4 +2927,112 @@ grep 'event=integrity_evidence_anchor_watch_stopped cause=' omni-node.log
 
 **Implementation reference:** [`docs/stage13.3-anchor-operations.md`](stage13.3-anchor-operations.md) — Stage 13.3 engineering doc (library helpers, time-based staleness rationale, event taxonomy, `cause=` vs `reason=` invariant).
 
+### Stage 13.4 — anchor-registry cleanup with quarantine
+
+**Use when:** Stage 13.3 detected one or more issues you want to act on — orphan `.tmp` files, orphan `tx_index.json` entries, malformed record files, or stale `Submitted` / `Included` records. Stage 13.4 turns those signals into a planned cleanup that defaults to dry-run and prefers quarantine over deletion. **Fully local — zero chain interaction.** Stage 13.0 wire / schema / domain unchanged.
+
+**Three-phase workflow:**
+
+```sh
+# Phase 1 — Plan (default; no FS mutations)
+omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
+  --anchor-registry-dir /var/omni-anchors \
+  --plan-out           /tmp/cleanup-plan.json \
+  --stale-threshold-secs 86400
+# event=integrity_evidence_anchor_cleanup_plan_started ...
+# event=integrity_evidence_anchor_cleanup_plan_written path=/tmp/cleanup-plan.json
+# event=integrity_evidence_anchor_cleanup_plan_summary plan_id=<16-hex> actions=N tier_a=A tier_b=B gated=G
+
+# Phase 2a — Apply, DRY-RUN (default — no --apply)
+omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
+  --anchor-registry-dir /var/omni-anchors \
+  --apply-plan         /tmp/cleanup-plan.json \
+  --quarantine-dir     /var/omni-anchors-quarantine
+# event=integrity_evidence_anchor_cleanup_apply_started ... mode=dry_run
+# event=integrity_evidence_anchor_cleanup_apply_action_outcome ... status=would_apply
+# event=integrity_evidence_anchor_cleanup_apply_summary mode=dry_run actions_dry_run=N ...
+
+# Phase 2b — Apply, REAL (explicit --apply confirmation)
+omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
+  --anchor-registry-dir /var/omni-anchors \
+  --apply-plan         /tmp/cleanup-plan.json \
+  --quarantine-dir     /var/omni-anchors-quarantine \
+  --apply \
+  --allow-stale-quarantine   # required iff plan contains stale-record actions
+# event=integrity_evidence_anchor_cleanup_apply_started ... mode=apply
+# event=integrity_evidence_anchor_cleanup_apply_action_outcome ... status=applied
+# event=integrity_evidence_anchor_cleanup_apply_summary mode=apply actions_applied=N quarantine_manifest_relative=<plan_id>/quarantine_manifest.json
+
+# Phase 3 — Restore (undo a prior apply via the quarantine manifest)
+omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
+  --anchor-registry-dir /var/omni-anchors \
+  --restore-manifest   /var/omni-anchors-quarantine/<plan_id>/quarantine_manifest.json
+# event=integrity_evidence_anchor_cleanup_restore_started ...
+# event=integrity_evidence_anchor_cleanup_restore_outcome ... status=restored
+# event=integrity_evidence_anchor_cleanup_restore_summary restored=N skipped=K
+```
+
+**Closed mutex / required-with rules** (CLI refuses with a clap usage error before any FS read):
+
+- `--apply-plan` and `--restore-manifest` are mutually exclusive.
+- `--plan-out` and `--stale-threshold-secs` are plan-mode only.
+- `--apply`, `--quarantine-dir`, `--allow-stale-quarantine` are apply-mode only.
+- `--apply` requires `--apply-plan`.
+- A plan containing Tier B actions requires `--quarantine-dir` at apply.
+
+**Three locked invariants you should rely on:**
+
+1. **Dry-run is the default.** Without `--apply`, the apply phase mutates nothing. You can review every action's `would_apply` outcome before committing.
+2. **Quarantine first for Tier B.** Malformed records and stale records are copied to `<quarantine-dir>/<plan_id>/<source_relative>` with a manifest entry recording the BLAKE3 + bytes BEFORE the source is removed. Restore reads the manifest to put bytes back exactly where they came from.
+3. **Drift refusal is the safety net.** If the registry changed between plan and apply (e.g. the watch loop transitioned an anchor while you were reviewing the plan), apply refuses with `reason=cleanup_drift` instead of acting on stale assumptions. Re-plan and re-apply.
+
+**Stale-cleanup needs TWO opt-ins.** First, `--stale-threshold-secs` at plan time (without it, no stale-cleanup actions are emitted). Second, `--allow-stale-quarantine` at apply time. This protects against accidentally quarantining records that the chain might still finalize.
+
+**Reason-tag taxonomy** (closed; surfaced on `event=integrity_evidence_anchor_cleanup_failed reason=<tag>` lines):
+
+- `cleanup_drift` — registry drifted since plan was generated. **New tag string in Stage 13.4.**
+- `cleanup_invalid_path` — plan or manifest entry has an invalid `source_relative` / `quarantine_relative` (absolute path, `..` traversal, separator-containing, or wrong per-kind shape). **New tag string added in the Stage 13.4 REJECT-fix loop to refuse operator-supplied JSON before any FS mutation.**
+- `unsupported_cleanup_plan_schema_version` — plan's `schema_version` is not the locked `ANCHOR_CLEANUP_PLAN_SCHEMA_VERSION`. **New tag string added in the Stage 13.4 REJECT-fix loop; refused before the plan-hash check so future-schema plans cannot apply.**
+- `cleanup_plan_hash_mismatch` — plan was hand-edited / corrupted. Reused from Stage 12.17.
+- `gate_required` — gated action (`QuarantineStaleOpenRecord`) without `--allow-stale-quarantine`. Reused from Stage 12.17.
+- `quarantine_blake3_mismatch` — quarantined bytes differ from manifest record. Reused from Stage 12.18.
+- `restore_target_exists` — restore target path is already populated by something else. Reused from Stage 12.18.
+- Plus the existing Stage 13.0 / 13.2 / 13.3 tags (`malformed_json`, `io`, etc.).
+
+CLI mutex / required-with refusals exit non-zero via clap usage errors (NOT `reason=…` event lines) — they're argument-parse concerns, not the closed refusal taxonomy.
+
+**Workflow recipe — "I noticed a stale anchor in Stage 13.3 watch output":**
+
+```sh
+# 1. Plan with a stale-threshold matching what watch showed.
+omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
+  --anchor-registry-dir /var/omni-anchors \
+  --plan-out           /tmp/p.json \
+  --stale-threshold-secs 604800   # 1 week
+
+# 2. Inspect /tmp/p.json. Confirm the actions look right.
+jq '.actions' /tmp/p.json
+
+# 3. Dry-run apply.
+omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
+  --anchor-registry-dir /var/omni-anchors \
+  --apply-plan         /tmp/p.json \
+  --quarantine-dir     /var/omni-anchors-quarantine
+
+# 4. Real apply with both opt-ins.
+omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
+  --anchor-registry-dir /var/omni-anchors \
+  --apply-plan         /tmp/p.json \
+  --quarantine-dir     /var/omni-anchors-quarantine \
+  --apply \
+  --allow-stale-quarantine
+
+# 5. If you change your mind, restore from the manifest.
+omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
+  --anchor-registry-dir /var/omni-anchors \
+  --restore-manifest   /var/omni-anchors-quarantine/<plan_id>/quarantine_manifest.json
+```
+
+**Implementation reference:** [`docs/stage13.4-anchor-cleanup.md`](stage13.4-anchor-cleanup.md) — Stage 13.4 engineering doc (action taxonomy, mutex rules, drift / plan-hash recipes, exact-FS-operation appendix).
+
 **No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module — no other constants change.

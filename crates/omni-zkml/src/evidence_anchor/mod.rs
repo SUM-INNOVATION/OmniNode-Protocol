@@ -25,6 +25,7 @@
 //! - [`evidence_anchor_reason_tag`] — closed-set reason-tag
 //!   mapper for `event=...` lines.
 
+pub mod cleanup;
 pub mod client;
 pub mod operations;
 pub mod registry;
@@ -33,6 +34,15 @@ pub mod workflow;
 
 pub use client::{
     AnchorStatus, AnchorSubmissionReceipt, EvidenceAnchorChainClient, StubEvidenceAnchorChainClient,
+};
+pub use cleanup::{
+    apply_anchor_cleanup, plan_anchor_cleanup, restore_anchor_cleanup_quarantine,
+    AnchorApplyOptions, AnchorCleanupAction, AnchorCleanupActionKind,
+    AnchorCleanupActionOutcome, AnchorCleanupPlan, AnchorCleanupReport,
+    AnchorPlanOptions, AnchorQuarantineEntry, AnchorQuarantineManifest,
+    AnchorQuarantineRestoreOutcome, AnchorQuarantineRestoreReport,
+    AnchorRestoreOptions, ANCHOR_CLEANUP_PLAN_SCHEMA_VERSION,
+    ANCHOR_QUARANTINE_MANIFEST_SCHEMA_VERSION,
 };
 pub use operations::{
     check_evidence_anchor_registry_health, list_evidence_anchors_by_status,
@@ -94,6 +104,18 @@ pub fn evidence_anchor_reason_tag(err: &EvidenceAnchorError) -> &'static str {
         EvidenceAnchorError::ChainRpc(_) => "chain_rpc",
         EvidenceAnchorError::ChainSubmitRefused(_) => "chain_submit_refused",
         EvidenceAnchorError::ChainResponseMalformed(_) => "chain_response_malformed",
+
+        // ── Stage 13.4 cleanup refusals ──
+        // Three new tag strings + four reused from Stage 12.17/12.18.
+        EvidenceAnchorError::CleanupDrift { .. } => "cleanup_drift",
+        EvidenceAnchorError::CleanupPlanHashMismatch { .. } => "cleanup_plan_hash_mismatch",
+        EvidenceAnchorError::CleanupGateRequired { .. } => "gate_required",
+        EvidenceAnchorError::QuarantineBlake3Mismatch { .. } => "quarantine_blake3_mismatch",
+        EvidenceAnchorError::RestoreTargetExists { .. } => "restore_target_exists",
+        EvidenceAnchorError::CleanupInvalidPath { .. } => "cleanup_invalid_path",
+        EvidenceAnchorError::CleanupPlanSchemaUnsupported { .. } => {
+            "unsupported_cleanup_plan_schema_version"
+        }
     }
 }
 
@@ -219,6 +241,57 @@ mod reason_tag_tests {
             (
                 EvidenceAnchorError::ChainResponseMalformed("missing tx_hash".into()),
                 "chain_response_malformed",
+            ),
+            // ── Stage 13.4 cleanup variants ──
+            (
+                EvidenceAnchorError::CleanupDrift {
+                    computed: "a".repeat(16),
+                    expected: "b".repeat(16),
+                },
+                "cleanup_drift",
+            ),
+            (
+                EvidenceAnchorError::CleanupPlanHashMismatch {
+                    computed: "c".repeat(64),
+                    expected: "d".repeat(64),
+                },
+                "cleanup_plan_hash_mismatch",
+            ),
+            (
+                EvidenceAnchorError::CleanupGateRequired {
+                    action_kind: "quarantine_stale_open_record",
+                    gate_flag: "--allow-stale-quarantine",
+                },
+                "gate_required",
+            ),
+            (
+                EvidenceAnchorError::QuarantineBlake3Mismatch {
+                    source_relative: "11".repeat(32) + ".json",
+                    computed: "e".repeat(64),
+                    expected: "f".repeat(64),
+                },
+                "quarantine_blake3_mismatch",
+            ),
+            (
+                EvidenceAnchorError::RestoreTargetExists {
+                    target_path: std::path::PathBuf::from("/tmp/anchors/22.json"),
+                },
+                "restore_target_exists",
+            ),
+            (
+                EvidenceAnchorError::CleanupInvalidPath {
+                    action_kind: "remove_orphan_tmp_file",
+                    source_relative: "../etc/passwd".to_string(),
+                    reason: "parent traversal forbidden",
+                },
+                "cleanup_invalid_path",
+            ),
+            (
+                EvidenceAnchorError::CleanupPlanSchemaUnsupported {
+                    got: 2,
+                    expected: 1,
+                },
+                "unsupported_cleanup_plan_schema_version",
             ),
         ];
         for (err, expected) in cases {

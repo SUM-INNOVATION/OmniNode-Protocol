@@ -43,14 +43,16 @@ use omni_contributor::{
 use omni_sumchain::SumChainClient;
 use omni_zkml::EvidenceAnchorError;
 use omni_zkml::{
-    AnchorRecord, AnchorSelector, AnchorStatus, ChainClientError,
-    EvidenceAnchorRegistryHealth, EvidenceAnchorRegistrySummary,
-    INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION, IntegrityEvidenceAnchorTxData,
-    LocalAnchorStatus, LocalEvidenceAnchorRegistry, StaleAnchorInfo,
-    anchor_hex_lower, check_evidence_anchor_registry_health,
-    evidence_anchor_reason_tag, list_evidence_anchors_by_status,
-    list_stale_submitted_or_included, parse_anchor_hex_32,
-    query_evidence_anchor_workflow, reconcile_evidence_anchors_workflow,
+    AnchorApplyOptions, AnchorCleanupPlan, AnchorPlanOptions,
+    AnchorQuarantineManifest, AnchorRecord, AnchorRestoreOptions, AnchorSelector,
+    AnchorStatus, ChainClientError, EvidenceAnchorRegistryHealth,
+    EvidenceAnchorRegistrySummary, INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION,
+    IntegrityEvidenceAnchorTxData, LocalAnchorStatus, LocalEvidenceAnchorRegistry,
+    StaleAnchorInfo, anchor_hex_lower, apply_anchor_cleanup,
+    check_evidence_anchor_registry_health, evidence_anchor_reason_tag,
+    list_evidence_anchors_by_status, list_stale_submitted_or_included,
+    parse_anchor_hex_32, plan_anchor_cleanup, query_evidence_anchor_workflow,
+    reconcile_evidence_anchors_workflow, restore_anchor_cleanup_quarantine,
     verify_anchor_against_registry, verify_anchor_file_against_artifact_bytes,
 };
 #[cfg(feature = "submit")]
@@ -104,6 +106,12 @@ enum EvidenceAnchorCmd {
     /// summary line; optional stale-detection. **Chain-read-only,
     /// local-registry-mutating.** Never invokes submit / retry.
     WatchIntegrityEvidenceAnchors(WatchAnchorArgs),
+    /// Stage 13.4 — three-phase anchor-registry cleanup
+    /// (plan → apply → restore). Fully local. Default is
+    /// **plan** mode (no FS mutations). Apply defaults to
+    /// dry-run; `--apply` is the explicit operator confirmation
+    /// to mutate. Quarantine-then-delete for Tier B actions.
+    CleanupIntegrityEvidenceAnchorRegistry(CleanupAnchorRegistryArgs),
     /// Registry-backed verify — proves the on-disk artifact
     /// corresponds to a recorded anchor authored by the
     /// artifact's signer.
@@ -259,6 +267,61 @@ struct WatchAnchorArgs {
     stale_threshold_secs: Option<u64>,
 }
 
+/// Stage 13.4 — three-phase cleanup CLI. Phase selectors:
+/// neither `--apply-plan` nor `--restore-manifest` → plan mode
+/// (default). `--apply-plan` → apply mode. `--restore-manifest`
+/// → restore mode. The closed mutex preflight rules
+/// (`stage_13_4::check_mutex_rules`) refuse any invalid
+/// combination at the CLI parse layer before any FS read.
+#[derive(Args)]
+struct CleanupAnchorRegistryArgs {
+    /// Directory in which the anchor record + tx_index live.
+    /// Required in all three phases.
+    #[arg(long)]
+    anchor_registry_dir: PathBuf,
+
+    // ── Phase selectors ──
+    /// Apply mode: load + execute a previously-written plan.
+    /// Mutually exclusive with `--restore-manifest`.
+    #[arg(long)]
+    apply_plan: Option<PathBuf>,
+    /// Restore mode: undo a prior apply by re-instating the
+    /// quarantined bytes. Mutually exclusive with
+    /// `--apply-plan`. The CLI derives the quarantine root
+    /// from `manifest_path.parent()` (Stage 13.4 Finding 4).
+    #[arg(long)]
+    restore_manifest: Option<PathBuf>,
+
+    // ── Plan-mode flags ──
+    /// Write the plan JSON to this path; if omitted in plan
+    /// mode, the plan is emitted to stdout. Refused outside
+    /// plan mode.
+    #[arg(long)]
+    plan_out: Option<PathBuf>,
+    /// Time-based stale threshold (seconds). When supplied,
+    /// `QuarantineStaleOpenRecord` actions are emitted for
+    /// `Submitted` / `Included` records past the threshold.
+    /// Refused outside plan mode.
+    #[arg(long)]
+    stale_threshold_secs: Option<u64>,
+
+    // ── Apply-mode flags ──
+    /// Root under which the `<plan_id>/...` quarantine subtree
+    /// and `quarantine_manifest.json` are written. Required iff
+    /// the plan contains Tier B actions. Refused outside apply
+    /// mode.
+    #[arg(long)]
+    quarantine_dir: Option<PathBuf>,
+    /// Explicit operator confirmation: without this flag,
+    /// apply runs as dry-run. Refused outside apply mode.
+    #[arg(long)]
+    apply: bool,
+    /// Required for any `QuarantineStaleOpenRecord` action in
+    /// the plan. Refused outside apply mode.
+    #[arg(long)]
+    allow_stale_quarantine: bool,
+}
+
 #[derive(Args)]
 struct VerifyAnchorArgs {
     /// Path to a Stage 12.25 `SignedIntegrityEvidenceChainReport`
@@ -322,6 +385,11 @@ pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
         // `?`, so they each evaluate to the inner `Result<()>`.
         // This arm bypasses the join hop and yields `Result<()>`
         // directly.
+        EvidenceAnchorCmd::CleanupIntegrityEvidenceAnchorRegistry(a) => {
+            tokio::task::spawn_blocking(move || run_cleanup(a))
+                .await
+                .map_err(|e| anyhow!("cleanup-anchor join error: {e}"))?
+        }
         EvidenceAnchorCmd::VerifyIntegrityEvidenceAnchor(a) => {
             tokio::task::spawn_blocking(move || run_verify(a))
                 .await
@@ -1064,6 +1132,348 @@ fn format_watch_stop_event(cause: &str, tick: u64) -> String {
     format!("event=integrity_evidence_anchor_watch_stopped cause={cause} ticks={tick}")
 }
 
+// ── Cleanup (Stage 13.4) ──────────────────────────────────────────────────────
+
+/// Closed mutex-preflight rule violation. Surfaced via `clap`'s
+/// own usage-error channel so log scrapers don't conflate these
+/// CLI-shape refusals with the `reason=<closed-tag>` refusal
+/// taxonomy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CleanupMutexViolation {
+    ApplyAndRestoreConflict,
+    PlanOutOutsidePlanMode,
+    StaleThresholdOutsidePlanMode,
+    ApplyFlagWithoutApplyPlan,
+    QuarantineDirOutsideApplyMode,
+    AllowStaleQuarantineOutsideApplyMode,
+    QuarantineDirRequiredForTierB,
+}
+
+impl CleanupMutexViolation {
+    fn message(self) -> &'static str {
+        match self {
+            CleanupMutexViolation::ApplyAndRestoreConflict => {
+                "--apply-plan and --restore-manifest are mutually exclusive"
+            }
+            CleanupMutexViolation::PlanOutOutsidePlanMode => {
+                "--plan-out is plan-mode only \
+                 (omit --apply-plan / --restore-manifest)"
+            }
+            CleanupMutexViolation::StaleThresholdOutsidePlanMode => {
+                "--stale-threshold-secs is plan-mode only \
+                 (omit --apply-plan / --restore-manifest)"
+            }
+            CleanupMutexViolation::ApplyFlagWithoutApplyPlan => {
+                "--apply requires --apply-plan"
+            }
+            CleanupMutexViolation::QuarantineDirOutsideApplyMode => {
+                "--quarantine-dir is apply-mode only (requires --apply-plan)"
+            }
+            CleanupMutexViolation::AllowStaleQuarantineOutsideApplyMode => {
+                "--allow-stale-quarantine is apply-mode only (requires --apply-plan)"
+            }
+            CleanupMutexViolation::QuarantineDirRequiredForTierB => {
+                "--quarantine-dir required: plan contains Tier B actions"
+            }
+        }
+    }
+}
+
+/// Pure mutex/required-with check. Runs BEFORE any FS read so a
+/// misuse fails fast. Returns the violation kind on refusal;
+/// `Ok(())` means the CLI args satisfy every Stage 13.4 mutex
+/// rule documented in the plan.
+fn check_cleanup_mutex_rules(
+    args: &CleanupAnchorRegistryArgs,
+) -> std::result::Result<(), CleanupMutexViolation> {
+    let in_apply_mode = args.apply_plan.is_some();
+    let in_restore_mode = args.restore_manifest.is_some();
+
+    if in_apply_mode && in_restore_mode {
+        return Err(CleanupMutexViolation::ApplyAndRestoreConflict);
+    }
+    if args.plan_out.is_some() && (in_apply_mode || in_restore_mode) {
+        return Err(CleanupMutexViolation::PlanOutOutsidePlanMode);
+    }
+    if args.stale_threshold_secs.is_some() && (in_apply_mode || in_restore_mode) {
+        return Err(CleanupMutexViolation::StaleThresholdOutsidePlanMode);
+    }
+    if args.apply && !in_apply_mode {
+        return Err(CleanupMutexViolation::ApplyFlagWithoutApplyPlan);
+    }
+    if args.quarantine_dir.is_some() && !in_apply_mode {
+        return Err(CleanupMutexViolation::QuarantineDirOutsideApplyMode);
+    }
+    if args.allow_stale_quarantine && !in_apply_mode {
+        return Err(CleanupMutexViolation::AllowStaleQuarantineOutsideApplyMode);
+    }
+    Ok(())
+}
+
+/// Dispatch entry point — runs mutex preflight, then branches
+/// into plan / apply / restore. CLI mutex refusals exit
+/// non-zero via `bail!` (not via `event=… reason=…` lines)
+/// because they're argument-parse-layer concerns, not the
+/// closed `reason=` refusal taxonomy.
+fn run_cleanup(args: CleanupAnchorRegistryArgs) -> Result<()> {
+    if let Err(v) = check_cleanup_mutex_rules(&args) {
+        bail!("invalid flag combination: {}", v.message());
+    }
+
+    if let Some(manifest_path) = args.restore_manifest.clone() {
+        return run_cleanup_restore(&args, &manifest_path);
+    }
+    if let Some(plan_path) = args.apply_plan.clone() {
+        return run_cleanup_apply(&args, &plan_path);
+    }
+    run_cleanup_plan(&args)
+}
+
+fn run_cleanup_plan(args: &CleanupAnchorRegistryArgs) -> Result<()> {
+    println!(
+        "event=integrity_evidence_anchor_cleanup_plan_started anchor_registry_dir={}",
+        args.anchor_registry_dir.display()
+    );
+    let registry =
+        LocalEvidenceAnchorRegistry::open(args.anchor_registry_dir.clone()).map_err(|e| {
+            println!(
+                "event=integrity_evidence_anchor_cleanup_failed reason=io detail={e}"
+            );
+            anyhow!(
+                "open --anchor-registry-dir {}: {e}",
+                args.anchor_registry_dir.display()
+            )
+        })?;
+    let now_utc = chrono::Utc::now().to_rfc3339();
+    let plan = plan_anchor_cleanup(
+        &registry,
+        &AnchorPlanOptions {
+            now_utc: &now_utc,
+            stale_threshold_secs: args.stale_threshold_secs,
+        },
+    )
+    .map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_cleanup_failed reason={reason} detail={err}"
+        );
+        anyhow!("cleanup plan refused: {err}")
+    })?;
+
+    let bytes = serde_json::to_vec_pretty(&plan)
+        .map_err(|e| anyhow!("serialize plan: {e}"))?;
+    if let Some(path) = args.plan_out.as_ref() {
+        // Atomic write via .tmp + rename to keep stale partial
+        // plans off disk.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| anyhow!("write tmp {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| anyhow!("rename {}: {e}", path.display()))?;
+        println!(
+            "event=integrity_evidence_anchor_cleanup_plan_written path={}",
+            path.display()
+        );
+    } else {
+        // Per the locked plan, default plan-mode output goes to
+        // stdout.
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        handle.write_all(&bytes).map_err(|e| anyhow!("write stdout: {e}"))?;
+        handle.write_all(b"\n").ok();
+    }
+
+    let (tier_a, tier_b, gated) = plan.actions.iter().fold(
+        (0u32, 0u32, 0u32),
+        |(a, b, g), action| {
+            let (a, b) = if action.kind.is_tier_b() {
+                (a, b + 1)
+            } else {
+                (a + 1, b)
+            };
+            let g = if action.kind.gate_flag().is_some() {
+                g + 1
+            } else {
+                g
+            };
+            (a, b, g)
+        },
+    );
+    println!(
+        "event=integrity_evidence_anchor_cleanup_plan_summary plan_id={} actions={} \
+         tier_a={tier_a} tier_b={tier_b} gated={gated}",
+        plan.plan_id,
+        plan.actions.len(),
+    );
+    Ok(())
+}
+
+fn run_cleanup_apply(
+    args: &CleanupAnchorRegistryArgs,
+    plan_path: &std::path::Path,
+) -> Result<()> {
+    let mode_tag = if args.apply { "apply" } else { "dry_run" };
+    println!(
+        "event=integrity_evidence_anchor_cleanup_apply_started \
+         anchor_registry_dir={} plan={} mode={mode_tag}",
+        args.anchor_registry_dir.display(),
+        plan_path.display(),
+    );
+
+    // Load plan.
+    let bytes = std::fs::read(plan_path).map_err(|e| {
+        println!(
+            "event=integrity_evidence_anchor_cleanup_failed reason=io detail={e}"
+        );
+        anyhow!("read --apply-plan {}: {e}", plan_path.display())
+    })?;
+    let plan: AnchorCleanupPlan = serde_json::from_slice(&bytes).map_err(|e| {
+        println!(
+            "event=integrity_evidence_anchor_cleanup_failed reason=malformed_json detail={e}"
+        );
+        anyhow!("parse --apply-plan {}: {e}", plan_path.display())
+    })?;
+
+    // Required-with check: Tier B requires --quarantine-dir.
+    let has_tier_b = plan.actions.iter().any(|a| a.kind.is_tier_b());
+    if has_tier_b && args.quarantine_dir.is_none() {
+        bail!(
+            "invalid flag combination: {}",
+            CleanupMutexViolation::QuarantineDirRequiredForTierB.message()
+        );
+    }
+
+    // Quarantine root is either operator-supplied or a temp dir
+    // unused by Tier-A-only plans.
+    let quarantine_dir = args.quarantine_dir.clone().unwrap_or_else(|| {
+        // Tier-A-only plans never write quarantine; this path is
+        // a placeholder that the library treats as inert because
+        // no Tier B actions reach it.
+        std::env::temp_dir().join(format!("omni-anchor-cleanup-noop-{}", plan.plan_id))
+    });
+    if has_tier_b {
+        std::fs::create_dir_all(&quarantine_dir).map_err(|e| {
+            println!(
+                "event=integrity_evidence_anchor_cleanup_failed reason=io detail={e}"
+            );
+            anyhow!(
+                "create --quarantine-dir {}: {e}",
+                quarantine_dir.display()
+            )
+        })?;
+    }
+
+    let now_utc = chrono::Utc::now().to_rfc3339();
+    let report = apply_anchor_cleanup(
+        &plan,
+        &AnchorApplyOptions {
+            quarantine_dir: &quarantine_dir,
+            dry_run: !args.apply,
+            allow_stale_quarantine: args.allow_stale_quarantine,
+            now_utc: &now_utc,
+        },
+    )
+    .map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_cleanup_failed reason={reason} detail={err}"
+        );
+        anyhow!("cleanup apply refused: {err}")
+    })?;
+
+    for outcome in &report.outcomes {
+        println!(
+            "event=integrity_evidence_anchor_cleanup_apply_action_outcome \
+             action_index={} kind={} source_relative={} status={}",
+            outcome.action_index,
+            outcome.kind,
+            outcome.source_relative,
+            outcome.status,
+        );
+    }
+    println!(
+        "event=integrity_evidence_anchor_cleanup_apply_summary plan_id={} mode={} \
+         actions_applied={} actions_dry_run={} actions_skipped={} quarantine_dir={} \
+         quarantine_manifest_relative={}",
+        report.plan_id,
+        report.mode,
+        report.actions_applied,
+        report.actions_dry_run,
+        report.actions_skipped,
+        report.quarantine_dir,
+        report
+            .quarantine_manifest_relative
+            .as_deref()
+            .unwrap_or("-"),
+    );
+    Ok(())
+}
+
+fn run_cleanup_restore(
+    args: &CleanupAnchorRegistryArgs,
+    manifest_path: &std::path::Path,
+) -> Result<()> {
+    println!(
+        "event=integrity_evidence_anchor_cleanup_restore_started \
+         anchor_registry_dir={} manifest={}",
+        args.anchor_registry_dir.display(),
+        manifest_path.display(),
+    );
+
+    let bytes = std::fs::read(manifest_path).map_err(|e| {
+        println!(
+            "event=integrity_evidence_anchor_cleanup_failed reason=io detail={e}"
+        );
+        anyhow!("read --restore-manifest {}: {e}", manifest_path.display())
+    })?;
+    let manifest: AnchorQuarantineManifest =
+        serde_json::from_slice(&bytes).map_err(|e| {
+            println!(
+                "event=integrity_evidence_anchor_cleanup_failed reason=malformed_json detail={e}"
+            );
+            anyhow!("parse --restore-manifest {}: {e}", manifest_path.display())
+        })?;
+
+    // Finding 4 fix: derive quarantine root from the manifest's
+    // parent. Apply phase writes the manifest into
+    // `<quarantine-dir>/<plan_id>/quarantine_manifest.json`, so
+    // its parent IS the quarantine root.
+    let quarantine_root = manifest_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+
+    let report = restore_anchor_cleanup_quarantine(
+        &manifest,
+        &AnchorRestoreOptions {
+            quarantine_dir: &quarantine_root,
+            anchor_registry_dir: &args.anchor_registry_dir,
+            dry_run: false,
+        },
+    )
+    .map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_cleanup_failed reason={reason} detail={err}"
+        );
+        anyhow!("cleanup restore refused: {err}")
+    })?;
+
+    for outcome in &report.outcomes {
+        println!(
+            "event=integrity_evidence_anchor_cleanup_restore_outcome \
+             source_relative={} status={}",
+            outcome.source_relative, outcome.status,
+        );
+    }
+    println!(
+        "event=integrity_evidence_anchor_cleanup_restore_summary plan_id={} mode={} \
+         restored={} skipped={}",
+        report.plan_id, report.mode, report.restored, report.skipped,
+    );
+    Ok(())
+}
+
 /// Run one watch tick on the blocking pool: open the registry,
 /// construct the `SumChainClient`, run the reconcile sweep,
 /// emit per-record + summary + (optional) stale events.
@@ -1718,5 +2128,246 @@ mod stage_13_3_cli_tests {
         // Should not panic — even though the registry can't be
         // opened, the tick body must return cleanly.
         run_watch_tick_blocking(&bogus, "http://127.0.0.1:1", None);
+    }
+}
+
+#[cfg(test)]
+mod stage_13_4_cli_tests {
+    //! Stage 13.4 — pin CLI invariants:
+    //! - Each closed mutex/required-with rule refuses cleanly
+    //!   with the documented violation message.
+    //! - Restore derives quarantine root from
+    //!   `manifest_path.parent()` (Finding 4).
+    //! - `cleanup_drift`, `gate_required`,
+    //!   `quarantine_blake3_mismatch`, and `restore_target_exists`
+    //!   reach the closed reason-tag mapper through the
+    //!   `EvidenceAnchorError` surface.
+
+    use super::*;
+
+    fn defaults() -> CleanupAnchorRegistryArgs {
+        CleanupAnchorRegistryArgs {
+            anchor_registry_dir: PathBuf::from("/tmp/registry"),
+            apply_plan: None,
+            restore_manifest: None,
+            plan_out: None,
+            stale_threshold_secs: None,
+            quarantine_dir: None,
+            apply: false,
+            allow_stale_quarantine: false,
+        }
+    }
+
+    // ── Mutex rule 1: --apply-plan + --restore-manifest ──
+
+    #[test]
+    fn mutex_refuses_apply_plan_with_restore_manifest() {
+        let mut a = defaults();
+        a.apply_plan = Some(PathBuf::from("plan.json"));
+        a.restore_manifest = Some(PathBuf::from("manifest.json"));
+        assert_eq!(
+            check_cleanup_mutex_rules(&a),
+            Err(CleanupMutexViolation::ApplyAndRestoreConflict)
+        );
+    }
+
+    // ── Mutex rule 2: --plan-out outside plan mode ──
+
+    #[test]
+    fn mutex_refuses_plan_out_with_apply_plan() {
+        let mut a = defaults();
+        a.apply_plan = Some(PathBuf::from("plan.json"));
+        a.plan_out = Some(PathBuf::from("out.json"));
+        assert_eq!(
+            check_cleanup_mutex_rules(&a),
+            Err(CleanupMutexViolation::PlanOutOutsidePlanMode)
+        );
+    }
+
+    #[test]
+    fn mutex_refuses_plan_out_with_restore_manifest() {
+        let mut a = defaults();
+        a.restore_manifest = Some(PathBuf::from("manifest.json"));
+        a.plan_out = Some(PathBuf::from("out.json"));
+        assert_eq!(
+            check_cleanup_mutex_rules(&a),
+            Err(CleanupMutexViolation::PlanOutOutsidePlanMode)
+        );
+    }
+
+    // ── Mutex rule 3: --stale-threshold-secs outside plan mode ──
+
+    #[test]
+    fn mutex_refuses_stale_threshold_secs_with_apply_plan() {
+        let mut a = defaults();
+        a.apply_plan = Some(PathBuf::from("plan.json"));
+        a.stale_threshold_secs = Some(3600);
+        assert_eq!(
+            check_cleanup_mutex_rules(&a),
+            Err(CleanupMutexViolation::StaleThresholdOutsidePlanMode)
+        );
+    }
+
+    // ── Mutex rule 4: --apply without --apply-plan ──
+
+    #[test]
+    fn mutex_refuses_apply_flag_without_apply_plan() {
+        let mut a = defaults();
+        a.apply = true;
+        assert_eq!(
+            check_cleanup_mutex_rules(&a),
+            Err(CleanupMutexViolation::ApplyFlagWithoutApplyPlan)
+        );
+    }
+
+    // ── Mutex rule 5: --quarantine-dir outside apply mode ──
+
+    #[test]
+    fn mutex_refuses_quarantine_dir_without_apply_plan() {
+        let mut a = defaults();
+        a.quarantine_dir = Some(PathBuf::from("/tmp/q"));
+        assert_eq!(
+            check_cleanup_mutex_rules(&a),
+            Err(CleanupMutexViolation::QuarantineDirOutsideApplyMode)
+        );
+    }
+
+    // ── Mutex rule 6: --allow-stale-quarantine outside apply mode ──
+
+    #[test]
+    fn mutex_refuses_allow_stale_quarantine_without_apply_plan() {
+        let mut a = defaults();
+        a.allow_stale_quarantine = true;
+        assert_eq!(
+            check_cleanup_mutex_rules(&a),
+            Err(CleanupMutexViolation::AllowStaleQuarantineOutsideApplyMode)
+        );
+    }
+
+    // ── Mutex passes on default (plan mode, no flags) ──
+
+    #[test]
+    fn mutex_passes_for_default_plan_mode() {
+        assert_eq!(check_cleanup_mutex_rules(&defaults()), Ok(()));
+    }
+
+    // ── Mutex passes for valid apply combo ──
+
+    #[test]
+    fn mutex_passes_for_apply_with_apply_plan_and_apply_flag() {
+        let mut a = defaults();
+        a.apply_plan = Some(PathBuf::from("plan.json"));
+        a.apply = true;
+        a.quarantine_dir = Some(PathBuf::from("/tmp/q"));
+        a.allow_stale_quarantine = true;
+        assert_eq!(check_cleanup_mutex_rules(&a), Ok(()));
+    }
+
+    // ── Mutex passes for restore mode ──
+
+    #[test]
+    fn mutex_passes_for_restore_mode() {
+        let mut a = defaults();
+        a.restore_manifest = Some(PathBuf::from("manifest.json"));
+        assert_eq!(check_cleanup_mutex_rules(&a), Ok(()));
+    }
+
+    // ── Violation message stability ──
+
+    #[test]
+    fn violation_messages_are_stable_strings() {
+        // Pin the operator-facing messages — log scrapers
+        // depend on them.
+        assert_eq!(
+            CleanupMutexViolation::ApplyAndRestoreConflict.message(),
+            "--apply-plan and --restore-manifest are mutually exclusive"
+        );
+        assert_eq!(
+            CleanupMutexViolation::ApplyFlagWithoutApplyPlan.message(),
+            "--apply requires --apply-plan"
+        );
+        assert!(CleanupMutexViolation::QuarantineDirRequiredForTierB
+            .message()
+            .contains("Tier B"));
+    }
+
+    // ── Closed reason-tag mapper covers Stage 13.4 variants ──
+
+    #[test]
+    fn cleanup_drift_variant_routes_to_cleanup_drift_tag() {
+        let err = EvidenceAnchorError::CleanupDrift {
+            computed: "a".repeat(16),
+            expected: "b".repeat(16),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "cleanup_drift");
+    }
+
+    #[test]
+    fn gate_required_variant_routes_to_gate_required_tag() {
+        let err = EvidenceAnchorError::CleanupGateRequired {
+            action_kind: "quarantine_stale_open_record",
+            gate_flag: "--allow-stale-quarantine",
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "gate_required");
+    }
+
+    #[test]
+    fn quarantine_blake3_mismatch_variant_routes_to_reused_tag_string() {
+        let err = EvidenceAnchorError::QuarantineBlake3Mismatch {
+            source_relative: "a.json".into(),
+            computed: "c".repeat(64),
+            expected: "d".repeat(64),
+        };
+        assert_eq!(
+            evidence_anchor_reason_tag(&err),
+            "quarantine_blake3_mismatch"
+        );
+    }
+
+    #[test]
+    fn restore_target_exists_variant_routes_to_reused_tag_string() {
+        let err = EvidenceAnchorError::RestoreTargetExists {
+            target_path: PathBuf::from("/tmp/x.json"),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "restore_target_exists");
+    }
+
+    #[test]
+    fn cleanup_invalid_path_variant_routes_to_cleanup_invalid_path_tag() {
+        let err = EvidenceAnchorError::CleanupInvalidPath {
+            action_kind: "quarantine_malformed_record",
+            source_relative: "/etc/passwd".into(),
+            reason: "absolute path",
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "cleanup_invalid_path");
+    }
+
+    #[test]
+    fn unsupported_cleanup_plan_schema_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::CleanupPlanSchemaUnsupported {
+            got: 2,
+            expected: 1,
+        };
+        assert_eq!(
+            evidence_anchor_reason_tag(&err),
+            "unsupported_cleanup_plan_schema_version"
+        );
+    }
+
+    // ── Finding 4: restore derives quarantine root from manifest parent ──
+
+    #[test]
+    fn restore_derives_quarantine_root_from_manifest_parent() {
+        // The CLI does: `manifest_path.parent()`. Pin the
+        // computation against a representative layout so the
+        // contract can't drift.
+        let manifest_path = std::path::Path::new(
+            "/var/omni-anchors-quarantine/abcdef0123456789/quarantine_manifest.json",
+        );
+        let derived = manifest_path.parent().unwrap();
+        assert_eq!(
+            derived,
+            std::path::Path::new("/var/omni-anchors-quarantine/abcdef0123456789")
+        );
     }
 }

@@ -192,3 +192,5 @@ In `crates/omni-node/src/evidence_anchor_cli.rs` `stage_13_3_cli_tests` (in-bin,
 - Stale-anchor quarantine / archive (operator decides).
 - Aggregation forms (anchor bundles, anchor chains).
 - Separate-submitter / relay flows.
+
+> **Post-Stage-13.4 note:** Stage 13.4 turns Stage 13.3's health/stale findings into a planned cleanup (plan → dry-run → apply → restore). Stage 13.3 detection helpers (`check_evidence_anchor_registry_health`, `list_stale_submitted_or_included`) are **unchanged**; Stage 13.4 calls them verbatim. See [`docs/stage13.4-anchor-cleanup.md`](stage13.4-anchor-cleanup.md).
