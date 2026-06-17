@@ -2848,4 +2848,83 @@ Mainnet (`chain_id == 1`) writes additionally require `--allow-mainnet-submit` A
 
 **Implementation reference:** [`docs/stage13.2-chain-adapter.md`](stage13.2-chain-adapter.md) — Stage 13.2 engineering doc (RPC method names, DTO ownership, classifier).
 
+### Stage 13.3 — anchor-lifecycle operations (summary, health, watch)
+
+**Use when:** you want a fast local snapshot of anchor registry state, want to detect stale `Submitted` / `Included` records that the chain hasn't progressed, or want a long-running monitor that periodically reconciles + summarizes. All three commands are **operator-side hardening only** — Stage 13.0 wire / schema / domain / reason tags / same-key submitter model unchanged; no new chain RPCs.
+
+**`summary-integrity-evidence-anchors`** — fully local, **no chain interaction**:
+
+```sh
+# Fast snapshot (default).
+omni-node operator evidence-anchor summary-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors
+# event=integrity_evidence_anchor_summary total=12 submitted=2 included=1 finalized=8 failed=1
+
+# Optionally include stale rows (time-based — uses the existing
+# `submitted_at` field, no record-shape change).
+omni-node operator evidence-anchor summary-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --stale-threshold-secs 86400
+# event=integrity_evidence_anchor_summary total=12 ...
+# event=integrity_evidence_anchor_stale artifact_hash_hex=<hex> tx_id=0x<hash> status=submitted age_secs=129600 threshold_secs=86400
+# event=integrity_evidence_anchor_stale_summary count=1 threshold_secs=86400
+
+# Optionally emit a registry-health diagnostic (read-only).
+omni-node operator evidence-anchor summary-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --include-health
+# event=integrity_evidence_anchor_health records=12 malformed_records=0 orphan_tx_index_entries=0 orphan_tmp_files=1
+```
+
+**Summary is fully local.** No `--rpc-url` flag. Chain reconciliation is the `reconcile-integrity-evidence-anchor` (one-shot) and `watch-integrity-evidence-anchors` (continuous) commands' job — separation of concerns lets the summary stay a fast scriptable check.
+
+**`watch-integrity-evidence-anchors`** — chain-read-only, local-registry-mutating, **never submits**:
+
+```sh
+omni-node operator evidence-anchor watch-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url            https://rpc.sumchain.example.com \
+  --expect-chain-id    42 \
+  --poll-interval-secs 60 \
+  --stale-threshold-secs 86400
+# event=integrity_evidence_anchor_watch_started anchor_registry_dir=/var/omni-anchors rpc_url=... expect_chain_id=42 poll_interval_secs=60
+# event=integrity_evidence_anchor_watch_tick tick=1
+# event=integrity_evidence_anchor_reconcile_record_ok artifact_hash_hex=... tx_id=0x... local_status=included chain_status=included transitioned=false
+# event=integrity_evidence_anchor_summary total=12 ...
+# event=integrity_evidence_anchor_stale ...
+# event=integrity_evidence_anchor_stale_summary count=0 threshold_secs=86400
+# ... (next tick after --poll-interval-secs)
+# Ctrl-C → event=integrity_evidence_anchor_watch_stopped cause=ctrl_c ticks=N
+```
+
+Each tick re-runs Stage 13.2's `reconcile-integrity-evidence-anchor` sweep (one chain query per `Submitted`/`Included` record), emits a summary line, and optionally emits stale rows. **Ctrl-C** triggers graceful shutdown after the current tick. `--max-ticks N` stops after N ticks with `cause=max_ticks` — primary use case is scripted single-shot reconcile (`--max-ticks 1`) or bounded test runs.
+
+**Locked `cause=` vs `reason=` invariant.** Watch-stop events use `cause=ctrl_c` / `cause=max_ticks` — the `reason=` key stays reserved for the closed refusal/failure taxonomy. Log scrapers can `grep 'reason='` for refusals only and `grep 'cause='` for informational stops:
+
+```sh
+# All refusals (any subcommand, any stage):
+grep 'reason=' omni-node.log
+
+# All clean watch stops:
+grep 'event=integrity_evidence_anchor_watch_stopped cause=' omni-node.log
+```
+
+**Watch never submits.** Stage 13.3 watch is monitor-only — no `--allow-submit` flag, no retry-on-failed semantics, no resubmit-on-dropped path. Anchors are one-shot per signed wrapper; to re-submit, operators re-invoke `submit-integrity-evidence-anchor` explicitly. This is a locked Stage 13.3 invariant (Q5).
+
+**Time-based staleness (locked Q1).** Stage 13.3 uses the existing `AnchorRecord::submitted_at: DateTime<Utc>` field — no record-shape change. Block-based staleness is deferred (would require adding `submitted_at_block: Option<u64>` to `AnchorRecord`, the Stage 5.2 posture for attestations).
+
+**No new reason tags.** Stage 13.3 adds informational events only (`_summary`, `_stale`, `_stale_summary`, `_health`, `_watch_started`, `_watch_tick`, `_watch_stopped`, `_watch_tick_failed`); failures inside any command continue to route through the existing closed-set tags from Stage 13.0 / 13.2 (`chain_id_mismatch`, `not_activated`, `mainnet_policy_unresolved`, `chain_rpc`, `chain_submit_refused`, `chain_response_malformed`, `io`, `malformed_json`, `anchor_not_found`, …). The taxonomy stays frozen.
+
+**When to use which command:**
+
+| Need | Command |
+| --- | --- |
+| Fast local count snapshot | `summary-integrity-evidence-anchors` (no flags) |
+| Quick local stale-record check | `summary-integrity-evidence-anchors --stale-threshold-secs N` |
+| Registry directory diagnostic | `summary-integrity-evidence-anchors --include-health` |
+| One-shot chain reconcile | `reconcile-integrity-evidence-anchor` (Stage 13.2) |
+| Continuous chain monitor | `watch-integrity-evidence-anchors` (Stage 13.3) |
+
+**Implementation reference:** [`docs/stage13.3-anchor-operations.md`](stage13.3-anchor-operations.md) — Stage 13.3 engineering doc (library helpers, time-based staleness rationale, event taxonomy, `cause=` vs `reason=` invariant).
+
 **No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module — no other constants change.
