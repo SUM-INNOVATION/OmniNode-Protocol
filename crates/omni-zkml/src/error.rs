@@ -458,6 +458,98 @@ pub enum EvidenceAnchorError {
     /// [`omni_sumchain::classify_chain_client_error`].
     #[error("chain response malformed: {0}")]
     ChainResponseMalformed(String),
+
+    // ── Stage 13.4 additions — local anchor-registry cleanup ─────────
+    //
+    // Five new variants, mapping one-to-one to closed-set
+    // `reason=<tag>` strings on Stage 13.4 cleanup event lines.
+    // Four reuse tag strings from the Stage 12.17/12.18 cleanup
+    // taxonomy (`gate_required`, `cleanup_plan_hash_mismatch`,
+    // `quarantine_blake3_mismatch`, `restore_target_exists`) so
+    // operators reading logs across stages don't have to learn
+    // two names for the same condition. The fifth tag string
+    // (`cleanup_drift`) is the only new tag introduced by
+    // Stage 13.4.
+    /// Apply: the anchor registry's state differs from the
+    /// `registry_state_hash` recorded in the plan. The operator
+    /// must re-plan against the current registry state and
+    /// re-apply. Stage 13.4 introduces this tag string; no
+    /// Stage 12 equivalent.
+    #[error(
+        "anchor registry drifted since plan was generated: \
+         computed {computed}, plan expected {expected}"
+    )]
+    CleanupDrift { computed: String, expected: String },
+
+    /// Apply: the plan's `cleanup_plan_hash` does not match the
+    /// recomputed canonical-hash of its remaining fields. The
+    /// plan was hand-edited (or corrupted on disk). Reuses the
+    /// Stage 12.17 tag string `cleanup_plan_hash_mismatch`.
+    #[error(
+        "anchor cleanup plan hash mismatch: computed {computed}, plan declares {expected}"
+    )]
+    CleanupPlanHashMismatch { computed: String, expected: String },
+
+    /// Apply: a gated action (e.g. `QuarantineStaleOpenRecord`)
+    /// is in the plan but the operator did not supply the
+    /// required apply-time flag (e.g. `--allow-stale-quarantine`).
+    /// Reuses the Stage 12.17 tag string `gate_required`.
+    #[error(
+        "anchor cleanup gate required: action {action_kind} requires {gate_flag}"
+    )]
+    CleanupGateRequired {
+        action_kind: &'static str,
+        gate_flag: &'static str,
+    },
+
+    /// Restore: the quarantined bytes' BLAKE3 hash does not
+    /// match the manifest's recorded hash. Either the
+    /// quarantine subtree was hand-edited or the manifest was
+    /// regenerated against different bytes. Refuses with no FS
+    /// mutation. Reuses the Stage 12.18 tag string
+    /// `quarantine_blake3_mismatch`.
+    #[error(
+        "quarantine BLAKE3 mismatch for {source_relative}: \
+         file hashes to {computed}, manifest declares {expected}"
+    )]
+    QuarantineBlake3Mismatch {
+        source_relative: String,
+        computed: String,
+        expected: String,
+    },
+
+    /// Restore: the restore target path is already populated.
+    /// No clobber — operator must rename/delete the conflict
+    /// before retrying. Reuses the Stage 12.18 tag string
+    /// `restore_target_exists`.
+    #[error("restore target already exists: {target_path}")]
+    RestoreTargetExists { target_path: std::path::PathBuf },
+
+    /// Apply / Restore: an action's `source_relative` (or a
+    /// quarantine-manifest entry's `quarantine_relative`)
+    /// fails per-kind path-shape validation. Defends against
+    /// path traversal (`..`), absolute paths, or unexpected
+    /// separators in operator-supplied JSON. Refuses BEFORE
+    /// any FS mutation. Stage 13.4 introduces this tag string.
+    #[error(
+        "anchor cleanup invalid path for action {action_kind}: \
+         {source_relative:?} ({reason})"
+    )]
+    CleanupInvalidPath {
+        action_kind: &'static str,
+        source_relative: String,
+        reason: &'static str,
+    },
+
+    /// Apply: the plan's `schema_version` is not the locked
+    /// `ANCHOR_CLEANUP_PLAN_SCHEMA_VERSION`. Future-schema
+    /// plans with re-computed hashes would otherwise apply as
+    /// v1; refusing here is the schema-version-as-boundary
+    /// contract. Stage 13.4 introduces this tag string.
+    #[error(
+        "unsupported anchor cleanup plan schema version: got {got}, expected {expected}"
+    )]
+    CleanupPlanSchemaUnsupported { got: u32, expected: u32 },
 }
 
 /// Stage 13.0 result alias. Distinct from earlier-stage aliases
