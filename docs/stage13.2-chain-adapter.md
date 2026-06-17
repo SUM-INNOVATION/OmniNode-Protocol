@@ -161,3 +161,5 @@ If mainnet has `integrity_evidence_anchor_enabled_from_height = None`, submissio
 - Aggregation forms (anchor bundles, anchor chains).
 - Separate-submitter / relay flows (would require an `anchor_schema_version` bump).
 - Operator monitoring loop subcommand (`watch-anchor-activation` analog of `operator watch-activation`).
+
+> **Post-Stage-13.3 note:** Stage 13.3 ships the operator monitoring surface on top of this adapter (`summary-integrity-evidence-anchors`, `watch-integrity-evidence-anchors`); see [`docs/stage13.3-anchor-operations.md`](stage13.3-anchor-operations.md). Stage 13.3 makes **zero** adapter changes — it consumes Stage 13.2's `reconcile_evidence_anchors_workflow` verbatim each watch tick.

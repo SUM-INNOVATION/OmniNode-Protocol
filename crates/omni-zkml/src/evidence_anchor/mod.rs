@@ -26,12 +26,18 @@
 //!   mapper for `event=...` lines.
 
 pub mod client;
+pub mod operations;
 pub mod registry;
 pub mod wire;
 pub mod workflow;
 
 pub use client::{
     AnchorStatus, AnchorSubmissionReceipt, EvidenceAnchorChainClient, StubEvidenceAnchorChainClient,
+};
+pub use operations::{
+    check_evidence_anchor_registry_health, list_evidence_anchors_by_status,
+    list_stale_submitted_or_included, EvidenceAnchorRegistryHealth,
+    EvidenceAnchorRegistrySummary, StaleAnchorInfo,
 };
 pub use registry::{
     AnchorRecord, LocalAnchorStatus, LocalEvidenceAnchorRegistry, local_status_from_chain,

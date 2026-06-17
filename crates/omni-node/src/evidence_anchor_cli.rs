@@ -44,11 +44,14 @@ use omni_sumchain::SumChainClient;
 use omni_zkml::EvidenceAnchorError;
 use omni_zkml::{
     AnchorRecord, AnchorSelector, AnchorStatus, ChainClientError,
+    EvidenceAnchorRegistryHealth, EvidenceAnchorRegistrySummary,
     INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION, IntegrityEvidenceAnchorTxData,
-    LocalAnchorStatus, LocalEvidenceAnchorRegistry, anchor_hex_lower,
-    evidence_anchor_reason_tag, parse_anchor_hex_32, query_evidence_anchor_workflow,
-    reconcile_evidence_anchors_workflow, verify_anchor_against_registry,
-    verify_anchor_file_against_artifact_bytes,
+    LocalAnchorStatus, LocalEvidenceAnchorRegistry, StaleAnchorInfo,
+    anchor_hex_lower, check_evidence_anchor_registry_health,
+    evidence_anchor_reason_tag, list_evidence_anchors_by_status,
+    list_stale_submitted_or_included, parse_anchor_hex_32,
+    query_evidence_anchor_workflow, reconcile_evidence_anchors_workflow,
+    verify_anchor_against_registry, verify_anchor_file_against_artifact_bytes,
 };
 #[cfg(feature = "submit")]
 use omni_zkml::{
@@ -90,6 +93,17 @@ enum EvidenceAnchorCmd {
     /// failures land in the per-record event line; the sweep
     /// continues.
     ReconcileIntegrityEvidenceAnchor(ReconcileAnchorArgs),
+    /// Stage 13.3 — fast local registry snapshot. Counts
+    /// records per `LocalAnchorStatus`. Optional flags emit
+    /// stale Submitted/Included records (time-based) and a
+    /// registry-health diagnostic. **Fully local — no chain
+    /// interaction.**
+    SummaryIntegrityEvidenceAnchors(SummaryAnchorArgs),
+    /// Stage 13.3 — periodic chain-read-only monitoring loop.
+    /// Each tick runs Stage 13.2's reconcile sweep plus a
+    /// summary line; optional stale-detection. **Chain-read-only,
+    /// local-registry-mutating.** Never invokes submit / retry.
+    WatchIntegrityEvidenceAnchors(WatchAnchorArgs),
     /// Registry-backed verify — proves the on-disk artifact
     /// corresponds to a recorded anchor authored by the
     /// artifact's signer.
@@ -198,6 +212,54 @@ struct ReconcileAnchorArgs {
 }
 
 #[derive(Args)]
+struct SummaryAnchorArgs {
+    /// Directory in which the anchor record + tx_index live.
+    #[arg(long)]
+    anchor_registry_dir: PathBuf,
+    /// Optional time-based stale threshold in seconds. When
+    /// supplied, emits one `event=integrity_evidence_anchor_stale`
+    /// line per `Submitted` / `Included` record whose
+    /// `now - submitted_at >= threshold`. Stage 13.3 ships
+    /// time-based detection only.
+    #[arg(long)]
+    stale_threshold_secs: Option<u64>,
+    /// Optional: emit a registry-health diagnostic line
+    /// (records, malformed records, orphan tx_index entries,
+    /// orphan `.tmp` files). Read-only — does NOT delete or
+    /// quarantine.
+    #[arg(long)]
+    include_health: bool,
+}
+
+#[derive(Args)]
+struct WatchAnchorArgs {
+    /// Directory in which the anchor record + tx_index live.
+    #[arg(long)]
+    anchor_registry_dir: PathBuf,
+    /// SUM Chain JSON-RPC endpoint URL. Required.
+    #[arg(long)]
+    rpc_url: String,
+    /// Chain-id sanity check. Required. Verified once at
+    /// startup; the watch loop never re-checks chain-id mid-run.
+    #[arg(long)]
+    expect_chain_id: u64,
+    /// Seconds between ticks. Default 30.
+    #[arg(long, default_value_t = 30)]
+    poll_interval_secs: u64,
+    /// Optional tick budget. When supplied, the watch loop
+    /// stops with `cause=max_ticks` after this many ticks.
+    /// Primary use case: hermetic tests + scripted single-shot
+    /// reconcile.
+    #[arg(long)]
+    max_ticks: Option<u64>,
+    /// Optional time-based stale threshold in seconds. When
+    /// supplied, the per-tick summary additionally emits stale
+    /// rows. Same semantics as `summary-integrity-evidence-anchors`.
+    #[arg(long)]
+    stale_threshold_secs: Option<u64>,
+}
+
+#[derive(Args)]
 struct VerifyAnchorArgs {
     /// Path to a Stage 12.25 `SignedIntegrityEvidenceChainReport`
     /// JSON wrapper. Hashed raw to recompute the artifact hash.
@@ -249,6 +311,17 @@ pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
                 .await
                 .map_err(|e| anyhow!("reconcile-anchor join error: {e}"))?
         }
+        EvidenceAnchorCmd::SummaryIntegrityEvidenceAnchors(a) => {
+            tokio::task::spawn_blocking(move || run_summary(a))
+                .await
+                .map_err(|e| anyhow!("summary-anchor join error: {e}"))?
+        }
+        EvidenceAnchorCmd::WatchIntegrityEvidenceAnchors(a) => run_watch(a).await,
+        // ^ run_watch is already async (uses tokio::signal::ctrl_c
+        // + sleep); other arms shed the JoinError layer via outer
+        // `?`, so they each evaluate to the inner `Result<()>`.
+        // This arm bypasses the join hop and yields `Result<()>`
+        // directly.
         EvidenceAnchorCmd::VerifyIntegrityEvidenceAnchor(a) => {
             tokio::task::spawn_blocking(move || run_verify(a))
                 .await
@@ -770,6 +843,316 @@ fn reconcile_record_reason_tag(err: &EvidenceAnchorError) -> &'static str {
     }
 }
 
+// ── Summary (Stage 13.3) ──────────────────────────────────────────────────────
+
+/// `summary-integrity-evidence-anchors` — fully local
+/// registry snapshot. Locked Stage 13.3 invariant: no chain
+/// interaction at all.
+fn run_summary(args: SummaryAnchorArgs) -> Result<()> {
+    println!(
+        "event=integrity_evidence_anchor_summary_started anchor_registry_dir={}",
+        args.anchor_registry_dir.display()
+    );
+    let registry =
+        LocalEvidenceAnchorRegistry::open(args.anchor_registry_dir.clone()).map_err(|e| {
+            println!(
+                "event=integrity_evidence_anchor_summary_failed reason=io detail={e}"
+            );
+            anyhow!(
+                "open --anchor-registry-dir {}: {e}",
+                args.anchor_registry_dir.display()
+            )
+        })?;
+
+    emit_summary_event(&registry).map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_summary_failed reason={reason} detail={err}"
+        );
+        anyhow!("summary refused: {err}")
+    })?;
+
+    if let Some(threshold_secs) = args.stale_threshold_secs {
+        emit_stale_events(&registry, threshold_secs).map_err(|err| {
+            let reason = evidence_anchor_reason_tag(&err);
+            println!(
+                "event=integrity_evidence_anchor_summary_failed reason={reason} detail={err}"
+            );
+            anyhow!("summary stale-detection refused: {err}")
+        })?;
+    }
+
+    if args.include_health {
+        emit_health_event(&registry).map_err(|err| {
+            let reason = evidence_anchor_reason_tag(&err);
+            println!(
+                "event=integrity_evidence_anchor_summary_failed reason={reason} detail={err}"
+            );
+            anyhow!("summary health-check refused: {err}")
+        })?;
+    }
+    Ok(())
+}
+
+/// Emit one `event=integrity_evidence_anchor_summary` line with
+/// counts-by-status. Shared by `summary` (one-shot) and
+/// `watch` (per-tick).
+fn emit_summary_event(
+    registry: &LocalEvidenceAnchorRegistry,
+) -> Result<EvidenceAnchorRegistrySummary, EvidenceAnchorError> {
+    let s = list_evidence_anchors_by_status(registry)?;
+    println!(
+        "event=integrity_evidence_anchor_summary total={} submitted={} included={} \
+         finalized={} failed={}",
+        s.total, s.submitted, s.included, s.finalized, s.failed,
+    );
+    Ok(s)
+}
+
+/// Emit per-stale-record event lines plus a summary count.
+fn emit_stale_events(
+    registry: &LocalEvidenceAnchorRegistry,
+    threshold_secs: u64,
+) -> Result<Vec<StaleAnchorInfo>, EvidenceAnchorError> {
+    let now = chrono::Utc::now();
+    let stale = list_stale_submitted_or_included(registry, now, threshold_secs)?;
+    for row in &stale {
+        let status_tag = match &row.status {
+            LocalAnchorStatus::Submitted => "submitted",
+            LocalAnchorStatus::Included => "included",
+            // Stale detection skips terminal states; this arm
+            // is unreachable but kept exhaustive.
+            LocalAnchorStatus::Finalized => "finalized",
+            LocalAnchorStatus::Failed { .. } => "failed",
+        };
+        println!(
+            "event=integrity_evidence_anchor_stale artifact_hash_hex={} tx_id={} \
+             status={} age_secs={} threshold_secs={}",
+            row.artifact_hash_hex, row.tx_id, status_tag, row.age_secs, threshold_secs,
+        );
+    }
+    println!(
+        "event=integrity_evidence_anchor_stale_summary count={} threshold_secs={}",
+        stale.len(),
+        threshold_secs
+    );
+    Ok(stale)
+}
+
+/// Emit one `event=integrity_evidence_anchor_health` line.
+fn emit_health_event(
+    registry: &LocalEvidenceAnchorRegistry,
+) -> Result<EvidenceAnchorRegistryHealth, EvidenceAnchorError> {
+    let h = check_evidence_anchor_registry_health(registry)?;
+    println!(
+        "event=integrity_evidence_anchor_health records={} malformed_records={} \
+         orphan_tx_index_entries={} orphan_tmp_files={}",
+        h.records, h.malformed_records, h.orphan_tx_index_entries, h.orphan_tmp_files,
+    );
+    Ok(h)
+}
+
+// ── Watch (Stage 13.3) ────────────────────────────────────────────────────────
+
+/// `watch-integrity-evidence-anchors` — periodic chain-read-only
+/// reconcile + summary loop. Locked Stage 13.3 invariants:
+/// - Chain interaction is read-only (no submit / no retry).
+/// - Local registry is mutated only by the reused Stage 13.2
+///   reconcile workflow's status-transition writes.
+/// - Stops emit `cause=ctrl_c` or `cause=max_ticks` — the
+///   `reason=` key stays reserved for refusal taxonomy.
+async fn run_watch(args: WatchAnchorArgs) -> Result<()> {
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    println!(
+        "event=integrity_evidence_anchor_watch_started anchor_registry_dir={} \
+         rpc_url={} expect_chain_id={} poll_interval_secs={}",
+        args.anchor_registry_dir.display(),
+        args.rpc_url,
+        args.expect_chain_id,
+        args.poll_interval_secs,
+    );
+
+    // CLI preflight is run synchronously inside spawn_blocking
+    // to keep the chain-id check on a thread the runtime can
+    // join cleanly. Same posture as Stage 8a `operator loop`.
+    let registry_path = args.anchor_registry_dir.clone();
+    let rpc_url = args.rpc_url.clone();
+    let expect_chain_id = args.expect_chain_id;
+    let preflight = tokio::task::spawn_blocking(move || -> Result<(), EvidenceAnchorError> {
+        let dummy_seed = [0u8; 32];
+        let client = SumChainClient::new(rpc_url, dummy_seed);
+        run_chain_read_preflight(&client, expect_chain_id)
+    })
+    .await
+    .map_err(|e| anyhow!("watch preflight join error: {e}"))?;
+    if let Err(err) = preflight {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_watch_failed reason={reason} detail={err}"
+        );
+        bail!("watch refused at preflight: {err}");
+    }
+
+    // Validate the registry directory once up-front (so a
+    // missing path is reported BEFORE the first tick), but
+    // re-open inside each blocking tick so the async runtime
+    // owns nothing reachable from the blocking work.
+    LocalEvidenceAnchorRegistry::open(registry_path.clone()).map_err(|e| {
+        println!("event=integrity_evidence_anchor_watch_failed reason=io detail={e}");
+        anyhow!(
+            "open --anchor-registry-dir {}: {e}",
+            registry_path.display()
+        )
+    })?;
+
+    let mut tick: u64 = 0;
+    let cause: &'static str = loop {
+        tick += 1;
+        println!("event=integrity_evidence_anchor_watch_tick tick={tick}");
+        // Every tick's RPC + FS work runs on the blocking
+        // pool. `UreqTransport::call` is sync HTTP and
+        // `LocalEvidenceAnchorRegistry::list()` does
+        // synchronous file IO — both would otherwise stall the
+        // runtime thread, delaying `ctrl_c`, timers, and any
+        // co-resident async tasks. Mirrors Stage 8a
+        // `loop_core`'s `run_blocking` posture for the tick
+        // body.
+        let registry_path_tick = registry_path.clone();
+        let rpc_url_tick = args.rpc_url.clone();
+        let stale_threshold_tick = args.stale_threshold_secs;
+        let tick_result = tokio::task::spawn_blocking(move || {
+            run_watch_tick_blocking(
+                &registry_path_tick,
+                &rpc_url_tick,
+                stale_threshold_tick,
+            )
+        })
+        .await;
+        if let Err(join_err) = tick_result {
+            // Per-tick join failure (panic in the blocking
+            // closure) is an internal invariant violation;
+            // surface it as an io-level failure so log
+            // scrapers can detect a wedged tick and continue.
+            println!(
+                "event=integrity_evidence_anchor_watch_tick_failed reason=io detail=join error: {join_err}"
+            );
+        }
+        if let Some(max) = args.max_ticks {
+            if tick >= max {
+                break "max_ticks";
+            }
+        }
+        tokio::select! {
+            _ = sleep(Duration::from_secs(args.poll_interval_secs)) => {}
+            _ = tokio::signal::ctrl_c() => {
+                break "ctrl_c";
+            }
+        }
+    };
+    println!("{}", format_watch_stop_event(cause, tick));
+    Ok(())
+}
+
+/// Format the watch-stop event line. Locked Stage 13.3
+/// invariant: informational stops use `cause=` (not `reason=`),
+/// reserving `reason=` for the closed refusal taxonomy. Extracted
+/// as a free function so the format is unit-testable without
+/// spinning up the async loop.
+fn format_watch_stop_event(cause: &str, tick: u64) -> String {
+    format!("event=integrity_evidence_anchor_watch_stopped cause={cause} ticks={tick}")
+}
+
+/// Run one watch tick on the blocking pool: open the registry,
+/// construct the `SumChainClient`, run the reconcile sweep,
+/// emit per-record + summary + (optional) stale events.
+///
+/// **Blocking by design.** The caller MUST invoke this via
+/// `tokio::task::spawn_blocking` (or `tokio::runtime::Handle::block_on`
+/// equivalent) — `UreqTransport::call` is sync HTTP and
+/// `LocalEvidenceAnchorRegistry::list()` does synchronous file
+/// IO. Calling this from an async context blocks the runtime
+/// thread for the duration of the slowest RPC, delaying
+/// `ctrl_c`, timers, and any co-resident async tasks.
+///
+/// Per-record reconcile failures emit their own event lines
+/// (same shape as the existing `reconcile` CLI); the sweep
+/// continues. Errors at the orchestration boundary (registry
+/// open failure, sweep abort) emit a tick-failure event but
+/// do NOT abort the watch loop — the next tick retries.
+fn run_watch_tick_blocking(
+    registry_path: &std::path::Path,
+    rpc_url: &str,
+    stale_threshold_secs: Option<u64>,
+) {
+    // Re-open the registry on each tick so the blocking
+    // closure owns its own handle (no shared state with the
+    // async outer loop). The `open()` cost is just
+    // `create_dir_all` + struct construction; the actual IO
+    // happens lazily inside `list()` / `load_by_*`.
+    let registry = match LocalEvidenceAnchorRegistry::open(registry_path.to_path_buf()) {
+        Ok(r) => r,
+        Err(e) => {
+            println!(
+                "event=integrity_evidence_anchor_watch_tick_failed reason=io detail={e}"
+            );
+            return;
+        }
+    };
+    let dummy_seed = [0u8; 32];
+    let client = SumChainClient::new(rpc_url.to_string(), dummy_seed);
+    let sweep = reconcile_evidence_anchors_workflow(&registry, &client);
+    match sweep {
+        Ok(entries) => {
+            for (artifact_hash_hex, result) in entries {
+                match result {
+                    Ok(outcome) => {
+                        let chain_tag = chain_status_tag(&outcome.chain_status);
+                        println!(
+                            "event=integrity_evidence_anchor_reconcile_record_ok \
+                             artifact_hash_hex={artifact_hash_hex} tx_id={} \
+                             local_status={} chain_status={chain_tag} transitioned={}",
+                            outcome.record.receipt.tx_id,
+                            outcome.record.status.as_str(),
+                            outcome.local_status_transitioned,
+                        );
+                    }
+                    Err(err) => {
+                        let reason = reconcile_record_reason_tag(&err);
+                        println!(
+                            "event=integrity_evidence_anchor_reconcile_record_failed \
+                             artifact_hash_hex={artifact_hash_hex} reason={reason} detail={err}"
+                        );
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            let reason = evidence_anchor_reason_tag(&err);
+            println!(
+                "event=integrity_evidence_anchor_watch_tick_failed reason={reason} detail={err}"
+            );
+        }
+    }
+    // Per-tick summary.
+    if let Err(err) = emit_summary_event(&registry) {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_watch_tick_failed reason={reason} detail={err}"
+        );
+    }
+    // Per-tick stale rows (optional).
+    if let Some(threshold) = stale_threshold_secs {
+        if let Err(err) = emit_stale_events(&registry, threshold) {
+            let reason = evidence_anchor_reason_tag(&err);
+            println!(
+                "event=integrity_evidence_anchor_watch_tick_failed reason={reason} detail={err}"
+            );
+        }
+    }
+}
+
 enum SelectorOwned {
     ArtifactHashHex(String),
     TxId(String),
@@ -1152,5 +1535,188 @@ mod reconcile_record_reason_tag_tests {
             "totally unrecognized text".to_string(),
         ));
         assert_eq!(reconcile_record_reason_tag(&err), "chain_rpc");
+    }
+}
+
+#[cfg(test)]
+mod stage_13_3_cli_tests {
+    //! Stage 13.3 — pin the CLI invariants:
+    //! - Summary / health / stale event emission shapes (via
+    //!   the typed return values of the shared helpers).
+    //! - `cause=` (not `reason=`) on watch-stop event.
+    //! - Time-based stale detection honors the threshold.
+    //!
+    //! Tests use the shared `emit_*` helpers + the small
+    //! `format_watch_stop_event` formatter. The watch loop's
+    //! tokio-driven body is covered by integration usage; the
+    //! unit tests here cover the closed-string invariants and
+    //! the per-tick helper behavior.
+
+    use super::*;
+    use chrono::{Duration, Utc};
+    use omni_zkml::{
+        anchor_signer_pubkey_bytes, build_anchor_digest,
+        submit_evidence_anchor_workflow, StubEvidenceAnchorChainClient,
+        VerifiedWrapperMetadata,
+    };
+
+    fn fresh_registry() -> (tempfile::TempDir, LocalEvidenceAnchorRegistry) {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = LocalEvidenceAnchorRegistry::open(dir.path().join("anchors")).unwrap();
+        (dir, reg)
+    }
+
+    fn seed_submitted(
+        reg: &LocalEvidenceAnchorRegistry,
+        seed: [u8; 32],
+        marker: u8,
+    ) -> String {
+        let client = StubEvidenceAnchorChainClient::new();
+        let raw = vec![marker; 32];
+        let metadata = VerifiedWrapperMetadata {
+            artifact_schema_version: 1,
+            signer_pubkey: anchor_signer_pubkey_bytes(&seed).unwrap(),
+            signed_at_utc_unix: 1_750_000_000,
+        };
+        let digest = build_anchor_digest(&metadata, &raw);
+        let record =
+            submit_evidence_anchor_workflow(reg, &client, digest, &seed).unwrap();
+        record.artifact_hash_hex
+    }
+
+    fn backdate(reg: &LocalEvidenceAnchorRegistry, hash: &str, secs_ago: u64) {
+        let path = reg.root().join(format!("{hash}.json"));
+        let bytes = std::fs::read(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let past = Utc::now() - Duration::seconds(secs_ago as i64);
+        value["submitted_at"] = serde_json::Value::String(past.to_rfc3339());
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    // ── Locked invariant: cause= (not reason=) on watch stops ─
+
+    #[test]
+    fn watch_stop_event_uses_cause_key_not_reason_key() {
+        let line = format_watch_stop_event("ctrl_c", 5);
+        assert!(line.contains("cause=ctrl_c"));
+        assert!(
+            !line.contains("reason="),
+            "watch-stop must NOT use reason= key (reserved for refusal taxonomy): {line}"
+        );
+        let line = format_watch_stop_event("max_ticks", 2);
+        assert!(line.contains("cause=max_ticks"));
+        assert!(!line.contains("reason="));
+    }
+
+    #[test]
+    fn watch_stop_event_emits_ticks_count() {
+        let line = format_watch_stop_event("max_ticks", 42);
+        assert!(line.contains("ticks=42"));
+    }
+
+    // ── Summary helper ────────────────────────────────────────
+
+    #[test]
+    fn summary_helper_returns_typed_counts() {
+        let (_dir, reg) = fresh_registry();
+        let h1 = seed_submitted(&reg, [1u8; 32], 0x11);
+        let _h2 = seed_submitted(&reg, [2u8; 32], 0x22);
+        let h3 = seed_submitted(&reg, [3u8; 32], 0x33);
+        reg.update_status(&h1, LocalAnchorStatus::Included).unwrap();
+        reg.update_status(&h3, LocalAnchorStatus::Finalized)
+            .unwrap();
+
+        let s = emit_summary_event(&reg).unwrap();
+        assert_eq!(s.total, 3);
+        assert_eq!(s.submitted, 1);
+        assert_eq!(s.included, 1);
+        assert_eq!(s.finalized, 1);
+        assert_eq!(s.failed, 0);
+    }
+
+    // ── Stale-detection helper ────────────────────────────────
+
+    #[test]
+    fn stale_helper_returns_rows_above_threshold_only() {
+        let (_dir, reg) = fresh_registry();
+        let h_old = seed_submitted(&reg, [1u8; 32], 0x11);
+        let _h_new = seed_submitted(&reg, [2u8; 32], 0x22);
+        backdate(&reg, &h_old, 600);
+
+        // Threshold 300 → old (>=600s) reports, new does not.
+        let rows = emit_stale_events(&reg, 300).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].artifact_hash_hex, h_old);
+        assert!(rows[0].age_secs >= 600);
+    }
+
+    #[test]
+    fn stale_helper_emits_empty_summary_when_no_rows() {
+        let (_dir, reg) = fresh_registry();
+        let _ = seed_submitted(&reg, [1u8; 32], 0x11);
+        // Threshold 9999 → no record old enough.
+        let rows = emit_stale_events(&reg, 9999).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    // ── Health helper ─────────────────────────────────────────
+
+    #[test]
+    fn health_helper_returns_typed_counts() {
+        let (_dir, reg) = fresh_registry();
+        let _ = seed_submitted(&reg, [1u8; 32], 0x11);
+        let h = emit_health_event(&reg).unwrap();
+        assert_eq!(h.records, 1);
+        assert_eq!(h.malformed_records, 0);
+        assert_eq!(h.orphan_tmp_files, 0);
+        assert_eq!(h.orphan_tx_index_entries, 0);
+    }
+
+    #[test]
+    fn health_helper_does_not_delete_orphan_tmp_files() {
+        let (_dir, reg) = fresh_registry();
+        let _ = seed_submitted(&reg, [1u8; 32], 0x11);
+        let tmp = reg.root().join("orphan.json.tmp");
+        std::fs::write(&tmp, b"stale").unwrap();
+        let h = emit_health_event(&reg).unwrap();
+        assert_eq!(h.orphan_tmp_files, 1);
+        assert!(tmp.exists(), "health check must NOT delete orphan tmp files");
+    }
+
+    // ── Locked invariant: tick body is synchronous (blocking) ────
+
+    /// Pins the contract that `run_watch_tick_blocking` is a
+    /// SYNC function. The watch loop calls it via
+    /// `tokio::task::spawn_blocking`; if a future refactor
+    /// makes the tick body `async` (or otherwise changes the
+    /// signature in a way that would re-acquire the runtime
+    /// thread), this assignment fails to typecheck.
+    ///
+    /// The signature target is
+    /// `fn(&Path, &str, Option<u64>)` — matches a sync
+    /// function pointer only. `async fn` cannot be coerced to
+    /// this type.
+    #[test]
+    fn watch_tick_body_is_blocking_sync_function() {
+        let _pin: fn(&std::path::Path, &str, Option<u64>) = run_watch_tick_blocking;
+    }
+
+    /// Per-tick fault tolerance: a registry that fails to open
+    /// (e.g. the dir was deleted out from under the watch)
+    /// must NOT panic — the tick emits an `io` failure event
+    /// and returns, leaving the watch loop to retry next tick.
+    /// Exercises `run_watch_tick_blocking` directly (no async
+    /// runtime) — the function's blocking contract.
+    #[test]
+    fn watch_tick_blocking_does_not_panic_when_registry_open_fails() {
+        // Path is a file, not a directory → `create_dir_all`
+        // fails. `run_watch_tick_blocking` must absorb this
+        // and emit a tick_failed event.
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("not_a_dir");
+        std::fs::write(&bogus, b"i am a file").unwrap();
+        // Should not panic — even though the registry can't be
+        // opened, the tick body must return cleanly.
+        run_watch_tick_blocking(&bogus, "http://127.0.0.1:1", None);
     }
 }
