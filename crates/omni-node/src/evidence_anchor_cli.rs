@@ -43,17 +43,20 @@ use omni_contributor::{
 use omni_sumchain::SumChainClient;
 use omni_zkml::EvidenceAnchorError;
 use omni_zkml::{
-    AnchorApplyOptions, AnchorCleanupPlan, AnchorPlanOptions,
+    AnchorApplyOptions, AnchorCleanupPlan, AnchorExportOptions,
+    AnchorExportSelection, AnchorExportVerifyOptions, AnchorPlanOptions,
     AnchorQuarantineManifest, AnchorRecord, AnchorRestoreOptions, AnchorSelector,
-    AnchorStatus, ChainClientError, EvidenceAnchorRegistryHealth,
-    EvidenceAnchorRegistrySummary, INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION,
-    IntegrityEvidenceAnchorTxData, LocalAnchorStatus, LocalEvidenceAnchorRegistry,
-    StaleAnchorInfo, anchor_hex_lower, apply_anchor_cleanup,
+    AnchorStatus, ArtifactBytesInclusion, ChainClientError,
+    EvidenceAnchorRegistryHealth, EvidenceAnchorRegistrySummary,
+    INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION, IntegrityEvidenceAnchorTxData,
+    LocalAnchorStatus, LocalEvidenceAnchorRegistry, StaleAnchorInfo,
+    anchor_hex_lower, apply_anchor_cleanup, apply_anchor_export,
     check_evidence_anchor_registry_health, evidence_anchor_reason_tag,
     list_evidence_anchors_by_status, list_stale_submitted_or_included,
     parse_anchor_hex_32, plan_anchor_cleanup, query_evidence_anchor_workflow,
     reconcile_evidence_anchors_workflow, restore_anchor_cleanup_quarantine,
-    verify_anchor_against_registry, verify_anchor_file_against_artifact_bytes,
+    verify_anchor_against_registry, verify_anchor_export,
+    verify_anchor_file_against_artifact_bytes,
 };
 #[cfg(feature = "submit")]
 use omni_zkml::{
@@ -120,6 +123,17 @@ enum EvidenceAnchorCmd {
     /// local artifact bytes WITHOUT consulting the registry.
     /// Does not prove submission / inclusion.
     VerifyIntegrityEvidenceAnchorFile(VerifyAnchorFileArgs),
+    /// Stage 13.5 — local-only export of a record subset plus
+    /// optional artifact-bytes / signed-chain-report files,
+    /// with a portable JSON manifest. **Fully local — zero
+    /// chain interaction.** Anchor registry is read-only.
+    ExportIntegrityEvidenceAnchors(ExportAnchorsArgs),
+    /// Stage 13.5 — pure-read verify of a Stage 13.5 export
+    /// directory. Re-hashes every copied file, parses every
+    /// anchor record, runs Stage 13.0's `verify_anchor_tx_data`,
+    /// and (for paired entries) re-checks the artifact-hash
+    /// binding. Does NOT prove the Stage 12.25 wrapper signer.
+    VerifyIntegrityEvidenceAnchorExport(VerifyAnchorExportArgs),
 }
 
 #[cfg(feature = "submit")]
@@ -354,6 +368,75 @@ struct VerifyAnchorFileArgs {
     anchor_json: PathBuf,
 }
 
+/// Stage 13.5 — export-anchor CLI. At least one of `--status`,
+/// `--tx-id`, `--artifact-hash-hex` must be supplied (no
+/// accidental "export everything", Q4). `--export-out` must be
+/// empty or non-existent (no-clobber, Q8).
+#[derive(Args)]
+pub(crate) struct ExportAnchorsArgs {
+    /// Directory in which the anchor record + tx_index live.
+    /// Read-only.
+    #[arg(long)]
+    pub(crate) anchor_registry_dir: PathBuf,
+
+    /// Destination directory. Must be empty or non-existent.
+    /// No `--force` flag — choose a fresh path or delete the
+    /// old one.
+    #[arg(long)]
+    pub(crate) export_out: PathBuf,
+
+    /// Status filter. Repeatable. OR within this kind, AND
+    /// across selector kinds.
+    #[arg(long)]
+    pub(crate) status: Vec<String>,
+    /// Stored `tx_id` filter. Repeatable. A selector miss
+    /// refuses with `reason=anchor_not_found`.
+    #[arg(long)]
+    pub(crate) tx_id: Vec<String>,
+    /// Lower-hex `artifact_hash_hex` filter. Repeatable. A
+    /// selector miss refuses with `reason=anchor_not_found`.
+    #[arg(long)]
+    pub(crate) artifact_hash_hex: Vec<String>,
+
+    /// Operator-supplied artifact-bytes inclusion pair
+    /// `<PATH>:<ARTIFACT_HASH_HEX>`. Repeatable. The file's
+    /// BLAKE3 must equal the claimed hash; refuses with
+    /// `reason=export_entry_metadata_mismatch` on drift.
+    #[arg(long)]
+    pub(crate) include_artifact_bytes: Vec<String>,
+
+    /// Operator-supplied Stage 12.25 signed-chain-report file
+    /// to bundle alongside. Repeatable. Stage 13.5 verifies
+    /// BLAKE3 only — Stage 12.25 own-signature verification is
+    /// out of scope.
+    #[arg(long)]
+    pub(crate) include_signed_chain_report: Vec<PathBuf>,
+
+    /// Free-form operator provenance. Default `""`.
+    #[arg(long, default_value = "")]
+    pub(crate) label: String,
+    /// Free-form operator provenance. Default `""`.
+    #[arg(long, default_value = "")]
+    pub(crate) notes: String,
+}
+
+/// Stage 13.5 — verify-anchor-export CLI.
+#[derive(Args)]
+pub(crate) struct VerifyAnchorExportArgs {
+    /// Directory holding `evidence_anchor_export_manifest.json`
+    /// and the copied bytes subtree.
+    #[arg(long)]
+    pub(crate) export_dir: PathBuf,
+
+    /// When set, refuses unless every `anchor_record` entry has
+    /// a matching `artifact_bytes` entry for the same
+    /// `artifact_hash_hex`. Routes through
+    /// `reason=export_strict_mode_artifact_bytes_missing` on
+    /// miss (verification-time refusal, not a clap usage error).
+    #[arg(long)]
+    pub(crate) strict: bool,
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
 pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
@@ -399,6 +482,16 @@ pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
             tokio::task::spawn_blocking(move || run_verify_file(a))
                 .await
                 .map_err(|e| anyhow!("verify-anchor-file join error: {e}"))?
+        }
+        EvidenceAnchorCmd::ExportIntegrityEvidenceAnchors(a) => {
+            tokio::task::spawn_blocking(move || run_export(a))
+                .await
+                .map_err(|e| anyhow!("export-anchor join error: {e}"))?
+        }
+        EvidenceAnchorCmd::VerifyIntegrityEvidenceAnchorExport(a) => {
+            tokio::task::spawn_blocking(move || run_verify_export(a))
+                .await
+                .map_err(|e| anyhow!("verify-anchor-export join error: {e}"))?
         }
     }
 }
@@ -1765,6 +1858,208 @@ fn run_verify_file(args: VerifyAnchorFileArgs) -> Result<()> {
     Ok(())
 }
 
+// ── Stage 13.5 — anchor export / verify ──────────────────────────────────────
+
+/// Closed clap-level mutex / required-with violation for the
+/// Stage 13.5 export command. Surfaced via `bail!` (NOT the
+/// closed `reason=` taxonomy) because these are argument-parse
+/// concerns, not refusals of well-shaped input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExportMutexViolation {
+    NoSelectorGiven,
+    MalformedArtifactBytesPair,
+    UnknownStatus,
+    MalformedArtifactHashHex,
+}
+
+impl ExportMutexViolation {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            ExportMutexViolation::NoSelectorGiven => {
+                "at least one of --status, --tx-id, --artifact-hash-hex is required"
+            }
+            ExportMutexViolation::MalformedArtifactBytesPair => {
+                "--include-artifact-bytes expects <path>:<64-lower-hex>"
+            }
+            ExportMutexViolation::UnknownStatus => {
+                "--status must be one of submitted | included | finalized | failed"
+            }
+            ExportMutexViolation::MalformedArtifactHashHex => {
+                "--artifact-hash-hex must be exactly 64 lowercase hex characters"
+            }
+        }
+    }
+}
+
+/// Parse a CLI `--status` token into the closed
+/// `LocalAnchorStatus`. Stage 13.5 only filters by status
+/// *kind*; the `Failed { reason }` variant is matched on kind
+/// alone (the inner reason is recorded in-band on each record).
+fn parse_status_token(s: &str) -> Option<LocalAnchorStatus> {
+    match s.to_ascii_lowercase().as_str() {
+        "submitted" | "SUBMITTED" => Some(LocalAnchorStatus::Submitted),
+        "included" | "INCLUDED" => Some(LocalAnchorStatus::Included),
+        "finalized" | "FINALIZED" => Some(LocalAnchorStatus::Finalized),
+        "failed" | "FAILED" => Some(LocalAnchorStatus::Failed {
+            reason: String::new(),
+        }),
+        _ => None,
+    }
+}
+
+/// Parse a `<PATH>:<64-lower-hex>` pair from the CLI. The split
+/// is on the LAST `:` so paths with embedded colons (e.g. drive
+/// letters on Windows-emulated layouts) still work.
+fn parse_artifact_bytes_pair(
+    raw: &str,
+) -> std::result::Result<ArtifactBytesInclusion, ExportMutexViolation> {
+    let Some(idx) = raw.rfind(':') else {
+        return Err(ExportMutexViolation::MalformedArtifactBytesPair);
+    };
+    if idx == 0 || idx + 1 >= raw.len() {
+        return Err(ExportMutexViolation::MalformedArtifactBytesPair);
+    }
+    let path = &raw[..idx];
+    let hash = &raw[idx + 1..];
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(ExportMutexViolation::MalformedArtifactBytesPair);
+    }
+    Ok(ArtifactBytesInclusion {
+        path: PathBuf::from(path),
+        artifact_hash_hex: hash.to_string(),
+    })
+}
+
+/// Pure mutex/required-with check. Runs BEFORE any FS read.
+pub(crate) fn check_export_mutex_rules(
+    args: &ExportAnchorsArgs,
+) -> std::result::Result<
+    (
+        Vec<LocalAnchorStatus>,
+        Vec<ArtifactBytesInclusion>,
+    ),
+    ExportMutexViolation,
+> {
+    // Q4: at least one of the three selector kinds must be set.
+    if args.status.is_empty() && args.tx_id.is_empty() && args.artifact_hash_hex.is_empty() {
+        return Err(ExportMutexViolation::NoSelectorGiven);
+    }
+    // Status tokens are closed-set.
+    let mut statuses = Vec::with_capacity(args.status.len());
+    for s in &args.status {
+        let parsed = parse_status_token(s).ok_or(ExportMutexViolation::UnknownStatus)?;
+        statuses.push(parsed);
+    }
+    // Artifact-hash-hex tokens are 64-lower-hex.
+    for h in &args.artifact_hash_hex {
+        if h.len() != 64
+            || !h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(ExportMutexViolation::MalformedArtifactHashHex);
+        }
+    }
+    // Pair-form `<PATH>:<HASH>` parsing.
+    let mut inclusions = Vec::with_capacity(args.include_artifact_bytes.len());
+    for raw in &args.include_artifact_bytes {
+        inclusions.push(parse_artifact_bytes_pair(raw)?);
+    }
+    Ok((statuses, inclusions))
+}
+
+fn run_export(args: ExportAnchorsArgs) -> Result<()> {
+    let (statuses, inclusions) = match check_export_mutex_rules(&args) {
+        Ok(v) => v,
+        Err(v) => bail!("invalid flag combination: {}", v.message()),
+    };
+    println!(
+        "event=integrity_evidence_anchor_export_started \
+         anchor_registry_dir={} export_out={}",
+        args.anchor_registry_dir.display(),
+        args.export_out.display()
+    );
+    let registry = LocalEvidenceAnchorRegistry::open(args.anchor_registry_dir.clone())
+        .map_err(|e| {
+            println!(
+                "event=integrity_evidence_anchor_export_failed reason=io detail={e}"
+            );
+            anyhow!(
+                "open --anchor-registry-dir {}: {e}",
+                args.anchor_registry_dir.display()
+            )
+        })?;
+    let now_utc = chrono::Utc::now().to_rfc3339();
+    let selection = AnchorExportSelection {
+        statuses,
+        tx_ids: args.tx_id.clone(),
+        artifact_hashes: args.artifact_hash_hex.clone(),
+    };
+    let opts = AnchorExportOptions {
+        export_out: &args.export_out,
+        selection: &selection,
+        artifact_bytes_inclusions: &inclusions,
+        signed_chain_report_paths: &args.include_signed_chain_report,
+        label: &args.label,
+        notes: &args.notes,
+        now_utc: &now_utc,
+    };
+    let report = apply_anchor_export(&registry, &opts).map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_export_failed reason={reason} detail={err}"
+        );
+        anyhow!("export refused: {err}")
+    })?;
+    println!(
+        "event=integrity_evidence_anchor_export_ok export_id={} \
+         anchors_written={} artifact_bytes_written={} \
+         signed_chain_reports_written={} manifest_relative_path={}",
+        report.export_id,
+        report.anchors_written,
+        report.artifact_bytes_written,
+        report.signed_chain_reports_written,
+        report.manifest_relative_path,
+    );
+    Ok(())
+}
+
+fn run_verify_export(args: VerifyAnchorExportArgs) -> Result<()> {
+    println!(
+        "event=integrity_evidence_anchor_verify_export_started \
+         export_dir={} strict={}",
+        args.export_dir.display(),
+        args.strict,
+    );
+    let opts = AnchorExportVerifyOptions {
+        export_dir: &args.export_dir,
+        strict: args.strict,
+    };
+    let report = verify_anchor_export(&opts).map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_verify_export_failed reason={reason} detail={err}"
+        );
+        anyhow!("verify export refused: {err}")
+    })?;
+    println!(
+        "event=integrity_evidence_anchor_verify_export_ok export_id={} \
+         entries_verified={} anchor_records_verified={} \
+         artifact_bytes_verified={} signed_chain_reports_verified={} \
+         pairings_artifact_hash_bound={} strict={}",
+        report.export_id,
+        report.entries_verified,
+        report.anchor_records_verified,
+        report.artifact_bytes_verified,
+        report.signed_chain_reports_verified,
+        report.pairings_artifact_hash_bound,
+        report.strict,
+    );
+    Ok(())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "submit")]
@@ -2369,5 +2664,256 @@ mod stage_13_4_cli_tests {
             derived,
             std::path::Path::new("/var/omni-anchors-quarantine/abcdef0123456789")
         );
+    }
+}
+
+#[cfg(test)]
+mod stage_13_5_cli_tests {
+    //! Stage 13.5 — pin CLI invariants:
+    //! - Closed mutex / required-with refusals routed via
+    //!   `bail!` (clap-level), not the `reason=` taxonomy.
+    //! - `--include-artifact-bytes` pair parsing
+    //!   (`<PATH>:<64-lower-hex>`).
+    //! - Closed reason-tag mapping for every new Stage 13.5
+    //!   `EvidenceAnchorError` variant.
+    //! - `--strict` is NOT a clap-level concern (REJECT-fix
+    //!   Finding 1) — it's a verification-time gate routed
+    //!   through `export_strict_mode_artifact_bytes_missing`.
+
+    use super::*;
+    use std::path::PathBuf;
+
+    fn defaults() -> ExportAnchorsArgs {
+        ExportAnchorsArgs {
+            anchor_registry_dir: PathBuf::from("/tmp/registry"),
+            export_out: PathBuf::from("/tmp/export-out"),
+            status: vec![],
+            tx_id: vec![],
+            artifact_hash_hex: vec![],
+            include_artifact_bytes: vec![],
+            include_signed_chain_report: vec![],
+            label: String::new(),
+            notes: String::new(),
+        }
+    }
+
+    // ── Mutex rule: at least one selector is required ──
+
+    #[test]
+    fn mutex_refuses_when_no_selector_given() {
+        let a = defaults();
+        assert_eq!(
+            check_export_mutex_rules(&a).err(),
+            Some(ExportMutexViolation::NoSelectorGiven)
+        );
+    }
+
+    #[test]
+    fn mutex_passes_with_only_status_selector() {
+        let mut a = defaults();
+        a.status = vec!["submitted".to_string()];
+        assert!(check_export_mutex_rules(&a).is_ok());
+    }
+
+    #[test]
+    fn mutex_passes_with_only_tx_id_selector() {
+        let mut a = defaults();
+        a.tx_id = vec!["anchor-1".to_string()];
+        assert!(check_export_mutex_rules(&a).is_ok());
+    }
+
+    #[test]
+    fn mutex_passes_with_only_artifact_hash_selector() {
+        let mut a = defaults();
+        a.artifact_hash_hex = vec!["aa".repeat(32)];
+        assert!(check_export_mutex_rules(&a).is_ok());
+    }
+
+    // ── Mutex rule: status tokens are closed-set ──
+
+    #[test]
+    fn mutex_refuses_unknown_status() {
+        let mut a = defaults();
+        a.status = vec!["weird".to_string()];
+        assert_eq!(
+            check_export_mutex_rules(&a).err(),
+            Some(ExportMutexViolation::UnknownStatus)
+        );
+    }
+
+    #[test]
+    fn mutex_accepts_all_four_status_kinds_case_insensitive() {
+        for s in &["submitted", "INCLUDED", "Finalized", "failed"] {
+            let mut a = defaults();
+            a.status = vec![s.to_string()];
+            assert!(check_export_mutex_rules(&a).is_ok(), "rejected {s}");
+        }
+    }
+
+    // ── Mutex rule: artifact-hash-hex must be 64 lower-hex ──
+
+    #[test]
+    fn mutex_refuses_malformed_artifact_hash_hex_wrong_length() {
+        let mut a = defaults();
+        a.artifact_hash_hex = vec!["aaa".to_string()];
+        assert_eq!(
+            check_export_mutex_rules(&a).err(),
+            Some(ExportMutexViolation::MalformedArtifactHashHex)
+        );
+    }
+
+    #[test]
+    fn mutex_refuses_malformed_artifact_hash_hex_uppercase() {
+        let mut a = defaults();
+        a.artifact_hash_hex = vec!["AA".repeat(32)];
+        assert_eq!(
+            check_export_mutex_rules(&a).err(),
+            Some(ExportMutexViolation::MalformedArtifactHashHex)
+        );
+    }
+
+    // ── Pair-form `--include-artifact-bytes` parsing ──
+
+    #[test]
+    fn pair_form_parses_path_colon_hash() {
+        let raw = format!("/some/file.bin:{}", "aa".repeat(32));
+        let pair = parse_artifact_bytes_pair(&raw).unwrap();
+        assert_eq!(pair.path, PathBuf::from("/some/file.bin"));
+        assert_eq!(pair.artifact_hash_hex, "aa".repeat(32));
+    }
+
+    #[test]
+    fn pair_form_refuses_missing_colon() {
+        assert_eq!(
+            parse_artifact_bytes_pair("/some/file.bin").err(),
+            Some(ExportMutexViolation::MalformedArtifactBytesPair)
+        );
+    }
+
+    #[test]
+    fn pair_form_refuses_short_hash() {
+        let raw = "/some/file.bin:aaa".to_string();
+        assert_eq!(
+            parse_artifact_bytes_pair(&raw).err(),
+            Some(ExportMutexViolation::MalformedArtifactBytesPair)
+        );
+    }
+
+    #[test]
+    fn pair_form_refuses_uppercase_hash() {
+        let raw = format!("/some/file.bin:{}", "AA".repeat(32));
+        assert_eq!(
+            parse_artifact_bytes_pair(&raw).err(),
+            Some(ExportMutexViolation::MalformedArtifactBytesPair)
+        );
+    }
+
+    // ── Violation message stability ──
+
+    #[test]
+    fn violation_messages_are_stable_strings() {
+        assert_eq!(
+            ExportMutexViolation::NoSelectorGiven.message(),
+            "at least one of --status, --tx-id, --artifact-hash-hex is required"
+        );
+        assert_eq!(
+            ExportMutexViolation::MalformedArtifactBytesPair.message(),
+            "--include-artifact-bytes expects <path>:<64-lower-hex>"
+        );
+        assert_eq!(
+            ExportMutexViolation::UnknownStatus.message(),
+            "--status must be one of submitted | included | finalized | failed"
+        );
+        assert_eq!(
+            ExportMutexViolation::MalformedArtifactHashHex.message(),
+            "--artifact-hash-hex must be exactly 64 lowercase hex characters"
+        );
+    }
+
+    // ── Closed reason-tag mapper covers all 6 Stage 13.5 variants ──
+
+    #[test]
+    fn unsupported_export_manifest_schema_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ExportManifestSchemaUnsupported {
+            got: 2,
+            expected: 1,
+        };
+        assert_eq!(
+            evidence_anchor_reason_tag(&err),
+            "unsupported_export_manifest_schema_version"
+        );
+    }
+
+    #[test]
+    fn export_manifest_hash_mismatch_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ExportManifestHashMismatch {
+            computed: "1".repeat(64),
+            expected: "2".repeat(64),
+        };
+        assert_eq!(
+            evidence_anchor_reason_tag(&err),
+            "export_manifest_hash_mismatch"
+        );
+    }
+
+    #[test]
+    fn export_invalid_path_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ExportInvalidPath {
+            entry_kind: "anchor_record",
+            relative_path: "../etc/passwd".to_string(),
+            reason: "parent traversal forbidden",
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "export_invalid_path");
+    }
+
+    #[test]
+    fn export_blake3_mismatch_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ExportBlake3Mismatch {
+            relative_path: "anchors/aa.json".to_string(),
+            computed: "3".repeat(64),
+            expected: "4".repeat(64),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "export_blake3_mismatch");
+    }
+
+    #[test]
+    fn export_entry_metadata_mismatch_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ExportEntryMetadataMismatch {
+            relative_path: "anchors/bb.json".to_string(),
+            field: "artifact_hash_hex",
+            computed: "aa".to_string(),
+            manifest: "bb".to_string(),
+        };
+        assert_eq!(
+            evidence_anchor_reason_tag(&err),
+            "export_entry_metadata_mismatch"
+        );
+    }
+
+    #[test]
+    fn export_strict_mode_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ExportStrictModeArtifactBytesMissing {
+            anchor_record_relative_path: "anchors/cc.json".to_string(),
+            artifact_hash_hex: "cc".repeat(32),
+        };
+        assert_eq!(
+            evidence_anchor_reason_tag(&err),
+            "export_strict_mode_artifact_bytes_missing"
+        );
+    }
+
+    // ── Selector-miss routes through anchor_not_found (REJECT
+    //    Finding 3) ──
+    //
+    // This is a reused tag from Stage 13.0 / 13.2. Pin that the
+    // mapper still routes the variant correctly so a Stage 13.5
+    // refactor doesn't accidentally swap the tag.
+
+    #[test]
+    fn anchor_not_found_remains_the_selector_miss_tag() {
+        let err = EvidenceAnchorError::AnchorNotFound {
+            selector: "tx_id=missing".to_string(),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "anchor_not_found");
     }
 }

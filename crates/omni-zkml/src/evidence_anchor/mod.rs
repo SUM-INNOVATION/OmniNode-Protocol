@@ -27,6 +27,7 @@
 
 pub mod cleanup;
 pub mod client;
+pub mod export;
 pub mod operations;
 pub mod registry;
 pub mod wire;
@@ -43,6 +44,15 @@ pub use cleanup::{
     AnchorQuarantineRestoreOutcome, AnchorQuarantineRestoreReport,
     AnchorRestoreOptions, ANCHOR_CLEANUP_PLAN_SCHEMA_VERSION,
     ANCHOR_QUARANTINE_MANIFEST_SCHEMA_VERSION,
+};
+pub use export::{
+    apply_anchor_export, plan_anchor_export, verify_anchor_export,
+    AnchorExportEntry, AnchorExportEntryKind, AnchorExportManifest,
+    AnchorExportOptions, AnchorExportPlan, AnchorExportReport,
+    AnchorExportSelection, AnchorExportVerifyOptions,
+    AnchorExportVerifyReport, ArtifactBytesInclusion,
+    EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION,
+    EXPORT_MANIFEST_FILENAME,
 };
 pub use operations::{
     check_evidence_anchor_registry_health, list_evidence_anchors_by_status,
@@ -115,6 +125,22 @@ pub fn evidence_anchor_reason_tag(err: &EvidenceAnchorError) -> &'static str {
         EvidenceAnchorError::CleanupInvalidPath { .. } => "cleanup_invalid_path",
         EvidenceAnchorError::CleanupPlanSchemaUnsupported { .. } => {
             "unsupported_cleanup_plan_schema_version"
+        }
+
+        // ── Stage 13.5 export-side refusals ──
+        EvidenceAnchorError::ExportManifestSchemaUnsupported { .. } => {
+            "unsupported_export_manifest_schema_version"
+        }
+        EvidenceAnchorError::ExportManifestHashMismatch { .. } => {
+            "export_manifest_hash_mismatch"
+        }
+        EvidenceAnchorError::ExportInvalidPath { .. } => "export_invalid_path",
+        EvidenceAnchorError::ExportBlake3Mismatch { .. } => "export_blake3_mismatch",
+        EvidenceAnchorError::ExportEntryMetadataMismatch { .. } => {
+            "export_entry_metadata_mismatch"
+        }
+        EvidenceAnchorError::ExportStrictModeArtifactBytesMissing { .. } => {
+            "export_strict_mode_artifact_bytes_missing"
         }
     }
 }
@@ -292,6 +318,53 @@ mod reason_tag_tests {
                     expected: 1,
                 },
                 "unsupported_cleanup_plan_schema_version",
+            ),
+            // ── Stage 13.5 export-side variants ──
+            (
+                EvidenceAnchorError::ExportManifestSchemaUnsupported {
+                    got: 2,
+                    expected: 1,
+                },
+                "unsupported_export_manifest_schema_version",
+            ),
+            (
+                EvidenceAnchorError::ExportManifestHashMismatch {
+                    computed: "1".repeat(64),
+                    expected: "2".repeat(64),
+                },
+                "export_manifest_hash_mismatch",
+            ),
+            (
+                EvidenceAnchorError::ExportInvalidPath {
+                    entry_kind: "anchor_record",
+                    relative_path: "../etc/passwd".to_string(),
+                    reason: "parent traversal forbidden",
+                },
+                "export_invalid_path",
+            ),
+            (
+                EvidenceAnchorError::ExportBlake3Mismatch {
+                    relative_path: "anchors/aa.json".to_string(),
+                    computed: "3".repeat(64),
+                    expected: "4".repeat(64),
+                },
+                "export_blake3_mismatch",
+            ),
+            (
+                EvidenceAnchorError::ExportEntryMetadataMismatch {
+                    relative_path: "anchors/bb.json".to_string(),
+                    field: "artifact_hash_hex",
+                    computed: "aa".to_string(),
+                    manifest: "bb".to_string(),
+                },
+                "export_entry_metadata_mismatch",
+            ),
+            (
+                EvidenceAnchorError::ExportStrictModeArtifactBytesMissing {
+                    anchor_record_relative_path: "anchors/cc.json".to_string(),
+                    artifact_hash_hex: "cc".repeat(32),
+                },
+                "export_strict_mode_artifact_bytes_missing",
             ),
         ];
         for (err, expected) in cases {

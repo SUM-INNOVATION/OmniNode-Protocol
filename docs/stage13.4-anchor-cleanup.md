@@ -259,3 +259,5 @@ All hermetic. No network.
 - Cleanup of standalone-JSON anchor files outside the registry.
 - Block-based "reorged out" detection.
 - Process locks (drift refusal is the contract).
+
+> **Post-Stage-13.5 note:** Stage 13.5 introduces a portable export form for anchor records (manifest + bytes subtree) plus a pure-read verify command. Stage 13.4's cleanup taxonomy, quarantine manifest, and reason-tag surface are **unchanged**; Stage 13.5 ships its own closed-set six-tag delta on a distinct concept (export-side refusals). See [`docs/stage13.5-anchor-export.md`](stage13.5-anchor-export.md).
