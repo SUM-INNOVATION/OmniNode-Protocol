@@ -2767,25 +2767,85 @@ The standalone-JSON command does **not** consult the registry — it only proves
 - `chain_client` — stub chain-client failure (rare; configurable in tests).
 - `io` — FS / registry IO failure.
 
+**Stage 13.2 chain-mode additions** (fire only when `--rpc-url` + `--expect-chain-id` are supplied):
+
+- `chain_id_mismatch` — `--expect-chain-id` ≠ `params.chain_id`. CLI preflight gate; no anchor RPC fires.
+- `not_activated` — chain reports anchor RPC not yet active (non-mainnet dormant / scheduled, OR mainnet scheduled-but-not-yet-reached). Emitted by CLI preflight; the adapter additionally emits `not_activated` if a non-CLI caller bypasses preflight.
+- `mainnet_policy_unresolved` — `chain_id == 1` AND `integrity_evidence_anchor_enabled_from_height == None` (chain governance has not set mainnet activation). Explicit, captures "mainnet anchors are not yet permitted" without implying a permanent refusal. Once mainnet sets `Some(h)`, refusal drops to `not_activated`.
+- `chain_rpc` — transport-layer failure (HTTP / body read / JSON-RPC envelope malformed / missing `result` field). Routed through `omni_sumchain::classify_chain_client_error`; CLI never inspects raw error strings.
+- `chain_submit_refused` — chain returned a JSON-RPC `error` object (chain refused at the application layer; chain's text surfaced verbatim).
+- `chain_response_malformed` — chain returned success but the response shape could not be parsed into the expected DTO, OR the response carried an unrecognized status enum string (e.g. `status: "foo"`).
+
 **What the chain attests (vs what it does not):**
 
 - **Attested**: existence of `(artifact_hash, signer_pubkey, signed_at, artifact_kind, anchor_schema_version, artifact_schema_version)`. The chain proves the operator submitted a commitment to this exact byte sequence at this time, under this signing key.
 - **NOT attested**: semantic correctness of the underlying integrity evidence. Stage 12.20-12.25's gates remain the source of truth for whether the evidence describes a successful verification — chain inclusion does not certify gate outcomes. Re-running `verify-integrity-evidence-chain` against the wrapper's `signed_bundle_path` is unchanged and unaffected by Stage 13.0.
 
-**The chain-anchor pipeline (terminating in Stage 13.0):**
+**The chain-anchor pipeline:**
 
+Stage 13.0 stub mode (default — local testing, regen, no chain):
 ```sh
 # 1-6: Stage 12.20-12.25 (forensic chain — see above)
-# 7. Stage 13.0 — submit chain anchor (stub client)
+# 7. Stage 13.0 — submit chain anchor via stub client
 omni-node operator evidence-anchor submit-integrity-evidence-anchor \
   --signed-chain-report /var/omni-evidence/2026-06-15.chain.signed.json \
   --submitter-seed     /etc/omni-node/chain-report-signer.seed \
   --anchor-registry-dir /var/omni-anchors \
   --json-out           /var/omni-evidence/2026-06-15.chain.anchor.json
+# event=integrity_evidence_anchor_submit_ok ... tx_id=anchor-00000000-<hash-prefix>
 ```
+
+Stage 13.2 chain mode (real SUM Chain RPC; gated `--features submit`):
+```sh
+# Submit
+omni-node operator evidence-anchor submit-integrity-evidence-anchor \
+  --signed-chain-report /var/omni-evidence/2026-06-15.chain.signed.json \
+  --submitter-seed     /etc/omni-node/chain-report-signer.seed \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url            https://rpc.sumchain.example.com \
+  --expect-chain-id    42 \
+  --allow-submit
+# event=integrity_evidence_anchor_submit_ok ... tx_id=0x<chain_tx_hash>
+
+# Query (chain-read-only, local-registry-mutating)
+omni-node operator evidence-anchor query-integrity-evidence-anchor \
+  --anchor-registry-dir /var/omni-anchors \
+  --tx-id              0x<chain_tx_hash> \
+  --rpc-url            https://rpc.sumchain.example.com \
+  --expect-chain-id    42
+
+# Reconcile sweep (chain-read-only, local-registry-mutating)
+omni-node operator evidence-anchor reconcile-integrity-evidence-anchor \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url            https://rpc.sumchain.example.com \
+  --expect-chain-id    42
+```
+
+**Verify (unchanged — local-only in BOTH stub and chain modes):**
+
+```sh
+omni-node operator evidence-anchor verify-integrity-evidence-anchor \
+  --signed-chain-report /var/omni-evidence/2026-06-15.chain.signed.json \
+  --anchor-registry-dir /var/omni-anchors
+```
+
+**Mainnet posture (Stage 13.2):**
+
+Mainnet (`chain_id == 1`) writes additionally require `--allow-mainnet-submit` AND chain governance must have set `integrity_evidence_anchor_enabled_from_height` to a value reached by the current chain head. Submission refuses with `mainnet_policy_unresolved` when activation is dormant, and `not_activated` when scheduled but not yet reached — neither can be overridden via flags.
+
+**Activation state machine** (drives the mainnet/non-mainnet tagging split):
+
+| chain_id | `integrity_evidence_anchor_enabled_from_height` | head vs. h | Refusal tag |
+| --- | --- | --- | --- |
+| `1` (mainnet) | `None` | — | `mainnet_policy_unresolved` |
+| `1` (mainnet) | `Some(h)` | `head < h` | `not_activated` |
+| `1` (mainnet) | `Some(h)` | `head >= h` | OK (subject to opt-ins) |
+| ≠ 1 (non-mainnet) | `None` | — | `not_activated` |
+| ≠ 1 (non-mainnet) | `Some(h)` | `head < h` | `not_activated` |
+| ≠ 1 (non-mainnet) | `Some(h)` | `head >= h` | OK (subject to `--allow-submit`) |
 
 **Determinism:** Anchoring the same on-disk wrapper bytes with the same submitter seed produces a byte-identical `IntegrityEvidenceAnchorTxData` payload — operators can commit the anchor JSON to an archive alongside the wrapper bytes and re-derive it.
 
-**Deferred to Stage 13.1:** real SUM Chain RPC submission path; block-height confirmation polling beyond the stub; aggregation forms (anchor-bundles / anchor-chains). The wire spec frozen in `docs/stage13-evidence-anchor-spec.md` is the contract Stage 13.1 implements against.
+**Implementation reference:** [`docs/stage13.2-chain-adapter.md`](stage13.2-chain-adapter.md) — Stage 13.2 engineering doc (RPC method names, DTO ownership, classifier).
 
 **No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module — no other constants change.

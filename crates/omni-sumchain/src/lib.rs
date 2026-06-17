@@ -50,6 +50,8 @@
 //!   the attestation's `verifier_address`; otherwise `sum_getNonce` /
 //!   `sum_sendRawTransaction` are never reached.
 
+pub(crate) mod anchor_dto;
+pub(crate) mod anchor_tx;
 pub mod client;
 pub mod dto;
 // Stage 9a + 9c: outer_sign + tx depend on the public chain
@@ -68,5 +70,8 @@ pub use dto::{
     BlockFinality, BlockHeightInfo, ChainParamsInfo, InferenceAttestationInfo,
     InferenceAttestationStatusInfo,
 };
-pub use rpc::{FakeJsonRpcTransport, JsonRpcTransport, UreqTransport};
+pub use rpc::{
+    classify_chain_client_error, error_prefixes, ChainErrorCategory, FakeJsonRpcTransport,
+    JsonRpcTransport, UreqTransport,
+};
 pub use status::map_status_info;

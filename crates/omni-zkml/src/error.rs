@@ -385,6 +385,79 @@ pub enum EvidenceAnchorError {
         #[source]
         source: std::io::Error,
     },
+
+    // ── Stage 13.2 additions — chain-touching CLI preflight refusals ──
+    //
+    // These six variants surface ONLY when an anchor command is
+    // invoked with the chain-touching flags (`--rpc-url` /
+    // `--expect-chain-id` / `--allow-submit` /
+    // `--allow-mainnet-submit`). Stage 13.0 stub-only flows never
+    // produce them. The reason-tag mapper in
+    // [`crate::evidence_anchor::evidence_anchor_reason_tag`]
+    // routes each one-to-one to the documented closed-set string.
+    /// `--expect-chain-id` did not match the chain's reported
+    /// `params.chain_id`. CLI preflight gate; submit / query /
+    /// reconcile all refuse here before any anchor RPC fires.
+    #[error(
+        "chain_id mismatch: --expect-chain-id {expected}, chain reports {actual}"
+    )]
+    ChainIdMismatch { expected: u64, actual: u64 },
+
+    /// Anchor RPC activation not reached. Fires on non-mainnet
+    /// dormant / scheduled-but-not-yet-reached, and on mainnet
+    /// scheduled-but-not-yet-reached. (Mainnet + dormant
+    /// `None` fires [`Self::MainnetPolicyUnresolved`] instead;
+    /// see Stage 13.1 R-packet for the locked semantic split.)
+    #[error(
+        "integrity_evidence_anchor not activated on chain (chain_id {chain_id}): \
+         {activation_status}"
+    )]
+    NotActivated {
+        chain_id: u64,
+        /// Human-readable activation status string. Examples:
+        /// "dormant (no activation height set)" or
+        /// "scheduled at height H, chain head at K".
+        activation_status: String,
+    },
+
+    /// Mainnet (`chain_id == 1`) + governance has not set
+    /// activation (`integrity_evidence_anchor_enabled_from_height == None`).
+    /// Stage 13.1 R-packet reserved this reason tag specifically
+    /// to capture "mainnet anchors are not yet permitted by
+    /// chain governance" without implying a permanent refusal.
+    /// When mainnet sets `Some(h)`, this becomes
+    /// [`Self::NotActivated`] until head reaches `h`.
+    #[error(
+        "mainnet anchor policy is unresolved \
+         (integrity_evidence_anchor_enabled_from_height == None on chain_id 1); \
+         awaiting chain governance to set an activation height"
+    )]
+    MainnetPolicyUnresolved,
+
+    /// Transport-layer JSON-RPC failure produced by
+    /// `omni-sumchain` (HTTP, body read, missing `result` field,
+    /// non-JSON response). Distinguished from
+    /// [`Self::ChainSubmitRefused`] by
+    /// [`omni_sumchain::classify_chain_client_error`].
+    #[error("chain RPC failure: {0}")]
+    ChainRpc(String),
+
+    /// Chain returned a JSON-RPC error object — the chain
+    /// refused the call at the application layer. The chain's
+    /// failure text is surfaced verbatim (chain-side failure
+    /// codes 60-63 are private detail; OmniNode does not decode
+    /// them).
+    #[error("chain refused the call: {0}")]
+    ChainSubmitRefused(String),
+
+    /// Chain returned success (no JSON-RPC error) but the
+    /// response shape could not be parsed into the expected
+    /// DTO, OR the deserialized DTO carried an unrecognized
+    /// enum string (e.g. `status: "foo"`). Distinguished from
+    /// [`Self::ChainRpc`] / [`Self::ChainSubmitRefused`] by
+    /// [`omni_sumchain::classify_chain_client_error`].
+    #[error("chain response malformed: {0}")]
+    ChainResponseMalformed(String),
 }
 
 /// Stage 13.0 result alias. Distinct from earlier-stage aliases

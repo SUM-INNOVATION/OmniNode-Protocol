@@ -131,4 +131,21 @@ pub struct ChainParamsInfo {
     /// transmitting.
     #[serde(default)]
     pub v2_enabled_from_height: Option<u64>,
+
+    /// Stage 13.2 addition — anchor-RPC activation height.
+    ///
+    /// Mirrors the two existing activation flags. `None` =
+    /// governance has not set anchor activation (dormant
+    /// indefinitely); `Some(h)` with `head >= h` = anchor RPC
+    /// live and `sum_submitIntegrityEvidenceAnchor` may be
+    /// called; `Some(h)` with `head < h` = scheduled but not
+    /// yet reached. Surfaced through
+    /// [`crate::SumChainClient::integrity_evidence_anchor_is_active`].
+    ///
+    /// **No coupling to `omninode_is_active` / `v2_is_active`**
+    /// — anchors gate behind their own dedicated flag per
+    /// chain-team confirmation (Stage 13.1 R-packet, Blocker
+    /// C resolved as Option C-new-flag).
+    #[serde(default)]
+    pub integrity_evidence_anchor_enabled_from_height: Option<u64>,
 }
