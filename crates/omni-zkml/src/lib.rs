@@ -75,10 +75,12 @@ pub use error::{
 };
 pub use evidence_anchor::{
     anchor_hex_lower, anchor_signer_pubkey_bytes, anchor_signing_input_bytes,
-    anchor_signing_input_for_digest, build_anchor_digest, canonical_anchor_bytes,
-    evidence_anchor_reason_tag, local_status_from_chain, parse_anchor_hex_32,
-    query_evidence_anchor_workflow, sign_anchor_digest, submit_evidence_anchor_workflow,
-    verify_anchor_against_registry, verify_anchor_file_against_artifact_bytes,
+    anchor_signing_input_for_digest, bincode1_serialize_anchor_tx_data,
+    build_anchor_digest, canonical_anchor_bytes, evidence_anchor_reason_tag,
+    local_status_from_chain, parse_anchor_hex_32, query_evidence_anchor_workflow,
+    reconcile_evidence_anchors_workflow, sign_anchor_digest,
+    submit_evidence_anchor_workflow, verify_anchor_against_registry,
+    verify_anchor_file_against_artifact_bytes,
     verify_anchor_tx_data, AnchorRecord, AnchorSelector, AnchorStatus, AnchorSubmissionReceipt,
     AnchoredArtifactKind, EvidenceAnchorChainClient, IntegrityEvidenceAnchorDigest,
     IntegrityEvidenceAnchorTxData, LocalAnchorStatus, LocalEvidenceAnchorRegistry,

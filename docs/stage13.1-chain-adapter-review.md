@@ -1,5 +1,7 @@
 # Stage 13.1 — Chain-Team Review Packet (Integrity-Evidence Anchor)
 
+> **Historical note (post-Stage-13.2):** chain-team review concluded; Stage 13.2 implemented the real `omni-sumchain` `EvidenceAnchorChainClient` adapter against the answers returned in this packet's decision form. The operative implementation reference is now [`docs/stage13.2-chain-adapter.md`](stage13.2-chain-adapter.md) (Stage 13.2 engineering doc) + [`docs/operator-runbook.md`](operator-runbook.md) §Stage 13.0. This packet is preserved as the locked contract Stage 13.2 implements against; the per-blocker decisions Stage 13.2 ships against are recorded in the Stage 13.2 doc.
+
 **Status:** review packet only. **Zero adapter code.** Stage 13.0 ships the wire (frozen); Stage 13.1 hands the chain team the spec + deterministic byte fixtures they need to confirm before a real `omni-sumchain` adapter can be built. The follow-on adapter stage is gated on the **per-blocker decision form** (Section 7) being returned with all five rows filled.
 
 **Co-references:**

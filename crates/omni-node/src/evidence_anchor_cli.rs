@@ -1,12 +1,26 @@
-//! Phase 5 Stage 13.0 — chain-anchor CLI surface for Stage 12.25
-//! signed-chain-report artifacts.
+//! Phase 5 Stage 13.0 / 13.2 — chain-anchor CLI surface for
+//! Stage 12.25 signed-chain-report artifacts.
 //!
-//! Lives on `omni-node operator …` as four subcommands:
+//! Lives on `omni-node operator …` as five subcommands:
 //!
 //! - `submit-integrity-evidence-anchor` (gated `--features submit`)
 //! - `query-integrity-evidence-anchor`
+//! - `reconcile-integrity-evidence-anchor` (Stage 13.2)
 //! - `verify-integrity-evidence-anchor`         — registry-backed
 //! - `verify-integrity-evidence-anchor-file`    — standalone JSON
+//!
+//! ## Stage 13.0 vs Stage 13.2 chain-mode fork
+//!
+//! - Stage 13.0 (stub mode, default): `submit` / `query` operate
+//!   against the local stub client + registry only. Verify stays
+//!   chain-untouched in either stage.
+//! - Stage 13.2 (chain mode, opt-in via `--rpc-url` +
+//!   `--expect-chain-id`): `submit` / `query` / `reconcile`
+//!   talk to the real SUM Chain via `omni-sumchain`'s
+//!   `EvidenceAnchorChainClient` impl. CLI preflight enforces
+//!   chain_id, anchor-activation, and operator double-gates
+//!   BEFORE the workflow is invoked; the adapter independently
+//!   re-checks activation + same-key as defense-in-depth.
 //!
 //! The submit command performs Stage 12.25 wrapper parse +
 //! signature verification BEFORE building / submitting the anchor
@@ -26,13 +40,14 @@ use clap::{Args, Subcommand};
 use omni_contributor::{
     SignedIntegrityEvidenceChainReport, verify_signed_integrity_evidence_chain_report,
 };
-#[cfg(feature = "submit")]
+use omni_sumchain::SumChainClient;
 use omni_zkml::EvidenceAnchorError;
 use omni_zkml::{
-    AnchorRecord, AnchorSelector, AnchorStatus, INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION,
-    IntegrityEvidenceAnchorTxData, LocalAnchorStatus, LocalEvidenceAnchorRegistry,
-    anchor_hex_lower, evidence_anchor_reason_tag, parse_anchor_hex_32,
-    query_evidence_anchor_workflow, verify_anchor_against_registry,
+    AnchorRecord, AnchorSelector, AnchorStatus, ChainClientError,
+    INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION, IntegrityEvidenceAnchorTxData,
+    LocalAnchorStatus, LocalEvidenceAnchorRegistry, anchor_hex_lower,
+    evidence_anchor_reason_tag, parse_anchor_hex_32, query_evidence_anchor_workflow,
+    reconcile_evidence_anchors_workflow, verify_anchor_against_registry,
     verify_anchor_file_against_artifact_bytes,
 };
 #[cfg(feature = "submit")]
@@ -51,15 +66,30 @@ pub(crate) struct EvidenceAnchorArgs {
 
 #[derive(Subcommand)]
 enum EvidenceAnchorCmd {
-    /// Anchor a Stage 12.25 `SignedIntegrityEvidenceChainReport`
-    /// to SUM Chain. Stage 13.0 uses a stub chain client; Stage
-    /// 13.1 will swap in the real adapter. Gated behind
-    /// `--features submit`.
+    /// Anchor a Stage 12.25 `SignedIntegrityEvidenceChainReport`.
+    /// Without `--rpc-url` uses the local stub client + registry
+    /// (Stage 13.0 path). With `--rpc-url` + `--expect-chain-id`
+    /// submits to SUM Chain via `omni-sumchain`'s
+    /// `EvidenceAnchorChainClient` adapter (Stage 13.2 path);
+    /// chain writes additionally require `--allow-submit`
+    /// (and `--allow-mainnet-submit` on `chain_id == 1`).
+    /// Gated behind `--features submit`.
     #[cfg(feature = "submit")]
     SubmitIntegrityEvidenceAnchor(SubmitAnchorArgs),
-    /// Query the registry-stored status of an anchor by
-    /// `--artifact-hash-hex` or `--tx-id`.
+    /// Query an anchor by `--artifact-hash-hex` or `--tx-id`.
+    /// Without `--rpc-url` reads the local stub registry only
+    /// (Stage 13.0 path). With `--rpc-url` + `--expect-chain-id`
+    /// queries the chain by stored `tx_id` and applies any
+    /// chain-returned status transition to the local record
+    /// (Stage 13.2 — chain-read-only, local-registry-mutating).
     QueryIntegrityEvidenceAnchor(QueryAnchorArgs),
+    /// Stage 13.2 — sweep the local registry; query the chain
+    /// for every `Submitted` / `Included` record and apply
+    /// chain-returned status transitions to the local registry.
+    /// Chain-read-only, local-registry-mutating. Per-record RPC
+    /// failures land in the per-record event line; the sweep
+    /// continues.
+    ReconcileIntegrityEvidenceAnchor(ReconcileAnchorArgs),
     /// Registry-backed verify — proves the on-disk artifact
     /// corresponds to a recorded anchor authored by the
     /// artifact's signer.
@@ -95,6 +125,32 @@ struct SubmitAnchorArgs {
     /// for distributing the anchor to peers out-of-band.
     #[arg(long)]
     json_out: Option<PathBuf>,
+
+    // ── Stage 13.2 chain-mode flags ────────────────────────────
+    /// Stage 13.2 — chain mode opt-in. When supplied, the CLI
+    /// runs preflight (chain_id, anchor activation, opt-ins)
+    /// and submits to the real SUM Chain via `omni-sumchain`.
+    /// When omitted, falls back to the Stage 13.0 stub-client
+    /// path.
+    #[arg(long)]
+    rpc_url: Option<String>,
+    /// Required iff `--rpc-url` is given. Sanity-checked against
+    /// `params.chain_id` in CLI preflight; mismatches refuse
+    /// with `chain_id_mismatch` before any anchor RPC fires.
+    #[arg(long)]
+    expect_chain_id: Option<u64>,
+    /// Required for chain-mode submit. Mirrors Stage 9a
+    /// `operator smoke --allow-submit` posture: explicit opt-in
+    /// to chain writes.
+    #[arg(long)]
+    allow_submit: bool,
+    /// Required additionally when `params.chain_id == 1`
+    /// (mainnet). Mirrors Stage 9a `--allow-mainnet-submit`.
+    /// Does NOT override the `mainnet_policy_unresolved`
+    /// refusal — chain governance must have set anchor
+    /// activation before mainnet submits are permitted.
+    #[arg(long)]
+    allow_mainnet_submit: bool,
 }
 
 #[derive(Args)]
@@ -112,6 +168,33 @@ struct QueryAnchorArgs {
     /// `--artifact-hash-hex`; either MUST be supplied.
     #[arg(long)]
     tx_id: Option<String>,
+
+    // ── Stage 13.2 chain-mode flags ────────────────────────────
+    /// Stage 13.2 — chain-mode opt-in. When supplied (with
+    /// `--expect-chain-id`), the CLI queries `omni-sumchain`'s
+    /// `sum_getIntegrityEvidenceAnchorStatus` for the record's
+    /// stored `tx_id` and applies the chain-returned status to
+    /// the local record. **Chain-read-only,
+    /// local-registry-mutating.** Without `--rpc-url`, behaves
+    /// as Stage 13.0 (registry-only).
+    #[arg(long)]
+    rpc_url: Option<String>,
+    /// Required iff `--rpc-url` is given.
+    #[arg(long)]
+    expect_chain_id: Option<u64>,
+}
+
+#[derive(Args)]
+struct ReconcileAnchorArgs {
+    /// Directory in which the anchor record + tx_index live.
+    #[arg(long)]
+    anchor_registry_dir: PathBuf,
+    /// SUM Chain JSON-RPC endpoint URL. Required.
+    #[arg(long)]
+    rpc_url: String,
+    /// Chain-id sanity check. Required.
+    #[arg(long)]
+    expect_chain_id: u64,
 }
 
 #[derive(Args)]
@@ -161,6 +244,11 @@ pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
                 .await
                 .map_err(|e| anyhow!("query-anchor join error: {e}"))?
         }
+        EvidenceAnchorCmd::ReconcileIntegrityEvidenceAnchor(a) => {
+            tokio::task::spawn_blocking(move || run_reconcile(a))
+                .await
+                .map_err(|e| anyhow!("reconcile-anchor join error: {e}"))?
+        }
         EvidenceAnchorCmd::VerifyIntegrityEvidenceAnchor(a) => {
             tokio::task::spawn_blocking(move || run_verify(a))
                 .await
@@ -172,6 +260,135 @@ pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
                 .map_err(|e| anyhow!("verify-anchor-file join error: {e}"))?
         }
     }
+}
+
+// ── Stage 13.2 chain-mode preflight helpers ───────────────────────────────────
+
+/// Map any `ChainClientError` produced by `omni-sumchain` into
+/// the closed Stage 13.2 [`EvidenceAnchorError`] set, using the
+/// typed classifier as the single chokepoint (no CLI-side
+/// prefix matching).
+fn chain_client_error_to_evidence_anchor_error(err: ChainClientError) -> EvidenceAnchorError {
+    use omni_sumchain::{ChainErrorCategory, classify_chain_client_error};
+    let text = match &err {
+        ChainClientError::Other(s) => s.clone(),
+    };
+    match classify_chain_client_error(&err) {
+        ChainErrorCategory::Transport => EvidenceAnchorError::ChainRpc(text),
+        ChainErrorCategory::JsonRpcError => EvidenceAnchorError::ChainSubmitRefused(text),
+        ChainErrorCategory::Malformed => EvidenceAnchorError::ChainResponseMalformed(text),
+        ChainErrorCategory::AdapterNotActivated => EvidenceAnchorError::NotActivated {
+            // The adapter-level refusal carries no chain_id
+            // context (the adapter doesn't know `--expect-chain-id`).
+            // Use 0 as a sentinel; the CLI preflight path always
+            // refuses earlier with the real chain_id, so this is
+            // only reached when a non-CLI caller bypasses
+            // preflight.
+            chain_id: 0,
+            activation_status: text,
+        },
+        // Adapter same-key check is a defense-in-depth catch
+        // for a misconfigured caller — surface as the catch-all
+        // chain_rpc tag per Stage 13.2 mapper rule.
+        ChainErrorCategory::AdapterSameKeyFail => EvidenceAnchorError::ChainRpc(text),
+        ChainErrorCategory::Unknown => EvidenceAnchorError::ChainRpc(text),
+    }
+}
+
+/// Run CLI preflight gates for chain-mode submit. Returns on
+/// first refusal; on success the caller proceeds to invoke
+/// `submit_evidence_anchor_workflow` against the real
+/// `SumChainClient`.
+///
+/// Gate order (matches the locked Stage 13.2 plan):
+/// 1. Fetch chain params (single RPC).
+/// 2. Chain-id sanity check (`expected == params.chain_id`).
+/// 3. Anchor-activation check (mainnet-aware tagging):
+///    - mainnet + `None` → `MainnetPolicyUnresolved`
+///    - any + `Some(h)` but `head < h` → `NotActivated` (scheduled)
+///    - non-mainnet + `None` → `NotActivated` (dormant)
+/// 4. `--allow-submit` opt-in.
+/// 5. mainnet AND `--allow-mainnet-submit` opt-in.
+#[cfg(feature = "submit")]
+fn run_chain_submit_preflight(
+    client: &SumChainClient,
+    expected_chain_id: u64,
+    allow_submit: bool,
+    allow_mainnet_submit: bool,
+) -> Result<(), EvidenceAnchorError> {
+    use omni_sumchain::BlockFinality;
+    // Gate 1+2: chain params + chain_id sanity.
+    let params = client
+        .get_chain_params()
+        .map_err(chain_client_error_to_evidence_anchor_error)?;
+    if params.chain_id != expected_chain_id {
+        return Err(EvidenceAnchorError::ChainIdMismatch {
+            expected: expected_chain_id,
+            actual: params.chain_id,
+        });
+    }
+    // Gate 3: anchor-activation, mainnet-aware tagging.
+    let activation = params.integrity_evidence_anchor_enabled_from_height;
+    let is_mainnet = params.chain_id == 1;
+    match activation {
+        None => {
+            if is_mainnet {
+                return Err(EvidenceAnchorError::MainnetPolicyUnresolved);
+            }
+            return Err(EvidenceAnchorError::NotActivated {
+                chain_id: params.chain_id,
+                activation_status: "dormant (no activation height set)".to_string(),
+            });
+        }
+        Some(h) => {
+            let head = client
+                .get_block_height(BlockFinality::Latest)
+                .map_err(chain_client_error_to_evidence_anchor_error)?
+                .height;
+            if head < h {
+                return Err(EvidenceAnchorError::NotActivated {
+                    chain_id: params.chain_id,
+                    activation_status: format!(
+                        "scheduled at height {h}, chain head at {head}"
+                    ),
+                });
+            }
+        }
+    }
+    // Gate 4: --allow-submit opt-in.
+    if !allow_submit {
+        return Err(EvidenceAnchorError::ChainRpc(
+            "chain writes not permitted: pass --allow-submit to enable submission".to_string(),
+        ));
+    }
+    // Gate 5: mainnet --allow-mainnet-submit opt-in.
+    if is_mainnet && !allow_mainnet_submit {
+        return Err(EvidenceAnchorError::ChainRpc(
+            "mainnet (chain_id 1) writes additionally require --allow-mainnet-submit"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Run CLI preflight for chain-mode read paths (query, reconcile).
+/// Only checks chain_id sanity — read paths neither require
+/// activation (anchors recorded pre-deactivation are still
+/// queryable) nor the operator double-gates.
+fn run_chain_read_preflight(
+    client: &SumChainClient,
+    expected_chain_id: u64,
+) -> Result<(), EvidenceAnchorError> {
+    let params = client
+        .get_chain_params()
+        .map_err(chain_client_error_to_evidence_anchor_error)?;
+    if params.chain_id != expected_chain_id {
+        return Err(EvidenceAnchorError::ChainIdMismatch {
+            expected: expected_chain_id,
+            actual: params.chain_id,
+        });
+    }
+    Ok(())
 }
 
 // ── Submit ────────────────────────────────────────────────────────────────────
@@ -244,15 +461,72 @@ fn run_submit(args: SubmitAnchorArgs) -> Result<()> {
             )
         })?;
 
-    let client = omni_zkml::StubEvidenceAnchorChainClient::new();
     let digest = build_anchor_digest(&metadata, &raw_bytes);
 
-    let record = submit_evidence_anchor_workflow(&registry, &client, digest, &submitter_seed)
-        .map_err(|err| {
-            let reason = evidence_anchor_reason_tag(&err);
-            println!("event=integrity_evidence_anchor_submit_failed reason={reason} detail={err}");
-            anyhow!("submit anchor refused: {err}")
-        })?;
+    // ── Stage 13.0 vs Stage 13.2 fork ─────────────────────────
+    // Without --rpc-url: stub client (Stage 13.0 path).
+    // With --rpc-url + --expect-chain-id: real SumChainClient
+    // after CLI preflight gates.
+    let record = match (args.rpc_url.as_deref(), args.expect_chain_id) {
+        (Some(url), Some(expected_chain_id)) => {
+            let client = SumChainClient::new(url.to_string(), submitter_seed);
+            // CLI preflight (chain_id + activation + opt-ins).
+            run_chain_submit_preflight(
+                &client,
+                expected_chain_id,
+                args.allow_submit,
+                args.allow_mainnet_submit,
+            )
+            .map_err(|err| {
+                let reason = evidence_anchor_reason_tag(&err);
+                println!(
+                    "event=integrity_evidence_anchor_submit_failed reason={reason} detail={err}"
+                );
+                anyhow!("submit anchor refused at preflight: {err}")
+            })?;
+            // Submit via the real adapter. The adapter
+            // independently re-checks activation + same-key as
+            // defense-in-depth.
+            submit_evidence_anchor_workflow(&registry, &client, digest, &submitter_seed)
+                .map_err(|err| {
+                    // Chain-side errors are routed through the
+                    // typed classifier; surface the closed tag.
+                    let mapped = if let EvidenceAnchorError::ChainClient(inner) = err {
+                        chain_client_error_to_evidence_anchor_error(inner)
+                    } else {
+                        err
+                    };
+                    let reason = evidence_anchor_reason_tag(&mapped);
+                    println!(
+                        "event=integrity_evidence_anchor_submit_failed reason={reason} detail={mapped}"
+                    );
+                    anyhow!("submit anchor refused: {mapped}")
+                })?
+        }
+        (None, None) => {
+            // Stage 13.0 stub mode.
+            let client = omni_zkml::StubEvidenceAnchorChainClient::new();
+            submit_evidence_anchor_workflow(&registry, &client, digest, &submitter_seed)
+                .map_err(|err| {
+                    let reason = evidence_anchor_reason_tag(&err);
+                    println!(
+                        "event=integrity_evidence_anchor_submit_failed reason={reason} detail={err}"
+                    );
+                    anyhow!("submit anchor refused: {err}")
+                })?
+        }
+        _ => {
+            // Partial chain-mode flags (e.g. only --rpc-url
+            // without --expect-chain-id, or vice versa). Refuse
+            // at parse time with a clear message.
+            let reason = "chain_rpc";
+            let detail = "chain mode requires BOTH --rpc-url and --expect-chain-id";
+            println!(
+                "event=integrity_evidence_anchor_submit_failed reason={reason} detail={detail}"
+            );
+            bail!(detail);
+        }
+    };
 
     println!(
         "event=integrity_evidence_anchor_submit_ok artifact_hash_hex={} signer_pubkey_hex={} tx_id={} \
@@ -325,16 +599,54 @@ fn run_query(args: QueryAnchorArgs) -> Result<()> {
                 args.anchor_registry_dir.display()
             )
         })?;
-    let client = omni_zkml::StubEvidenceAnchorChainClient::new();
-    let outcome = query_evidence_anchor_workflow(
-        &registry,
-        &client,
-        match &selector_owned {
-            SelectorOwned::ArtifactHashHex(h) => AnchorSelector::ArtifactHashHex(h),
-            SelectorOwned::TxId(t) => AnchorSelector::TxId(t),
-        },
-    )
-    .map_err(|err| {
+
+    // ── Stage 13.0 vs Stage 13.2 fork ─────────────────────────
+    // Without --rpc-url: stub client (Stage 13.0 path).
+    // With --rpc-url + --expect-chain-id: real SumChainClient.
+    // The workflow is identical in both branches; only the
+    // client differs.
+    let selector_for_workflow = match &selector_owned {
+        SelectorOwned::ArtifactHashHex(h) => AnchorSelector::ArtifactHashHex(h),
+        SelectorOwned::TxId(t) => AnchorSelector::TxId(t),
+    };
+    let outcome_result = match (args.rpc_url.as_deref(), args.expect_chain_id) {
+        (Some(url), Some(expected_chain_id)) => {
+            // The seed isn't used by read-only RPCs; pass a
+            // throwaway-zero seed (matching Stage 8a's
+            // DUMMY_SEED posture for read-only ops).
+            let dummy_seed = [0u8; 32];
+            let client = SumChainClient::new(url.to_string(), dummy_seed);
+            if let Err(err) = run_chain_read_preflight(&client, expected_chain_id) {
+                let reason = evidence_anchor_reason_tag(&err);
+                println!(
+                    "event=integrity_evidence_anchor_query_failed reason={reason} \
+                     selector={selector_label} detail={err}"
+                );
+                bail!("query anchor refused at preflight: {err}");
+            }
+            query_evidence_anchor_workflow(&registry, &client, selector_for_workflow)
+                .map_err(|err| match err {
+                    EvidenceAnchorError::ChainClient(inner) => {
+                        chain_client_error_to_evidence_anchor_error(inner)
+                    }
+                    other => other,
+                })
+        }
+        (None, None) => {
+            let client = omni_zkml::StubEvidenceAnchorChainClient::new();
+            query_evidence_anchor_workflow(&registry, &client, selector_for_workflow)
+        }
+        _ => {
+            let reason = "chain_rpc";
+            let detail = "chain mode requires BOTH --rpc-url and --expect-chain-id";
+            println!(
+                "event=integrity_evidence_anchor_query_failed reason={reason} \
+                 selector={selector_label} detail={detail}"
+            );
+            bail!(detail);
+        }
+    };
+    let outcome = outcome_result.map_err(|err| {
         let reason = evidence_anchor_reason_tag(&err);
         println!(
             "event=integrity_evidence_anchor_query_failed reason={reason} \
@@ -354,6 +666,108 @@ fn run_query(args: QueryAnchorArgs) -> Result<()> {
         outcome.local_status_transitioned,
     );
     Ok(())
+}
+
+// ── Reconcile (Stage 13.2) ────────────────────────────────────────────────────
+
+fn run_reconcile(args: ReconcileAnchorArgs) -> Result<()> {
+    println!(
+        "event=integrity_evidence_anchor_reconcile_started anchor_registry_dir={} \
+         rpc_url={} expect_chain_id={}",
+        args.anchor_registry_dir.display(),
+        args.rpc_url,
+        args.expect_chain_id,
+    );
+
+    let registry =
+        LocalEvidenceAnchorRegistry::open(args.anchor_registry_dir.clone()).map_err(|e| {
+            println!(
+                "event=integrity_evidence_anchor_reconcile_failed reason=io detail={e}"
+            );
+            anyhow!(
+                "open --anchor-registry-dir {}: {e}",
+                args.anchor_registry_dir.display()
+            )
+        })?;
+
+    let dummy_seed = [0u8; 32];
+    let client = SumChainClient::new(args.rpc_url.clone(), dummy_seed);
+
+    if let Err(err) = run_chain_read_preflight(&client, args.expect_chain_id) {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_reconcile_failed reason={reason} detail={err}"
+        );
+        bail!("reconcile refused at preflight: {err}");
+    }
+
+    let entries = reconcile_evidence_anchors_workflow(&registry, &client).map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_reconcile_failed reason={reason} detail={err}"
+        );
+        anyhow!("reconcile sweep failed: {err}")
+    })?;
+
+    let mut ok_count = 0u64;
+    let mut transitioned_count = 0u64;
+    let mut err_count = 0u64;
+    for (artifact_hash_hex, result) in &entries {
+        match result {
+            Ok(outcome) => {
+                ok_count += 1;
+                if outcome.local_status_transitioned {
+                    transitioned_count += 1;
+                }
+                let chain_tag = chain_status_tag(&outcome.chain_status);
+                println!(
+                    "event=integrity_evidence_anchor_reconcile_record_ok \
+                     artifact_hash_hex={artifact_hash_hex} tx_id={} \
+                     local_status={} chain_status={chain_tag} transitioned={}",
+                    outcome.record.receipt.tx_id,
+                    outcome.record.status.as_str(),
+                    outcome.local_status_transitioned,
+                );
+            }
+            Err(err) => {
+                err_count += 1;
+                let reason = reconcile_record_reason_tag(err);
+                println!(
+                    "event=integrity_evidence_anchor_reconcile_record_failed \
+                     artifact_hash_hex={artifact_hash_hex} reason={reason} detail={err}"
+                );
+            }
+        }
+    }
+    println!(
+        "event=integrity_evidence_anchor_reconcile_summary ok={ok_count} \
+         transitioned={transitioned_count} failed={err_count}"
+    );
+    Ok(())
+}
+
+/// Resolve the closed-set `reason=<tag>` for a per-record
+/// reconcile failure from a BORROWED `EvidenceAnchorError`.
+///
+/// Non-chain errors (`io` / `anchor_not_found` /
+/// `malformed_json` / …) keep their real tag — they describe
+/// local registry / data conditions, not chain transport
+/// failures. Only `EvidenceAnchorError::ChainClient(inner)`
+/// gets routed through the typed
+/// [`omni_sumchain::classify_chain_client_error`] to pick
+/// between `chain_rpc` / `chain_submit_refused` /
+/// `chain_response_malformed`.
+///
+/// Pinned by [`reconcile_record_reason_tag_tests`] below so the
+/// taxonomy can't drift back to "everything is chain_rpc".
+fn reconcile_record_reason_tag(err: &EvidenceAnchorError) -> &'static str {
+    match err {
+        EvidenceAnchorError::ChainClient(inner) => {
+            let mapped = chain_client_error_to_evidence_anchor_error(inner.clone());
+            evidence_anchor_reason_tag(&mapped)
+        }
+        other => evidence_anchor_reason_tag(other),
+    }
 }
 
 enum SelectorOwned {
@@ -643,3 +1057,100 @@ const _: fn() = || {
     fn _accept<T>(_: T) {}
     _accept::<LocalAnchorStatus>(LocalAnchorStatus::Submitted);
 };
+
+#[cfg(test)]
+mod reconcile_record_reason_tag_tests {
+    //! Stage 13.2 — pin the reconcile per-record reason-tag
+    //! taxonomy.
+    //!
+    //! These tests defend against a regression where every
+    //! per-record failure was collapsed into `reason=chain_rpc`.
+    //! Local registry / data errors (`io`,
+    //! `anchor_not_found`, `malformed_json`) MUST surface their
+    //! real closed-set tag; only chain-transport / chain-side
+    //! refusals route through the typed classifier.
+
+    use super::*;
+
+    #[test]
+    fn io_error_keeps_io_tag() {
+        let err = EvidenceAnchorError::Io {
+            path: std::path::PathBuf::from("/tmp/anchors/foo.json"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope"),
+        };
+        assert_eq!(reconcile_record_reason_tag(&err), "io");
+    }
+
+    #[test]
+    fn anchor_not_found_keeps_anchor_not_found_tag() {
+        let err = EvidenceAnchorError::AnchorNotFound {
+            selector: "tx_id=0xmissing".to_string(),
+        };
+        assert_eq!(reconcile_record_reason_tag(&err), "anchor_not_found");
+    }
+
+    #[test]
+    fn malformed_json_keeps_malformed_json_tag() {
+        let source = serde_json::from_str::<serde_json::Value>("not json")
+            .expect_err("intentional parse failure");
+        let err = EvidenceAnchorError::MalformedJson {
+            path: std::path::PathBuf::from("/tmp/anchors/bogus.json"),
+            source,
+        };
+        assert_eq!(reconcile_record_reason_tag(&err), "malformed_json");
+    }
+
+    #[test]
+    fn artifact_hash_mismatch_keeps_artifact_hash_mismatch_tag() {
+        let err = EvidenceAnchorError::ArtifactHashMismatch {
+            recomputed_hex: "a".repeat(64),
+            anchored_hex: "b".repeat(64),
+        };
+        assert_eq!(reconcile_record_reason_tag(&err), "artifact_hash_mismatch");
+    }
+
+    #[test]
+    fn chain_client_transport_failure_maps_to_chain_rpc() {
+        let err = EvidenceAnchorError::ChainClient(ChainClientError::Other(
+            "HTTP transport failure: connection refused".to_string(),
+        ));
+        assert_eq!(reconcile_record_reason_tag(&err), "chain_rpc");
+    }
+
+    #[test]
+    fn chain_client_jsonrpc_error_maps_to_chain_submit_refused() {
+        let err = EvidenceAnchorError::ChainClient(ChainClientError::Other(
+            "JSON-RPC error: {\"code\":-32601,\"message\":\"method not found\"}"
+                .to_string(),
+        ));
+        assert_eq!(reconcile_record_reason_tag(&err), "chain_submit_refused");
+    }
+
+    #[test]
+    fn chain_client_adapter_malformed_status_maps_to_chain_response_malformed() {
+        let err = EvidenceAnchorError::ChainClient(ChainClientError::Other(
+            "malformed sum_getIntegrityEvidenceAnchorStatus response: missing field"
+                .to_string(),
+        ));
+        assert_eq!(
+            reconcile_record_reason_tag(&err),
+            "chain_response_malformed"
+        );
+    }
+
+    #[test]
+    fn chain_client_adapter_not_activated_maps_to_not_activated() {
+        let err = EvidenceAnchorError::ChainClient(ChainClientError::Other(
+            "integrity_evidence_anchor not activated".to_string(),
+        ));
+        assert_eq!(reconcile_record_reason_tag(&err), "not_activated");
+    }
+
+    #[test]
+    fn chain_client_unknown_string_falls_back_to_chain_rpc() {
+        let err = EvidenceAnchorError::ChainClient(ChainClientError::Other(
+            "totally unrecognized text".to_string(),
+        ));
+        assert_eq!(reconcile_record_reason_tag(&err), "chain_rpc");
+    }
+}

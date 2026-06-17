@@ -244,6 +244,50 @@ impl LocalEvidenceAnchorRegistry {
         self.load_by_artifact_hash(artifact_hash_hex)
     }
 
+    /// Stage 13.2 — iterate every persisted record. Non-record
+    /// entries (`.tmp`, `tx_index.json`, anything that isn't a
+    /// 64-hex `*.json`) are skipped silently. A parse failure
+    /// on a record file surfaces as
+    /// `io::Error(InvalidData, …)`. Records are returned sorted
+    /// by `artifact_hash_hex` ascending for deterministic
+    /// reconcile-sweep ordering.
+    ///
+    /// Consumers (the reconcile workflow) iterate this and
+    /// query the chain per record; per-record RPC failures do
+    /// not abort the sweep.
+    pub fn list(&self) -> Result<Vec<AnchorRecord>, std::io::Error> {
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(stem) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+            else {
+                continue;
+            };
+            // Only consider `<64-hex>.json` files; ignore
+            // `tx_index.json` (stem length 8) and any stray
+            // `.tmp` / other extensions.
+            if path.extension().and_then(|s| s.to_str()) != Some(RECORD_EXTENSION) {
+                continue;
+            }
+            if stem.len() != 64 {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            let record: AnchorRecord = serde_json::from_slice(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("malformed record at {}: {e}", path.display()),
+                )
+            })?;
+            records.push(record);
+        }
+        records.sort_by(|a, b| a.artifact_hash_hex.cmp(&b.artifact_hash_hex));
+        Ok(records)
+    }
+
     /// Apply a chain-returned local status transition; clears
     /// `error_message` semantics is unnecessary because
     /// `LocalAnchorStatus::Failed` carries the reason in-band.

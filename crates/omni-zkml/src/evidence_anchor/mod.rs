@@ -39,13 +39,16 @@ pub use registry::{
 pub use wire::{
     AnchoredArtifactKind, EVIDENCE_ANCHOR_DOMAIN, INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION,
     IntegrityEvidenceAnchorDigest, IntegrityEvidenceAnchorTxData, anchor_hex_lower,
-    anchor_signer_pubkey_bytes, anchor_signing_input_bytes, canonical_anchor_bytes,
-    parse_anchor_hex_32, sign_anchor_digest, verify_anchor_tx_data,
+    anchor_signer_pubkey_bytes, anchor_signing_input_bytes,
+    bincode1_serialize_anchor_tx_data, canonical_anchor_bytes, parse_anchor_hex_32,
+    sign_anchor_digest, verify_anchor_tx_data,
 };
 pub use workflow::{
-    AnchorSelector, QueryAnchorOutcome, VerifiedWrapperMetadata, anchor_signing_input_for_digest,
-    build_anchor_digest, query_evidence_anchor_workflow, submit_evidence_anchor_workflow,
-    verify_anchor_against_registry, verify_anchor_file_against_artifact_bytes,
+    AnchorSelector, QueryAnchorOutcome, VerifiedWrapperMetadata,
+    anchor_signing_input_for_digest, build_anchor_digest,
+    query_evidence_anchor_workflow, reconcile_evidence_anchors_workflow,
+    submit_evidence_anchor_workflow, verify_anchor_against_registry,
+    verify_anchor_file_against_artifact_bytes,
 };
 
 use crate::error::EvidenceAnchorError;
@@ -77,6 +80,14 @@ pub fn evidence_anchor_reason_tag(err: &EvidenceAnchorError) -> &'static str {
         EvidenceAnchorError::Signing(_) => "signing",
         EvidenceAnchorError::ChainClient(_) => "chain_client",
         EvidenceAnchorError::Io { .. } => "io",
+
+        // ── Stage 13.2 chain-touching CLI preflight refusals ──
+        EvidenceAnchorError::ChainIdMismatch { .. } => "chain_id_mismatch",
+        EvidenceAnchorError::NotActivated { .. } => "not_activated",
+        EvidenceAnchorError::MainnetPolicyUnresolved => "mainnet_policy_unresolved",
+        EvidenceAnchorError::ChainRpc(_) => "chain_rpc",
+        EvidenceAnchorError::ChainSubmitRefused(_) => "chain_submit_refused",
+        EvidenceAnchorError::ChainResponseMalformed(_) => "chain_response_malformed",
     }
 }
 
@@ -171,6 +182,37 @@ mod reason_tag_tests {
             (
                 EvidenceAnchorError::ChainClient(ChainClientError::Other("rpc gone".into())),
                 "chain_client",
+            ),
+            // ── Stage 13.2 additions ──
+            (
+                EvidenceAnchorError::ChainIdMismatch {
+                    expected: 1,
+                    actual: 42,
+                },
+                "chain_id_mismatch",
+            ),
+            (
+                EvidenceAnchorError::NotActivated {
+                    chain_id: 42,
+                    activation_status: "dormant (no activation height set)".into(),
+                },
+                "not_activated",
+            ),
+            (
+                EvidenceAnchorError::MainnetPolicyUnresolved,
+                "mainnet_policy_unresolved",
+            ),
+            (
+                EvidenceAnchorError::ChainRpc("HTTP transport failure: timed out".into()),
+                "chain_rpc",
+            ),
+            (
+                EvidenceAnchorError::ChainSubmitRefused("dedup conflict".into()),
+                "chain_submit_refused",
+            ),
+            (
+                EvidenceAnchorError::ChainResponseMalformed("missing tx_hash".into()),
+                "chain_response_malformed",
             ),
         ];
         for (err, expected) in cases {

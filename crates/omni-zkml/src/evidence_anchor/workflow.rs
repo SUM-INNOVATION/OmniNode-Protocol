@@ -17,7 +17,7 @@
 use crate::error::{EvidenceAnchorError, EvidenceAnchorResult};
 use crate::evidence_anchor::client::{AnchorStatus, EvidenceAnchorChainClient};
 use crate::evidence_anchor::registry::{
-    AnchorRecord, LocalEvidenceAnchorRegistry, local_status_from_chain,
+    AnchorRecord, LocalAnchorStatus, LocalEvidenceAnchorRegistry, local_status_from_chain,
 };
 use crate::evidence_anchor::wire::{
     AnchoredArtifactKind, INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION, IntegrityEvidenceAnchorDigest,
@@ -159,6 +159,56 @@ pub fn query_evidence_anchor_workflow<C: EvidenceAnchorChainClient>(
 pub enum AnchorSelector<'a> {
     ArtifactHashHex(&'a str),
     TxId(&'a str),
+}
+
+/// Stage 13.2 — sweep the registry and reconcile every local
+/// record's status against the chain.
+///
+/// Mirrors Stage 5.3 [`crate::poll_attestations_workflow`] shape
+/// verbatim:
+///
+/// - Only `Submitted` / `Included` records are queried;
+///   `Finalized` / `Failed` records are skipped (omitted from
+///   the result vec).
+/// - **Chain-read-only, local-registry-mutating.** Each chain
+///   query never sends a tx; local status transitions are the
+///   only side effect.
+/// - Per-record RPC failures land as `Err` entries in the
+///   returned vec; the sweep continues with the next record.
+/// - Stage 5.1 observation-only contract preserved: chain
+///   `Unknown` leaves the local record unchanged.
+/// - Records are iterated in deterministic
+///   `artifact_hash_hex` ascending order.
+pub fn reconcile_evidence_anchors_workflow<C: EvidenceAnchorChainClient>(
+    registry: &LocalEvidenceAnchorRegistry,
+    client: &C,
+) -> EvidenceAnchorResult<Vec<(String, EvidenceAnchorResult<QueryAnchorOutcome>)>> {
+    let mut out = Vec::new();
+    let records = registry.list().map_err(|e| EvidenceAnchorError::Io {
+        path: registry.root().to_path_buf(),
+        source: e,
+    })?;
+    for record in records {
+        let from = record.status.clone();
+        let is_queryable = matches!(
+            from,
+            LocalAnchorStatus::Submitted | LocalAnchorStatus::Included
+        );
+        if !is_queryable {
+            continue;
+        }
+        let artifact_hash_hex = record.artifact_hash_hex.clone();
+        // Delegate to query_evidence_anchor_workflow so the
+        // chain-Unknown observation-only path is shared verbatim
+        // with the single-record query CLI.
+        let result = query_evidence_anchor_workflow(
+            registry,
+            client,
+            AnchorSelector::ArtifactHashHex(&artifact_hash_hex),
+        );
+        out.push((artifact_hash_hex, result));
+    }
+    Ok(out)
 }
 
 fn load_for_selector(

@@ -230,6 +230,25 @@ pub fn canonical_anchor_bytes(
         .map_err(|e| EvidenceAnchorError::CanonicalSerialization(e.to_string()))
 }
 
+/// Bincode-1 serialize the **full 148-byte
+/// `IntegrityEvidenceAnchorTxData`** payload that
+/// `sum_submitIntegrityEvidenceAnchor` accepts.
+///
+/// Layout: 84-byte canonical digest (per
+/// [`canonical_anchor_bytes`]) followed by the 64-byte
+/// submitter signature. Total **148 bytes**, deterministic and
+/// frozen for `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1`.
+///
+/// Stage 13.2's `omni-sumchain` adapter hex-encodes this with a
+/// `0x` prefix and POSTs it as the single positional param to
+/// `sum_submitIntegrityEvidenceAnchor`.
+pub fn bincode1_serialize_anchor_tx_data(
+    tx_data: &IntegrityEvidenceAnchorTxData,
+) -> EvidenceAnchorResult<Vec<u8>> {
+    bincode1::serialize(tx_data)
+        .map_err(|e| EvidenceAnchorError::CanonicalSerialization(e.to_string()))
+}
+
 /// `EVIDENCE_ANCHOR_DOMAIN || canonical_anchor_bytes(digest)` — the
 /// exact byte sequence the submitter signs. Equivalent form for
 /// the `omni-zkml` chain-wire convention.
@@ -373,6 +392,30 @@ mod tests {
         let a = canonical_anchor_bytes(&d).unwrap();
         let b = canonical_anchor_bytes(&d).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Stage 13.2 — pins the full `IntegrityEvidenceAnchorTxData`
+    /// wire payload at exactly 148 bytes (84 canonical digest +
+    /// 64 submitter signature). `sum_submitIntegrityEvidenceAnchor`
+    /// accepts this byte sequence hex-encoded with a `0x` prefix.
+    #[test]
+    fn bincode1_serialize_anchor_tx_data_is_148_bytes() {
+        let seed = [7u8; 32];
+        let pubkey = anchor_signer_pubkey_bytes(&seed).unwrap();
+        let mut d = sample_digest();
+        d.signer_pubkey = pubkey;
+        let sig = sign_anchor_digest(&seed, &d).unwrap();
+        let tx = IntegrityEvidenceAnchorTxData {
+            digest: d,
+            submitter_signature: sig,
+        };
+        let bytes = bincode1_serialize_anchor_tx_data(&tx).unwrap();
+        assert_eq!(bytes.len(), 148);
+        // First 84 bytes equal canonical_anchor_bytes; last 64
+        // equal the signature.
+        let canonical = canonical_anchor_bytes(&tx.digest).unwrap();
+        assert_eq!(&bytes[..84], canonical.as_slice());
+        assert_eq!(&bytes[84..], &tx.submitter_signature);
     }
 
     /// Pins the exact bincode-1.3 wire layout. Total 84 bytes:

@@ -1,15 +1,16 @@
 # Stage 13.0 — Chain Anchoring for Integrity Evidence (Wire Spec)
 
-**Status:** Stage 13.0 frozen — spec + stub implementation. The chain-team review packet that gates the real SUM Chain submission path lives at [`docs/stage13.1-chain-adapter-review.md`](stage13.1-chain-adapter-review.md); a follow-on adapter stage builds against the answers returned in that packet's decision form. No real RPC submission in Stage 13.0; the local stub client persists records to `--anchor-registry-dir` and emits deterministic stub `tx_id`s.
+**Status:** Stage 13.0 wire frozen — spec is the byte contract for all Stage 13.x adapter work. Stage 13.0 ships the stub-mode adapter (`StubEvidenceAnchorChainClient` + local registry); Stage 13.2 ships the real `omni-sumchain` `EvidenceAnchorChainClient` adapter activated via `--rpc-url` + `--expect-chain-id`. The stub remains the default and is still useful for local testing / regen. See [`docs/stage13.2-chain-adapter.md`](stage13.2-chain-adapter.md) for the chain-mode implementation reference.
 
-**Scope of this document:** the on-chain wire payload, canonical signing bytes, schema constants, refusal taxonomy, and forward-compatibility constraints that the future SUM Chain adapter must implement against.
+**Scope of this document:** the on-chain wire payload, canonical signing bytes, schema constants, refusal taxonomy, and forward-compatibility constraints that **every** SUM Chain adapter — stub or real — implements against.
 
 **Co-references:**
-- [`docs/operator-runbook.md`](operator-runbook.md) §Stage 13.0 — operator workflow.
+- [`docs/operator-runbook.md`](operator-runbook.md) §Stage 13.0 — operator workflow (covers both stub and chain modes).
 - [`docs/stage12-contributor-protocol.md`](stage12-contributor-protocol.md) §Forward link — what Stage 12 ships and what Stage 13 layers on top.
-- [`docs/stage13.1-chain-adapter-review.md`](stage13.1-chain-adapter-review.md) — chain-team review packet (Stage 13.1).
+- [`docs/stage13.1-chain-adapter-review.md`](stage13.1-chain-adapter-review.md) — chain-team review packet (historical; chain-team review concluded).
+- [`docs/stage13.2-chain-adapter.md`](stage13.2-chain-adapter.md) — Stage 13.2 real-adapter engineering doc (`omni-sumchain` impl, RPC method names, classifier).
 - `crates/omni-zkml/src/evidence_anchor/` — reference implementation.
-- `crates/omni-zkml/tests/fixtures/evidence_anchor_wire_vectors.json` — three deterministic wire vectors the chain team rebuilds for byte-parity assertion.
+- `crates/omni-zkml/tests/fixtures/evidence_anchor_wire_vectors.json` — three deterministic wire vectors for byte-parity assertion.
 
 ## Goal
 

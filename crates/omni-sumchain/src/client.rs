@@ -14,9 +14,18 @@
 
 use omni_types::phase5::InferenceAttestation;
 use omni_zkml::{
-    AttestationStatus, ChainClient, ChainClientError, OrchestrationClient, SubmissionReceipt,
+    AnchorStatus, AnchorSubmissionReceipt, AttestationStatus, ChainClient, ChainClientError,
+    EvidenceAnchorChainClient, IntegrityEvidenceAnchorTxData, OrchestrationClient,
+    SubmissionReceipt,
 };
+// `IntegrityEvidenceAnchorTxData` is in the public trait signature
+// (`fn submit_anchor(&self, tx_data: &IntegrityEvidenceAnchorTxData)`)
+// so it is always reachable; the actual bincode-1 serialize path
+// only runs under `--features submit`.
 
+#[cfg(feature = "submit")]
+use crate::anchor_tx::build_and_submit_anchor;
+use crate::anchor_tx::query_anchor_status;
 use crate::dto::{
     BlockFinality, BlockHeightInfo, ChainParamsInfo, InferenceAttestationInfo,
     InferenceAttestationStatusInfo,
@@ -219,6 +228,25 @@ impl<T: JsonRpcTransport> SumChainClient<T> {
         self.activation_satisfied(params.v2_enabled_from_height)
     }
 
+    /// Stage 13.2 — `Ok(true)` only when the chain has activated the
+    /// integrity-evidence-anchor RPC AND has progressed past
+    /// `integrity_evidence_anchor_enabled_from_height`.
+    ///
+    /// Symmetric to [`Self::omninode_is_active`] /
+    /// [`Self::v2_is_active`]; **independent** of both — anchors gate
+    /// behind their own dedicated chain flag per Stage 13.1 R-packet's
+    /// Blocker C resolution. Used by the adapter-layer activation
+    /// defense in [`crate::client::SumChainClient`]'s
+    /// `EvidenceAnchorChainClient` impl (CLI preflight runs an
+    /// equivalent check first so it can distinguish
+    /// `mainnet_policy_unresolved` from `not_activated`).
+    pub fn integrity_evidence_anchor_is_active(
+        &self,
+    ) -> std::result::Result<bool, ChainClientError> {
+        let params = self.get_chain_params()?;
+        self.activation_satisfied(params.integrity_evidence_anchor_enabled_from_height)
+    }
+
     /// Stage 7b helper: given an `Option<u64>` activation height from
     /// `chain_getChainParams`, return `Ok(true)` iff it is `Some(h)` and
     /// the chain's latest head is `>= h`. `None` (field absent / pre-
@@ -317,5 +345,72 @@ impl<T: JsonRpcTransport> OrchestrationClient for SumChainClient<T> {
     /// declare records stale.
     fn get_latest_block_height(&self) -> std::result::Result<u64, ChainClientError> {
         self.get_block_height(BlockFinality::Latest).map(|h| h.height)
+    }
+}
+
+// ── EvidenceAnchorChainClient trait impl (Stage 13.2) ────────────────────────
+
+impl<T: JsonRpcTransport> EvidenceAnchorChainClient for SumChainClient<T> {
+    /// Stage 13.2 — `sum_submitIntegrityEvidenceAnchor`.
+    ///
+    /// Adapter-layer defense-in-depth gates run BEFORE any
+    /// submit RPC:
+    /// 1. Activation: `integrity_evidence_anchor_is_active()`.
+    ///    Returns
+    ///    `ChainClientError::Other(error_prefixes::ADAPTER_NOT_ACTIVATED)`
+    ///    on inactive chain. CLI preflight runs an equivalent
+    ///    check first so it can emit `mainnet_policy_unresolved`
+    ///    vs `not_activated`; this adapter-layer gate protects
+    ///    non-CLI callers and gives a generic
+    ///    `reason=not_activated` via
+    ///    [`crate::rpc::classify_chain_client_error`].
+    /// 2. Same-key submitter: `self.seed()` must derive
+    ///    `tx_data.digest.signer_pubkey`. The Stage 13.0
+    ///    `submit_evidence_anchor_workflow` already enforces
+    ///    this; re-checking here defends against direct trait
+    ///    callers that skip the workflow.
+    ///
+    /// **Chain-id is NOT gated here.** The trait does not carry
+    /// `expected_chain_id` and `SumChainClient` does not store
+    /// one; CLI preflight owns chain-id enforcement.
+    ///
+    /// `--features submit` gate: identical posture to Stage 7b
+    /// [`Self::submit_attestation`]. Without the feature, the
+    /// call returns
+    /// `ChainClientError::Other("…rebuild with --features submit…")`
+    /// without reaching the adapter helper.
+    fn submit_anchor(
+        &self,
+        tx_data: &IntegrityEvidenceAnchorTxData,
+    ) -> std::result::Result<AnchorSubmissionReceipt, ChainClientError> {
+        #[cfg(feature = "submit")]
+        {
+            build_and_submit_anchor(self, tx_data)
+        }
+        #[cfg(not(feature = "submit"))]
+        {
+            let _ = tx_data;
+            Err(ChainClientError::Other(
+                "omni-sumchain built without the `submit` feature; \
+                 rebuild with --features submit to enable \
+                 sum_submitIntegrityEvidenceAnchor"
+                    .into(),
+            ))
+        }
+    }
+
+    /// Stage 13.2 — `sum_getIntegrityEvidenceAnchorStatus`.
+    ///
+    /// Chain-read-only. Maps lowercase chain status string into
+    /// `omni_zkml::AnchorStatus`. `included_at_height` parsed
+    /// but dropped per Stage 13.2 Q5 (Stage 13.0 enum unchanged).
+    /// Foreign / non-anchor tx_hash returns `Unknown` per chain
+    /// contract; callers treat as observation-only (mirrors
+    /// Stage 5.1 `query_attestation_workflow`).
+    fn query_anchor_status(
+        &self,
+        tx_id: &str,
+    ) -> std::result::Result<AnchorStatus, ChainClientError> {
+        query_anchor_status(self, tx_id)
     }
 }
