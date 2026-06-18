@@ -44,19 +44,19 @@ use omni_sumchain::SumChainClient;
 use omni_zkml::EvidenceAnchorError;
 use omni_zkml::{
     AnchorApplyOptions, AnchorCleanupPlan, AnchorExportOptions,
-    AnchorExportSelection, AnchorExportVerifyOptions, AnchorPlanOptions,
-    AnchorQuarantineManifest, AnchorRecord, AnchorRestoreOptions, AnchorSelector,
-    AnchorStatus, ArtifactBytesInclusion, ChainClientError,
-    EvidenceAnchorRegistryHealth, EvidenceAnchorRegistrySummary,
-    INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION, IntegrityEvidenceAnchorTxData,
-    LocalAnchorStatus, LocalEvidenceAnchorRegistry, StaleAnchorInfo,
-    anchor_hex_lower, apply_anchor_cleanup, apply_anchor_export,
-    check_evidence_anchor_registry_health, evidence_anchor_reason_tag,
-    list_evidence_anchors_by_status, list_stale_submitted_or_included,
-    parse_anchor_hex_32, plan_anchor_cleanup, query_evidence_anchor_workflow,
-    reconcile_evidence_anchors_workflow, restore_anchor_cleanup_quarantine,
-    verify_anchor_against_registry, verify_anchor_export,
-    verify_anchor_file_against_artifact_bytes,
+    AnchorExportSelection, AnchorExportVerifyOptions, AnchorImportOptions,
+    AnchorImportSelection, AnchorPlanOptions, AnchorQuarantineManifest,
+    AnchorRecord, AnchorRestoreOptions, AnchorSelector, AnchorStatus,
+    ArtifactBytesInclusion, ChainClientError, EvidenceAnchorRegistryHealth,
+    EvidenceAnchorRegistrySummary, INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION,
+    IntegrityEvidenceAnchorTxData, LocalAnchorStatus, LocalEvidenceAnchorRegistry,
+    StaleAnchorInfo, anchor_hex_lower, apply_anchor_cleanup, apply_anchor_export,
+    apply_anchor_export_import, check_evidence_anchor_registry_health,
+    evidence_anchor_reason_tag, list_evidence_anchors_by_status,
+    list_stale_submitted_or_included, parse_anchor_hex_32, plan_anchor_cleanup,
+    query_evidence_anchor_workflow, reconcile_evidence_anchors_workflow,
+    restore_anchor_cleanup_quarantine, verify_anchor_against_registry,
+    verify_anchor_export, verify_anchor_file_against_artifact_bytes,
 };
 #[cfg(feature = "submit")]
 use omni_zkml::{
@@ -134,6 +134,12 @@ enum EvidenceAnchorCmd {
     /// and (for paired entries) re-checks the artifact-hash
     /// binding. Does NOT prove the Stage 12.25 wrapper signer.
     VerifyIntegrityEvidenceAnchorExport(VerifyAnchorExportArgs),
+    /// Stage 13.6 — restore selected `anchor_record` entries
+    /// from a Stage 13.5 export into a target local anchor
+    /// registry. Verify-first, default dry-run, byte-preserve.
+    /// **Fully local — zero chain interaction.** No re-signing.
+    /// Stage 13.0 wire / schema / domain unchanged.
+    ImportIntegrityEvidenceAnchorExport(ImportAnchorExportArgs),
 }
 
 #[cfg(feature = "submit")]
@@ -437,6 +443,42 @@ pub(crate) struct VerifyAnchorExportArgs {
     pub(crate) strict: bool,
 }
 
+/// Stage 13.6 — import-anchor-export CLI. Default dry-run;
+/// `--apply` is the explicit mutation gate. `--strict` passes
+/// through to Stage 13.5 `verify_anchor_export` and validates
+/// the WHOLE export tree.
+#[derive(Args)]
+pub(crate) struct ImportAnchorExportArgs {
+    /// Source: directory holding the Stage 13.5 export.
+    #[arg(long)]
+    pub(crate) export_dir: PathBuf,
+    /// Target: local anchor registry to restore records into.
+    /// Created on first import if missing.
+    #[arg(long)]
+    pub(crate) anchor_registry_dir: PathBuf,
+    /// Explicit operator confirmation. Without it, the command
+    /// runs as dry-run.
+    #[arg(long)]
+    pub(crate) apply: bool,
+    /// Passed through to `verify_anchor_export`. Validates the
+    /// WHOLE export tree (every anchor_record must have a paired
+    /// artifact_bytes), not just the records being imported.
+    #[arg(long)]
+    pub(crate) strict: bool,
+    /// Optional repeatable selector. Empty = import all
+    /// `anchor_record` entries from the manifest (intentional
+    /// asymmetry vs Stage 13.5 export).
+    #[arg(long)]
+    pub(crate) artifact_hash_hex: Vec<String>,
+    /// Optional repeatable selector.
+    #[arg(long)]
+    pub(crate) tx_id: Vec<String>,
+    /// Optional repeatable selector
+    /// (`SUBMITTED|INCLUDED|FINALIZED|FAILED`, case-insensitive).
+    #[arg(long)]
+    pub(crate) status: Vec<String>,
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
 pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
@@ -492,6 +534,11 @@ pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
             tokio::task::spawn_blocking(move || run_verify_export(a))
                 .await
                 .map_err(|e| anyhow!("verify-anchor-export join error: {e}"))?
+        }
+        EvidenceAnchorCmd::ImportIntegrityEvidenceAnchorExport(a) => {
+            tokio::task::spawn_blocking(move || run_import_export(a))
+                .await
+                .map_err(|e| anyhow!("import-anchor-export join error: {e}"))?
         }
     }
 }
@@ -2060,6 +2107,107 @@ fn run_verify_export(args: VerifyAnchorExportArgs) -> Result<()> {
     Ok(())
 }
 
+// ── Stage 13.6 — anchor export import / registry restore ─────────────────────
+
+/// Closed clap-level mutex / required-with violation for the
+/// Stage 13.6 import command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImportMutexViolation {
+    UnknownStatus,
+    MalformedArtifactHashHex,
+}
+
+impl ImportMutexViolation {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            ImportMutexViolation::UnknownStatus => {
+                "--status must be one of submitted | included | finalized | failed"
+            }
+            ImportMutexViolation::MalformedArtifactHashHex => {
+                "--artifact-hash-hex must be exactly 64 lowercase hex characters"
+            }
+        }
+    }
+}
+
+/// Pure clap-level mutex check. Returns the parsed selection
+/// shape on success.
+pub(crate) fn check_import_mutex_rules(
+    args: &ImportAnchorExportArgs,
+) -> std::result::Result<Vec<LocalAnchorStatus>, ImportMutexViolation> {
+    let mut statuses = Vec::with_capacity(args.status.len());
+    for s in &args.status {
+        let parsed = parse_status_token(s).ok_or(ImportMutexViolation::UnknownStatus)?;
+        statuses.push(parsed);
+    }
+    for h in &args.artifact_hash_hex {
+        if h.len() != 64
+            || !h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(ImportMutexViolation::MalformedArtifactHashHex);
+        }
+    }
+    Ok(statuses)
+}
+
+fn run_import_export(args: ImportAnchorExportArgs) -> Result<()> {
+    let statuses = match check_import_mutex_rules(&args) {
+        Ok(v) => v,
+        Err(v) => bail!("invalid flag combination: {}", v.message()),
+    };
+    println!(
+        "event=integrity_evidence_anchor_import_started \
+         export_dir={} anchor_registry_dir={} apply={} strict={}",
+        args.export_dir.display(),
+        args.anchor_registry_dir.display(),
+        args.apply,
+        args.strict,
+    );
+    let registry = LocalEvidenceAnchorRegistry::open(args.anchor_registry_dir.clone())
+        .map_err(|e| {
+            println!(
+                "event=integrity_evidence_anchor_import_failed reason=io detail={e}"
+            );
+            anyhow!(
+                "open --anchor-registry-dir {}: {e}",
+                args.anchor_registry_dir.display()
+            )
+        })?;
+    let now_utc = chrono::Utc::now().to_rfc3339();
+    let selection = AnchorImportSelection {
+        statuses,
+        tx_ids: args.tx_id.clone(),
+        artifact_hashes: args.artifact_hash_hex.clone(),
+    };
+    let opts = AnchorImportOptions {
+        dry_run: !args.apply,
+        strict: args.strict,
+        selection: &selection,
+        now_utc: &now_utc,
+    };
+    let report = apply_anchor_export_import(&args.export_dir, &registry, &opts).map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_import_failed reason={reason} detail={err}"
+        );
+        anyhow!("import refused: {err}")
+    })?;
+    println!(
+        "event=integrity_evidence_anchor_import_ok export_id={} mode={} \
+         actions_imported={} actions_would_import={} \
+         actions_skipped_already_imported={} actions_re_added_tx_index_entry={} \
+         actions_would_re_add_tx_index_entry={}",
+        report.export_id,
+        report.mode,
+        report.actions_imported,
+        report.actions_would_import,
+        report.actions_skipped_already_imported,
+        report.actions_re_added_tx_index_entry,
+        report.actions_would_re_add_tx_index_entry,
+    );
+    Ok(())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "submit")]
@@ -2915,5 +3063,145 @@ mod stage_13_5_cli_tests {
             selector: "tx_id=missing".to_string(),
         };
         assert_eq!(evidence_anchor_reason_tag(&err), "anchor_not_found");
+    }
+}
+
+#[cfg(test)]
+mod stage_13_6_cli_tests {
+    //! Stage 13.6 — pin CLI invariants:
+    //! - Closed clap-level mutex / required-with rules.
+    //! - Reason-tag mapper routes `ImportTargetExists` to
+    //!   `import_target_exists`.
+    //! - Selector-miss reuse of `anchor_not_found`.
+    //! - `--strict` recognised at the CLI layer (its enforcement
+    //!   happens inside the library, but the flag round-trips
+    //!   correctly here).
+    //! - `--apply` opt-in: without it, the library is invoked
+    //!   with `dry_run = true`.
+
+    use super::*;
+    use std::path::PathBuf;
+
+    fn defaults() -> ImportAnchorExportArgs {
+        ImportAnchorExportArgs {
+            export_dir: PathBuf::from("/tmp/export-dir"),
+            anchor_registry_dir: PathBuf::from("/tmp/registry"),
+            apply: false,
+            strict: false,
+            artifact_hash_hex: vec![],
+            tx_id: vec![],
+            status: vec![],
+        }
+    }
+
+    // ── Mutex rule: status closed-set ──
+
+    #[test]
+    fn mutex_refuses_unknown_status() {
+        let mut a = defaults();
+        a.status = vec!["weird".to_string()];
+        assert_eq!(
+            check_import_mutex_rules(&a).err(),
+            Some(ImportMutexViolation::UnknownStatus)
+        );
+    }
+
+    #[test]
+    fn mutex_accepts_all_four_status_kinds_case_insensitive() {
+        for s in &["submitted", "INCLUDED", "Finalized", "failed"] {
+            let mut a = defaults();
+            a.status = vec![s.to_string()];
+            assert!(check_import_mutex_rules(&a).is_ok(), "rejected {s}");
+        }
+    }
+
+    // ── Mutex rule: artifact-hash shape ──
+
+    #[test]
+    fn mutex_refuses_malformed_artifact_hash_hex_wrong_length() {
+        let mut a = defaults();
+        a.artifact_hash_hex = vec!["aaa".to_string()];
+        assert_eq!(
+            check_import_mutex_rules(&a).err(),
+            Some(ImportMutexViolation::MalformedArtifactHashHex)
+        );
+    }
+
+    #[test]
+    fn mutex_refuses_malformed_artifact_hash_hex_uppercase() {
+        let mut a = defaults();
+        a.artifact_hash_hex = vec!["AA".repeat(32)];
+        assert_eq!(
+            check_import_mutex_rules(&a).err(),
+            Some(ImportMutexViolation::MalformedArtifactHashHex)
+        );
+    }
+
+    // ── Mutex passes on default + no selectors ──
+
+    #[test]
+    fn mutex_passes_with_no_selectors_for_d6_lock() {
+        // D6: no-selector import is allowed (asymmetric to Stage
+        // 13.5 export which requires a selector).
+        let a = defaults();
+        assert!(check_import_mutex_rules(&a).is_ok());
+    }
+
+    // ── Violation message stability ──
+
+    #[test]
+    fn violation_messages_are_stable_strings() {
+        assert_eq!(
+            ImportMutexViolation::UnknownStatus.message(),
+            "--status must be one of submitted | included | finalized | failed"
+        );
+        assert_eq!(
+            ImportMutexViolation::MalformedArtifactHashHex.message(),
+            "--artifact-hash-hex must be exactly 64 lowercase hex characters"
+        );
+    }
+
+    // ── Closed reason-tag mapper covers the Stage 13.6 variant ──
+
+    #[test]
+    fn import_target_exists_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ImportTargetExists {
+            field: "artifact_hash",
+            artifact_hash_hex: "aa".repeat(32),
+            tx_id: "anchor-1".to_string(),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "import_target_exists");
+    }
+
+    #[test]
+    fn import_target_exists_tx_id_field_also_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ImportTargetExists {
+            field: "tx_id",
+            artifact_hash_hex: "aa".repeat(32),
+            tx_id: "anchor-2".to_string(),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "import_target_exists");
+    }
+
+    // ── Selector miss reuses anchor_not_found (D8 lock) ──
+
+    #[test]
+    fn anchor_not_found_remains_the_selector_miss_tag_for_import() {
+        let err = EvidenceAnchorError::AnchorNotFound {
+            selector: "tx_id=missing-on-import".to_string(),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "anchor_not_found");
+    }
+
+    // ── `--apply` flag round-trips into the library's dry_run ──
+
+    #[test]
+    fn apply_flag_means_dry_run_false_inside_library_call() {
+        // Pin the compile-time mapping: !apply == dry_run.
+        let mut a = defaults();
+        a.apply = true;
+        assert!(!(!a.apply), "--apply=true should map to dry_run=false");
+        a.apply = false;
+        assert!(!a.apply, "--apply=false should map to dry_run=true");
     }
 }

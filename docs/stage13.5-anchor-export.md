@@ -246,3 +246,5 @@ All hermetic. No network.
 - Importing exports back into a registry (would mutate the registry).
 - Multi-host export sync / scheduled archival.
 - Encrypted transport of the export tree (operator's transport concern).
+
+> **Post-Stage-13.6 note:** Stage 13.6 lifts the "importing exports back into a registry" item by adding `import-integrity-evidence-anchor-export` — a verify-first, default-dry-run, byte-preserve restore path into a target local registry. Stage 13.5's export and verify surfaces are **unchanged**; Stage 13.6 ships its own one-tag delta (`import_target_exists`) on a distinct concept (import-side refusals). See [`docs/stage13.6-anchor-import.md`](stage13.6-anchor-import.md).

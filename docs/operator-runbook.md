@@ -3101,4 +3101,81 @@ omni-node operator evidence-anchor verify-integrity-evidence-anchor-export \
 
 **Implementation reference:** [`docs/stage13.5-anchor-export.md`](stage13.5-anchor-export.md) — Stage 13.5 engineering doc (entry-kind taxonomy, mutex rules, manifest schema, file layout, verify preflight ordering, what's proven vs not, test inventory).
 
-**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface — no other constants change.
+### Stage 13.6 — local-only anchor export import / registry restore
+
+**Use when:** you have a Stage 13.5 export from another operator host and need to restore those anchor records into a local target registry — for forensic record retention, cross-team handoff, or rebuilding a registry after host loss. **Fully local — zero chain interaction.** Source export is read-only; target registry is write-once-per-record. No re-signing. Stage 13.0 wire / domain / canonical-bytes / signing unchanged.
+
+**Subcommand:**
+- `omni-node operator evidence-anchor import-integrity-evidence-anchor-export` — verify-first, default dry-run, byte-preserve.
+
+**Key invariants:**
+
+1. **Verify-first.** Apply calls `verify_anchor_export(--strict?)` before any FS write. A post-plan tamper of the export is caught by the durability fence on apply.
+2. **Default dry-run.** Without `--apply`, the command reports `would_import` / `would_re_add_tx_index_entry` / `skipped_already_imported` outcomes; no record file is written, no `tx_index.json` is touched.
+3. **No-clobber on real conflicts.** Conflict matrix:
+    - Target has a byte-equal record AND tx_index maps the tx_id to the same hash → `skipped_already_imported`.
+    - Target has a byte-equal record but the tx_index entry is missing → `re_added_tx_index_entry` (tx_index updated only; record file NOT rewritten).
+    - Target has a byte-DIFFERENT record under the same hash → refuse with `reason=import_target_exists field=artifact_hash`.
+    - Target's tx_index maps the same tx_id to a DIFFERENT hash → refuse with `reason=import_target_exists field=tx_id`.
+4. **Preflight-all-before-mutate.** Apply classifies EVERY selected action before writing any record file. A tx_id collision on action #5 of 5 refuses with zero writes from actions 1–4.
+5. **Byte-preserve.** Imported record files are copied verbatim from the export. Imported records carry historical `submitted_at` / `updated_at` from the source registry — Stage 13.3 stale-age views may report historical ages on imported records by design.
+6. **`tx_index.json` is merged**, not rebuilt. Unrelated entries (pre-existing local submits, prior imports, Stage 13.4 restores) are preserved verbatim.
+7. **`--strict` validates the WHOLE export tree** via Stage 13.5 `verify_anchor_export(strict=true)` — every `anchor_record` in the manifest must have a paired `artifact_bytes`. NOT just the records being imported.
+8. **No-selector default imports all `anchor_record` entries from the manifest.** Asymmetric to Stage 13.5 export's required-selector (the export is already a curated subset).
+
+**Reason-tag taxonomy** (closed; surfaced on `event=integrity_evidence_anchor_import_failed reason=<tag>` lines):
+
+- `import_target_exists` — target registry already has a different record under the same artifact_hash, OR maps the import's tx_id to a different artifact_hash. **New tag in Stage 13.6.** Detail field carries `field=artifact_hash | tx_id` for disambiguation.
+- `anchor_not_found` — `--tx-id` or `--artifact-hash-hex` selector points at a manifest entry that does not exist. Reused from Stage 13.0.
+- `export_entry_metadata_mismatch` — manifest claim doesn't match the record's actual fields. Reused from Stage 13.5.
+- `unsupported_export_manifest_schema_version`, `export_manifest_hash_mismatch`, `export_invalid_path`, `export_blake3_mismatch`, `export_strict_mode_artifact_bytes_missing` — propagated from `verify_anchor_export`. Reused from Stage 13.5.
+- `submitter_signature_invalid`, `unsupported_anchor_schema_version`, `malformed_json`, `io` — reused from Stage 13.0.
+
+CLI mutex / required-with refusals exit non-zero via clap usage errors (NOT `reason=…` event lines) — they're argument-parse concerns.
+
+**Workflow recipe — restore a finalized anchor onto a remote operator host:**
+
+```sh
+# 1. On host A, build the export (Stage 13.5).
+omni-node operator evidence-anchor export-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --export-out          /tmp/anchor-export-2026-06-18 \
+  --status              finalized
+
+# 2. Transport /tmp/anchor-export-2026-06-18 to host B (out-of-band).
+
+# 3. On host B, sanity-verify the export (Stage 13.5; read-only).
+omni-node operator evidence-anchor verify-integrity-evidence-anchor-export \
+  --export-dir /var/anchor-retention/anchor-export-2026-06-18
+
+# 4. On host B, dry-run the import.
+omni-node operator evidence-anchor import-integrity-evidence-anchor-export \
+  --export-dir          /var/anchor-retention/anchor-export-2026-06-18 \
+  --anchor-registry-dir /var/omni-anchors
+
+# 5. On host B, apply the import.
+omni-node operator evidence-anchor import-integrity-evidence-anchor-export \
+  --export-dir          /var/anchor-retention/anchor-export-2026-06-18 \
+  --anchor-registry-dir /var/omni-anchors \
+  --apply
+
+# 6. (Optional) On host B, confirm the imported records are visible.
+omni-node operator evidence-anchor summary-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --include-health
+
+# 7. (Optional, recommended) On host B, run Stage 13.2 reconcile to
+#    bring the imported records' status up to current chain truth.
+omni-node operator evidence-anchor reconcile-integrity-evidence-anchor \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url             https://sum-chain.example/rpc \
+  --expect-chain-id     <CHAIN_ID>
+```
+
+**Limitation — historical timestamps:** imported records' `submitted_at` / `updated_at` are facts from the SOURCE registry's clock, not the import time. Stage 13.3 `summary --stale-threshold-secs` will report imported records as "submitted last quarter" if they were submitted last quarter on the source host, even if they were imported on this host moments ago. This is intentional (forensic fidelity) — the import event line + file mtime are the only "this host first saw the record" traces.
+
+**Limitation — wrapper-signer binding:** like Stage 13.5 verify, Stage 13.6 does NOT re-verify the Stage 12.25 wrapper signer. The imported anchor record's submitter signature is verified (`verify_anchor_tx_data`), but binding the anchor to its Stage 12.25 wrapper requires running Stage 12.25 verify on a paired signed-chain-report separately.
+
+**Implementation reference:** [`docs/stage13.6-anchor-import.md`](stage13.6-anchor-import.md) — Stage 13.6 engineering doc (library surface, conflict matrix, mutex rules, verify-first invariant, byte-preserve + historical-timestamps note, test inventory).
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface; Stage 13.6 reuses both verbatim and adds no new schema constants — no other constants change.

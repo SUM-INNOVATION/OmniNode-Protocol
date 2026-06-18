@@ -638,6 +638,36 @@ pub enum EvidenceAnchorError {
         anchor_record_relative_path: String,
         artifact_hash_hex: String,
     },
+
+    // ── Stage 13.6 additions — local export-import / registry restore ─
+    //
+    // One new variant, one new closed `reason=` tag string.
+    // Disambiguates the artifact-hash vs tx_id conflict case via
+    // a closed `field` discriminator — single variant per the
+    // Stage 13.6 reviewer-locked decision.
+    /// Import: the target registry already carries a different
+    /// anchor under the same key.
+    ///
+    /// `field = "artifact_hash"` — there is a file at
+    /// `<registry>/<artifact_hash_hex>.json` whose BLAKE3 differs
+    /// from the manifest's recorded `blake3_hex` (a different
+    /// record under the same hash).
+    ///
+    /// `field = "tx_id"` — `tx_index.json` already maps the
+    /// import's `tx_id` to a different `artifact_hash_hex` than
+    /// the manifest declares.
+    ///
+    /// Byte-equal records under the same hash + same tx_id are
+    /// idempotent (`skipped_already_imported`) — not refused.
+    #[error(
+        "anchor import target exists (field {field}): \
+         artifact_hash_hex {artifact_hash_hex}, tx_id {tx_id}"
+    )]
+    ImportTargetExists {
+        field: &'static str,
+        artifact_hash_hex: String,
+        tx_id: String,
+    },
 }
 
 /// Stage 13.0 result alias. Distinct from earlier-stage aliases
