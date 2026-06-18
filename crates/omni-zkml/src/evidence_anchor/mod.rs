@@ -28,6 +28,7 @@
 pub mod cleanup;
 pub mod client;
 pub mod export;
+pub mod import;
 pub mod operations;
 pub mod registry;
 pub mod wire;
@@ -53,6 +54,11 @@ pub use export::{
     AnchorExportVerifyReport, ArtifactBytesInclusion,
     EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION,
     EXPORT_MANIFEST_FILENAME,
+};
+pub use import::{
+    apply_anchor_export_import, plan_anchor_export_import,
+    AnchorImportActionOutcome, AnchorImportOptions, AnchorImportPlan,
+    AnchorImportReport, AnchorImportSelection, PlannedImportAction,
 };
 pub use operations::{
     check_evidence_anchor_registry_health, list_evidence_anchors_by_status,
@@ -142,6 +148,9 @@ pub fn evidence_anchor_reason_tag(err: &EvidenceAnchorError) -> &'static str {
         EvidenceAnchorError::ExportStrictModeArtifactBytesMissing { .. } => {
             "export_strict_mode_artifact_bytes_missing"
         }
+
+        // ── Stage 13.6 import-side refusal ──
+        EvidenceAnchorError::ImportTargetExists { .. } => "import_target_exists",
     }
 }
 
@@ -365,6 +374,15 @@ mod reason_tag_tests {
                     artifact_hash_hex: "cc".repeat(32),
                 },
                 "export_strict_mode_artifact_bytes_missing",
+            ),
+            // ── Stage 13.6 import-side variant ──
+            (
+                EvidenceAnchorError::ImportTargetExists {
+                    field: "artifact_hash",
+                    artifact_hash_hex: "dd".repeat(32),
+                    tx_id: "anchor-1".to_string(),
+                },
+                "import_target_exists",
             ),
         ];
         for (err, expected) in cases {
