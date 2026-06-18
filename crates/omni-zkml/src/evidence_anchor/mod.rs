@@ -28,6 +28,7 @@
 pub mod archive;
 pub mod cleanup;
 pub mod client;
+pub mod consistency;
 pub mod export;
 pub mod import;
 pub mod operations;
@@ -64,6 +65,12 @@ pub use archive::{
     AnchorArchiveRestoreOptions, AnchorArchiveRestoreOutcome,
     AnchorArchiveRestoreReport, AnchorArchiveSelection,
     ANCHOR_ARCHIVE_MANIFEST_SCHEMA_VERSION, ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION,
+};
+pub use consistency::{
+    build_anchor_consistency_report, AnchorConsistencyFinding,
+    AnchorConsistencyFindingKind, AnchorConsistencyOptions, AnchorConsistencyReport,
+    AnchorConsistencySeverity, AnchorConsistencySummary,
+    ANCHOR_CONSISTENCY_REPORT_SCHEMA_VERSION,
 };
 pub use import::{
     apply_anchor_export_import, plan_anchor_export_import,

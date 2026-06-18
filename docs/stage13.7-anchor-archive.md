@@ -282,3 +282,5 @@ All hermetic. No network.
 
 - **Stage 13.8** — local registry consistency report. Cross-checks hot registry + archive subtrees + `tx_index.json` integrity in a single read-only sweep. Reports drift, dangling references, orphan archives. No chain interaction.
 - **Stage 13.9** — comprehensive chain read / reconcile support. Operator-driven chain catch-up that bridges archived records back into reconcile flows when needed (e.g. an archived `Failed` record that the chain later re-finalized).
+
+> **Post-Stage-13.8 note:** Stage 13.8 turns Stage 13.7's archive subtrees into one of three first-class inspection surfaces (hot, archive, export) in a single read-only consistency report. Stage 13.7's archive shape / restore path / two-phase durability contract is **unchanged**; Stage 13.8 reads archives without ever invoking restore. A Phase-2 partial-apply state surfaces as `archive_hot_collision_same_bytes` (warning) findings on records Phase 2 didn't reach. See [`docs/stage13.8-anchor-consistency-report.md`](stage13.8-anchor-consistency-report.md).
