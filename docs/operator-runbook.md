@@ -3269,9 +3269,87 @@ omni-node operator evidence-anchor archive-integrity-evidence-anchors \
 
 **Implementation reference:** [`docs/stage13.7-anchor-archive.md`](stage13.7-anchor-archive.md) — Stage 13.7 engineering doc (library surface, plan / manifest schemas, two-phase durability contract, restore conflict matrix, mutex rules, test inventory).
 
+### Stage 13.8 — local integrity-evidence-anchor consistency report
+
+**Use when:** you want a single read-only sweep across the hot registry, every Stage 13.7 archive subtree, and every Stage 13.5 export tree — at any operationally meaningful moment: after Stage 13.4 cleanup, after Stage 13.7 archive, before Stage 13.5 export, before Stage 13.9 chain reconcile (forward outlook), or as a periodic preflight stored to JSON for forensic retention. **Fully local — zero chain interaction.** Strictly read-only.
+
+**Subcommand:**
+- `omni-node operator evidence-anchor report-integrity-evidence-anchor-consistency`
+
+**Key invariants:**
+
+1. **Read-only.** The library uses only `std::fs::read` / `read_dir`. No registry, archive, export, or `tx_index.json` write helper is reachable from the consistency module.
+2. **No new `reason=` tags.** Findings are typed report data ON the report, NOT refusals. The closed `EvidenceAnchorError` taxonomy is unchanged. The only `reason=` line the command can emit is `reason=io` when the required `--anchor-registry-dir` itself is unreadable at startup.
+3. **Optional path unreadability is a finding, not a command failure.** Both `ArchiveDirUnreadable` and `ExportDirUnreadable` are `warning` severity. `ArchiveDirNoManifest` (warning) is distinct — it fires when the directory exists and is readable but contains no archive manifest.
+4. **Severity principle (locked):** optional path can't be opened OR no manifest found → `warning`; readable AND claims to be an archive/export but fails integrity/schema checks → `error`.
+5. **Cross-surface "expected duplicate" overlaps are summary counters, NOT per-item findings.** A 10k-record export overlapping the hot registry contributes at most 10k to `summary.hot_export_overlaps`, with **no per-item finding flood**. The `summary.archive_export_overlaps` counter behaves the same. Set semantics: each unique `artifact_hash_hex` contributes at most 1.
+6. **Archive↔hot byte-equal duplicate IS emitted as a `warning` finding** (`ArchiveHotCollisionSameBytes`) because it indicates a likely partial-Phase-2 archive state — operationally distinct from the export "copy by design" case.
+7. **Coarse export verification.** `verify_anchor_export(strict=false)` delegates per-export errors to Stage 13.5; a single `ExportVerifyFailed` finding carries the Stage 13.5 reason tag in `detail`.
+8. **Bad `--json-out` parent is a CLI usage error (`bail!`)**, NOT a `reason=…` refusal.
+
+**Finding kinds (24 closed):**
+
+- **Hot (9):** `hot_record_malformed`, `hot_record_signature_invalid`, `hot_record_schema_unsupported`, `hot_filename_hash_mismatch`, `hot_tx_index_orphan`, `hot_tx_index_mismatch`, `hot_tx_id_duplicate`, `hot_stale_open_record`, `hot_tmp_orphan`.
+- **Archive (13):** `archive_dir_unreadable`, `archive_dir_no_manifest`, `archive_manifest_malformed`, `archive_manifest_schema_unsupported`, `archive_entry_invalid_path`, `archive_entry_missing_file`, `archive_entry_blake3_mismatch`, `archive_entry_record_malformed`, `archive_entry_signature_invalid`, `archive_entry_metadata_mismatch`, `archive_hot_collision_same_bytes`, `archive_hot_collision_different_bytes`, `archive_tx_id_collision`.
+- **Export (2):** `export_dir_unreadable`, `export_verify_failed`.
+
+**Severity guide for operators:**
+
+- `error` → stop and investigate before running mutation commands. Findings of this severity indicate real integrity problems that would cause downstream Stage 13.4 / 13.6 / 13.7 operations to refuse or behave incorrectly.
+- `warning` → aware-of and decide. Includes optional-path-not-found, stale records, `.tmp` orphans, and tx_index orphans. Often resolved by running Stage 13.4 cleanup.
+- `info` → currently unused in v1. Cross-surface "expected duplicate" overlaps live in summary counters instead.
+
+**Workflow recipes:**
+
+```sh
+# 1. Periodic preflight; defaults to event-line output + summary.
+omni-node operator evidence-anchor report-integrity-evidence-anchor-consistency \
+  --anchor-registry-dir /var/omni-anchors
+
+# 2. After Stage 13.4 cleanup, scan with archive + export surfaces too.
+omni-node operator evidence-anchor report-integrity-evidence-anchor-consistency \
+  --anchor-registry-dir /var/omni-anchors \
+  --archive-dir         /var/omni-anchors-archive \
+  --export-dir          /var/omni-exports/2026-Q1 \
+  --export-dir          /var/omni-exports/2026-Q2
+
+# 3. Include Stage 13.3-style stale findings.
+omni-node operator evidence-anchor report-integrity-evidence-anchor-consistency \
+  --anchor-registry-dir   /var/omni-anchors \
+  --stale-threshold-secs  604800   # 1 week
+
+# 4. Snapshot the report to JSON for forensic retention.
+omni-node operator evidence-anchor report-integrity-evidence-anchor-consistency \
+  --anchor-registry-dir /var/omni-anchors \
+  --archive-dir         /var/omni-anchors-archive \
+  --json-out            /var/omni-consistency-reports/2026-06-18.json
+
+# 5. After Stage 13.7 archive apply, validate Phase-2 completeness.
+#    Per the Stage 13.7 honest-durability contract, a Phase-2 IO
+#    failure leaves the manifest durable but the hot registry
+#    potentially partially mutated. A subsequent consistency
+#    report surfaces this via ArchiveHotCollisionSameBytes
+#    (warning) findings on records Phase 2 didn't reach.
+omni-node operator evidence-anchor report-integrity-evidence-anchor-consistency \
+  --anchor-registry-dir /var/omni-anchors \
+  --archive-dir         /var/omni-anchors-archive
+```
+
+**Cross-surface overlap counter semantics:**
+
+- `summary.hot_export_overlaps`: unique `artifact_hash_hex` count present in both hot registry and any export's `anchor_record` entries.
+- `summary.archive_export_overlaps`: unique `artifact_hash_hex` count present in both any archive and any export.
+
+Both use set semantics — duplicate manifest entries within a single export or archive do NOT inflate the counters.
+
+**Limitation — no mutation.** Stage 13.8 reports problems; it does NOT repair them. `suggested_action` strings on findings point operators to the relevant mutation command (Stage 13.4 cleanup, Stage 13.7 restore, Stage 13.6 import, etc.).
+
+**Limitation — no chain interaction.** Stage 13.8 cannot tell you whether the chain agrees with your local registry. Stage 13.9 (forward outlook) is the chain-facing reconcile / read stage.
+
+**Implementation reference:** [`docs/stage13.8-anchor-consistency-report.md`](stage13.8-anchor-consistency-report.md) — Stage 13.8 engineering doc (library surface, finding taxonomy with all 24 closed kinds, severity matrix, cross-surface overlap counter semantics, test inventory).
+
 **Forward outlook:**
 
-- **Stage 13.8** — local registry consistency report. A single read-only sweep that cross-checks the hot registry, every archive subtree, and `tx_index.json` integrity. Reports drift, dangling references, orphan archives.
-- **Stage 13.9** — comprehensive chain read / reconcile support. Operator-driven chain catch-up that bridges archived records back into reconcile flows when needed (e.g. an archived `Failed` record that the chain later re-finalized).
+- **Stage 13.9** — comprehensive chain read / reconcile support. Operator-driven, chain-facing. Cross-checks hot registry tx_ids against the chain's recorded anchors, drives reconcile sweeps over backlogs, and bridges archived records back into reconcile flows when needed. Stage 13.8's report is the recommended preflight before any 13.9 invocation.
 
-**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface; Stage 13.6 reuses both verbatim and adds no new schema constants; Stage 13.7 ships `ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION = 1` and `ANCHOR_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1` on its own plan + manifest surface — no other constants change.
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface; Stage 13.6 reuses both verbatim and adds no new schema constants; Stage 13.7 ships `ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION = 1` and `ANCHOR_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1` on its own plan + manifest surface; Stage 13.8 ships `ANCHOR_CONSISTENCY_REPORT_SCHEMA_VERSION = 1` on its own report surface and **modifies no existing surface** — no other constants change.
