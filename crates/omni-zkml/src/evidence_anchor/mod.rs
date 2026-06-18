@@ -25,6 +25,7 @@
 //! - [`evidence_anchor_reason_tag`] — closed-set reason-tag
 //!   mapper for `event=...` lines.
 
+pub mod archive;
 pub mod cleanup;
 pub mod client;
 pub mod export;
@@ -54,6 +55,15 @@ pub use export::{
     AnchorExportVerifyReport, ArtifactBytesInclusion,
     EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION,
     EXPORT_MANIFEST_FILENAME,
+};
+pub use archive::{
+    apply_anchor_archive, plan_anchor_archive, restore_anchor_archive,
+    AnchorArchiveAction, AnchorArchiveActionKind, AnchorArchiveActionOutcome,
+    AnchorArchiveApplyOptions, AnchorArchiveEntry, AnchorArchiveManifest,
+    AnchorArchivePlan, AnchorArchivePlanOptions, AnchorArchiveReport,
+    AnchorArchiveRestoreOptions, AnchorArchiveRestoreOutcome,
+    AnchorArchiveRestoreReport, AnchorArchiveSelection,
+    ANCHOR_ARCHIVE_MANIFEST_SCHEMA_VERSION, ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION,
 };
 pub use import::{
     apply_anchor_export_import, plan_anchor_export_import,
@@ -151,6 +161,16 @@ pub fn evidence_anchor_reason_tag(err: &EvidenceAnchorError) -> &'static str {
 
         // ── Stage 13.6 import-side refusal ──
         EvidenceAnchorError::ImportTargetExists { .. } => "import_target_exists",
+
+        // ── Stage 13.7 archive-side refusals ──
+        EvidenceAnchorError::ArchivePlanSchemaUnsupported { .. } => {
+            "unsupported_archive_plan_schema_version"
+        }
+        EvidenceAnchorError::ArchivePlanHashMismatch { .. } => "archive_plan_hash_mismatch",
+        EvidenceAnchorError::ArchiveDrift { .. } => "archive_drift",
+        EvidenceAnchorError::ArchiveInvalidPath { .. } => "archive_invalid_path",
+        EvidenceAnchorError::ArchiveBlake3Mismatch { .. } => "archive_blake3_mismatch",
+        EvidenceAnchorError::ArchiveTargetExists { .. } => "archive_target_exists",
     }
 }
 
@@ -383,6 +403,51 @@ mod reason_tag_tests {
                     tx_id: "anchor-1".to_string(),
                 },
                 "import_target_exists",
+            ),
+            // ── Stage 13.7 archive-side variants ──
+            (
+                EvidenceAnchorError::ArchivePlanSchemaUnsupported {
+                    got: 2,
+                    expected: 1,
+                },
+                "unsupported_archive_plan_schema_version",
+            ),
+            (
+                EvidenceAnchorError::ArchivePlanHashMismatch {
+                    computed: "1".repeat(64),
+                    expected: "2".repeat(64),
+                },
+                "archive_plan_hash_mismatch",
+            ),
+            (
+                EvidenceAnchorError::ArchiveDrift {
+                    computed: "3".repeat(16),
+                    expected: "4".repeat(16),
+                },
+                "archive_drift",
+            ),
+            (
+                EvidenceAnchorError::ArchiveInvalidPath {
+                    source_relative: "../etc/passwd".to_string(),
+                    reason: "parent traversal forbidden",
+                },
+                "archive_invalid_path",
+            ),
+            (
+                EvidenceAnchorError::ArchiveBlake3Mismatch {
+                    archive_relative: "anchors/aa.json".to_string(),
+                    computed: "5".repeat(64),
+                    expected: "6".repeat(64),
+                },
+                "archive_blake3_mismatch",
+            ),
+            (
+                EvidenceAnchorError::ArchiveTargetExists {
+                    field: "tx_id",
+                    artifact_hash_hex: "ee".repeat(32),
+                    tx_id: "anchor-2".to_string(),
+                },
+                "archive_target_exists",
             ),
         ];
         for (err, expected) in cases {

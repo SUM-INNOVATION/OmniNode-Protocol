@@ -668,6 +668,94 @@ pub enum EvidenceAnchorError {
         artifact_hash_hex: String,
         tx_id: String,
     },
+
+    // ── Stage 13.7 additions — local terminal-anchor archive / restore ─
+    //
+    // Six new variants, six new closed `reason=` tag strings. All
+    // semantically distinct from Stage 13.4 cleanup tags so
+    // operator logs can route archive-lifecycle events without
+    // conflating them with quarantine cleanup. The
+    // `field=artifact_hash | tx_id` discriminator on the target-
+    // exists variant parallels the Stage 13.6 `ImportTargetExists`
+    // shape.
+    /// Apply: the plan's `schema_version` is not the locked
+    /// `ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION`. Refused FIRST —
+    /// before the hash check — so a future-schema plan whose
+    /// hash field was re-computed cannot smuggle through as v1.
+    #[error(
+        "unsupported anchor archive plan schema version: got {got}, expected {expected}"
+    )]
+    ArchivePlanSchemaUnsupported { got: u32, expected: u32 },
+
+    /// Apply: the plan's `archive_plan_hash` does not match the
+    /// recomputed canonical-bytes BLAKE3 of its remaining
+    /// fields. The plan was hand-edited or corrupted on disk.
+    #[error(
+        "anchor archive plan hash mismatch: computed {computed}, plan declares {expected}"
+    )]
+    ArchivePlanHashMismatch { computed: String, expected: String },
+
+    /// Apply: the anchor registry's state differs from the
+    /// `registry_state_hash` recorded in the plan. The operator
+    /// must re-plan against the current registry state and
+    /// re-apply.
+    #[error(
+        "anchor registry drifted since archive plan was generated: \
+         computed {computed}, plan expected {expected}"
+    )]
+    ArchiveDrift { computed: String, expected: String },
+
+    /// Apply / Restore: an action's `source_relative` (or a
+    /// manifest entry's `archive_relative`) fails per-kind path
+    /// validation. Defends against path traversal (`..`),
+    /// absolute paths, separator misuse, or per-kind shape
+    /// violations in operator-supplied JSON. Refuses BEFORE
+    /// any FS mutation.
+    #[error(
+        "anchor archive invalid path: {source_relative:?} ({reason})"
+    )]
+    ArchiveInvalidPath {
+        source_relative: String,
+        reason: &'static str,
+    },
+
+    /// Restore: the archived bytes' BLAKE3 hash does not match
+    /// the manifest's recorded `blake3_hex`. The archive subtree
+    /// was hand-edited or transport corrupted. Refuses with no
+    /// FS mutation.
+    #[error(
+        "anchor archive BLAKE3 mismatch for {archive_relative}: \
+         file hashes to {computed}, manifest declares {expected}"
+    )]
+    ArchiveBlake3Mismatch {
+        archive_relative: String,
+        computed: String,
+        expected: String,
+    },
+
+    /// Restore: the target registry already carries a different
+    /// anchor under the same key (parallels Stage 13.6
+    /// `ImportTargetExists`).
+    ///
+    /// `field = "artifact_hash"` — there is a file at
+    /// `<registry>/<artifact_hash_hex>.json` whose BLAKE3 differs
+    /// from the manifest's recorded `blake3_hex`.
+    ///
+    /// `field = "tx_id"` — `tx_index.json` already maps the
+    /// archive entry's `tx_id` to a different `artifact_hash_hex`
+    /// than the manifest declares.
+    ///
+    /// Byte-equal records under the same hash + same tx_id are
+    /// idempotent (`skipped_already_restored`) — not refused.
+    #[error(
+        "anchor archive target exists (field {field}): \
+         artifact_hash_hex {artifact_hash_hex}, tx_id {tx_id}"
+    )]
+    ArchiveTargetExists {
+        field: &'static str,
+        artifact_hash_hex: String,
+        tx_id: String,
+    },
 }
 
 /// Stage 13.0 result alias. Distinct from earlier-stage aliases

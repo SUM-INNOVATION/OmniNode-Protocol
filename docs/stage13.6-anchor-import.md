@@ -232,3 +232,5 @@ All hermetic. No network.
 - Conflict resolution beyond refuse-or-skip — no `--force-overwrite-tx-id-collision`, no `--re-stamp-updated-at-on-import`.
 - Multi-export merge into a single registry (operators run multiple imports sequentially).
 - Importing into an in-memory registry surface.
+
+> **Post-Stage-13.7 note:** Stage 13.7 adds the inverse local lifecycle step — archive valid terminal records out of the hot registry and restore them on demand. Stage 13.6's import path is **unchanged**; Stage 13.7 ships its own six-tag delta on a distinct archive-lifecycle concept (plan / apply / restore mirroring Stage 13.4's shape). See [`docs/stage13.7-anchor-archive.md`](stage13.7-anchor-archive.md).

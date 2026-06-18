@@ -43,20 +43,24 @@ use omni_contributor::{
 use omni_sumchain::SumChainClient;
 use omni_zkml::EvidenceAnchorError;
 use omni_zkml::{
-    AnchorApplyOptions, AnchorCleanupPlan, AnchorExportOptions,
+    AnchorApplyOptions, AnchorArchiveApplyOptions, AnchorArchiveManifest,
+    AnchorArchivePlan, AnchorArchivePlanOptions, AnchorArchiveRestoreOptions,
+    AnchorArchiveSelection, AnchorCleanupPlan, AnchorExportOptions,
     AnchorExportSelection, AnchorExportVerifyOptions, AnchorImportOptions,
     AnchorImportSelection, AnchorPlanOptions, AnchorQuarantineManifest,
     AnchorRecord, AnchorRestoreOptions, AnchorSelector, AnchorStatus,
     ArtifactBytesInclusion, ChainClientError, EvidenceAnchorRegistryHealth,
     EvidenceAnchorRegistrySummary, INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION,
     IntegrityEvidenceAnchorTxData, LocalAnchorStatus, LocalEvidenceAnchorRegistry,
-    StaleAnchorInfo, anchor_hex_lower, apply_anchor_cleanup, apply_anchor_export,
-    apply_anchor_export_import, check_evidence_anchor_registry_health,
-    evidence_anchor_reason_tag, list_evidence_anchors_by_status,
-    list_stale_submitted_or_included, parse_anchor_hex_32, plan_anchor_cleanup,
+    StaleAnchorInfo, anchor_hex_lower, apply_anchor_archive, apply_anchor_cleanup,
+    apply_anchor_export, apply_anchor_export_import,
+    check_evidence_anchor_registry_health, evidence_anchor_reason_tag,
+    list_evidence_anchors_by_status, list_stale_submitted_or_included,
+    parse_anchor_hex_32, plan_anchor_archive, plan_anchor_cleanup,
     query_evidence_anchor_workflow, reconcile_evidence_anchors_workflow,
-    restore_anchor_cleanup_quarantine, verify_anchor_against_registry,
-    verify_anchor_export, verify_anchor_file_against_artifact_bytes,
+    restore_anchor_archive, restore_anchor_cleanup_quarantine,
+    verify_anchor_against_registry, verify_anchor_export,
+    verify_anchor_file_against_artifact_bytes,
 };
 #[cfg(feature = "submit")]
 use omni_zkml::{
@@ -140,6 +144,14 @@ enum EvidenceAnchorCmd {
     /// **Fully local — zero chain interaction.** No re-signing.
     /// Stage 13.0 wire / schema / domain unchanged.
     ImportIntegrityEvidenceAnchorExport(ImportAnchorExportArgs),
+    /// Stage 13.7 — three-phase terminal-anchor archive
+    /// (plan → apply → restore). Moves valid `Finalized` /
+    /// `Failed` records out of the hot registry into a
+    /// byte-preserving archive subtree. **Fully local — zero
+    /// chain interaction.** Apply AND restore are dry-run by
+    /// default; `--apply` is the explicit operator confirmation
+    /// in both mutation modes.
+    ArchiveIntegrityEvidenceAnchors(ArchiveAnchorArgs),
 }
 
 #[cfg(feature = "submit")]
@@ -479,6 +491,51 @@ pub(crate) struct ImportAnchorExportArgs {
     pub(crate) status: Vec<String>,
 }
 
+/// Stage 13.7 — archive-anchor CLI. Three-phase plan / apply /
+/// restore. `--apply` gates BOTH apply mode and restore mode
+/// (Stage 13.7 REJECT-fix Finding 1).
+#[derive(Args)]
+pub(crate) struct ArchiveAnchorArgs {
+    /// Hot anchor registry. Required in all three modes.
+    #[arg(long)]
+    pub(crate) anchor_registry_dir: PathBuf,
+
+    // ── Phase selectors ──
+    #[arg(long)]
+    pub(crate) apply_plan: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) restore_manifest: Option<PathBuf>,
+
+    // ── Plan-mode flags ──
+    #[arg(long)]
+    pub(crate) plan_out: Option<PathBuf>,
+    /// Repeatable. Closed set: `finalized | failed`. Default
+    /// when empty: `[FINALIZED]`. Non-terminal values are refused
+    /// at the clap layer (`Submitted` / `Included` are not
+    /// archivable).
+    #[arg(long)]
+    pub(crate) status: Vec<String>,
+    /// Optional RFC 3339 timestamp; archive only records with
+    /// `updated_at < before`.
+    #[arg(long)]
+    pub(crate) before: Option<String>,
+    #[arg(long)]
+    pub(crate) tx_id: Vec<String>,
+    #[arg(long)]
+    pub(crate) artifact_hash_hex: Vec<String>,
+
+    // ── Apply-mode flags ──
+    /// Root under which the `<plan_id>/anchors/` subtree +
+    /// `archive_manifest.json` are written. Required when the
+    /// plan has ≥1 action.
+    #[arg(long)]
+    pub(crate) archive_dir: Option<PathBuf>,
+
+    // ── Mutation gate — valid in both apply and restore modes ──
+    #[arg(long)]
+    pub(crate) apply: bool,
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
 pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
@@ -539,6 +596,11 @@ pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
             tokio::task::spawn_blocking(move || run_import_export(a))
                 .await
                 .map_err(|e| anyhow!("import-anchor-export join error: {e}"))?
+        }
+        EvidenceAnchorCmd::ArchiveIntegrityEvidenceAnchors(a) => {
+            tokio::task::spawn_blocking(move || run_archive(a))
+                .await
+                .map_err(|e| anyhow!("archive-anchor join error: {e}"))?
         }
     }
 }
@@ -2208,6 +2270,428 @@ fn run_import_export(args: ImportAnchorExportArgs) -> Result<()> {
     Ok(())
 }
 
+// ── Stage 13.7 — terminal-anchor archive / restore ───────────────────────────
+
+/// Closed clap-level mutex / required-with violation for the
+/// Stage 13.7 archive command. Surfaced via clap's own
+/// usage-error channel so log scrapers don't conflate these
+/// CLI-shape refusals with the `reason=<closed-tag>` taxonomy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArchiveMutexViolation {
+    ApplyAndRestoreConflict,
+    PlanOutOutsidePlanMode,
+    StatusOutsidePlanMode,
+    BeforeOutsidePlanMode,
+    SelectorsOutsidePlanMode,
+    ArchiveDirOutsideApplyMode,
+    ApplyRequiresApplyOrRestore,
+    UnknownStatus,
+    NonTerminalStatus,
+    MalformedArtifactHashHex,
+    MalformedBeforeTimestamp,
+    // Stage 13.7 REJECT-fix Finding 1: CLI --anchor-registry-dir
+    // must match the plan's anchor_registry_dir or the operator
+    // could silently mutate the wrong registry.
+    AnchorRegistryDirMismatchPlan,
+    // Stage 13.7 REJECT-fix Finding 2: --archive-dir is required
+    // when (and only when) the plan has ≥1 action. A zero-action
+    // plan can apply with no destination.
+    ArchiveDirRequiredWhenPlanHasActions,
+}
+
+impl ArchiveMutexViolation {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            ArchiveMutexViolation::ApplyAndRestoreConflict => {
+                "--apply-plan and --restore-manifest are mutually exclusive"
+            }
+            ArchiveMutexViolation::PlanOutOutsidePlanMode => {
+                "--plan-out is plan-mode only (omit --apply-plan / --restore-manifest)"
+            }
+            ArchiveMutexViolation::StatusOutsidePlanMode => {
+                "--status is plan-mode only"
+            }
+            ArchiveMutexViolation::BeforeOutsidePlanMode => {
+                "--before is plan-mode only"
+            }
+            ArchiveMutexViolation::SelectorsOutsidePlanMode => {
+                "--tx-id / --artifact-hash-hex are plan-mode only"
+            }
+            ArchiveMutexViolation::ArchiveDirOutsideApplyMode => {
+                "--archive-dir is apply-mode only (requires --apply-plan)"
+            }
+            ArchiveMutexViolation::ApplyRequiresApplyOrRestore => {
+                "--apply requires --apply-plan or --restore-manifest"
+            }
+            ArchiveMutexViolation::UnknownStatus => {
+                "--status must be one of finalized | failed (case-insensitive); \
+                 Stage 13.7 archives terminal records only"
+            }
+            ArchiveMutexViolation::NonTerminalStatus => {
+                "--status must be one of finalized | failed (archive operates only on terminal records)"
+            }
+            ArchiveMutexViolation::MalformedArtifactHashHex => {
+                "--artifact-hash-hex must be exactly 64 lowercase hex characters"
+            }
+            ArchiveMutexViolation::MalformedBeforeTimestamp => {
+                "--before must be an RFC 3339 timestamp"
+            }
+            ArchiveMutexViolation::AnchorRegistryDirMismatchPlan => {
+                "--anchor-registry-dir does not match the plan's anchor_registry_dir; \
+                 refusing before any archive write"
+            }
+            ArchiveMutexViolation::ArchiveDirRequiredWhenPlanHasActions => {
+                "--archive-dir is required when the plan has one or more actions"
+            }
+        }
+    }
+}
+
+/// Stage 13.7 REJECT-fix Finding 1 — refuse if the CLI
+/// `--anchor-registry-dir` does not match the plan's recorded
+/// `anchor_registry_dir`. Without this, an operator can pass
+/// `--anchor-registry-dir B --apply-plan plan-for-A.json` and
+/// silently mutate registry A while the event log says B.
+///
+/// Comparison strategy:
+/// 1. Try canonicalize both paths; if both succeed and are
+///    equal, accept.
+/// 2. Fall back to lexical equality (handles the case where
+///    one or both paths don't exist on disk — e.g. the plan
+///    was generated against a directory that was since
+///    relocated).
+pub(crate) fn check_archive_registry_dir_matches_plan(
+    cli_dir: &std::path::Path,
+    plan_dir: &str,
+) -> std::result::Result<(), ArchiveMutexViolation> {
+    if let (Ok(a), Ok(b)) = (
+        std::fs::canonicalize(cli_dir),
+        std::fs::canonicalize(plan_dir),
+    ) {
+        if a == b {
+            return Ok(());
+        }
+    }
+    if cli_dir.to_string_lossy() == plan_dir {
+        return Ok(());
+    }
+    Err(ArchiveMutexViolation::AnchorRegistryDirMismatchPlan)
+}
+
+/// Stage 13.7 REJECT-fix Finding 2 — resolve `--archive-dir`
+/// against the parsed plan:
+/// - Supplied: use it as-is.
+/// - Absent, plan has zero actions: use an empty path. The
+///   library never touches it (Pass 1 / Pass 1.5 / Pass 2 all
+///   loop zero times).
+/// - Absent, plan has ≥1 action: refuse.
+pub(crate) fn resolve_archive_dir_for_apply(
+    args_archive_dir: Option<&std::path::Path>,
+    plan_action_count: usize,
+) -> std::result::Result<PathBuf, ArchiveMutexViolation> {
+    match args_archive_dir {
+        Some(p) => Ok(p.to_path_buf()),
+        None if plan_action_count == 0 => Ok(PathBuf::new()),
+        None => Err(ArchiveMutexViolation::ArchiveDirRequiredWhenPlanHasActions),
+    }
+}
+
+fn parse_terminal_status_token(
+    s: &str,
+) -> std::result::Result<LocalAnchorStatus, ArchiveMutexViolation> {
+    match s.to_ascii_lowercase().as_str() {
+        "finalized" => Ok(LocalAnchorStatus::Finalized),
+        "failed" => Ok(LocalAnchorStatus::Failed {
+            reason: String::new(),
+        }),
+        "submitted" | "included" => Err(ArchiveMutexViolation::NonTerminalStatus),
+        _ => Err(ArchiveMutexViolation::UnknownStatus),
+    }
+}
+
+/// Pure clap-level mutex check. Returns the parsed
+/// terminal-status list on success.
+pub(crate) fn check_archive_mutex_rules(
+    args: &ArchiveAnchorArgs,
+) -> std::result::Result<Vec<LocalAnchorStatus>, ArchiveMutexViolation> {
+    let in_apply_mode = args.apply_plan.is_some();
+    let in_restore_mode = args.restore_manifest.is_some();
+    let in_plan_mode = !in_apply_mode && !in_restore_mode;
+
+    if in_apply_mode && in_restore_mode {
+        return Err(ArchiveMutexViolation::ApplyAndRestoreConflict);
+    }
+    if args.plan_out.is_some() && !in_plan_mode {
+        return Err(ArchiveMutexViolation::PlanOutOutsidePlanMode);
+    }
+    if !args.status.is_empty() && !in_plan_mode {
+        return Err(ArchiveMutexViolation::StatusOutsidePlanMode);
+    }
+    if args.before.is_some() && !in_plan_mode {
+        return Err(ArchiveMutexViolation::BeforeOutsidePlanMode);
+    }
+    if (!args.tx_id.is_empty() || !args.artifact_hash_hex.is_empty()) && !in_plan_mode {
+        return Err(ArchiveMutexViolation::SelectorsOutsidePlanMode);
+    }
+    if args.archive_dir.is_some() && !in_apply_mode {
+        return Err(ArchiveMutexViolation::ArchiveDirOutsideApplyMode);
+    }
+    // Stage 13.7 REJECT-fix Finding 1: --apply requires
+    // --apply-plan OR --restore-manifest.
+    if args.apply && in_plan_mode {
+        return Err(ArchiveMutexViolation::ApplyRequiresApplyOrRestore);
+    }
+    // Status closed-set + terminal-only validation.
+    let mut statuses = Vec::with_capacity(args.status.len());
+    for s in &args.status {
+        statuses.push(parse_terminal_status_token(s)?);
+    }
+    // Artifact-hash format.
+    for h in &args.artifact_hash_hex {
+        if h.len() != 64
+            || !h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(ArchiveMutexViolation::MalformedArtifactHashHex);
+        }
+    }
+    // --before RFC 3339 parse.
+    if let Some(s) = &args.before {
+        if chrono::DateTime::parse_from_rfc3339(s).is_err() {
+            return Err(ArchiveMutexViolation::MalformedBeforeTimestamp);
+        }
+    }
+    Ok(statuses)
+}
+
+fn run_archive(args: ArchiveAnchorArgs) -> Result<()> {
+    let statuses = match check_archive_mutex_rules(&args) {
+        Ok(v) => v,
+        Err(v) => bail!("invalid flag combination: {}", v.message()),
+    };
+    if let Some(manifest_path) = args.restore_manifest.clone() {
+        return run_archive_restore(&args, &manifest_path);
+    }
+    if let Some(plan_path) = args.apply_plan.clone() {
+        return run_archive_apply(&args, &plan_path);
+    }
+    run_archive_plan(&args, statuses)
+}
+
+fn run_archive_plan(args: &ArchiveAnchorArgs, statuses: Vec<LocalAnchorStatus>) -> Result<()> {
+    println!(
+        "event=integrity_evidence_anchor_archive_plan_started \
+         anchor_registry_dir={}",
+        args.anchor_registry_dir.display(),
+    );
+    let registry =
+        LocalEvidenceAnchorRegistry::open(args.anchor_registry_dir.clone()).map_err(|e| {
+            println!(
+                "event=integrity_evidence_anchor_archive_failed reason=io detail={e}"
+            );
+            anyhow!(
+                "open --anchor-registry-dir {}: {e}",
+                args.anchor_registry_dir.display()
+            )
+        })?;
+    let now_utc = chrono::Utc::now().to_rfc3339();
+    let selection = AnchorArchiveSelection {
+        tx_ids: args.tx_id.clone(),
+        artifact_hashes: args.artifact_hash_hex.clone(),
+    };
+    let plan = plan_anchor_archive(
+        &registry,
+        &AnchorArchivePlanOptions {
+            now_utc: &now_utc,
+            statuses,
+            before_utc: args.before.as_deref(),
+            selection: &selection,
+        },
+    )
+    .map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_archive_failed reason={reason} detail={err}"
+        );
+        anyhow!("archive plan refused: {err}")
+    })?;
+
+    let bytes = serde_json::to_vec_pretty(&plan)
+        .map_err(|e| anyhow!("serialize plan: {e}"))?;
+    if let Some(path) = args.plan_out.as_ref() {
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| anyhow!("write tmp {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| anyhow!("rename {}: {e}", path.display()))?;
+        println!(
+            "event=integrity_evidence_anchor_archive_plan_written path={}",
+            path.display()
+        );
+    } else {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        handle.write_all(&bytes).map_err(|e| anyhow!("write stdout: {e}"))?;
+        handle.write_all(b"\n").ok();
+    }
+    println!(
+        "event=integrity_evidence_anchor_archive_plan_summary plan_id={} actions={}",
+        plan.plan_id,
+        plan.actions.len(),
+    );
+    Ok(())
+}
+
+fn run_archive_apply(args: &ArchiveAnchorArgs, plan_path: &std::path::Path) -> Result<()> {
+    println!(
+        "event=integrity_evidence_anchor_archive_apply_started \
+         anchor_registry_dir={} plan={} mode={}",
+        args.anchor_registry_dir.display(),
+        plan_path.display(),
+        if args.apply { "apply" } else { "dry_run" },
+    );
+    let bytes = std::fs::read(plan_path).map_err(|e| {
+        println!(
+            "event=integrity_evidence_anchor_archive_failed reason=io detail={e}"
+        );
+        anyhow!("read --apply-plan {}: {e}", plan_path.display())
+    })?;
+    let plan: AnchorArchivePlan = serde_json::from_slice(&bytes).map_err(|e| {
+        println!(
+            "event=integrity_evidence_anchor_archive_failed reason=malformed_json detail={e}"
+        );
+        anyhow!("parse --apply-plan {}: {e}", plan_path.display())
+    })?;
+
+    // Stage 13.7 REJECT-fix Finding 1: refuse before any FS
+    // mutation if the CLI registry dir disagrees with the plan.
+    // The library uses plan.anchor_registry_dir for actual
+    // mutation — without this check, an operator could silently
+    // mutate the wrong registry.
+    if let Err(v) =
+        check_archive_registry_dir_matches_plan(&args.anchor_registry_dir, &plan.anchor_registry_dir)
+    {
+        bail!("invalid flag combination: {}", v.message());
+    }
+
+    // Stage 13.7 REJECT-fix Finding 2: --archive-dir is required
+    // ONLY when the plan has ≥1 action.
+    let archive_dir_owned =
+        match resolve_archive_dir_for_apply(args.archive_dir.as_deref(), plan.actions.len()) {
+            Ok(p) => p,
+            Err(v) => bail!("invalid flag combination: {}", v.message()),
+        };
+
+    let _ = LocalEvidenceAnchorRegistry::open(args.anchor_registry_dir.clone()).map_err(|e| {
+        println!(
+            "event=integrity_evidence_anchor_archive_failed reason=io detail={e}"
+        );
+        anyhow!(
+            "open --anchor-registry-dir {}: {e}",
+            args.anchor_registry_dir.display()
+        )
+    })?;
+    let now_utc = chrono::Utc::now().to_rfc3339();
+    let report = apply_anchor_archive(
+        &plan,
+        &AnchorArchiveApplyOptions {
+            archive_dir: &archive_dir_owned,
+            dry_run: !args.apply,
+            now_utc: &now_utc,
+        },
+    )
+    .map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_archive_failed reason={reason} detail={err}"
+        );
+        anyhow!("archive apply refused: {err}")
+    })?;
+    println!(
+        "event=integrity_evidence_anchor_archive_apply_summary plan_id={} mode={} \
+         actions_archived={} actions_would_archive={} archive_dir={} \
+         archive_manifest_relative={}",
+        report.plan_id,
+        report.mode,
+        report.actions_archived,
+        report.actions_would_archive,
+        report.archive_dir,
+        report.archive_manifest_relative.as_deref().unwrap_or(""),
+    );
+    Ok(())
+}
+
+fn run_archive_restore(args: &ArchiveAnchorArgs, manifest_path: &std::path::Path) -> Result<()> {
+    println!(
+        "event=integrity_evidence_anchor_archive_restore_started \
+         anchor_registry_dir={} manifest={} mode={}",
+        args.anchor_registry_dir.display(),
+        manifest_path.display(),
+        if args.apply { "apply" } else { "dry_run" },
+    );
+    let archive_dir = manifest_path.parent().ok_or_else(|| {
+        bail_string("--restore-manifest path has no parent")
+    })?;
+    let bytes = std::fs::read(manifest_path).map_err(|e| {
+        println!(
+            "event=integrity_evidence_anchor_archive_failed reason=io detail={e}"
+        );
+        anyhow!(
+            "read --restore-manifest {}: {e}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: AnchorArchiveManifest = serde_json::from_slice(&bytes).map_err(|e| {
+        println!(
+            "event=integrity_evidence_anchor_archive_failed reason=malformed_json detail={e}"
+        );
+        anyhow!(
+            "parse --restore-manifest {}: {e}",
+            manifest_path.display()
+        )
+    })?;
+    let _ = LocalEvidenceAnchorRegistry::open(args.anchor_registry_dir.clone()).map_err(|e| {
+        println!(
+            "event=integrity_evidence_anchor_archive_failed reason=io detail={e}"
+        );
+        anyhow!(
+            "open --anchor-registry-dir {}: {e}",
+            args.anchor_registry_dir.display()
+        )
+    })?;
+    let report = restore_anchor_archive(
+        &manifest,
+        &AnchorArchiveRestoreOptions {
+            archive_dir,
+            anchor_registry_dir: &args.anchor_registry_dir,
+            dry_run: !args.apply,
+        },
+    )
+    .map_err(|err| {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_archive_failed reason={reason} detail={err}"
+        );
+        anyhow!("archive restore refused: {err}")
+    })?;
+    println!(
+        "event=integrity_evidence_anchor_archive_restore_summary plan_id={} mode={} \
+         restored={} would_restore={} skipped_already_restored={} \
+         re_added_tx_index_entry={} would_re_add_tx_index_entry={}",
+        report.plan_id,
+        report.mode,
+        report.restored,
+        report.would_restore,
+        report.skipped_already_restored,
+        report.re_added_tx_index_entry,
+        report.would_re_add_tx_index_entry,
+    );
+    Ok(())
+}
+
+fn bail_string(s: &'static str) -> anyhow::Error {
+    anyhow!("{s}")
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "submit")]
@@ -3203,5 +3687,402 @@ mod stage_13_6_cli_tests {
         assert!(!(!a.apply), "--apply=true should map to dry_run=false");
         a.apply = false;
         assert!(!a.apply, "--apply=false should map to dry_run=true");
+    }
+}
+
+#[cfg(test)]
+mod stage_13_7_cli_tests {
+    //! Stage 13.7 — pin CLI invariants:
+    //! - Closed clap-level mutex / required-with rules covering
+    //!   plan / apply / restore mode separation.
+    //! - `--apply` is valid in BOTH apply and restore modes
+    //!   (Stage 13.7 REJECT-fix Finding 1).
+    //! - `--status` is closed-set and TERMINAL-ONLY at clap layer.
+    //! - `--before` requires a parseable RFC 3339 timestamp.
+    //! - Reason-tag mapper routes all 6 new variants.
+
+    use super::*;
+    use std::path::PathBuf;
+
+    fn defaults() -> ArchiveAnchorArgs {
+        ArchiveAnchorArgs {
+            anchor_registry_dir: PathBuf::from("/tmp/registry"),
+            apply_plan: None,
+            restore_manifest: None,
+            plan_out: None,
+            status: vec![],
+            before: None,
+            tx_id: vec![],
+            artifact_hash_hex: vec![],
+            archive_dir: None,
+            apply: false,
+        }
+    }
+
+    // ── Mutex rule: apply-plan vs restore-manifest ──
+
+    #[test]
+    fn mutex_refuses_apply_plan_with_restore_manifest() {
+        let mut a = defaults();
+        a.apply_plan = Some(PathBuf::from("plan.json"));
+        a.restore_manifest = Some(PathBuf::from("manifest.json"));
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::ApplyAndRestoreConflict)
+        );
+    }
+
+    // ── Mutex rule: plan-mode-only flags ──
+
+    #[test]
+    fn mutex_refuses_plan_out_with_apply_plan() {
+        let mut a = defaults();
+        a.apply_plan = Some(PathBuf::from("plan.json"));
+        a.plan_out = Some(PathBuf::from("out.json"));
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::PlanOutOutsidePlanMode)
+        );
+    }
+
+    #[test]
+    fn mutex_refuses_status_with_apply_plan() {
+        let mut a = defaults();
+        a.apply_plan = Some(PathBuf::from("plan.json"));
+        a.status = vec!["finalized".to_string()];
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::StatusOutsidePlanMode)
+        );
+    }
+
+    #[test]
+    fn mutex_refuses_before_with_restore_manifest() {
+        let mut a = defaults();
+        a.restore_manifest = Some(PathBuf::from("manifest.json"));
+        a.before = Some("2026-01-01T00:00:00Z".to_string());
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::BeforeOutsidePlanMode)
+        );
+    }
+
+    #[test]
+    fn mutex_refuses_tx_id_selector_with_apply_plan() {
+        let mut a = defaults();
+        a.apply_plan = Some(PathBuf::from("plan.json"));
+        a.tx_id = vec!["anchor-1".to_string()];
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::SelectorsOutsidePlanMode)
+        );
+    }
+
+    // ── Mutex rule: apply-mode-only flags ──
+
+    #[test]
+    fn mutex_refuses_archive_dir_without_apply_plan() {
+        let mut a = defaults();
+        a.archive_dir = Some(PathBuf::from("/tmp/archive"));
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::ArchiveDirOutsideApplyMode)
+        );
+    }
+
+    // ── REJECT-fix Finding 1: --apply must be valid for apply AND restore ──
+
+    #[test]
+    fn mutex_refuses_apply_in_plan_mode() {
+        let mut a = defaults();
+        a.apply = true;
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::ApplyRequiresApplyOrRestore)
+        );
+    }
+
+    #[test]
+    fn mutex_passes_for_apply_mode_with_apply_plan_and_apply_flag() {
+        let mut a = defaults();
+        a.apply_plan = Some(PathBuf::from("plan.json"));
+        a.archive_dir = Some(PathBuf::from("/tmp/archive"));
+        a.apply = true;
+        assert!(check_archive_mutex_rules(&a).is_ok());
+    }
+
+    #[test]
+    fn mutex_passes_for_restore_mode_with_apply() {
+        // Stage 13.7 REJECT-fix Finding 1 — restore can be
+        // either dry-run OR --apply.
+        let mut a = defaults();
+        a.restore_manifest = Some(PathBuf::from("manifest.json"));
+        a.apply = true;
+        assert!(check_archive_mutex_rules(&a).is_ok());
+    }
+
+    #[test]
+    fn mutex_passes_for_restore_mode_without_apply_dry_run() {
+        let mut a = defaults();
+        a.restore_manifest = Some(PathBuf::from("manifest.json"));
+        assert!(check_archive_mutex_rules(&a).is_ok());
+    }
+
+    #[test]
+    fn mutex_passes_for_default_plan_mode() {
+        assert!(check_archive_mutex_rules(&defaults()).is_ok());
+    }
+
+    // ── Status closed-set ──
+
+    #[test]
+    fn mutex_accepts_finalized_and_failed_case_insensitive() {
+        for s in &["finalized", "FAILED", "Finalized"] {
+            let mut a = defaults();
+            a.status = vec![s.to_string()];
+            assert!(check_archive_mutex_rules(&a).is_ok(), "rejected {s}");
+        }
+    }
+
+    #[test]
+    fn mutex_refuses_submitted_at_clap_layer() {
+        let mut a = defaults();
+        a.status = vec!["submitted".to_string()];
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::NonTerminalStatus)
+        );
+    }
+
+    #[test]
+    fn mutex_refuses_included_at_clap_layer() {
+        let mut a = defaults();
+        a.status = vec!["included".to_string()];
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::NonTerminalStatus)
+        );
+    }
+
+    #[test]
+    fn mutex_refuses_unknown_status() {
+        let mut a = defaults();
+        a.status = vec!["weird".to_string()];
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::UnknownStatus)
+        );
+    }
+
+    // ── --before RFC 3339 parse ──
+
+    #[test]
+    fn mutex_refuses_malformed_before_timestamp() {
+        let mut a = defaults();
+        a.before = Some("not-a-timestamp".to_string());
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::MalformedBeforeTimestamp)
+        );
+    }
+
+    #[test]
+    fn mutex_accepts_parseable_before_timestamp() {
+        let mut a = defaults();
+        a.before = Some("2026-06-18T00:00:00Z".to_string());
+        assert!(check_archive_mutex_rules(&a).is_ok());
+    }
+
+    // ── Artifact-hash format ──
+
+    #[test]
+    fn mutex_refuses_malformed_artifact_hash_hex() {
+        let mut a = defaults();
+        a.artifact_hash_hex = vec!["AA".repeat(32)];
+        assert_eq!(
+            check_archive_mutex_rules(&a).err(),
+            Some(ArchiveMutexViolation::MalformedArtifactHashHex)
+        );
+    }
+
+    // ── Violation message stability ──
+
+    #[test]
+    fn violation_messages_are_stable_strings() {
+        assert_eq!(
+            ArchiveMutexViolation::ApplyAndRestoreConflict.message(),
+            "--apply-plan and --restore-manifest are mutually exclusive"
+        );
+        assert_eq!(
+            ArchiveMutexViolation::ApplyRequiresApplyOrRestore.message(),
+            "--apply requires --apply-plan or --restore-manifest"
+        );
+        assert!(ArchiveMutexViolation::NonTerminalStatus
+            .message()
+            .contains("terminal records"));
+    }
+
+    // ── Closed reason-tag mapper covers all 6 Stage 13.7 variants ──
+
+    #[test]
+    fn unsupported_archive_plan_schema_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ArchivePlanSchemaUnsupported {
+            got: 2,
+            expected: 1,
+        };
+        assert_eq!(
+            evidence_anchor_reason_tag(&err),
+            "unsupported_archive_plan_schema_version"
+        );
+    }
+
+    #[test]
+    fn archive_plan_hash_mismatch_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ArchivePlanHashMismatch {
+            computed: "1".repeat(64),
+            expected: "2".repeat(64),
+        };
+        assert_eq!(
+            evidence_anchor_reason_tag(&err),
+            "archive_plan_hash_mismatch"
+        );
+    }
+
+    #[test]
+    fn archive_drift_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ArchiveDrift {
+            computed: "3".repeat(16),
+            expected: "4".repeat(16),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "archive_drift");
+    }
+
+    #[test]
+    fn archive_invalid_path_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ArchiveInvalidPath {
+            source_relative: "../etc/passwd".to_string(),
+            reason: "parent traversal forbidden",
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "archive_invalid_path");
+    }
+
+    #[test]
+    fn archive_blake3_mismatch_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ArchiveBlake3Mismatch {
+            archive_relative: "anchors/aa.json".to_string(),
+            computed: "5".repeat(64),
+            expected: "6".repeat(64),
+        };
+        assert_eq!(
+            evidence_anchor_reason_tag(&err),
+            "archive_blake3_mismatch"
+        );
+    }
+
+    #[test]
+    fn archive_target_exists_variant_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ArchiveTargetExists {
+            field: "artifact_hash",
+            artifact_hash_hex: "aa".repeat(32),
+            tx_id: "anchor-1".to_string(),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "archive_target_exists");
+    }
+
+    #[test]
+    fn archive_target_exists_tx_id_field_also_routes_to_documented_tag() {
+        let err = EvidenceAnchorError::ArchiveTargetExists {
+            field: "tx_id",
+            artifact_hash_hex: "aa".repeat(32),
+            tx_id: "anchor-2".to_string(),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "archive_target_exists");
+    }
+
+    // ── Selector miss reuses anchor_not_found ──
+
+    #[test]
+    fn anchor_not_found_remains_the_selector_miss_tag_for_archive() {
+        let err = EvidenceAnchorError::AnchorNotFound {
+            selector: "tx_id=missing".to_string(),
+        };
+        assert_eq!(evidence_anchor_reason_tag(&err), "anchor_not_found");
+    }
+
+    // ── REJECT-fix Finding 1: CLI registry-dir vs plan registry-dir ──
+
+    #[test]
+    fn cli_check_refuses_when_anchor_registry_dir_does_not_match_plan_dir() {
+        // Two synthetic paths that don't exist on disk and are
+        // lexically different → refuse without any FS read.
+        let cli = PathBuf::from("/var/B");
+        let plan = "/var/A".to_string();
+        assert_eq!(
+            check_archive_registry_dir_matches_plan(&cli, &plan).err(),
+            Some(ArchiveMutexViolation::AnchorRegistryDirMismatchPlan)
+        );
+    }
+
+    #[test]
+    fn cli_check_accepts_lexically_equal_dirs_when_paths_dont_exist() {
+        let cli = PathBuf::from("/var/A");
+        let plan = "/var/A".to_string();
+        assert!(check_archive_registry_dir_matches_plan(&cli, &plan).is_ok());
+    }
+
+    #[test]
+    fn cli_check_accepts_canonically_equal_dirs_via_tempdir() {
+        // Two PathBufs pointing at the same real directory via
+        // different lexical forms (one trailing slash) must
+        // canonicalize equal.
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = tmp.path().to_path_buf();
+        let plan = format!("{}/", tmp.path().display());
+        assert!(check_archive_registry_dir_matches_plan(&cli, &plan).is_ok());
+    }
+
+    // ── REJECT-fix Finding 2: --archive-dir conditional on actions ──
+
+    #[test]
+    fn resolve_archive_dir_required_when_plan_has_actions() {
+        assert_eq!(
+            resolve_archive_dir_for_apply(None, 5).err(),
+            Some(ArchiveMutexViolation::ArchiveDirRequiredWhenPlanHasActions)
+        );
+    }
+
+    #[test]
+    fn resolve_archive_dir_optional_when_plan_has_zero_actions() {
+        // Zero-action plan: no destination needed; library will
+        // run zero passes.
+        let resolved = resolve_archive_dir_for_apply(None, 0).unwrap();
+        assert_eq!(resolved, PathBuf::new());
+    }
+
+    #[test]
+    fn resolve_archive_dir_uses_supplied_path_when_present() {
+        let supplied = PathBuf::from("/var/omni-anchors-archive");
+        let resolved =
+            resolve_archive_dir_for_apply(Some(&supplied), 5).unwrap();
+        assert_eq!(resolved, supplied);
+    }
+
+    // ── New violation messages stable ──
+
+    #[test]
+    fn anchor_registry_dir_mismatch_message_is_stable() {
+        assert_eq!(
+            ArchiveMutexViolation::AnchorRegistryDirMismatchPlan.message(),
+            "--anchor-registry-dir does not match the plan's anchor_registry_dir; \
+             refusing before any archive write"
+        );
+    }
+
+    #[test]
+    fn archive_dir_required_message_is_stable() {
+        assert_eq!(
+            ArchiveMutexViolation::ArchiveDirRequiredWhenPlanHasActions.message(),
+            "--archive-dir is required when the plan has one or more actions"
+        );
     }
 }
