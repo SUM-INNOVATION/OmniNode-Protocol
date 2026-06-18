@@ -3035,4 +3035,70 @@ omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
 
 **Implementation reference:** [`docs/stage13.4-anchor-cleanup.md`](stage13.4-anchor-cleanup.md) — Stage 13.4 engineering doc (action taxonomy, mutex rules, drift / plan-hash recipes, exact-FS-operation appendix).
 
-**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module — no other constants change.
+### Stage 13.5 — local-only anchor export and verify
+
+**Use when:** you need to hand off a subset of anchor records (plus optionally the raw artifact bytes and / or a Stage 12.25 signed-chain-report) to another operator host — for forensic record retention, cross-team review, or as an evidence artifact to keep alongside the on-disk registry snapshot. **Fully local — zero chain interaction.** Anchor registry is read-only. Stage 13.0 wire / domain / canonical-bytes / signing unchanged.
+
+**Subcommands:**
+- `omni-node operator evidence-anchor export-integrity-evidence-anchors` — produce a portable manifest + bytes subtree.
+- `omni-node operator evidence-anchor verify-integrity-evidence-anchor-export` — re-check a previously-produced export tree.
+
+**Key invariants:**
+
+1. **At least one selector is required** (`--status`, `--tx-id`, or `--artifact-hash-hex`). No accidental "export everything." Misuse refuses at the clap layer with `at least one of --status, --tx-id, --artifact-hash-hex is required` — NOT via `reason=...`.
+2. **No-clobber on `--export-out`.** The dir must be empty or non-existent. There is no `--force` — operator picks a fresh path or deletes the old one first.
+3. **`--include-artifact-bytes` is a pair form** `<PATH>:<ARTIFACT_HASH_HEX>`. The file's BLAKE3 must equal the claimed hash; export refuses with `reason=export_entry_metadata_mismatch` on drift.
+4. **Manifest does NOT carry `anchor_registry_dir`.** A portable handoff artifact does not leak host-local path layout. Operator-supplied `--label` / `--notes` are the provenance channel.
+5. **What verify proves:** the export bytes match the manifest; each anchor's submitter signature is valid under its embedded `digest.signer_pubkey`; per-record metadata in the manifest matches the record's own fields; for paired `artifact_bytes`, `blake3(bytes) == record.tx_data.digest.artifact_hash` (the **artifact-hash binding**).
+6. **What verify does NOT prove:** the Stage 12.25 **wrapper signer**. That binding lives in a signed-chain-report — Stage 12.25 own-signature verification is **out of scope** here. Operator runs Stage 12.25 verify on the signed-chain-report separately. Stage 13.5 verifies BLAKE3-of-bytes for any included signed-chain-report; it does NOT re-verify Stage 12.25's signature.
+7. **`--strict` is a verification-time gate**, NOT a clap-level usage error. Missing `artifact_bytes` for an anchor record refuses with `reason=export_strict_mode_artifact_bytes_missing`.
+
+**Reason-tag taxonomy** (closed; surfaced on `event=integrity_evidence_anchor_(export|verify_export)_failed reason=<tag>` lines):
+
+- `unsupported_export_manifest_schema_version` — manifest declares a `schema_version` other than 1. **New tag in Stage 13.5.**
+- `export_manifest_hash_mismatch` — recomputed canonical-bytes BLAKE3 of the manifest does not match the declared `export_manifest_hash`. **New tag in Stage 13.5.**
+- `export_invalid_path` — manifest entry's `relative_path` is absolute, contains `..`, contains backslash, or violates the per-kind shape (anchors/<64-lower-hex>.json, artifacts/<64-lower-hex>, signed_chain_reports/<safe-basename>). **New tag in Stage 13.5.**
+- `export_blake3_mismatch` — a copied file's BLAKE3 or length does not match the manifest's declaration. **New tag in Stage 13.5.**
+- `export_entry_metadata_mismatch` — a manifest entry's metadata (artifact_hash / tx_id / status) does not match the record file's actual fields, OR a paired artifact_bytes file's `blake3(bytes)` does not equal `record.tx_data.digest.artifact_hash`. **New tag in Stage 13.5** (Q9 fold — single tag for every "manifest claim doesn't match the underlying byte fact" case).
+- `export_strict_mode_artifact_bytes_missing` — verify-time `--strict` gate: an anchor_record entry has no paired artifact_bytes entry for the same `artifact_hash_hex`. **New tag in Stage 13.5.**
+- `anchor_not_found` — `--tx-id` or `--artifact-hash-hex` selector points at a record that does not exist. **Reused** from Stage 13.0 (corrected from the v1 plan's `record_not_found` — that tag does not exist in the closed taxonomy).
+- `malformed_json` — manifest or anchor record JSON parse failure. Reused.
+- `io` — file presence / read errors; also covers `--export-out` non-empty refusal. Reused.
+- `submitter_signature_invalid`, `unsupported_anchor_schema_version` — refusals from the Stage 13.0 verifier (`verify_anchor_tx_data`) when an exported record's signature or schema is bad. Reused.
+
+CLI mutex / required-with refusals exit non-zero via clap usage errors (NOT `reason=…` event lines) — they're argument-parse concerns, not the closed refusal taxonomy.
+
+**Workflow recipe — hand off a finalized anchor to another operator host for retention:**
+
+```sh
+# 1. On host A, plan-and-write the export.
+omni-node operator evidence-anchor export-integrity-evidence-anchors \
+  --anchor-registry-dir         /var/omni-anchors \
+  --export-out                  /tmp/anchor-export-2026-06-17 \
+  --status                      finalized \
+  --include-artifact-bytes      /var/omni-artifacts/<hash>.signed.json:<artifact_hash_hex> \
+  --include-signed-chain-report /var/omni-artifacts/<hash>.signed.json \
+  --label                       "Q2-2026 forensic retention"
+
+# 2. Inspect the manifest.
+jq '.entries | map({kind, relative_path, status})' \
+   /tmp/anchor-export-2026-06-17/evidence_anchor_export_manifest.json
+
+# 3. Transport /tmp/anchor-export-2026-06-17 to host B.
+tar czf anchor-export.tar.gz -C /tmp anchor-export-2026-06-17
+
+# 4. On host B, verify the export.
+omni-node operator evidence-anchor verify-integrity-evidence-anchor-export \
+  --export-dir /var/anchor-retention/anchor-export-2026-06-17
+
+# 5. Optional: strict mode for full artifact-hash binding.
+omni-node operator evidence-anchor verify-integrity-evidence-anchor-export \
+  --export-dir /var/anchor-retention/anchor-export-2026-06-17 \
+  --strict
+```
+
+**Limitation — wrapper-signer binding:** Stage 13.5 verify does NOT re-verify the Stage 12.25 wrapper signer from artifact bytes alone. That binding requires the wrapper's own signature. To prove wrapper-signer binding, the operator runs Stage 12.25 verify (`omni-node operator evidence-anchor verify-integrity-evidence-anchor-file --signed-chain-report <SCR>` or equivalent) on the bundled signed-chain-report separately.
+
+**Implementation reference:** [`docs/stage13.5-anchor-export.md`](stage13.5-anchor-export.md) — Stage 13.5 engineering doc (entry-kind taxonomy, mutex rules, manifest schema, file layout, verify preflight ordering, what's proven vs not, test inventory).
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface — no other constants change.

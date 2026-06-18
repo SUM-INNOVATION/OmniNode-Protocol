@@ -550,6 +550,94 @@ pub enum EvidenceAnchorError {
         "unsupported anchor cleanup plan schema version: got {got}, expected {expected}"
     )]
     CleanupPlanSchemaUnsupported { got: u32, expected: u32 },
+
+    // ── Stage 13.5 additions — local export / import verification ─
+    //
+    // Six new closed reason-tag strings, paralleling the Stage 13.4
+    // shape but on a distinct export-side concept: a portable
+    // handoff manifest plus copied bytes. Refusals fire in the
+    // verify command's fixed preflight order (schema → manifest
+    // hash → per-entry path → file presence → BLAKE3 → per-record
+    // checks → strict-mode gate).
+    /// Verify: the export manifest's `schema_version` is not the
+    /// locked `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION`.
+    /// Refused FIRST — before the manifest-hash check — so a
+    /// future-schema manifest with a re-computed hash cannot
+    /// smuggle through as v1.
+    #[error(
+        "unsupported anchor export manifest schema version: got {got}, expected {expected}"
+    )]
+    ExportManifestSchemaUnsupported { got: u32, expected: u32 },
+
+    /// Verify: the recomputed canonical-bytes BLAKE3 of the
+    /// manifest (with `export_manifest_hash` blanked) does not
+    /// match the manifest's declared `export_manifest_hash`.
+    /// Indicates the manifest was hand-edited or transport
+    /// corrupted.
+    #[error(
+        "anchor export manifest hash mismatch: computed {computed}, manifest declares {expected}"
+    )]
+    ExportManifestHashMismatch { computed: String, expected: String },
+
+    /// Apply / Verify: a manifest entry's `relative_path` is
+    /// invalid — absolute, contains `..`, contains backslash,
+    /// or violates the per-kind shape (anchors/<64hex>.json,
+    /// artifacts/<64hex>, signed_chain_reports/<safe-basename>).
+    /// Refuses BEFORE any FS mutation / read.
+    #[error(
+        "anchor export invalid path for {entry_kind}: {relative_path:?} ({reason})"
+    )]
+    ExportInvalidPath {
+        entry_kind: &'static str,
+        relative_path: String,
+        reason: &'static str,
+    },
+
+    /// Verify: a copied file's BLAKE3-of-bytes (or its byte
+    /// length) does not match the manifest's declared
+    /// `blake3_hex` / `bytes`. Indicates the export tree was
+    /// hand-edited or transport corrupted.
+    #[error(
+        "anchor export BLAKE3 mismatch for {relative_path}: computed {computed}, manifest declares {expected}"
+    )]
+    ExportBlake3Mismatch {
+        relative_path: String,
+        computed: String,
+        expected: String,
+    },
+
+    /// Verify: a manifest entry's per-record metadata (artifact
+    /// hash, tx_id, status) does not match the record file's
+    /// own fields, OR a paired `artifact_bytes` entry's
+    /// declared `artifact_hash_hex` does not match the
+    /// `anchor_record`'s `tx_data.digest.artifact_hash`
+    /// (artifact-hash binding refusal). Single closed tag for
+    /// every "manifest claim does not match the underlying
+    /// byte fact" case (Q9 fold).
+    #[error(
+        "anchor export entry metadata mismatch for {relative_path} (field {field}): \
+         computed {computed}, manifest declares {manifest}"
+    )]
+    ExportEntryMetadataMismatch {
+        relative_path: String,
+        field: &'static str,
+        computed: String,
+        manifest: String,
+    },
+
+    /// Verify, `--strict` only: an `anchor_record` entry does
+    /// not have a matching `artifact_bytes` entry for the same
+    /// `artifact_hash_hex`. Routes through the closed taxonomy
+    /// (not a clap-level usage error) because the missing
+    /// pairing is only knowable after parsing the manifest.
+    #[error(
+        "anchor export strict mode: anchor_record {anchor_record_relative_path} \
+         has no paired artifact_bytes entry for artifact_hash_hex {artifact_hash_hex}"
+    )]
+    ExportStrictModeArtifactBytesMissing {
+        anchor_record_relative_path: String,
+        artifact_hash_hex: String,
+    },
 }
 
 /// Stage 13.0 result alias. Distinct from earlier-stage aliases
