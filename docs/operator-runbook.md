@@ -3178,4 +3178,100 @@ omni-node operator evidence-anchor reconcile-integrity-evidence-anchor \
 
 **Implementation reference:** [`docs/stage13.6-anchor-import.md`](stage13.6-anchor-import.md) — Stage 13.6 engineering doc (library surface, conflict matrix, mutex rules, verify-first invariant, byte-preserve + historical-timestamps note, test inventory).
 
-**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface; Stage 13.6 reuses both verbatim and adds no new schema constants — no other constants change.
+### Stage 13.7 — local terminal-anchor archive / restore
+
+**Use when:** the hot anchor registry has accumulated `Finalized` / `Failed` records you want to move out of the working set — for forensic retention, disk-pressure relief, or because the operational interest in those records has expired. **Fully local — zero chain interaction.** The chain is the source of truth for status; archive doesn't ask it anything. Stage 13.0 wire / schema / domain unchanged.
+
+**Subcommand:**
+- `omni-node operator evidence-anchor archive-integrity-evidence-anchors` — three-phase plan / apply / restore mirroring Stage 13.4 cleanup but targeting valid TERMINAL records.
+
+**Key invariants:**
+
+1. **Terminal records only.** `--status` is closed-set `finalized | failed` at the clap layer. `Submitted` / `Included` are not eligible. Default when no `--status` is given: `[FINALIZED]`. `Failed` requires explicit `--status FAILED`.
+2. **Verify-first preflight.** Apply checks schema version → plan hash → drift → per-action path shape before any FS work. Each refusal routes through a new closed `reason=` tag (see taxonomy below).
+3. **Two-phase durability — honest contract.**
+   - **Phase 1** (before manifest lands): zero hot-registry mutation. A failure here leaves the registry byte-identical to its pre-apply state.
+   - **Phase 2** (after manifest lands): destructive phase may be partially applied on IO failure. **Restore is the official recovery path** — run the same command in restore mode against the manifest the apply produced, and any source record that Phase 2 successfully deleted is re-established (row 2 idempotent for records Phase 2 didn't reach).
+4. **Default dry-run for BOTH apply and restore.** `--apply` is the explicit operator confirmation in both mutation modes (Stage 13.7 REJECT-fix Finding 1). Restore without `--apply` reports `would_restore` outcomes without touching the hot registry.
+5. **Byte-preserve.** Apply copies records verbatim into the archive subtree via atomic temp+rename. Restore copies archived bytes back via the same pattern. `submitted_at` / `updated_at` are preserved verbatim. Stage 13.3 stale-age views may show historical ages on restored records.
+6. **Plan local, manifest portable.** The plan JSON includes `anchor_registry_dir` for local replay (drift recomputation). The archive manifest does NOT include host-local paths — it's a portable handoff artifact, parallel to Stage 13.5 export manifest.
+7. **`registry_state_hash` includes `updated_at_unix`.** Deliberate divergence from Stage 13.4 because Stage 13.7's `--before <RFC3339>` selector reads `updated_at`; reconcile-driven timestamp bumps must trip drift.
+8. **`tx_index.json` is merge-updated, not rebuilt** in both apply (remove archived tx_ids) and restore (add restored tx_ids). Unrelated entries preserved verbatim.
+
+**Reason-tag taxonomy** (closed; surfaced on `event=integrity_evidence_anchor_archive_failed reason=<tag>` lines):
+
+- `unsupported_archive_plan_schema_version` — plan's `schema_version` is not the locked `ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION = 1`. Refused FIRST. **New in Stage 13.7.**
+- `archive_plan_hash_mismatch` — plan was hand-edited or corrupted. **New in Stage 13.7.**
+- `archive_drift` — registry state changed since plan was generated. **New in Stage 13.7.**
+- `archive_invalid_path` — manifest entry's `archive_relative` (or a plan action's `source_relative`) is absolute, contains `..`, contains backslash, or violates per-kind shape. **New in Stage 13.7.**
+- `archive_blake3_mismatch` — archived bytes' BLAKE3 doesn't match the manifest's recorded `blake3_hex`. **New in Stage 13.7.**
+- `archive_target_exists` — restore target conflict. `field=artifact_hash` (byte-different record at target) OR `field=tx_id` (tx_index maps the same tx_id to a different hash). **New in Stage 13.7.**
+- `anchor_not_found` — selector miss. Operator-readable detail names the reason (`no such record`, `not terminal`, `excluded by --before`). Reused from Stage 13.0.
+- `submitter_signature_invalid`, `unsupported_anchor_schema_version` — defense-in-depth refusals from Stage 13.0's `verify_anchor_tx_data`, re-run on every archived record at restore time. Reused.
+- `malformed_json`, `io` — reused.
+
+CLI mutex / required-with refusals exit non-zero via clap usage errors (NOT `reason=…` event lines).
+
+**Workflow recipe — shrink the hot registry by archiving Finalized records older than 90 days:**
+
+```sh
+# 1. Plan with a date filter.
+omni-node operator evidence-anchor archive-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --plan-out            /tmp/archive-plan.json \
+  --status              finalized \
+  --before              "$(date -u -v-90d +%Y-%m-%dT%H:%M:%SZ)"
+
+# 2. Inspect the plan.
+jq '.actions | length' /tmp/archive-plan.json
+jq '.actions | map({status, artifact_hash_hex, tx_id})' /tmp/archive-plan.json
+
+# 3. Dry-run the apply.
+omni-node operator evidence-anchor archive-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --apply-plan          /tmp/archive-plan.json \
+  --archive-dir         /var/omni-anchors-archive
+
+# 4. Real apply.
+omni-node operator evidence-anchor archive-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --apply-plan          /tmp/archive-plan.json \
+  --archive-dir         /var/omni-anchors-archive \
+  --apply
+
+# 5. (Rare) Restore an archive subset later for re-investigation.
+omni-node operator evidence-anchor archive-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --restore-manifest    /var/omni-anchors-archive/<plan_id>/archive_manifest.json \
+  --apply
+```
+
+**Phase-2 partial-failure recovery recipe:**
+
+```sh
+# If a real apply fails mid-Phase-2 (e.g. disk fills, target FS
+# error), the archive manifest IS durable but the hot registry
+# may be partially mutated. Recover by running the same command
+# in restore mode against the manifest the apply produced:
+omni-node operator evidence-anchor archive-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --restore-manifest    /var/omni-anchors-archive/<plan_id>/archive_manifest.json \
+  --apply
+
+# Restore is idempotent: records Phase 2 didn't reach are
+# byte-equal (row 2 → skipped_already_restored); records
+# Phase 2 deleted are restored from the archive.
+```
+
+**Limitation — historical timestamps:** restored records carry the original `submitted_at` / `updated_at` from the source registry — exactly as in Stage 13.6 import. Stage 13.3 stale-age views may report historical ages by design.
+
+**Limitation — terminal records only:** archiving `Submitted` / `Included` records would put records whose lifecycle is in flight beyond Stage 13.2 reconcile's reach. Explicitly disallowed at clap.
+
+**Implementation reference:** [`docs/stage13.7-anchor-archive.md`](stage13.7-anchor-archive.md) — Stage 13.7 engineering doc (library surface, plan / manifest schemas, two-phase durability contract, restore conflict matrix, mutex rules, test inventory).
+
+**Forward outlook:**
+
+- **Stage 13.8** — local registry consistency report. A single read-only sweep that cross-checks the hot registry, every archive subtree, and `tx_index.json` integrity. Reports drift, dangling references, orphan archives.
+- **Stage 13.9** — comprehensive chain read / reconcile support. Operator-driven chain catch-up that bridges archived records back into reconcile flows when needed (e.g. an archived `Failed` record that the chain later re-finalized).
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface; Stage 13.6 reuses both verbatim and adds no new schema constants; Stage 13.7 ships `ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION = 1` and `ANCHOR_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1` on its own plan + manifest surface — no other constants change.
