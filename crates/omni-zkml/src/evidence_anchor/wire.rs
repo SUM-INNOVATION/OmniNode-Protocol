@@ -96,6 +96,17 @@ impl AnchoredArtifactKind {
             }
         }
     }
+
+    /// Stage 13.9 — bincode-1 enum discriminant used in the
+    /// chain's by-tuple RPC params (positional array form). The
+    /// chain contract spec uses this numeric tag, NOT the
+    /// snake_case string form. Locked at `0` for v1
+    /// (`SignedIntegrityEvidenceChainReport`).
+    pub fn to_chain_tag_u32(self) -> u32 {
+        match self {
+            AnchoredArtifactKind::SignedIntegrityEvidenceChainReport => 0,
+        }
+    }
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────

@@ -49,6 +49,16 @@ pub mod error_prefixes {
     pub const ADAPTER_MALFORMED_STATUS_RESP: &str =
         "malformed sum_getIntegrityEvidenceAnchorStatus response: ";
     pub const ADAPTER_UNRECOGNIZED_STATUS: &str = "unrecognized anchor status: ";
+
+    // ── Stage 13.9 adapter-layer additions ───────────────────────────
+    pub const ADAPTER_MALFORMED_STATUS_BATCH_RESP: &str =
+        "malformed sum_getIntegrityEvidenceAnchorStatusBatch response: ";
+    pub const ADAPTER_BATCH_ORDER_MISMATCH: &str =
+        "batch response order mismatch: ";
+    pub const ADAPTER_BATCH_LENGTH_MISMATCH: &str =
+        "batch response length mismatch: ";
+    pub const ADAPTER_MALFORMED_BY_TUPLE_RESP: &str =
+        "malformed sum_getIntegrityEvidenceAnchorByTuple response: ";
 }
 
 /// Closed-set category for `ChainClientError::Other(_)` produced
@@ -105,6 +115,10 @@ pub fn classify_chain_client_error(err: &ChainClientError) -> ChainErrorCategory
     if msg.starts_with(ADAPTER_MALFORMED_SUBMIT_RESP)
         || msg.starts_with(ADAPTER_MALFORMED_STATUS_RESP)
         || msg.starts_with(ADAPTER_UNRECOGNIZED_STATUS)
+        || msg.starts_with(ADAPTER_MALFORMED_STATUS_BATCH_RESP)
+        || msg.starts_with(ADAPTER_BATCH_ORDER_MISMATCH)
+        || msg.starts_with(ADAPTER_BATCH_LENGTH_MISMATCH)
+        || msg.starts_with(ADAPTER_MALFORMED_BY_TUPLE_RESP)
     {
         return ChainErrorCategory::Malformed;
     }

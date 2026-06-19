@@ -59,8 +59,44 @@ pub(crate) struct AnchorStatusResult {
     pub status: String,
     #[serde(default)]
     pub included_at_height: Option<u64>,
+    /// Stage 13.9 — failure code parsed and exposed as
+    /// `Option<u32>`. Stable values per chain contract:
+    /// `60` not activated, `61` duplicate 5-tuple,
+    /// `62` invalid submitter signature, `63` `tx.from !=
+    /// address(signer_pubkey)`. Other failures may carry
+    /// `code: null`. Parse the field; do not interpret unknown
+    /// codes.
+    #[serde(default)]
+    pub code: Option<u32>,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// Stage 13.9 — per-item entry of
+/// `sum_getIntegrityEvidenceAnchorStatusBatch`. Echo-back
+/// `tx_hash` preserves request ordering; `result` carries the
+/// status when no per-item error; `error` carries the chain's
+/// per-item error text (e.g. malformed hash). Exactly one of
+/// `result` / `error` is non-null per item.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct BatchStatusItem {
+    pub tx_hash: String,
+    #[serde(default)]
+    pub result: Option<AnchorStatusResult>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Stage 13.9 — response from
+/// `sum_getIntegrityEvidenceAnchorByTuple`. Either present (chain
+/// has an anchor matching the 5-tuple) or `null` (no match — the
+/// outer JSON-RPC `result` field is `null`; this DTO is only
+/// constructed for the present case).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct ByTupleResult {
+    /// Canonical `0x`-prefixed 32-byte lowercase hex.
+    pub tx_hash: String,
+    pub included_at_height: u64,
 }
 
 #[cfg(all(test, feature = "submit"))]
@@ -123,5 +159,66 @@ mod submit_response_tests {
         let parsed: AnchorStatusResult = serde_json::from_value(v).unwrap();
         assert_eq!(parsed.status, "failed");
         assert_eq!(parsed.reason.as_deref(), Some("fee below min"));
+    }
+
+    #[test]
+    fn status_response_parses_code_field_when_present() {
+        let v = serde_json::json!({
+            "status": "failed",
+            "code": 61u32,
+            "reason": "duplicate 5-tuple",
+        });
+        let parsed: AnchorStatusResult = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.status, "failed");
+        assert_eq!(parsed.code, Some(61));
+        assert_eq!(parsed.reason.as_deref(), Some("duplicate 5-tuple"));
+    }
+
+    #[test]
+    fn status_response_parses_code_absent_as_none() {
+        let v = serde_json::json!({
+            "status": "finalized",
+            "included_at_height": 100u64,
+        });
+        let parsed: AnchorStatusResult = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.code, None);
+    }
+
+    #[test]
+    fn batch_status_item_parses_success_shape() {
+        let v = serde_json::json!({
+            "tx_hash": "0xabcd",
+            "result": { "status": "finalized", "included_at_height": 4807033u64 },
+            "error": null,
+        });
+        let parsed: BatchStatusItem = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.tx_hash, "0xabcd");
+        assert!(parsed.error.is_none());
+        let result = parsed.result.unwrap();
+        assert_eq!(result.status, "finalized");
+        assert_eq!(result.included_at_height, Some(4807033));
+    }
+
+    #[test]
+    fn batch_status_item_parses_error_shape() {
+        let v = serde_json::json!({
+            "tx_hash": "bad",
+            "result": null,
+            "error": "Invalid hash: not 0x-prefixed",
+        });
+        let parsed: BatchStatusItem = serde_json::from_value(v).unwrap();
+        assert!(parsed.result.is_none());
+        assert_eq!(parsed.error.as_deref(), Some("Invalid hash: not 0x-prefixed"));
+    }
+
+    #[test]
+    fn by_tuple_result_parses_canonical_tx_hash_and_height() {
+        let v = serde_json::json!({
+            "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "included_at_height": 120u64,
+        });
+        let parsed: ByTupleResult = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.included_at_height, 120);
+        assert!(parsed.tx_hash.starts_with("0x"));
     }
 }

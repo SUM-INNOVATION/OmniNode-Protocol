@@ -37,7 +37,9 @@ pub mod wire;
 pub mod workflow;
 
 pub use client::{
-    AnchorStatus, AnchorSubmissionReceipt, EvidenceAnchorChainClient, StubEvidenceAnchorChainClient,
+    canonicalize_tx_hash, AnchorStatus, AnchorStatusReport, AnchorSubmissionReceipt,
+    BatchStatusItem, EvidenceAnchorChainClient, StubEvidenceAnchorChainClient,
+    TupleLookupResult, ANCHOR_STATUS_BATCH_MAX, FAILED_REASON_NULL_FALLBACK,
 };
 pub use cleanup::{
     apply_anchor_cleanup, plan_anchor_cleanup, restore_anchor_cleanup_quarantine,
@@ -93,11 +95,11 @@ pub use wire::{
     sign_anchor_digest, verify_anchor_tx_data,
 };
 pub use workflow::{
-    AnchorSelector, QueryAnchorOutcome, VerifiedWrapperMetadata,
+    AnchorSelector, QueryAnchorOutcome, TupleLookupOutcome, VerifiedWrapperMetadata,
     anchor_signing_input_for_digest, build_anchor_digest,
-    query_evidence_anchor_workflow, reconcile_evidence_anchors_workflow,
-    submit_evidence_anchor_workflow, verify_anchor_against_registry,
-    verify_anchor_file_against_artifact_bytes,
+    lookup_anchor_by_tuple_workflow, query_evidence_anchor_workflow,
+    reconcile_evidence_anchors_workflow, submit_evidence_anchor_workflow,
+    verify_anchor_against_registry, verify_anchor_file_against_artifact_bytes,
 };
 
 use crate::error::EvidenceAnchorError;
