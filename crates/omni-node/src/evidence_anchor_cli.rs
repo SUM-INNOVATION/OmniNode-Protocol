@@ -40,7 +40,7 @@ use clap::{Args, Subcommand};
 use omni_contributor::{
     SignedIntegrityEvidenceChainReport, verify_signed_integrity_evidence_chain_report,
 };
-use omni_sumchain::SumChainClient;
+use omni_sumchain::{JsonRpcTransport, SumChainClient};
 use omni_zkml::EvidenceAnchorError;
 use omni_zkml::{
     AnchorApplyOptions, AnchorArchiveApplyOptions, AnchorArchiveManifest,
@@ -159,6 +159,14 @@ enum EvidenceAnchorCmd {
     /// emits typed findings + summary. **No mutation. Adds no
     /// new `reason=` tags.**
     ReportIntegrityEvidenceAnchorConsistency(ReportConsistencyArgs),
+    /// Stage 13.9 — by-tuple chain lookup. Loads a local record
+    /// via `--artifact-hash-hex` or `--tx-id`, extracts the
+    /// 5-tuple from its `tx_data.digest`, and asks the chain for
+    /// its canonical anchor. **Read-only — does NOT mutate the
+    /// local registry.** Stage 13.2 read preflight (chain_id
+    /// only); activation / mainnet gates do NOT apply (read
+    /// RPCs work during dormant).
+    LookupIntegrityEvidenceAnchorByTuple(LookupByTupleArgs),
 }
 
 #[cfg(feature = "submit")]
@@ -577,6 +585,30 @@ pub(crate) struct ReportConsistencyArgs {
     pub(crate) json_out: Option<PathBuf>,
 }
 
+/// Stage 13.9 — by-tuple chain lookup CLI args.
+#[derive(Args)]
+pub(crate) struct LookupByTupleArgs {
+    /// Hot anchor registry (source of the tuple). Read-only.
+    #[arg(long)]
+    pub(crate) anchor_registry_dir: PathBuf,
+    /// SUM Chain JSON-RPC endpoint URL.
+    #[arg(long)]
+    pub(crate) rpc_url: String,
+    /// Chain-id sanity check. The Stage 13.9 read preflight
+    /// runs ONLY this check — NO mainnet / activation gates
+    /// (read RPCs work during dormant).
+    #[arg(long)]
+    pub(crate) expect_chain_id: u64,
+    /// Selector — mutually exclusive with `--tx-id`; exactly
+    /// one must be supplied.
+    #[arg(long)]
+    pub(crate) artifact_hash_hex: Option<String>,
+    /// Selector — mutually exclusive with `--artifact-hash-hex`;
+    /// exactly one must be supplied.
+    #[arg(long)]
+    pub(crate) tx_id: Option<String>,
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
 pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
@@ -648,6 +680,11 @@ pub(crate) async fn dispatch(args: EvidenceAnchorArgs) -> Result<()> {
                 .await
                 .map_err(|e| anyhow!("consistency-report join error: {e}"))?
         }
+        EvidenceAnchorCmd::LookupIntegrityEvidenceAnchorByTuple(a) => {
+            tokio::task::spawn_blocking(move || run_lookup_by_tuple(a))
+                .await
+                .map_err(|e| anyhow!("lookup-by-tuple join error: {e}"))?
+        }
     }
 }
 
@@ -684,6 +721,33 @@ fn chain_client_error_to_evidence_anchor_error(err: ChainClientError) -> Evidenc
     }
 }
 
+/// Stage 13.9 — read-path `ChainClientError` mapper. Distinct
+/// from [`chain_client_error_to_evidence_anchor_error`]: read
+/// RPCs (status / batch-status / by-tuple) MUST NOT produce
+/// `chain_submit_refused` — that tag is submit-specific. JSON-RPC
+/// error objects on a read RPC route through `chain_rpc` instead
+/// (REJECT-fix Finding 4 lock).
+fn read_rpc_error_to_evidence_anchor_error(
+    err: ChainClientError,
+) -> EvidenceAnchorError {
+    use omni_sumchain::{ChainErrorCategory, classify_chain_client_error};
+    let text = match &err {
+        ChainClientError::Other(s) => s.clone(),
+    };
+    match classify_chain_client_error(&err) {
+        ChainErrorCategory::Transport => EvidenceAnchorError::ChainRpc(text),
+        // Stage 13.9 lock — read-path JSON-RPC errors route
+        // through chain_rpc, NOT chain_submit_refused.
+        ChainErrorCategory::JsonRpcError => EvidenceAnchorError::ChainRpc(text),
+        ChainErrorCategory::Malformed => EvidenceAnchorError::ChainResponseMalformed(text),
+        // Adapter gates are submit-side concerns; surfacing them
+        // on a read path is a defense-in-depth catch-all.
+        ChainErrorCategory::AdapterNotActivated => EvidenceAnchorError::ChainRpc(text),
+        ChainErrorCategory::AdapterSameKeyFail => EvidenceAnchorError::ChainRpc(text),
+        ChainErrorCategory::Unknown => EvidenceAnchorError::ChainRpc(text),
+    }
+}
+
 /// Run CLI preflight gates for chain-mode submit. Returns on
 /// first refusal; on success the caller proceeds to invoke
 /// `submit_evidence_anchor_workflow` against the real
@@ -699,8 +763,8 @@ fn chain_client_error_to_evidence_anchor_error(err: ChainClientError) -> Evidenc
 /// 4. `--allow-submit` opt-in.
 /// 5. mainnet AND `--allow-mainnet-submit` opt-in.
 #[cfg(feature = "submit")]
-fn run_chain_submit_preflight(
-    client: &SumChainClient,
+fn run_chain_submit_preflight<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
     expected_chain_id: u64,
     allow_submit: bool,
     allow_mainnet_submit: bool,
@@ -764,8 +828,8 @@ fn run_chain_submit_preflight(
 /// Only checks chain_id sanity — read paths neither require
 /// activation (anchors recorded pre-deactivation are still
 /// queryable) nor the operator double-gates.
-fn run_chain_read_preflight(
-    client: &SumChainClient,
+fn run_chain_read_preflight<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
     expected_chain_id: u64,
 ) -> Result<(), EvidenceAnchorError> {
     let params = client
@@ -2873,6 +2937,163 @@ fn emit_finding_line(f: &AnchorConsistencyFinding) {
 const STAGE_13_8_SCHEMA_VERSION_PIN: u32 =
     omni_zkml::ANCHOR_CONSISTENCY_REPORT_SCHEMA_VERSION;
 
+// ── Stage 13.9 — lookup-by-tuple CLI ─────────────────────────────────────────
+
+/// Stage 13.9 closed mutex violation for the lookup CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LookupByTupleMutexViolation {
+    NoSelector,
+    BothSelectors,
+}
+
+impl LookupByTupleMutexViolation {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            LookupByTupleMutexViolation::NoSelector => {
+                "one of --artifact-hash-hex or --tx-id is required"
+            }
+            LookupByTupleMutexViolation::BothSelectors => {
+                "--artifact-hash-hex and --tx-id are mutually exclusive"
+            }
+        }
+    }
+}
+
+/// Validate the mutually-exclusive selector pair at clap layer.
+pub(crate) fn check_lookup_selector_rules(
+    args: &LookupByTupleArgs,
+) -> std::result::Result<(), LookupByTupleMutexViolation> {
+    match (args.artifact_hash_hex.is_some(), args.tx_id.is_some()) {
+        (false, false) => Err(LookupByTupleMutexViolation::NoSelector),
+        (true, true) => Err(LookupByTupleMutexViolation::BothSelectors),
+        _ => Ok(()),
+    }
+}
+
+/// Stage 13.9 Q8 lock — the lookup-by-tuple preflight is the
+/// read-only preflight. Chain_id check ONLY; NO activation
+/// gate; NO mainnet `--allow-mainnet-submit` gate; NO submit
+/// opt-in. This wrapper is the single entry point used by
+/// [`run_lookup_by_tuple`] so the read-vs-submit choice is
+/// pinned at a named call site.
+fn lookup_by_tuple_preflight<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
+    expected_chain_id: u64,
+) -> Result<(), EvidenceAnchorError> {
+    run_chain_read_preflight(client, expected_chain_id)
+}
+
+fn run_lookup_by_tuple(args: LookupByTupleArgs) -> Result<()> {
+    if let Err(v) = check_lookup_selector_rules(&args) {
+        bail!("invalid flag combination: {}", v.message());
+    }
+    println!(
+        "event=integrity_evidence_anchor_tuple_lookup_started \
+         anchor_registry_dir={} rpc_url={} expect_chain_id={}",
+        args.anchor_registry_dir.display(),
+        args.rpc_url,
+        args.expect_chain_id,
+    );
+    let registry = LocalEvidenceAnchorRegistry::open(args.anchor_registry_dir.clone())
+        .map_err(|e| {
+            println!(
+                "event=integrity_evidence_anchor_tuple_lookup_failed reason=io detail={e}"
+            );
+            anyhow!(
+                "open --anchor-registry-dir {}: {e}",
+                args.anchor_registry_dir.display()
+            )
+        })?;
+    let client = SumChainClient::new(args.rpc_url.clone(), [0u8; 32]);
+    // Stage 13.9 Q8 lock — the lookup runner uses the read-only
+    // preflight wrapper. The wrapper is the single, named entry
+    // point for the lookup-by-tuple preflight; any future
+    // accidental switch to a submit preflight has to edit this
+    // line, which surfaces in review.
+    if let Err(err) = lookup_by_tuple_preflight(&client, args.expect_chain_id) {
+        let reason = evidence_anchor_reason_tag(&err);
+        println!(
+            "event=integrity_evidence_anchor_tuple_lookup_failed reason={reason} detail={err}"
+        );
+        bail!("read preflight refused: {err}");
+    }
+
+    let selector = if let Some(hash) = args.artifact_hash_hex.as_deref() {
+        AnchorSelector::ArtifactHashHex(hash)
+    } else {
+        AnchorSelector::TxId(args.tx_id.as_deref().expect("checked by selector rules"))
+    };
+
+    let outcome =
+        omni_zkml::lookup_anchor_by_tuple_workflow(&registry, &client, selector)
+            .map_err(|err| {
+                // Stage 13.9 lock — read-path mapper. JSON-RPC
+                // errors NEVER route through chain_submit_refused.
+                let mapped = match err {
+                    EvidenceAnchorError::ChainClient(inner) => {
+                        read_rpc_error_to_evidence_anchor_error(inner)
+                    }
+                    other => other,
+                };
+                let reason = evidence_anchor_reason_tag(&mapped);
+                println!(
+                    "event=integrity_evidence_anchor_tuple_lookup_failed reason={reason} detail={mapped}"
+                );
+                anyhow!("tuple lookup refused: {mapped}")
+            })?;
+
+    let line = format_tuple_lookup_outcome_event(
+        &outcome,
+        &args.anchor_registry_dir,
+        &args.rpc_url,
+    );
+    println!("{line}");
+    tuple_lookup_outcome_to_cli_result(&outcome)
+}
+
+/// Stage 13.9 Q5 — pure formatter for the tuple-lookup outcome
+/// event line. Extracted from [`run_lookup_by_tuple`] so the
+/// `NotFound` informational-event contract is regression-pinned:
+/// event name is `_no_chain_anchor` (NOT `_failed`), and the line
+/// carries no `reason=` key.
+pub(crate) fn format_tuple_lookup_outcome_event(
+    outcome: &omni_zkml::TupleLookupOutcome,
+    anchor_registry_dir: &std::path::Path,
+    rpc_url: &str,
+) -> String {
+    match outcome {
+        omni_zkml::TupleLookupOutcome::Found {
+            canonical_tx_hash,
+            included_at_height,
+            local_record_tx_id,
+        } => {
+            let matches = canonical_tx_hash == local_record_tx_id;
+            format!(
+                "event=integrity_evidence_anchor_tuple_lookup_ok \
+                 local_tx_id={local_record_tx_id} canonical_tx_hash={canonical_tx_hash} \
+                 included_at_height={included_at_height} tx_id_matches_canonical={matches}"
+            )
+        }
+        omni_zkml::TupleLookupOutcome::NotFound => format!(
+            "event=integrity_evidence_anchor_tuple_lookup_no_chain_anchor \
+             anchor_registry_dir={} rpc_url={}",
+            anchor_registry_dir.display(),
+            rpc_url,
+        ),
+    }
+}
+
+/// Stage 13.9 Q5 — both outcome arms are "the read succeeded;"
+/// CLI exits 0. Failure paths emit `_failed` events earlier and
+/// `bail!` from [`run_lookup_by_tuple`] before reaching this
+/// helper. Pinning the success contract here keeps the
+/// informational `NotFound` exit code regression-locked.
+pub(crate) fn tuple_lookup_outcome_to_cli_result(
+    _outcome: &omni_zkml::TupleLookupOutcome,
+) -> Result<()> {
+    Ok(())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "submit")]
@@ -4382,5 +4603,338 @@ mod stage_13_8_cli_tests {
             !format_contract.contains("reason="),
             "Stage 13.8 finding lines must not carry reason= (lives only on the closed refusal taxonomy)"
         );
+    }
+}
+
+#[cfg(test)]
+mod stage_13_9_cli_tests {
+    //! Stage 13.9 — pin CLI invariants:
+    //! - lookup-by-tuple selector mutex (artifact_hash_hex /
+    //!   tx_id exactly one).
+    //! - Read-path mapper does NOT produce chain_submit_refused
+    //!   for JSON-RPC errors (REJECT-fix Finding 4 lock).
+    //! - Raw tuple flags are NOT exposed.
+    //! - No-chain-anchor event line uses informational format,
+    //!   not reason= taxonomy (Finding 5).
+
+    use super::*;
+    use omni_sumchain::ChainErrorCategory;
+    use std::path::PathBuf;
+
+    fn defaults() -> LookupByTupleArgs {
+        LookupByTupleArgs {
+            anchor_registry_dir: PathBuf::from("/tmp/registry"),
+            rpc_url: "http://localhost:0".to_string(),
+            expect_chain_id: 1,
+            artifact_hash_hex: None,
+            tx_id: None,
+        }
+    }
+
+    #[test]
+    fn lookup_selector_no_selector_fails_at_clap_layer() {
+        let a = defaults();
+        assert_eq!(
+            check_lookup_selector_rules(&a).err(),
+            Some(LookupByTupleMutexViolation::NoSelector)
+        );
+    }
+
+    #[test]
+    fn lookup_selector_both_selectors_fails_at_clap_layer() {
+        let mut a = defaults();
+        a.artifact_hash_hex = Some("aa".repeat(32));
+        a.tx_id = Some("anchor-1".to_string());
+        assert_eq!(
+            check_lookup_selector_rules(&a).err(),
+            Some(LookupByTupleMutexViolation::BothSelectors)
+        );
+    }
+
+    #[test]
+    fn lookup_selector_passes_with_artifact_hash_only() {
+        let mut a = defaults();
+        a.artifact_hash_hex = Some("aa".repeat(32));
+        assert!(check_lookup_selector_rules(&a).is_ok());
+    }
+
+    #[test]
+    fn lookup_selector_passes_with_tx_id_only() {
+        let mut a = defaults();
+        a.tx_id = Some("anchor-1".to_string());
+        assert!(check_lookup_selector_rules(&a).is_ok());
+    }
+
+    #[test]
+    fn read_rpc_mapper_routes_jsonrpc_error_to_chain_rpc_not_chain_submit_refused() {
+        // Stage 13.9 REJECT-fix Finding 4 lock.
+        let err = ChainClientError::Other(
+            "JSON-RPC error: -32000 something went wrong".to_string(),
+        );
+        // Sanity: the upstream classifier sees this as JsonRpcError.
+        assert_eq!(
+            omni_sumchain::classify_chain_client_error(&err),
+            ChainErrorCategory::JsonRpcError
+        );
+        let mapped = read_rpc_error_to_evidence_anchor_error(err);
+        let tag = evidence_anchor_reason_tag(&mapped);
+        assert_eq!(
+            tag, "chain_rpc",
+            "Stage 13.9 lock: JSON-RPC errors on read paths MUST NOT be chain_submit_refused"
+        );
+    }
+
+    #[test]
+    fn read_rpc_mapper_routes_transport_error_to_chain_rpc() {
+        let err = ChainClientError::Other(
+            "HTTP transport failure: timed out".to_string(),
+        );
+        let mapped = read_rpc_error_to_evidence_anchor_error(err);
+        assert_eq!(evidence_anchor_reason_tag(&mapped), "chain_rpc");
+    }
+
+    #[test]
+    fn read_rpc_mapper_routes_malformed_to_chain_response_malformed() {
+        let err = ChainClientError::Other(
+            "malformed sum_getIntegrityEvidenceAnchorStatus response: …".to_string(),
+        );
+        let mapped = read_rpc_error_to_evidence_anchor_error(err);
+        assert_eq!(
+            evidence_anchor_reason_tag(&mapped),
+            "chain_response_malformed"
+        );
+    }
+
+    #[test]
+    fn lookup_mutex_violation_messages_are_stable_strings() {
+        assert_eq!(
+            LookupByTupleMutexViolation::NoSelector.message(),
+            "one of --artifact-hash-hex or --tx-id is required"
+        );
+        assert_eq!(
+            LookupByTupleMutexViolation::BothSelectors.message(),
+            "--artifact-hash-hex and --tx-id are mutually exclusive"
+        );
+    }
+
+    // ── Stage 13.9 REJECT-fix 2 regression pins ──────────────────────────
+
+    /// Stage 13.9 REJECT-fix v2 Finding (Q5) — pin that the
+    /// no-chain-anchor informational event carries no `reason=`
+    /// key. A regression that routes NotFound through the
+    /// `_failed` taxonomy would surface here.
+    #[test]
+    fn tuple_lookup_no_chain_anchor_event_has_no_reason_key() {
+        let outcome = omni_zkml::TupleLookupOutcome::NotFound;
+        let line = format_tuple_lookup_outcome_event(
+            &outcome,
+            std::path::Path::new("/tmp/registry"),
+            "http://localhost:0",
+        );
+        assert!(
+            !line.contains("reason="),
+            "Stage 13.9 Q5 lock: no-chain-anchor event MUST NOT \
+             carry a reason= key; got line: {line:?}"
+        );
+    }
+
+    /// Stage 13.9 REJECT-fix v2 Finding (Q5) — pin that the
+    /// event name on the NotFound outcome is the informational
+    /// `_no_chain_anchor` form, NOT the `_failed` form.
+    #[test]
+    fn tuple_lookup_no_chain_anchor_event_uses_informational_name_not_failed() {
+        let outcome = omni_zkml::TupleLookupOutcome::NotFound;
+        let line = format_tuple_lookup_outcome_event(
+            &outcome,
+            std::path::Path::new("/tmp/registry"),
+            "http://localhost:0",
+        );
+        assert!(
+            line.contains(
+                "event=integrity_evidence_anchor_tuple_lookup_no_chain_anchor"
+            ),
+            "expected informational event name; got: {line:?}"
+        );
+        assert!(
+            !line.contains("event=integrity_evidence_anchor_tuple_lookup_failed"),
+            "NotFound MUST NOT use the _failed event name; got: {line:?}"
+        );
+    }
+
+    /// Stage 13.9 REJECT-fix v2 Finding (Q5) — pin that the
+    /// NotFound outcome maps to a successful CLI exit (Ok).
+    /// A regression that routes NotFound through `bail!` would
+    /// surface here.
+    #[test]
+    fn tuple_lookup_not_found_outcome_returns_ok_for_cli_exit_zero() {
+        let outcome = omni_zkml::TupleLookupOutcome::NotFound;
+        assert!(
+            tuple_lookup_outcome_to_cli_result(&outcome).is_ok(),
+            "Stage 13.9 Q5 lock: NotFound MUST yield CLI exit 0"
+        );
+    }
+
+    /// Stage 13.9 REJECT-fix v2 Finding (Q8) — pin that the
+    /// lookup-by-tuple preflight is the read-only preflight.
+    /// Default build exercises only the read preflight to keep
+    /// this pin live regardless of the `submit` feature; the
+    /// comparison-against-submit tests below run under
+    /// `--features submit` and prove the two preflights make
+    /// opposite decisions on the same fake-client state.
+    ///
+    /// Scenario: `chain_id=1` (mainnet) with
+    /// `integrity_evidence_anchor_enabled_from_height = None`
+    /// (dormant) — submit preflight would refuse with
+    /// `MainnetPolicyUnresolved`.
+    #[test]
+    fn lookup_by_tuple_preflight_accepts_mainnet_with_dormant_activation() {
+        let tx = omni_sumchain::FakeJsonRpcTransport::new();
+        tx.set_response(
+            "chain_getChainParams",
+            Ok(serde_json::json!({
+                "finality_depth": 12,
+                "min_fee": 1_000,
+                "chain_id": 1,
+                "integrity_evidence_anchor_enabled_from_height":
+                    serde_json::Value::Null,
+            })),
+        );
+        let client =
+            omni_sumchain::SumChainClient::with_transport([0u8; 32], tx);
+
+        assert!(
+            lookup_by_tuple_preflight(&client, 1).is_ok(),
+            "Stage 13.9 Q8 lock: lookup_by_tuple_preflight must \
+             accept mainnet+dormant configuration (chain_id check \
+             only, no activation/mainnet gate)"
+        );
+    }
+
+    /// Stage 13.9 REJECT-fix v2 Finding (Q8) — second default-build
+    /// pin under a different gate: testnet (`chain_id=42`) with
+    /// anchor activation scheduled at height 1000 but chain head
+    /// only at 500. Submit preflight would refuse with
+    /// `NotActivated`; lookup preflight must accept.
+    #[test]
+    fn lookup_by_tuple_preflight_accepts_pre_activation_chain() {
+        let tx = omni_sumchain::FakeJsonRpcTransport::new();
+        tx.set_response(
+            "chain_getChainParams",
+            Ok(serde_json::json!({
+                "finality_depth": 12,
+                "min_fee": 1_000,
+                "chain_id": 42,
+                "integrity_evidence_anchor_enabled_from_height": 1000,
+            })),
+        );
+        tx.set_response(
+            "chain_getBlockHeight",
+            Ok(serde_json::json!({
+                "height": 500,
+                "finality": "latest",
+            })),
+        );
+        let client =
+            omni_sumchain::SumChainClient::with_transport([0u8; 32], tx);
+
+        assert!(
+            lookup_by_tuple_preflight(&client, 42).is_ok(),
+            "Stage 13.9 Q8 lock: lookup_by_tuple_preflight must \
+             accept pre-activation testnet (no activation gate on \
+             read paths)"
+        );
+    }
+
+    /// Stage 13.9 REJECT-fix v2 Finding (Q8) — submit-feature
+    /// build: same fake-client state, two preflights, opposite
+    /// decisions. Proves the read and submit preflights are not
+    /// aliased; the runner's named call to
+    /// [`lookup_by_tuple_preflight`] cannot accidentally route
+    /// through the submit gate without changing observable
+    /// behavior.
+    #[cfg(feature = "submit")]
+    #[test]
+    fn submit_preflight_refuses_mainnet_dormant_state_that_lookup_preflight_accepts()
+    {
+        let tx = omni_sumchain::FakeJsonRpcTransport::new();
+        tx.set_response(
+            "chain_getChainParams",
+            Ok(serde_json::json!({
+                "finality_depth": 12,
+                "min_fee": 1_000,
+                "chain_id": 1,
+                "integrity_evidence_anchor_enabled_from_height":
+                    serde_json::Value::Null,
+            })),
+        );
+        let client =
+            omni_sumchain::SumChainClient::with_transport([0u8; 32], tx);
+
+        // Lookup preflight accepts.
+        assert!(lookup_by_tuple_preflight(&client, 1).is_ok());
+        // Submit preflight refuses with MainnetPolicyUnresolved
+        // on the same state.
+        let submit_err =
+            run_chain_submit_preflight(&client, 1, true, true).unwrap_err();
+        assert!(
+            matches!(submit_err, EvidenceAnchorError::MainnetPolicyUnresolved),
+            "expected MainnetPolicyUnresolved from submit preflight; got: {submit_err:?}"
+        );
+    }
+
+    /// Stage 13.9 REJECT-fix v2 Finding (Q8) — submit-feature
+    /// build, pre-activation pair: read preflight accepts;
+    /// submit preflight refuses with `NotActivated`.
+    #[cfg(feature = "submit")]
+    #[test]
+    fn submit_preflight_refuses_pre_activation_state_that_lookup_preflight_accepts()
+    {
+        let tx = omni_sumchain::FakeJsonRpcTransport::new();
+        tx.set_response(
+            "chain_getChainParams",
+            Ok(serde_json::json!({
+                "finality_depth": 12,
+                "min_fee": 1_000,
+                "chain_id": 42,
+                "integrity_evidence_anchor_enabled_from_height": 1000,
+            })),
+        );
+        tx.set_response(
+            "chain_getBlockHeight",
+            Ok(serde_json::json!({
+                "height": 500,
+                "finality": "latest",
+            })),
+        );
+        let client =
+            omni_sumchain::SumChainClient::with_transport([0u8; 32], tx);
+
+        assert!(lookup_by_tuple_preflight(&client, 42).is_ok());
+        let submit_err =
+            run_chain_submit_preflight(&client, 42, true, true).unwrap_err();
+        assert!(
+            matches!(submit_err, EvidenceAnchorError::NotActivated { .. }),
+            "expected NotActivated from submit preflight; got: {submit_err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_tuple_flags_are_not_exposed_compile_time_pin() {
+        // Operator-footgun guard — the CLI struct must NOT have
+        // raw tuple flags. The tuple is always derived from a
+        // verified local record via selector.
+        //
+        // This test is a compile-time pin: it constructs the
+        // args struct using only the documented fields. Adding
+        // a raw `anchor_schema_version` / `artifact_kind` /
+        // etc. field would require updating this construction
+        // and would surface in a code review.
+        let _a = LookupByTupleArgs {
+            anchor_registry_dir: PathBuf::from("/tmp"),
+            rpc_url: "http://localhost:0".to_string(),
+            expect_chain_id: 1,
+            artifact_hash_hex: Some("aa".repeat(32)),
+            tx_id: None,
+        };
     }
 }

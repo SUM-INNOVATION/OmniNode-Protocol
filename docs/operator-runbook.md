@@ -3348,8 +3348,90 @@ Both use set semantics — duplicate manifest entries within a single export or 
 
 **Implementation reference:** [`docs/stage13.8-anchor-consistency-report.md`](stage13.8-anchor-consistency-report.md) — Stage 13.8 engineering doc (library surface, finding taxonomy with all 24 closed kinds, severity matrix, cross-surface overlap counter semantics, test inventory).
 
-**Forward outlook:**
+### Stage 13.9 — SUM Chain read/reconcile integration
 
-- **Stage 13.9** — comprehensive chain read / reconcile support. Operator-driven, chain-facing. Cross-checks hot registry tx_ids against the chain's recorded anchors, drives reconcile sweeps over backlogs, and bridges archived records back into reconcile flows when needed. Stage 13.8's report is the recommended preflight before any 13.9 invocation.
+**Use when:** you want to bring local anchor statuses up to date against the SUM Chain. Stage 13.9 turns Stage 13.2's per-record reconcile into a batched flow against the chain's `sum_getIntegrityEvidenceAnchorStatusBatch` RPC (up to 100 tx_ids per call), and adds a new by-tuple lookup CLI for verifying a local record's canonical chain identity. **Read-only on the chain.** Reconcile applies the chain-returned status to local records per the locked transition table; the new by-tuple lookup is strictly read-only on the local registry.
 
-**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface; Stage 13.6 reuses both verbatim and adds no new schema constants; Stage 13.7 ships `ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION = 1` and `ANCHOR_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1` on its own plan + manifest surface; Stage 13.8 ships `ANCHOR_CONSISTENCY_REPORT_SCHEMA_VERSION = 1` on its own report surface and **modifies no existing surface** — no other constants change.
+**Subcommands:**
+- `omni-node operator evidence-anchor reconcile-integrity-evidence-anchor` (existing) — now auto-batches via the trait's `query_anchor_status_batch` method when the chain client overrides it; falls back to per-record queries with fail-fast on transport errors when the client doesn't.
+- `omni-node operator evidence-anchor watch-integrity-evidence-anchors` (existing) — gains batching transparently via reconcile.
+- `omni-node operator evidence-anchor lookup-integrity-evidence-anchor-by-tuple` — **NEW.** Loads a local record via `--artifact-hash-hex` or `--tx-id`, extracts the locked 5-tuple from its `tx_data.digest`, and asks the chain for the canonical anchor. Read-only; useful for duplicate-anchor detection or after a chain prune event.
+
+**Recommended preflight before any chain reconcile:** run Stage 13.8's `report-integrity-evidence-anchor-consistency`. Local-side problems (malformed records, tx_index drift, archive-hot collisions) should be resolved before talking to the chain.
+
+**Key invariants:**
+
+1. **Batch max 100.** The reconcile workflow chunks at `ANCHOR_STATUS_BATCH_MAX = 100` before calling the batch RPC. Oversize is never sent.
+2. **Closed transition table.** Chain `Submitted` is **observation-only** for ALL local states (no reorg downgrade in 13.x). `Unknown` is observation-only. `Included` / `Finalized` / `Failed` apply forward-only from `Submitted` / `Included`; no downgrade overwrites of `Finalized` / `Failed`.
+3. **Chunk-level failure fans out per-record.** A `ChainClientError` on a chunk (transport failure, malformed response shape) surfaces as ONE per-record `Err` entry for every tx_id in the chunk. Sweep continues with the next chunk.
+4. **Per-item batch errors stay per-item.** When the chain echoes a per-item `error` field (e.g. operator typo'd a tx_id), the sibling records in the same chunk still succeed.
+5. **By-tuple lookup is read-only on the local registry.** No `--apply` flag. The chain's canonical `tx_hash` and `included_at_height` are surfaced in event lines for operator inspection; mutation is out of scope for Stage 13.9.
+6. **Raw-tuple flags are NOT exposed on the by-tuple CLI.** The tuple is always derived from a verified local record's digest. Operator-footgun guard.
+7. **Read-path mapper.** JSON-RPC errors on read RPCs route to `chain_rpc`, NOT `chain_submit_refused`. The submit-path mapper is unchanged.
+8. **By-tuple `null` outcome is informational.** Event line `event=integrity_evidence_anchor_tuple_lookup_no_chain_anchor ...` carries **no `reason=` key**; exit 0. Distinguishes "local found, chain says no" from `anchor_not_found` (local selector miss).
+9. **`code` and `included_at_height` surface in event lines.** Stable on `failed`; opaque on other statuses. `AnchorStatus` enum unchanged.
+10. **No live-chain tests.** All Stage 13.9 tests use `FakeJsonRpcTransport` + stub clients.
+
+**Reason-tag taxonomy** — Stage 13.9 introduces **ZERO** new closed `reason=` tags:
+
+- `chain_rpc` — per-item batch error; whole-chunk transport / fail-fast; JSON-RPC errors on read RPCs (NOT `chain_submit_refused`).
+- `chain_response_malformed` — whole-chunk malformed response (shape / length / order mismatch).
+- `io` — local FS / registry errors.
+- By-tuple `null` outcome — **informational event line, no `reason=` key**.
+
+CLI mutex / required-with refusals exit non-zero via clap usage errors (NOT `reason=…`).
+
+**Workflow recipes:**
+
+```sh
+# 1. Periodic chain catch-up (now auto-batches against the real
+#    chain). The Stage 13.2 chain-mode preflight + transitions
+#    behavior is preserved; only the wire path changes.
+omni-node operator evidence-anchor reconcile-integrity-evidence-anchor \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url             https://rpc.sumchain.io \
+  --expect-chain-id     1
+
+# 2. By-tuple cross-check (read-only). Operator picks a local
+#    record; the command extracts the 5-tuple from that record's
+#    tx_data.digest and asks the chain for the canonical anchor.
+#    Useful when the operator suspects a duplicate-anchor race
+#    (chain first-wins) or after a chain prune event.
+omni-node operator evidence-anchor lookup-integrity-evidence-anchor-by-tuple \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url             https://rpc.sumchain.io \
+  --expect-chain-id     1 \
+  --artifact-hash-hex   <64-lower-hex>
+
+# 3. Same, by tx_id (when the operator has the receipt but not
+#    the hash).
+omni-node operator evidence-anchor lookup-integrity-evidence-anchor-by-tuple \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url             https://rpc.sumchain.io \
+  --expect-chain-id     1 \
+  --tx-id               <chain-tx_id>
+```
+
+**Limitation — by-tuple lookup does NOT mutate local registry.** If the chain's canonical `tx_hash` differs from the local record's `receipt.tx_id`, Stage 13.9 reports the divergence via `tx_id_matches_canonical=false` on the event line. The operator decides what to do; Stage 13.9 itself does nothing.
+
+**Limitation — no reorg-aware downgrade.** Chain `Submitted` on a record local-recorded as `Included` does NOT downgrade local. The 13.x track has no reorg model. If chain truly reverts an `Included` anchor, the operator's local record stays `Included` until a fresh terminal state arrives.
+
+**Limitation — `tx_hash` status may become `unknown` if pruning is enabled in the future.** **By-tuple lookup is durable and never pruned.** If a local record's `tx_id` falls out of `getStatus` (returns `unknown`), run `lookup-integrity-evidence-anchor-by-tuple` to confirm the chain still has the anchor under the locked 5-tuple identity. This is the recommended long-term identity check.
+
+**Failure-code 60–63 operator guide** (stable codes on `status == "failed"`):
+
+| `code` | Meaning | Operator response |
+| --- | --- | --- |
+| `60` | not activated | Submit was rejected; chain hadn't activated anchor support. Re-submit later if applicable. |
+| `61` | duplicate 5-tuple | First-wins. Local record may carry a non-canonical `tx_id`. Use by-tuple lookup to find the canonical one. |
+| `62` | invalid submitter signature | Local record was tampered or submit was buggy. Investigate Stage 13.0 verifier output. |
+| `63` | `tx.from != address(signer_pubkey)` | Submit-side configuration error — investigate the submit recipe. |
+| other | parse `code` numerically; treat `reason` as opaque | — |
+
+The `reason` field is **opaque** — log scrapers match on `code` for closed-set routing; `reason` is documentation, not a parsed token.
+
+**Implementation reference:** [`docs/stage13.9-chain-read-reconcile.md`](stage13.9-chain-read-reconcile.md) — Stage 13.9 engineering doc (chain JSON-RPC wire shapes, locked transition table, read-path mapper, library surface, implementation locks, test inventory).
+
+**Stage 13.x track closes here.** Stages 13.0–13.9 deliver the complete integrity-evidence-anchor lifecycle (submit → verify → reconcile → summary → cleanup → export → import → archive → consistency → chain read). Future evolution (operator UX, reorg model, multi-chain) is out of scope for the 13.x track.
+
+**No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface; Stage 13.6 reuses both verbatim and adds no new schema constants; Stage 13.7 ships `ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION = 1` and `ANCHOR_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1` on its own plan + manifest surface; Stage 13.8 ships `ANCHOR_CONSISTENCY_REPORT_SCHEMA_VERSION = 1` on its own report surface; Stage 13.9 ships `ANCHOR_STATUS_BATCH_MAX = 100` and `FAILED_REASON_NULL_FALLBACK` as documentation constants alongside the new `AnchorStatusReport` DTO — **no new schema constants and no existing schema modified**.

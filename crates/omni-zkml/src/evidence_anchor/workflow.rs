@@ -14,8 +14,10 @@
 //! [`crate::registry::submit_attestation_workflow`] +
 //! [`crate::registry::query_attestation_workflow`]).
 
-use crate::error::{EvidenceAnchorError, EvidenceAnchorResult};
-use crate::evidence_anchor::client::{AnchorStatus, EvidenceAnchorChainClient};
+use crate::error::{ChainClientError, EvidenceAnchorError, EvidenceAnchorResult};
+use crate::evidence_anchor::client::{
+    AnchorStatus, EvidenceAnchorChainClient, ANCHOR_STATUS_BATCH_MAX,
+};
 use crate::evidence_anchor::registry::{
     AnchorRecord, LocalAnchorStatus, LocalEvidenceAnchorRegistry, local_status_from_chain,
 };
@@ -111,11 +113,28 @@ pub fn submit_evidence_anchor_workflow<C: EvidenceAnchorChainClient>(
 /// Outcome of a registry-driven query. Mirrors the Stage 5
 /// observation-only contract: `Unknown` leaves the local record
 /// unchanged.
+///
+/// ## Stage 13.9 additions (backward-compatible)
+///
+/// `included_at_height` and `code` were added as `Option<...>`
+/// fields surfacing chain-side metadata that's now exposed via
+/// the [`AnchorStatusReport`](crate::AnchorStatusReport) shape.
+/// Stage 13.2 callers can continue to ignore them; the existing
+/// `record` / `chain_status` / `local_status_transitioned`
+/// surface is unchanged.
 #[derive(Debug, Clone)]
 pub struct QueryAnchorOutcome {
     pub record: AnchorRecord,
     pub chain_status: AnchorStatus,
     pub local_status_transitioned: bool,
+    /// Stage 13.9 — chain's `included_at_height` field. Populated
+    /// for `Included` / `Finalized` chain responses. `None` for
+    /// `Submitted` / `Unknown` / `Failed` (or whenever the chain
+    /// returns `null`).
+    pub included_at_height: Option<u64>,
+    /// Stage 13.9 — chain's `code` field. Stable on `Failed` per
+    /// chain contract; `None` otherwise.
+    pub code: Option<u32>,
 }
 
 /// Look up the record in `registry` and ask the chain for its
@@ -128,12 +147,17 @@ pub fn query_evidence_anchor_workflow<C: EvidenceAnchorChainClient>(
 ) -> EvidenceAnchorResult<QueryAnchorOutcome> {
     let record = load_for_selector(registry, &selector)?;
     let tx_id = record.receipt.tx_id.clone();
-    let chain_status = client
-        .query_anchor_status(&tx_id)
+    // Stage 13.9 — use the richer `query_anchor_status_report`
+    // so `included_at_height` / `code` surface on the
+    // `QueryAnchorOutcome`. The default trait impl wraps the
+    // existing `query_anchor_status` with `None` fields, so
+    // stubs that don't override are unaffected.
+    let report = client
+        .query_anchor_status_report(&tx_id)
         .map_err(EvidenceAnchorError::from)?;
 
     let prior = record.status.clone();
-    let new_local = local_status_from_chain(&chain_status);
+    let new_local = local_status_from_chain(&report.status);
     let (record, transitioned) = match new_local {
         Some(target) if target != prior => {
             let updated = registry
@@ -149,8 +173,10 @@ pub fn query_evidence_anchor_workflow<C: EvidenceAnchorChainClient>(
 
     Ok(QueryAnchorOutcome {
         record,
-        chain_status,
+        chain_status: report.status,
         local_status_transitioned: transitioned,
+        included_at_height: report.included_at_height,
+        code: report.code,
     })
 }
 
@@ -161,24 +187,52 @@ pub enum AnchorSelector<'a> {
     TxId(&'a str),
 }
 
-/// Stage 13.2 — sweep the registry and reconcile every local
-/// record's status against the chain.
+/// Stage 13.2 + Stage 13.9 — sweep the registry and reconcile
+/// every local record's status against the chain.
 ///
-/// Mirrors Stage 5.3 [`crate::poll_attestations_workflow`] shape
-/// verbatim:
+/// ## Stage 13.9 rewrite — batched chain reads
 ///
-/// - Only `Submitted` / `Included` records are queried;
-///   `Finalized` / `Failed` records are skipped (omitted from
-///   the result vec).
-/// - **Chain-read-only, local-registry-mutating.** Each chain
-///   query never sends a tx; local status transitions are the
-///   only side effect.
-/// - Per-record RPC failures land as `Err` entries in the
-///   returned vec; the sweep continues with the next record.
-/// - Stage 5.1 observation-only contract preserved: chain
-///   `Unknown` leaves the local record unchanged.
-/// - Records are iterated in deterministic
-///   `artifact_hash_hex` ascending order.
+/// Now uses [`EvidenceAnchorChainClient::query_anchor_status_batch`]
+/// internally, chunked at [`ANCHOR_STATUS_BATCH_MAX`]. The trait
+/// method's default fallback (per-call `query_anchor_status` loop,
+/// fail-fast on the first error) keeps stub clients working without
+/// any change to their impl; real chain clients (`omni-sumchain`)
+/// override with the actual `sum_getIntegrityEvidenceAnchorStatusBatch`
+/// RPC for throughput.
+///
+/// ## Closed transition table (Stage 13.9 lock)
+///
+/// | Chain says    | Local was          | Local becomes        | Why                             |
+/// | ------------- | ------------------ | -------------------- | ------------------------------- |
+/// | `Unknown`     | any                | unchanged            | observation-only (Stage 13.0)   |
+/// | `Submitted`   | any                | unchanged            | no reorg downgrade (13.9 lock)  |
+/// | `Included`    | `Submitted`        | `Included`           | normal forward transition       |
+/// | `Included`    | else               | unchanged            | no reorg downgrade              |
+/// | `Finalized`   | `Submitted/Included`| `Finalized`         | normal forward transition       |
+/// | `Finalized`   | else               | unchanged            | no reorg downgrade              |
+/// | `Failed`      | `Submitted/Included`| `Failed{reason}`    | normal forward transition       |
+/// | `Failed`      | else               | unchanged            | no overwrite                    |
+///
+/// ## Chunk-level error fan-out
+///
+/// A whole-chunk failure (`Err(ChainClientError)` from the batch
+/// call) fans out to ONE per-record `EvidenceAnchorResult::Err`
+/// entry for EVERY tx_id in the chunk. The error text is mapped
+/// via the existing `EvidenceAnchorError::from(ChainClientError)`
+/// path; CLI layer maps via a read-path mapper (Stage 13.9
+/// `read_rpc_error_to_evidence_anchor_error`) so JSON-RPC errors
+/// route through `chain_rpc` and never through
+/// `chain_submit_refused`. The sweep continues with the next
+/// chunk.
+///
+/// ## Backward-compat
+///
+/// - Public signature unchanged.
+/// - Records iterated in deterministic `artifact_hash_hex`
+///   ascending order (unchanged from Stage 13.2).
+/// - Per-record `Err` containment unchanged (per-item errors
+///   from a real batch RPC AND chunk-level failures both surface
+///   as `Err` entries in the result vec).
 pub fn reconcile_evidence_anchors_workflow<C: EvidenceAnchorChainClient>(
     registry: &LocalEvidenceAnchorRegistry,
     client: &C,
@@ -188,27 +242,199 @@ pub fn reconcile_evidence_anchors_workflow<C: EvidenceAnchorChainClient>(
         path: registry.root().to_path_buf(),
         source: e,
     })?;
-    for record in records {
-        let from = record.status.clone();
-        let is_queryable = matches!(
-            from,
-            LocalAnchorStatus::Submitted | LocalAnchorStatus::Included
-        );
-        if !is_queryable {
-            continue;
+
+    // Collect queryable records (Submitted | Included) in
+    // deterministic order.
+    let queryable: Vec<&crate::evidence_anchor::registry::AnchorRecord> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.status,
+                LocalAnchorStatus::Submitted | LocalAnchorStatus::Included
+            )
+        })
+        .collect();
+
+    // Stage 13.9 — chunk at 100 (chain contract max). Empty
+    // collections short-circuit to a single empty batch call
+    // (or zero calls), keeping behavior trivial.
+    for chunk in queryable.chunks(ANCHOR_STATUS_BATCH_MAX) {
+        let tx_ids: Vec<String> = chunk.iter().map(|r| r.receipt.tx_id.clone()).collect();
+        match client.query_anchor_status_batch(&tx_ids) {
+            Err(chain_err) => {
+                // Whole-chunk failure — fan out per-record (Stage
+                // 13.9 Finding 5 lock).
+                for record in chunk {
+                    out.push((
+                        record.artifact_hash_hex.clone(),
+                        Err(EvidenceAnchorError::from(chain_err.clone())),
+                    ));
+                }
+            }
+            Ok(items) => {
+                if items.len() != chunk.len() {
+                    // Chain returned length-mismatched response.
+                    // Surface as malformed for every tx_id in the
+                    // chunk. (The omni-sumchain client also
+                    // refuses this internally with
+                    // ChainErrorCategory::Malformed; this branch
+                    // covers stubs that don't.)
+                    let synthetic = ChainClientError::Other(format!(
+                        "batch response length mismatch: requested {}, got {}",
+                        chunk.len(),
+                        items.len()
+                    ));
+                    for record in chunk {
+                        out.push((
+                            record.artifact_hash_hex.clone(),
+                            Err(EvidenceAnchorError::from(synthetic.clone())),
+                        ));
+                    }
+                    continue;
+                }
+                for (record, item) in chunk.iter().zip(items.into_iter()) {
+                    let artifact_hash_hex = record.artifact_hash_hex.clone();
+                    let outcome = process_batch_item(registry, record, item);
+                    out.push((artifact_hash_hex, outcome));
+                }
+            }
         }
-        let artifact_hash_hex = record.artifact_hash_hex.clone();
-        // Delegate to query_evidence_anchor_workflow so the
-        // chain-Unknown observation-only path is shared verbatim
-        // with the single-record query CLI.
-        let result = query_evidence_anchor_workflow(
-            registry,
-            client,
-            AnchorSelector::ArtifactHashHex(&artifact_hash_hex),
-        );
-        out.push((artifact_hash_hex, result));
     }
     Ok(out)
+}
+
+/// Stage 13.9 — process one `BatchStatusItem` against a local
+/// record. Applies the closed transition table (Submitted /
+/// Unknown observation-only; Included / Finalized / Failed
+/// forward-transitions on Submitted/Included; no downgrades).
+fn process_batch_item(
+    registry: &LocalEvidenceAnchorRegistry,
+    record: &crate::evidence_anchor::registry::AnchorRecord,
+    item: crate::evidence_anchor::client::BatchStatusItem,
+) -> EvidenceAnchorResult<QueryAnchorOutcome> {
+    // Per-item error from the batch RPC.
+    if let Some(err_text) = item.error {
+        return Err(EvidenceAnchorError::ChainRpc(err_text));
+    }
+
+    let Some(report) = item.result else {
+        return Err(EvidenceAnchorError::ChainResponseMalformed(
+            "batch item carried neither result nor error".to_string(),
+        ));
+    };
+
+    let prior = record.status.clone();
+    let chain_status = report.status.clone();
+
+    // Stage 13.9 closed transition table (locked in doc above).
+    let target: Option<LocalAnchorStatus> = match &chain_status {
+        // Observation-only — no change to local.
+        AnchorStatus::Unknown => None,
+        AnchorStatus::Submitted => None,
+        // Forward-only — only transition `Submitted → Included`.
+        AnchorStatus::Included => match prior {
+            LocalAnchorStatus::Submitted => Some(LocalAnchorStatus::Included),
+            _ => None,
+        },
+        // Forward-only — `Submitted/Included → Finalized`.
+        AnchorStatus::Finalized => match prior {
+            LocalAnchorStatus::Submitted | LocalAnchorStatus::Included => {
+                Some(LocalAnchorStatus::Finalized)
+            }
+            _ => None,
+        },
+        // Forward-only — `Submitted/Included → Failed`.
+        AnchorStatus::Failed { reason } => match prior {
+            LocalAnchorStatus::Submitted | LocalAnchorStatus::Included => {
+                Some(LocalAnchorStatus::Failed {
+                    reason: reason.clone(),
+                })
+            }
+            _ => None,
+        },
+    };
+
+    let (updated_record, transitioned) = match target {
+        Some(t) => {
+            let updated = registry
+                .update_status(&record.artifact_hash_hex, t)
+                .map_err(|e| EvidenceAnchorError::Io {
+                    path: registry.root().to_path_buf(),
+                    source: e,
+                })?;
+            (updated, true)
+        }
+        None => (record.clone(), false),
+    };
+
+    Ok(QueryAnchorOutcome {
+        record: updated_record,
+        chain_status,
+        local_status_transitioned: transitioned,
+        included_at_height: report.included_at_height,
+        code: report.code,
+    })
+}
+
+// ── Stage 13.9 — by-tuple lookup workflow ────────────────────────────────────
+
+/// Outcome of a by-tuple chain lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TupleLookupOutcome {
+    /// The chain knows about an anchor matching the 5-tuple.
+    Found {
+        /// Canonical `0x`-prefixed lowercase 32-byte hex of the
+        /// chain's authoritative tx hash.
+        canonical_tx_hash: String,
+        included_at_height: u64,
+        /// The local record's `receipt.tx_id` at lookup time —
+        /// for cross-comparison with `canonical_tx_hash`. The
+        /// CLI surfaces both so operators can detect drift
+        /// (e.g. duplicate-anchor scenarios where multiple
+        /// submits with the same 5-tuple race; chain first-wins).
+        local_record_tx_id: String,
+    },
+    /// The chain's `result` was `null` — no chain anchor for
+    /// this tuple. Surfaces as an informational event line at
+    /// the CLI layer (NO `reason=` key per Stage 13.9
+    /// REJECT-fix Finding 5).
+    NotFound,
+}
+
+/// Stage 13.9 — look up the canonical chain anchor for the
+/// 5-tuple derived from a local record. **Read-only** — does
+/// NOT mutate the registry (Stage 13.9 Q3 lock).
+///
+/// The local record selector picks which record's digest fields
+/// to use as the tuple; raw tuple flags are never accepted (CLI
+/// footgun). Tuple fields:
+/// `(anchor_schema_version, artifact_kind, artifact_schema_version,
+/// artifact_hash, signer_pubkey)`.
+pub fn lookup_anchor_by_tuple_workflow<C: EvidenceAnchorChainClient>(
+    registry: &LocalEvidenceAnchorRegistry,
+    client: &C,
+    selector: AnchorSelector<'_>,
+) -> EvidenceAnchorResult<TupleLookupOutcome> {
+    let record = load_for_selector(registry, &selector)?;
+    let local_record_tx_id = record.receipt.tx_id.clone();
+    let digest = &record.tx_data.digest;
+    let chain_result = client
+        .lookup_anchor_by_tuple(
+            digest.anchor_schema_version,
+            digest.artifact_kind,
+            digest.artifact_schema_version,
+            &digest.artifact_hash,
+            &digest.signer_pubkey,
+        )
+        .map_err(EvidenceAnchorError::from)?;
+    match chain_result {
+        Some(found) => Ok(TupleLookupOutcome::Found {
+            canonical_tx_hash: found.tx_hash,
+            included_at_height: found.included_at_height,
+            local_record_tx_id,
+        }),
+        None => Ok(TupleLookupOutcome::NotFound),
+    }
 }
 
 fn load_for_selector(

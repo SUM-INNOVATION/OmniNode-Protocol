@@ -259,3 +259,5 @@ Exhaustive `every_variant_has_a_stable_tag` mapper test in `mod.rs` is **unchang
 - No multi-host correlation.
 - No JSON report signing (operators wrap with Stage 12.25 separately if desired).
 - No interactive paginated review / HTML / Markdown rendering.
+
+> **Post-Stage-13.9 note:** Stage 13.9 closes the 13.x track by integrating the filled SUM Chain read/reconcile contract — batch status RPC (chunks of 100), by-tuple lookup (durable, never pruned), and a richer `AnchorStatusReport` DTO surfacing `code` / `included_at_height` / opaque `reason`. Stage 13.8's read-only consistency report is the **recommended preflight** before any Stage 13.9 chain reconcile invocation. See [`docs/stage13.9-chain-read-reconcile.md`](stage13.9-chain-read-reconcile.md).

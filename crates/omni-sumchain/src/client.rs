@@ -14,9 +14,10 @@
 
 use omni_types::phase5::InferenceAttestation;
 use omni_zkml::{
-    AnchorStatus, AnchorSubmissionReceipt, AttestationStatus, ChainClient, ChainClientError,
-    EvidenceAnchorChainClient, IntegrityEvidenceAnchorTxData, OrchestrationClient,
-    SubmissionReceipt,
+    AnchorStatus, AnchorStatusReport, AnchorSubmissionReceipt, AttestationStatus,
+    BatchStatusItem, ChainClient, ChainClientError, EvidenceAnchorChainClient,
+    IntegrityEvidenceAnchorTxData, OrchestrationClient, SubmissionReceipt,
+    TupleLookupResult,
 };
 // `IntegrityEvidenceAnchorTxData` is in the public trait signature
 // (`fn submit_anchor(&self, tx_data: &IntegrityEvidenceAnchorTxData)`)
@@ -412,5 +413,47 @@ impl<T: JsonRpcTransport> EvidenceAnchorChainClient for SumChainClient<T> {
         tx_id: &str,
     ) -> std::result::Result<AnchorStatus, ChainClientError> {
         query_anchor_status(self, tx_id)
+    }
+
+    /// Stage 13.9 — single-record richer report. Overrides the
+    /// default-impl wrapper to surface `included_at_height` /
+    /// `code` / `reason` from the chain.
+    fn query_anchor_status_report(
+        &self,
+        tx_id: &str,
+    ) -> std::result::Result<AnchorStatusReport, ChainClientError> {
+        crate::anchor_tx::query_anchor_status_report(self, tx_id)
+    }
+
+    /// Stage 13.9 — batch status RPC. Overrides the default
+    /// fail-fast fallback with the real
+    /// `sum_getIntegrityEvidenceAnchorStatusBatch` call. The
+    /// caller chunks at `ANCHOR_STATUS_BATCH_MAX = 100`.
+    fn query_anchor_status_batch(
+        &self,
+        tx_ids: &[String],
+    ) -> std::result::Result<Vec<BatchStatusItem>, ChainClientError> {
+        crate::anchor_tx::query_anchor_status_batch(self, tx_ids)
+    }
+
+    /// Stage 13.9 — by-tuple lookup. Overrides the default
+    /// "not supported" with the real
+    /// `sum_getIntegrityEvidenceAnchorByTuple` call.
+    fn lookup_anchor_by_tuple(
+        &self,
+        anchor_schema_version: u32,
+        artifact_kind: omni_zkml::AnchoredArtifactKind,
+        artifact_schema_version: u32,
+        artifact_hash: &[u8; 32],
+        signer_pubkey: &[u8; 32],
+    ) -> std::result::Result<Option<TupleLookupResult>, ChainClientError> {
+        crate::anchor_tx::lookup_anchor_by_tuple(
+            self,
+            anchor_schema_version,
+            artifact_kind,
+            artifact_schema_version,
+            artifact_hash,
+            signer_pubkey,
+        )
     }
 }

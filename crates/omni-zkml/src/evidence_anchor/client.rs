@@ -36,6 +36,23 @@ use crate::evidence_anchor::wire::IntegrityEvidenceAnchorTxData;
 /// `tx_id` is opaque (string). The stub uses a deterministic
 /// `"anchor-{counter:08x}-{artifact_hash_hex[..12]}"` form; a real
 /// adapter would use the chain's native tx hash.
+///
+/// ## Stage 13.9 extension
+///
+/// Three default-impl'd methods were added — `query_anchor_status_report`,
+/// `query_anchor_status_batch`, `lookup_anchor_by_tuple` — for batch
+/// reads and by-tuple lookup. The defaults keep every existing
+/// `EvidenceAnchorChainClient` impl compiling unchanged:
+///
+/// - `query_anchor_status_report` wraps `query_anchor_status` with
+///   `Option<u64>` / `Option<u32>` / `Option<String>` chain fields
+///   defaulted to `None`. Real adapter overrides for richer info.
+/// - `query_anchor_status_batch` loops `query_anchor_status` and
+///   **fails fast on the first `ChainClientError`** (Stage 13.9
+///   REJECT-fix Finding 3 — symmetric with real chunk-level batch
+///   failure; reconcile fans out per-record from the `Err`).
+/// - `lookup_anchor_by_tuple` returns
+///   `Err(ChainClientError::Other("by-tuple lookup not supported by this client"))`.
 pub trait EvidenceAnchorChainClient {
     /// Submit a signed anchor wire payload. Returns an
     /// implementation-specific receipt on success.
@@ -51,6 +68,82 @@ pub trait EvidenceAnchorChainClient {
         &self,
         tx_id: &str,
     ) -> std::result::Result<AnchorStatus, ChainClientError>;
+
+    /// Stage 13.9 — single-record richer status report. Default
+    /// impl wraps [`Self::query_anchor_status`] and fills the
+    /// chain-only fields with `None`. Real adapter overrides for
+    /// actual `included_at_height` / `code` / `reason`.
+    fn query_anchor_status_report(
+        &self,
+        tx_id: &str,
+    ) -> std::result::Result<AnchorStatusReport, ChainClientError> {
+        let status = self.query_anchor_status(tx_id)?;
+        Ok(AnchorStatusReport {
+            status,
+            included_at_height: None,
+            code: None,
+            reason: None,
+        })
+    }
+
+    /// Stage 13.9 — batch status read. Default impl loops
+    /// [`Self::query_anchor_status`] and **fails fast** on the
+    /// first per-call transport / client error. This is
+    /// semantically symmetric with real chunk-level batch
+    /// failure — reconcile's chunk-level handler fans out per-
+    /// record from the `Err`, not from item errors (per-item
+    /// errors only originate from a real batch RPC returning
+    /// per-item `error` fields).
+    ///
+    /// Implementations that send a real batch RPC override this
+    /// method.
+    fn query_anchor_status_batch(
+        &self,
+        tx_ids: &[String],
+    ) -> std::result::Result<Vec<BatchStatusItem>, ChainClientError> {
+        let mut out = Vec::with_capacity(tx_ids.len());
+        for tx_id in tx_ids {
+            let status = self.query_anchor_status(tx_id)?;
+            out.push(BatchStatusItem {
+                tx_hash: tx_id.clone(),
+                result: Some(AnchorStatusReport {
+                    status,
+                    included_at_height: None,
+                    code: None,
+                    reason: None,
+                }),
+                error: None,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Stage 13.9 — by-tuple lookup. Default impl returns an
+    /// `Err("not supported")` so existing stubs that never call
+    /// this method keep compiling. Real adapter overrides.
+    ///
+    /// Tuple field order matches the chain contract:
+    /// `(anchor_schema_version, artifact_kind, artifact_schema_version,
+    /// artifact_hash, signer_pubkey)`.
+    fn lookup_anchor_by_tuple(
+        &self,
+        anchor_schema_version: u32,
+        artifact_kind: crate::evidence_anchor::wire::AnchoredArtifactKind,
+        artifact_schema_version: u32,
+        artifact_hash: &[u8; 32],
+        signer_pubkey: &[u8; 32],
+    ) -> std::result::Result<Option<TupleLookupResult>, ChainClientError> {
+        let _ = (
+            anchor_schema_version,
+            artifact_kind,
+            artifact_schema_version,
+            artifact_hash,
+            signer_pubkey,
+        );
+        Err(ChainClientError::Other(
+            "by-tuple lookup not supported by this client".to_string(),
+        ))
+    }
 }
 
 // ── Receipt + status ──────────────────────────────────────────────────────────
@@ -84,6 +177,94 @@ pub enum AnchorStatus {
     /// 13.0 leaves the record unchanged on `Unknown`; staleness
     /// detection is a future-stage concern.
     Unknown,
+}
+
+// ── Stage 13.9 — richer chain-status DTOs ────────────────────────────────────
+
+/// Stage 13.9 — single-record richer status response. Carries
+/// the chain-only metadata (`included_at_height` / `code` /
+/// `reason`) without growing the closed [`AnchorStatus`] enum.
+/// The Stage 13.0 surface is unchanged; new callers consume
+/// this type when they want richer event-line output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorStatusReport {
+    pub status: AnchorStatus,
+    pub included_at_height: Option<u64>,
+    /// Stable on `Failed` per chain contract:
+    /// `60` not activated, `61` duplicate 5-tuple,
+    /// `62` invalid submitter signature, `63` `tx.from !=
+    /// address(signer_pubkey)`. Other failures may carry
+    /// `None`. Operators read `code` as a numeric token, not as
+    /// a parsed enum — the closed-set lives in operator-runbook
+    /// docs.
+    pub code: Option<u32>,
+    /// Opaque human-readable text. Never parsed; surfaced
+    /// verbatim. When the chain returns `failed` with
+    /// `reason: null`, reconcile uses
+    /// [`FAILED_REASON_NULL_FALLBACK`] so the existing
+    /// `AnchorStatus::Failed { reason: String }` shape stays
+    /// compatible (Stage 13.9 implementation lock).
+    pub reason: Option<String>,
+}
+
+/// Stage 13.9 — per-item entry of the batch-status response.
+/// `tx_hash` is the chain-echoed hash (used for response-order
+/// verification). Exactly one of `result` / `error` is non-`None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchStatusItem {
+    pub tx_hash: String,
+    pub result: Option<AnchorStatusReport>,
+    pub error: Option<String>,
+}
+
+/// Stage 13.9 — by-tuple lookup successful result. Returned in
+/// the `Some(...)` arm of `lookup_anchor_by_tuple` when the
+/// chain has an anchor matching the 5-tuple.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TupleLookupResult {
+    /// Canonical `0x`-prefixed 32-byte lowercase hex of the
+    /// final committed `TransactionV2` envelope.
+    pub tx_hash: String,
+    pub included_at_height: u64,
+}
+
+/// Stage 13.9 implementation lock — fallback `reason` text when
+/// the chain returns `failed` with `reason: null`. Keeps
+/// [`AnchorStatus::Failed { reason: String }`] backward-
+/// compatible (no Stage 13.0 schema change) while still
+/// surfacing the chain's `code` independently via event lines.
+pub const FAILED_REASON_NULL_FALLBACK: &str =
+    "chain returned failed with no reason";
+
+/// Stage 13.9 batch chunk size — chain contract max. Mirrors
+/// the omni-sumchain `ANCHOR_STATUS_BATCH_MAX`. The reconcile
+/// workflow chunks at this size before calling
+/// [`EvidenceAnchorChainClient::query_anchor_status_batch`].
+pub const ANCHOR_STATUS_BATCH_MAX: usize = 100;
+
+/// Stage 13.9 implementation lock — canonicalize a tx hash for
+/// batch-response order verification. Strips an optional `0x`
+/// prefix and lowercases. Returns `None` when the canonical
+/// form is not exactly 64 lower-hex characters (caller routes
+/// this through `chain_response_malformed`).
+///
+/// This handles the practical case where local `tx_id`s and
+/// the chain's echoed `tx_hash` differ only in `0x` prefix or
+/// case — a valid response should NOT be falsely rejected for
+/// cosmetic differences.
+pub fn canonicalize_tx_hash(s: &str) -> Option<String> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    if stripped.len() != 64 {
+        return None;
+    }
+    let lower = stripped.to_ascii_lowercase();
+    if !lower
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    Some(lower)
 }
 
 // ── In-memory stub client (tests + CLI stub mode) ─────────────────────────────

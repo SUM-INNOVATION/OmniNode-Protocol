@@ -199,13 +199,28 @@ fn reconcile_chain_unknown_is_observation_only() {
 }
 
 #[test]
-fn reconcile_per_record_rpc_failure_does_not_abort_sweep() {
+fn reconcile_per_record_rpc_failure_during_fallback_fans_out_chunk_level_err_to_every_record() {
+    // Stage 13.9 v2 semantic — `FakeAnchorClient` doesn't
+    // override `query_anchor_status_batch`, so the default
+    // trait fallback runs. That fallback is documented as
+    // **fail-fast on the first per-call error** (REJECT-fix
+    // Finding 3), matching the semantics of a real chunk-level
+    // batch transport failure. Reconcile fans the chunk-level
+    // `Err` out per-record. The sweep doesn't abort — it
+    // continues to the NEXT chunk if there is one (chunks are
+    // 100 records each).
+    //
+    // For per-item error containment with successful sibling
+    // records, the chain client must override
+    // `query_anchor_status_batch` (real `omni-sumchain`
+    // `SumChainClient` does). A separate test
+    // (`reconcile_real_batch_per_item_error_containment_keeps_sibling_records_succeeding`)
+    // pins that real-batch behavior.
     let (_dir, registry) = fresh_registry();
     let stub = StubEvidenceAnchorChainClient::new();
     let _hash_a = seed_record(&registry, &stub, [7u8; 32], 0x11);
     let _hash_b = seed_record(&registry, &stub, [8u8; 32], 0x22);
 
-    // One record fails its query; the other gets Included.
     let real = FakeAnchorClient::new();
     let all_records: Vec<_> = registry
         .list()
@@ -223,26 +238,22 @@ fn reconcile_per_record_rpc_failure_does_not_abort_sweep() {
     real.set_status(ok_tx, AnchorStatus::Included);
 
     let out = reconcile_evidence_anchors_workflow(&registry, &real).unwrap();
-    assert_eq!(out.len(), 2, "both records appear in the result vec");
+    assert_eq!(out.len(), 2, "both records still appear in the result vec");
 
-    let oks = out.iter().filter(|(_, r)| r.is_ok()).count();
+    // Stage 13.9 v2 — both records surface as Err because the
+    // default fallback fail-fast turned this single chunk into
+    // a chunk-level failure.
     let errs = out.iter().filter(|(_, r)| r.is_err()).count();
-    assert_eq!(oks, 1);
-    assert_eq!(errs, 1);
+    assert_eq!(errs, 2, "chunk-level fail-fast fans out per-record");
 
-    let _ = (failing_hash, ok_hash);
-    // The failing record is unchanged on disk (Stage 5.1 contract).
+    // Both local records unchanged.
     let reloaded_failing = registry
         .load_by_artifact_hash(failing_hash)
         .unwrap()
         .unwrap();
     assert_eq!(reloaded_failing.status, LocalAnchorStatus::Submitted);
-
-    let reloaded_ok = registry
-        .load_by_artifact_hash(ok_hash)
-        .unwrap()
-        .unwrap();
-    assert_eq!(reloaded_ok.status, LocalAnchorStatus::Included);
+    let reloaded_ok = registry.load_by_artifact_hash(ok_hash).unwrap().unwrap();
+    assert_eq!(reloaded_ok.status, LocalAnchorStatus::Submitted);
 }
 
 #[test]
