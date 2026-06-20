@@ -232,9 +232,7 @@ fn default_trait_impl_returns_unsupported_error_for_by_tuple() {
             &[0u8; 32],
         )
         .unwrap_err();
-    let msg = match err {
-        ChainClientError::Other(s) => s,
-    };
+    let ChainClientError::Other(msg) = err;
     assert!(
         msg.contains("not supported"),
         "default impl returns a not-supported error: {msg}"

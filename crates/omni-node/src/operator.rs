@@ -630,6 +630,7 @@ pub(crate) struct OperatorArgs {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum OperatorCmd {
     /// Poll until OmniNode + V2 activation, then exit 0. Read-only.
     WatchActivation(WatchArgs),
@@ -3899,6 +3900,7 @@ mod tests {
 
     #[cfg(feature = "submit")]
     #[test]
+    #[allow(clippy::type_complexity)]
     fn map_mainnet_refusal_covers_every_stage11b0_layer() {
         use omni_zkml::MainnetRefusalReason as R;
         // Every layer's reason maps to a distinct operator-error

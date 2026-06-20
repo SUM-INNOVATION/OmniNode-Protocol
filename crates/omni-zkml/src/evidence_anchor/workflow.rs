@@ -292,7 +292,7 @@ pub fn reconcile_evidence_anchors_workflow<C: EvidenceAnchorChainClient>(
                     }
                     continue;
                 }
-                for (record, item) in chunk.iter().zip(items.into_iter()) {
+                for (record, item) in chunk.iter().zip(items) {
                     let artifact_hash_hex = record.artifact_hash_hex.clone();
                     let outcome = process_batch_item(registry, record, item);
                     out.push((artifact_hash_hex, outcome));

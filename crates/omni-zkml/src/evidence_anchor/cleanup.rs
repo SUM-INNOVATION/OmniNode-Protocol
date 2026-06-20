@@ -5,7 +5,7 @@
 //! narrowed to the integrity-evidence anchor registry. Detection
 //! is reused verbatim from Stage 13.3
 //! [`crate::evidence_anchor::check_evidence_anchor_registry_health`]
-//! + [`crate::evidence_anchor::list_stale_submitted_or_included`];
+//! and [`crate::evidence_anchor::list_stale_submitted_or_included`];
 //! this module turns those signals into a typed plan, applies it
 //! with dry-run-first posture, and provides symmetric restore.
 //!
@@ -183,7 +183,7 @@ pub struct AnchorPlanOptions<'a> {
 
 pub struct AnchorApplyOptions<'a> {
     /// Root under which the `<plan_id>/...` quarantine subtree
-    /// + `quarantine_manifest.json` are written. The caller is
+    /// and `quarantine_manifest.json` are written. The caller is
     /// responsible for ensuring the directory exists and is
     /// writable. Used for both Tier B writes and the manifest
     /// landing site.

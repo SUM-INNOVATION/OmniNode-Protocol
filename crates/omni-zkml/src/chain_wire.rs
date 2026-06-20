@@ -631,7 +631,7 @@ mod tests {
         let d = sample_digest();
         let canonical = canonical_digest_bytes(&d).unwrap();
         let signing = signing_input_bytes(&d).unwrap();
-        assert_eq!(signing.len(), DOMAIN_TAG.as_bytes().len() + canonical.len());
+        assert_eq!(signing.len(), DOMAIN_TAG.len() + canonical.len());
     }
 
     // ── Signing (4) ──────────────────────────────────────────────────────

@@ -4086,7 +4086,7 @@ mod stage_13_6_cli_tests {
         // Pin the compile-time mapping: !apply == dry_run.
         let mut a = defaults();
         a.apply = true;
-        assert!(!(!a.apply), "--apply=true should map to dry_run=false");
+        assert!(a.apply, "--apply=true should map to dry_run=false");
         a.apply = false;
         assert!(!a.apply, "--apply=false should map to dry_run=true");
     }

@@ -44,6 +44,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Listen indefinitely, serving shard requests and printing events.
     Listen,

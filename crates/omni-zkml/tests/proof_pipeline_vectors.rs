@@ -49,7 +49,7 @@ use omni_zkml::{
 /// - vector 1: empty input bytes (edge case — caller proves "no input").
 /// - vector 2: ASCII-only longer body matching the Stage 6
 ///   `omninode-stage6-vec-3-…` session-id shape so we have at least one
-///    vector at a realistic operator-facing length.
+///   vector at a realistic operator-facing length.
 const VECTORS: &[Input] = &[
     Input {
         name: "stage11a-vector-0",

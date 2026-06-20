@@ -1337,7 +1337,7 @@ mod tests {
             &self,
             path: &Path,
         ) -> std::result::Result<SnipV2ObjectRef, SnipV2Error> {
-            let bytes = std::fs::read(path).map_err(|e| SnipV2Error::CommandSpawn(e))?;
+            let bytes = std::fs::read(path).map_err(SnipV2Error::CommandSpawn)?;
             let hash = blake3::hash(&bytes);
             let mut id_bytes = [0u8; 32];
             id_bytes.copy_from_slice(hash.as_bytes());
@@ -1422,7 +1422,7 @@ mod tests {
             input_hash: *blake3::hash(b"input").as_bytes(),
             output_hash: *blake3::hash(b"output").as_bytes(),
         };
-        assert_eq!(MockProofVerifier.verify(&proof, &pi).unwrap(), true);
+        assert!(MockProofVerifier.verify(&proof, &pi).unwrap());
     }
 
     #[test]
@@ -1436,7 +1436,7 @@ mod tests {
             input_hash: *blake3::hash(b"input").as_bytes(),
             output_hash: *blake3::hash(b"output").as_bytes(),
         };
-        assert_eq!(MockProofVerifier.verify(&proof, &pi).unwrap(), false);
+        assert!(!MockProofVerifier.verify(&proof, &pi).unwrap());
     }
 
     #[test]
@@ -1449,7 +1449,7 @@ mod tests {
             input_hash: *blake3::hash(b"input").as_bytes(),
             output_hash: *blake3::hash(b"output").as_bytes(),
         };
-        assert_eq!(MockProofVerifier.verify(&proof, &pi).unwrap(), false);
+        assert!(!MockProofVerifier.verify(&proof, &pi).unwrap());
     }
 
     #[test]
@@ -1554,7 +1554,7 @@ mod tests {
         // Verifier accepts the proof bytes recovered from the artifact.
         let recovered_proof = parsed.proof_bytes().unwrap();
         let pi = parsed.metadata.public_inputs().unwrap();
-        assert_eq!(MockProofVerifier.verify(&recovered_proof, &pi).unwrap(), true);
+        assert!(MockProofVerifier.verify(&recovered_proof, &pi).unwrap());
     }
 
     // ── Stage 11b.0 — trait extensions + schema + mainnet refusal ──

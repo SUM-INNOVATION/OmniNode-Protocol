@@ -10,7 +10,7 @@
 #![cfg(feature = "submit")]
 
 use omni_sumchain::{
-    error_prefixes, FakeJsonRpcTransport, JsonRpcTransport, SumChainClient,
+    error_prefixes, FakeJsonRpcTransport, SumChainClient,
 };
 use omni_zkml::{
     anchor_signer_pubkey_bytes, sign_anchor_digest, AnchorStatus, AnchoredArtifactKind,
