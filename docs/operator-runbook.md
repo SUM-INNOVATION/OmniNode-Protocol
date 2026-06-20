@@ -3519,3 +3519,60 @@ The umbrella suite's scenario 1 (`scenario_1_happy_path_full_lifecycle_seed_reco
 - Umbrella test suite: [`crates/omni-zkml/tests/evidence_anchor_stage_13_10_acceptance.rs`](../crates/omni-zkml/tests/evidence_anchor_stage_13_10_acceptance.rs) — 12 hermetic tests covering the 9 scenarios above plus a `parse_event_line` self-test, a `_no_chain_anchor` event-line shape pin, and an error-taxonomy smoke.
 
 **No new operator features.** Stage 13.10 changes no production code; the 13.x track closes as delivered through Stage 13.9.
+
+## Phase 5 — real proof generation
+
+### Stage 14.1 — halo2-reference prover reachable from `omni-node`
+
+**Use when:** you want to generate a real (non-Mock) Stage 11b halo2 proof for the canonical reference circuit (4 → 8 → 4 `i16` fixed-point MLP) from the operator binary, then verify it through the existing `operator verify-proof` surface — closing the first end-to-end real proof loop locally.
+
+**What was already in place (Stage 11b.1.b):**
+
+- [`omni-proofs-halo2-reference`](../crates/omni-proofs-halo2-reference/) ships both a verifier (behind crate-feature `verify`) and a developer-host prover (behind crate-feature `prove`), both bound to the same [`BoundedMlpCircuit`](../crates/omni-proofs-halo2-reference/src/circuit.rs).
+- `ProofSystem::Stage11bHalo2Reference` is already a closed variant; the mainnet allowlist is empty by design — submission to `chain_id == 1` is hard-refused at [`omni_zkml::check_mainnet_eligible`](../crates/omni-zkml/src/proof.rs) layers 1 + 3 + 6.
+- `prove_canonical` is byte-deterministic via a fixed `ChaCha20Rng` seed; existing fixture `proof.bin` is committed.
+
+**What Stage 14.1 added:**
+
+- [`Halo2ReferenceProofBackend`](../crates/omni-proofs-halo2-reference/src/prover.rs) — a thin `omni_zkml::ProofBackend` adapter over `prove_canonical`. Validates the `(model, input, output)` byte triple against the canonical spec and the neutral canonical evaluator before invoking the halo2 prover.
+- New `omni-node` feature `halo2-reference-prove` (superset of `halo2-reference-verify`) that opts into the reference crate's `prove` feature.
+- New subcommand `operator generate-reference-proof` (gated by the new feature) that emits a `ProofArtifactBody` JSON directly consumable by `operator verify-proof`.
+- New CI tree gate `halo2-reference-prove tree — must contain halo2_proofs + rand_chacha`.
+
+**Default-build posture unchanged:** `cargo build -p omni-node` (no features) pulls zero halo2 / pasta / `omni-proofs-halo2-reference` deps. The Mock-backend verification flow still works end-to-end. Both invariants are pinned by CI tree gates.
+
+**Workflow recipe:**
+
+```sh
+# 1. Generate a halo2-reference proof for the canonical input
+#    (or any in-range [i16; 4]). Output is a ProofArtifactBody JSON.
+cargo run -p omni-node --features halo2-reference-prove -- \
+  operator generate-reference-proof \
+  --input-i16   "-5,10,20,-100" \
+  --output-path /tmp/halo2_ref_proof.json
+
+# 2. Verify the same artifact under the same build. The verifier's
+#    embedded params.bin + the deterministic prover seed mean
+#    proof bytes are byte-stable across regen runs.
+cargo run -p omni-node --features halo2-reference-prove -- \
+  operator verify-proof \
+  --proof-artifact /tmp/halo2_ref_proof.json
+```
+
+The roundtrip is exercised hermetically in CI by [`crates/omni-proofs-halo2-reference/tests/halo2_reference_prove_verify_roundtrip.rs`](../crates/omni-proofs-halo2-reference/tests/halo2_reference_prove_verify_roundtrip.rs) (4 tests: canonical input, non-canonical input, byte-determinism, tamper rejection) and by `operator::tests::generate_reference_proof_writes_artifact_that_verify_proof_accepts`.
+
+**Mainnet posture (unchanged from Stage 11b):**
+
+| Layer | Behavior |
+| --- | --- |
+| `testnet_or_dev_only = Some(true)` set by generator | Refused at [`check_mainnet_eligible`](../crates/omni-zkml/src/proof.rs) layer 1 |
+| `proof_system = Stage11bHalo2Reference` | Refused at layer 3 (`BoundedReference` class) and layer 6 (not in `MAINNET_APPROVED_PROOF_SYSTEMS`) |
+| Operator `--allow-mainnet-submit` | **Cannot override** the bounded-reference refusal |
+
+**Limitations:**
+
+- Circuit is bounded — the reference MLP. No model-format generality (the `model_format` is locked to `Halo2ReferenceMlp`).
+- Operator-supplied `--input-i16` must be 4 comma-separated values in `i16` range. The canonical evaluator derives the output deterministically; you cannot prove an attacker-chosen output.
+- The committed `params.bin` / `proof.bin` fixtures stay byte-stable; a `halo2_proofs` version bump shifts the bytes and requires a fixture-regen run via the workspace-excluded `tools/halo2_reference_regen/` tool.
+
+**Stage 14.1 engineering doc:** [`docs/stage14.1-halo2-reference-prove.md`](stage14.1-halo2-reference-prove.md) — scope, locks, surface map, CI gates, future outlook.

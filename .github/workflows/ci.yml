@@ -156,6 +156,31 @@ jobs:
           fi
           echo "default tree: no omni-proofs-halo2-production-mlp — Stage 11d.2 isolation intact."
 
+      # Stage 14.1 — explicit isolation guard for the halo2-reference
+      # PROVER crate. `omni-proofs-halo2-reference` is opt-in via
+      # both `halo2-reference-verify` AND `halo2-reference-prove`;
+      # default omni-node must contain neither.
+      #
+      # Note: `rand_chacha` is NOT a reliable isolation marker — it
+      # already ships as a transitive dep of libp2p / others in the
+      # default graph. The halo2_proofs check above (Stage 11b.1.b)
+      # and the omni-proofs-halo2-reference check here together
+      # cover the Stage 14.1 surface.
+      - name: Assert `omni-node` default tree has NO omni-proofs-halo2-reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo tree -p omni-node | grep -E 'omni-proofs-halo2-reference'; then
+            {
+              echo "::error::Default \`omni-node\` build pulls omni-proofs-halo2-reference."
+              echo "Stage 11b.1.b / Stage 14.1 feature gating must keep that crate"
+              echo "out of the default graph; only --features halo2-reference-verify"
+              echo "or --features halo2-reference-prove should pull it in."
+            } >&2
+            exit 1
+          fi
+          echo "default tree: no omni-proofs-halo2-reference — Stage 14.1 isolation intact."
+
       # Stage 12.0 — omni-contributor is intentionally INCLUDED in the
       # default omni-node graph (the `operator contributor …`
       # subcommand needs it). Assert presence as a hard gate — if the
@@ -343,6 +368,107 @@ jobs:
             exit 1
           fi
           echo "halo2-reference-verify tree: halo2_proofs present as expected."
+
+  # ── Stage 14.1: halo2-reference-prove build + test ──────────────────────────
+  #
+  # Prover + verifier: builds `omni-proofs-halo2-reference` with the
+  # `prove` feature (superset of `verify`, adds `rand_chacha` for
+  # the deterministic transcript) and runs:
+  #   1. the prover/adapter unit tests (`src/prover.rs::tests`)
+  #   2. the prove → verify roundtrip integration test
+  #      (`tests/halo2_reference_prove_verify_roundtrip.rs`)
+  #   3. the Stage 14.1 omni-node CLI tests in
+  #      `operator::tests::{parse_input_i16_*, generate_reference_proof_*,
+  #      mock_artifact_verify_path_*}` under
+  #      `--features halo2-reference-prove`
+  # The Mock artifact verification path is asserted to stay green
+  # under the new feature combination (coexistence pin).
+  halo2-reference-prove-build-test:
+    name: --features halo2-reference-prove — prover-and-verifier build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git / target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-halo2prove-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-halo2prove-
+
+      - name: cargo build -p omni-node --features halo2-reference-prove
+        run: cargo build -p omni-node --features halo2-reference-prove
+
+      - name: cargo test -p omni-proofs-halo2-reference --features prove --features verify
+        run: |
+          cargo test \
+            -p omni-proofs-halo2-reference \
+            --features prove --features verify
+
+      - name: cargo test -p omni-node --features halo2-reference-prove
+        run: |
+          cargo test \
+            -p omni-node \
+            --features halo2-reference-prove \
+            --bins
+
+  # ── Stage 14.1: opt-in prove-side tree-check ───────────────────────────────
+  #
+  # HARD GATE: with `--features halo2-reference-prove`, `omni-node`
+  # MUST pull BOTH `halo2_proofs` (verifier deps inherited via the
+  # crate's prove → verify chain) AND `rand_chacha` (the prover's
+  # deterministic transcript RNG). Either missing means the feature
+  # has silently gone inert.
+  halo2-reference-prove-tree-check:
+    name: halo2-reference-prove tree — must contain halo2_proofs + rand_chacha
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-tree-halo2prove-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tree-halo2prove-
+
+      - name: Assert `omni-node --features halo2-reference-prove` tree DOES contain halo2_proofs + rand_chacha
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree_out="$(cargo tree -p omni-node --features halo2-reference-prove)"
+          if ! echo "$tree_out" | grep -Eq 'halo2_proofs'; then
+            {
+              echo "::error::--features halo2-reference-prove no longer pulls halo2_proofs."
+              echo "The Stage 14.1 feature has gone inert; re-check the"
+              echo "omni-node feature definition and the dep gating on"
+              echo "omni-proofs-halo2-reference."
+            } >&2
+            exit 1
+          fi
+          if ! echo "$tree_out" | grep -Eq 'rand_chacha'; then
+            {
+              echo "::error::--features halo2-reference-prove no longer pulls rand_chacha."
+              echo "The Stage 14.1 prover-side RNG dep is missing; either the"
+              echo "omni-proofs-halo2-reference \`prove\` crate-feature is not"
+              echo "being enabled, or the rand_chacha optional dep gate broke."
+            } >&2
+            exit 1
+          fi
+          echo "halo2-reference-prove tree: halo2_proofs + rand_chacha present as expected."
 
   # ── Stage 11d.2: stage11d-production-verify build + test ───────────────────
   #
