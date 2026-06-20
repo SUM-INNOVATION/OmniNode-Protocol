@@ -3435,3 +3435,87 @@ The `reason` field is **opaque** — log scrapers match on `code` for closed-set
 **Stage 13.x track closes here.** Stages 13.0–13.9 deliver the complete integrity-evidence-anchor lifecycle (submit → verify → reconcile → summary → cleanup → export → import → archive → consistency → chain read). Future evolution (operator UX, reorg model, multi-chain) is out of scope for the 13.x track.
 
 **No protocol surface touched.** No envelope, no canonical-byte changes on Stage 12.0–12.25 surfaces, no `STATE_VERSION` / `STATE_INTEGRITY_REPORT_SCHEMA_VERSION` / `STATE_INTEGRITY_DIFF_SCHEMA_VERSION` / `SIGNED_BASELINE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION` / `INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` / `SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION` bump, no SNIP / mesh / payment / proof / marketplace surface. Stage 13.0 ships a new `INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION = 1` constant on its own wire surface and a new `omni-zkml::evidence_anchor` module; Stage 13.5 ships `EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION = 1` on its own portable-manifest surface; Stage 13.6 reuses both verbatim and adds no new schema constants; Stage 13.7 ships `ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION = 1` and `ANCHOR_ARCHIVE_MANIFEST_SCHEMA_VERSION = 1` on its own plan + manifest surface; Stage 13.8 ships `ANCHOR_CONSISTENCY_REPORT_SCHEMA_VERSION = 1` on its own report surface; Stage 13.9 ships `ANCHOR_STATUS_BATCH_MAX = 100` and `FAILED_REASON_NULL_FALLBACK` as documentation constants alongside the new `AnchorStatusReport` DTO — **no new schema constants and no existing schema modified**.
+
+### Stage 13.10 — operator acceptance: full lifecycle recipe + recovery playbook
+
+**Use when:** you want the canonical end-to-end walkthrough that stitches every 13.x command together, plus the failure-mode playbooks for the situations the umbrella acceptance suite pins. Stage 13.10 ships **no new operator features**; it is an acceptance / hardening checkpoint for the 13.x track.
+
+#### Full lifecycle recipe
+
+The canonical happy path threads through stages 13.0 → 13.9. Each step's invariants are pinned by the umbrella suite at [`crates/omni-zkml/tests/evidence_anchor_stage_13_10_acceptance.rs`](../crates/omni-zkml/tests/evidence_anchor_stage_13_10_acceptance.rs).
+
+```sh
+# ── 0. Pre-flight (Stage 13.8): always run consistency first ────────────────
+omni-node operator evidence-anchor report-integrity-evidence-anchor-consistency \
+  --anchor-registry-dir /var/omni-anchors
+
+# ── 1. Submit (Stage 13.0, requires --features submit) ─────────────────────
+omni-node operator evidence-anchor submit-integrity-evidence-anchor \
+  --signed-chain-report /var/signed/<report>.json \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url             https://rpc.sumchain.io \
+  --expect-chain-id     1 \
+  --allow-submit
+
+# ── 2. Chain-state catch-up (Stage 13.9 batched reconcile) ─────────────────
+omni-node operator evidence-anchor reconcile-integrity-evidence-anchor \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url             https://rpc.sumchain.io \
+  --expect-chain-id     1
+
+# ── 3. Inspect (Stage 13.3) ─────────────────────────────────────────────────
+omni-node operator evidence-anchor summary-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors
+
+# ── 4. Optional: keep an open record's identity in sync with the chain ─────
+omni-node operator evidence-anchor lookup-integrity-evidence-anchor-by-tuple \
+  --anchor-registry-dir /var/omni-anchors \
+  --rpc-url             https://rpc.sumchain.io \
+  --expect-chain-id     1 \
+  --tx-id               <chain-tx_id>
+
+# ── 5. Periodic cleanup of orphans / corrupted records (Stage 13.4) ────────
+omni-node operator evidence-anchor cleanup-integrity-evidence-anchor-registry \
+  --anchor-registry-dir /var/omni-anchors \
+  --quarantine-dir      /var/omni-anchor-quarantine \
+  --dry-run             # remove flag to apply
+
+# ── 6. Portable evidence packaging (Stage 13.5 + 13.6) ─────────────────────
+omni-node operator evidence-anchor export-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --export-out          /var/omni-anchor-export-2026-06
+
+omni-node operator evidence-anchor verify-integrity-evidence-anchor-export \
+  --export-dir          /var/omni-anchor-export-2026-06
+
+omni-node operator evidence-anchor import-integrity-evidence-anchor-export \
+  --export-dir          /var/omni-anchor-export-2026-06 \
+  --anchor-registry-dir /var/omni-anchors-target
+
+# ── 7. Cold archive of terminal records (Stage 13.7) ───────────────────────
+omni-node operator evidence-anchor archive-integrity-evidence-anchors \
+  --anchor-registry-dir /var/omni-anchors \
+  --archive-dir         /var/omni-anchor-archive
+```
+
+The umbrella suite's scenario 1 (`scenario_1_happy_path_full_lifecycle_seed_reconcile_summary_export_import_archive_restore`) exercises steps 1–7 against `FakeJsonRpcTransport`. If you need to validate a change against the lifecycle without touching a real chain, that test is the canonical reproducer.
+
+#### Recovery playbook
+
+| Symptom | Diagnosis command | Recovery |
+| --- | --- | --- |
+| Hot registry contains a record file that won't parse | `report-integrity-evidence-anchor-consistency` flags it as `hot_record_malformed` (Error severity). | `cleanup-integrity-evidence-anchor-registry --dry-run` plans a `quarantine_malformed_record` action; rerun without `--dry-run` to apply. The quarantine manifest is durable — restore via `restore-…` if quarantine was wrong. Pinned by umbrella scenario 2. |
+| `summary` reports a record stuck in `Submitted` past your expected confirmation window | `summary-…` + Stage 13.3 stale-list. `reconcile-…` with chain reporting `unknown` is **observation-only** and does NOT downgrade the local record. | If you suspect the chain truly never accepted the submit, use `lookup-integrity-evidence-anchor-by-tuple` to confirm; only the operator decides whether to mark the local record `Failed`. Pinned by umbrella scenario 3. |
+| `tx_index.json` has an entry with no backing record file | `report-…-consistency` flags `hot_tx_index_orphan`. | `cleanup-…-registry` plans `remove_orphan_tx_index_entry`. Pinned by umbrella scenario 4. |
+| A portable export bundle has been tampered with in transit | `verify-integrity-evidence-anchor-export` refuses with a Stage 13.5 reason tag. | **Do not import.** Re-export from the source registry, transfer again, re-verify. The import command re-runs verification internally, so a tampered bundle cannot accidentally be imported. Pinned by umbrella scenario 5. |
+| Operator re-ran `import-…-export` against a target that already holds the bundle's records byte-equal | `import-…-export` either succeeds idempotently (no record bytes change) or refuses with `import_target_exists` whose closed-set `field` distinguishes byte-equal vs divergent collision. | Re-running a clean import is safe; the on-disk record bytes do not change. Investigate any `import_target_exists` refusal where `field=tx_id` or `field=artifact_hash` indicates divergent bytes. Pinned by umbrella scenario 6. |
+| Archive apply failed mid-flight; some records gone from hot but the manifest is durable | `report-…-consistency` (with `--archive-dirs` pointing at the affected archive plan) cross-checks archive vs hot. | Run `restore-anchor-archive` on the archive manifest with the same `--anchor-registry-dir`. The restore is **idempotent** byte-equal: missing records are materialised from archive bytes, byte-equal records are left untouched (no rewrite), and tx_index entries are re-added. Pinned by umbrella scenario 7. |
+| Want consistency over chain reconcile, but chain is unreachable | `report-…-consistency` is local-only — it makes **zero chain RPCs.** | Run consistency first, fix any orphans/malformed records, then run reconcile when the chain is reachable. Pinned by umbrella scenario 8. |
+| By-tuple lookup reports `tx_id_matches_canonical=false` | The chain's canonical `tx_hash` differs from the local record's `receipt.tx_id` (cosmetic `0x`/case canonicalization, or genuine duplicate-anchor race). | **Stage 13.x does NOT auto-repair.** The local registry is not mutated by the lookup. Operator decides what to do (e.g. write a follow-up record manually, document the divergence). Pinned by umbrella scenario 9. |
+
+#### Stage 13.10 acceptance reference
+
+- Engineering doc: [`docs/stage13.10-acceptance.md`](stage13.10-acceptance.md) — operator-acceptance scope, scenario inventory, sign-off matrix.
+- Umbrella test suite: [`crates/omni-zkml/tests/evidence_anchor_stage_13_10_acceptance.rs`](../crates/omni-zkml/tests/evidence_anchor_stage_13_10_acceptance.rs) — 12 hermetic tests covering the 9 scenarios above plus a `parse_event_line` self-test, a `_no_chain_anchor` event-line shape pin, and an error-taxonomy smoke.
+
+**No new operator features.** Stage 13.10 changes no production code; the 13.x track closes as delivered through Stage 13.9.
