@@ -57,3 +57,11 @@ pub use shared::{
 
 #[cfg(feature = "verify")]
 pub use verifier::Halo2ReferenceVerifier;
+
+// Stage 14.1 — operator-reachable prover. The adapter exposes
+// `prove_canonical` through `omni_zkml::ProofBackend` so
+// `omni-node`'s `halo2-reference-prove` feature can dispatch
+// proof generation through the same trait seam as the Mock
+// backend.
+#[cfg(feature = "prove")]
+pub use prover::Halo2ReferenceProofBackend;

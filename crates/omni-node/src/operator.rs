@@ -220,6 +220,30 @@ pub(crate) enum OperatorError {
         source: std::io::Error,
     },
 
+    /// Stage 14.1: `operator generate-reference-proof` could not
+    /// parse the `--input-i16` argument as four comma-separated
+    /// `i16` values.
+    #[cfg(feature = "halo2-reference-prove")]
+    #[error("--input-i16 must be four comma-separated i16 values: {0}")]
+    ReferenceProofInputParse(String),
+
+    /// Stage 14.1: `operator generate-reference-proof` failed
+    /// inside the halo2-reference prover (canonical-spec drift,
+    /// halo2 internal failure, …).
+    #[cfg(feature = "halo2-reference-prove")]
+    #[error("halo2-reference prover failure: {0}")]
+    ReferenceProofProver(String),
+
+    /// Stage 14.1: `operator generate-reference-proof` could not
+    /// write the artifact JSON to the requested `--output-path`.
+    #[cfg(feature = "halo2-reference-prove")]
+    #[error("failed to write --output-path {path}: {source}")]
+    ReferenceProofWrite {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[cfg(feature = "submit")]
     #[error(
         "smoke needs an attestation source: pass --attestation-json, or \
@@ -682,6 +706,18 @@ enum OperatorCmd {
     /// behaviour change to make in Stage 11b.0.
     VerifyProof(VerifyProofArgs),
 
+    /// Stage 14.1 — generate a halo2-reference proof artifact for
+    /// a `[i16; 4]` input. Gated by the `halo2-reference-prove`
+    /// feature; runs entirely on the operator host (deterministic
+    /// halo2 prover with seeded transcript). The produced
+    /// artifact has `proof_system = Stage11bHalo2Reference` and
+    /// `testnet_or_dev_only = Some(true)` — submission to
+    /// `chain_id == 1` is hard-refused at
+    /// `check_mainnet_eligible` layers 1 + 3 + 6. Symmetric with
+    /// `verify-proof`'s halo2-reference dispatch arm.
+    #[cfg(feature = "halo2-reference-prove")]
+    GenerateReferenceProof(GenerateReferenceProofArgs),
+
     /// Stage 12.0 — Contributor Inference Node workflow subcommands.
     /// Off-chain only. Reachable on the default build. AttestationOnly
     /// evidence mode only in 12.0.
@@ -746,6 +782,25 @@ struct VerifyProofArgs {
     /// must parse via [`omni_zkml::ProofArtifactBody`]'s serde shape.
     #[arg(long)]
     proof_artifact: PathBuf,
+}
+
+#[cfg(feature = "halo2-reference-prove")]
+#[derive(Args)]
+struct GenerateReferenceProofArgs {
+    /// Four `i16` values, comma-separated (e.g. `-5,10,20,-100`).
+    /// The canonical evaluator derives the output deterministically;
+    /// the produced proof binds the `(canonical_spec, input, output)`
+    /// triple under the Stage 11b.1 halo2-reference circuit.
+    #[arg(long)]
+    input_i16: String,
+
+    /// Destination JSON file. The on-disk shape is
+    /// [`omni_zkml::ProofArtifactBody`] — directly consumable by
+    /// `operator verify-proof --proof-artifact <path>` under the
+    /// same `--features halo2-reference-prove` (or
+    /// `--features halo2-reference-verify`) build.
+    #[arg(long)]
+    output_path: PathBuf,
 }
 
 #[derive(Args)]
@@ -1011,6 +1066,10 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
         },
         OperatorCmd::VerifyProof(a) => {
             verify_proof_core(a.proof_artifact).await?;
+        }
+        #[cfg(feature = "halo2-reference-prove")]
+        OperatorCmd::GenerateReferenceProof(a) => {
+            generate_reference_proof_core(a.input_i16, a.output_path).await?;
         }
         OperatorCmd::Contributor(a) => {
             // Stage 12.0 — off-chain contributor workflow. Maps any
@@ -1795,6 +1854,8 @@ fn subcommand_name(c: &OperatorCmd) -> &'static str {
         OperatorCmd::DeriveAddress => "derive-address",
         OperatorCmd::Registry(_) => "registry",
         OperatorCmd::VerifyProof(_) => "verify-proof",
+        #[cfg(feature = "halo2-reference-prove")]
+        OperatorCmd::GenerateReferenceProof(_) => "generate-reference-proof",
         OperatorCmd::Contributor(_) => "contributor",
         OperatorCmd::EvidenceAnchor(_) => "evidence-anchor",
     }
@@ -1978,6 +2039,136 @@ async fn verify_proof_core(proof_artifact_path: PathBuf) -> Result<(), OperatorE
         Ok(())
     })
     .await
+}
+
+// ── Stage 14.1: generate-reference-proof ─────────────────────────────────────
+
+/// Stage 14.1 — produce a `ProofArtifactBody` JSON for the given
+/// `[i16; 4]` input, signed off by the halo2-reference prover.
+/// The artifact is directly consumable by `operator verify-proof`
+/// under the same `--features halo2-reference-verify` build, and
+/// is hard-refused on `chain_id == 1` by the same allowlist that
+/// already gates the verifier (no new mainnet-eligibility surface).
+#[cfg(feature = "halo2-reference-prove")]
+async fn generate_reference_proof_core(
+    input_i16_str: String,
+    output_path: PathBuf,
+) -> Result<(), OperatorError> {
+    run_blocking(move || -> Result<(), OperatorError> {
+        let input_i16 = parse_input_i16(&input_i16_str)?;
+
+        // The canonical-spec bytes are embedded into the
+        // reference crate at compile time; we recover them via
+        // the same `include_bytes!` path the verifier uses for
+        // `params.bin` (relative to the reference crate's
+        // assets/). The operator never has to supply them.
+        let model_bytes: &[u8] = include_bytes!(
+            "../../omni-proofs-halo2-reference/assets/canonical_spec.json"
+        );
+        let output_i16 = omni_proofs_halo2_reference::canonical_evaluate(input_i16);
+        let input_bytes =
+            omni_proofs_halo2_reference::encode_canonical_input(&input_i16);
+        let output_bytes =
+            omni_proofs_halo2_reference::encode_canonical_output(&output_i16);
+
+        // Drive the prover through the ProofBackend trait — the
+        // same seam Stage 11a uses for the Mock backend. This
+        // routes every (model, input, output) validation through
+        // the adapter and keeps any future backend swap a single
+        // type substitution.
+        use omni_zkml::ProofBackend;
+        let backend = omni_proofs_halo2_reference::Halo2ReferenceProofBackend::new();
+        let proof_bytes = backend
+            .prove(model_bytes, &input_bytes, &output_bytes)
+            .map_err(|e| OperatorError::ReferenceProofProver(e.to_string()))?;
+
+        // Assemble the verifier-compatible metadata. Field shape
+        // mirrors `Halo2ReferenceVerifier::verify_artifact`'s
+        // expectations 1:1 (proof_system / model_format /
+        // model_framework / testnet_or_dev_only / model_hash /
+        // public_inputs JSON).
+        let model_hash_hex = blake3::hash(model_bytes).to_hex().to_string();
+        let input_hash_hex = blake3::hash(&input_bytes).to_hex().to_string();
+        let output_hash_hex = blake3::hash(&output_bytes).to_hex().to_string();
+        let circuit_id_hex = backend
+            .circuit_id()
+            .map(|id| hex_lower(&id))
+            .expect("halo2-reference backend always exposes a circuit_id");
+        let public_inputs_json = serde_json::json!({
+            "input":  [input_i16[0],  input_i16[1],  input_i16[2],  input_i16[3]],
+            "output": [output_i16[0], output_i16[1], output_i16[2], output_i16[3]],
+        });
+
+        let metadata = omni_zkml::ProofMetadata {
+            backend_id: backend.backend_id().to_string(),
+            model_hash: model_hash_hex,
+            input_hash: input_hash_hex,
+            response_hash: output_hash_hex,
+            model_format: Some(omni_zkml::ModelFormat::Halo2ReferenceMlp),
+            proof_system: Some(omni_zkml::ProofSystem::Stage11bHalo2Reference),
+            circuit_id_hex: Some(circuit_id_hex),
+            verification_key_hex: None,
+            public_inputs: Some(public_inputs_json),
+            testnet_or_dev_only: Some(true),
+            model_framework: Some(omni_zkml::ModelFramework::FrameworkAgnostic),
+        };
+        let body =
+            omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes);
+        let body_bytes = serde_json::to_vec_pretty(&body).map_err(|e| {
+            OperatorError::ReferenceProofProver(format!(
+                "serialising ProofArtifactBody: {e}"
+            ))
+        })?;
+        std::fs::write(&output_path, &body_bytes).map_err(|e| {
+            OperatorError::ReferenceProofWrite {
+                path: output_path.display().to_string(),
+                source: e,
+            }
+        })?;
+
+        // Bare-stdout event line — same style as the rest of the
+        // operator surface; consumers grep `event=` to pick out
+        // structured fields.
+        println!(
+            "event=halo2_reference_proof_generated \
+             output_path={} proof_system=Stage11bHalo2Reference \
+             backend_id={} proof_bytes_len={} testnet_or_dev_only=true",
+            output_path.display(),
+            backend.backend_id(),
+            proof_bytes.len(),
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(feature = "halo2-reference-prove")]
+fn parse_input_i16(s: &str) -> Result<[i16; 4], OperatorError> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if parts.len() != 4 {
+        return Err(OperatorError::ReferenceProofInputParse(format!(
+            "expected 4 comma-separated values; got {}",
+            parts.len()
+        )));
+    }
+    let mut out = [0i16; 4];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = p.parse::<i16>().map_err(|e| {
+            OperatorError::ReferenceProofInputParse(format!(
+                "value {i} = {p:?}: {e}"
+            ))
+        })?;
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "halo2-reference-prove")]
+fn hex_lower(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 // ── registry list / show (Stage 9a) ───────────────────────────────────────────
@@ -3946,5 +4137,122 @@ mod tests {
             let mapped = map_mainnet_refusal(reason.clone());
             assert!(check(&mapped), "wrong mapping for {reason:?}: got {mapped:?}");
         }
+    }
+
+    // ── Stage 14.1 — generate-reference-proof CLI tests ─────────────────────
+
+    #[cfg(feature = "halo2-reference-prove")]
+    #[test]
+    fn parse_input_i16_accepts_canonical_value() {
+        let out = parse_input_i16("-5,10,20,-100").unwrap();
+        assert_eq!(
+            out,
+            omni_proofs_halo2_reference::CANONICAL_INPUT,
+            "canonical input string must round-trip into the canonical tuple"
+        );
+    }
+
+    #[cfg(feature = "halo2-reference-prove")]
+    #[test]
+    fn parse_input_i16_tolerates_whitespace_around_separators() {
+        let out = parse_input_i16(" -5 , 10 , 20 , -100 ").unwrap();
+        assert_eq!(out, [-5, 10, 20, -100]);
+    }
+
+    #[cfg(feature = "halo2-reference-prove")]
+    #[test]
+    fn parse_input_i16_refuses_wrong_arity() {
+        let err = parse_input_i16("1,2,3").unwrap_err();
+        match err {
+            OperatorError::ReferenceProofInputParse(msg) => {
+                assert!(msg.contains("expected 4"), "got: {msg}");
+            }
+            other => panic!("expected ReferenceProofInputParse, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "halo2-reference-prove")]
+    #[test]
+    fn parse_input_i16_refuses_non_i16_value() {
+        let err = parse_input_i16("999999,0,0,0").unwrap_err();
+        match err {
+            OperatorError::ReferenceProofInputParse(msg) => {
+                assert!(msg.contains("value 0"), "got: {msg}");
+            }
+            other => panic!("expected ReferenceProofInputParse, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "halo2-reference-prove")]
+    #[tokio::test]
+    async fn generate_reference_proof_writes_artifact_that_verify_proof_accepts() {
+        // End-to-end CLI roundtrip: generate-reference-proof
+        // writes an artifact at `--output-path`; verify-proof
+        // then accepts it under the same build's verifier
+        // dispatch arm. Pins the operator-side seam closed.
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("stage14_1_artifact.json");
+
+        generate_reference_proof_core("-5,10,20,-100".to_string(), out_path.clone())
+            .await
+            .expect("generate-reference-proof must succeed for canonical input");
+
+        // Artifact lands at the requested path.
+        assert!(out_path.is_file());
+        let body_bytes = std::fs::read(&out_path).unwrap();
+        let body: omni_zkml::ProofArtifactBody =
+            serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            body.metadata.proof_system,
+            Some(omni_zkml::ProofSystem::Stage11bHalo2Reference)
+        );
+        assert_eq!(body.metadata.testnet_or_dev_only, Some(true));
+        assert!(!body.proof_bytes_hex.is_empty());
+
+        // verify-proof accepts the artifact (same build's
+        // halo2-reference-verify dispatch arm).
+        verify_proof_core(out_path).await.expect(
+            "verify-proof must accept the artifact produced by generate-reference-proof",
+        );
+    }
+
+    #[cfg(feature = "halo2-reference-prove")]
+    #[tokio::test]
+    async fn generate_reference_proof_refuses_when_input_parse_fails_before_invoking_prover()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("never_written.json");
+        let err = generate_reference_proof_core(
+            "bogus-not-four-ints".to_string(),
+            out_path.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::ReferenceProofInputParse(_)),
+            "expected ReferenceProofInputParse, got {err:?}"
+        );
+        assert!(
+            !out_path.exists(),
+            "no artifact must be written when input parsing fails"
+        );
+    }
+
+    /// Stage 14.1 coexistence pin: the existing Mock-backend
+    /// verification flow stays green even when the
+    /// `halo2-reference-prove` feature is enabled. This proves
+    /// adding a real prover does not regress the default Mock
+    /// path (whose CI gate is the existing
+    /// `verify_proof_accepts_stage11a_mock_artifact_and_refuses_mainnet`
+    /// test, here re-asserted under the new feature combination).
+    #[cfg(feature = "halo2-reference-prove")]
+    #[tokio::test]
+    async fn mock_artifact_verify_path_still_accepts_under_halo2_reference_prove_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_stage11a_mock_proof_artifact(dir.path());
+        verify_proof_core(path).await.expect(
+            "Mock-backend artifact must still verify under \
+             --features halo2-reference-prove",
+        );
     }
 }

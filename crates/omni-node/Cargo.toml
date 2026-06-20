@@ -37,6 +37,17 @@ halo2-reference-verify = ["dep:omni-proofs-halo2-reference"]
 # refused by `check_mainnet_eligible` layer 6 because
 # `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty through Stage 11d.2.
 stage11d-production-verify = ["dep:omni-proofs-halo2-production-mlp"]
+# Stage 14.1 — opt-in feature that pulls the halo2 reference
+# PROVER (in addition to the verifier) into the operator binary so
+# operators can generate Stage11bHalo2Reference proofs in dev /
+# testnet. Superset of `halo2-reference-verify`: the underlying
+# crate's `prove` feature is a superset of `verify`, and the
+# operator-side prove path is only useful alongside the verify
+# path. Pulls `rand_chacha` (deterministic prover RNG) into the
+# compile graph. Default-OFF; mainnet posture unchanged —
+# `Stage11bHalo2Reference` is still hard-refused on `chain_id == 1`
+# at `check_mainnet_eligible` layers 1 + 3 + 6.
+halo2-reference-prove = ["halo2-reference-verify", "omni-proofs-halo2-reference/prove"]
 
 [dependencies]
 omni-types         = { workspace = true }
