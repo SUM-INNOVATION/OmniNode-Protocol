@@ -3576,3 +3576,68 @@ The roundtrip is exercised hermetically in CI by [`crates/omni-proofs-halo2-refe
 - The committed `params.bin` / `proof.bin` fixtures stay byte-stable; a `halo2_proofs` version bump shifts the bytes and requires a fixture-regen run via the workspace-excluded `tools/halo2_reference_regen/` tool.
 
 **Stage 14.1 engineering doc:** [`docs/stage14.1-halo2-reference-prove.md`](stage14.1-halo2-reference-prove.md) — scope, locks, surface map, CI gates, future outlook.
+
+### Stage 14.2 — contributor sidecar proof emission
+
+**Use when:** you want the `contributor run-job` flow to emit a halo2-reference `ProofArtifactBody` JSON sidecar alongside the produced `ContributorResult`, so a single CLI invocation closes the "run inference + prove correctness" loop for a canonical halo2-mlp-v1 job.
+
+**Requires:** `--features halo2-reference-prove` (the same feature Stage 14.1 introduced — no new feature is added in 14.2).
+
+**What changed:**
+- Two new feature-gated fields on `contributor run-job`:
+  - `--emit-halo2-reference-proof <PATH>` — destination JSON path for the sidecar artifact.
+  - `--stub-input <PATH>` — raw input bytes file. Clap enforces this is **required** whenever `--emit-halo2-reference-proof` is set; the missing-pair case fails at the argument layer before any work runs.
+- A post-run helper in [`crates/omni-node/src/contributor_cli.rs`](../crates/omni-node/src/contributor_cli.rs) (`emit_halo2_reference_proof_sidecar`) drives the existing Stage 14.1 [`Halo2ReferenceProofBackend`](../crates/omni-proofs-halo2-reference/src/prover.rs).
+- The sidecar artifact's `metadata.public_inputs` JSON carries `input + output + contributor_job_id` (the last is a new, additive key; the verifier reads only `input` and `output` and tolerates extras).
+
+**Required job shape:** the contributor `--job` MUST be a canonical `halo2-mlp-v1` job, i.e. `job.model_hash == BLAKE3(canonical_spec.json)`. Arbitrary models / GGUF / ONNX jobs are out of scope (Stage 14.4+ ezkl candidate). The CLI refuses non-canonical jobs cleanly with no sidecar written.
+
+**Required runner:** `--runner stub` only. ExternalCommandRunner proof emission is deferred to a later stage because capturing runner-produced response bytes for proving requires its own design.
+
+**Bytes flow (StubRunner-only, hermetic):**
+
+```
+--stub-input    →  raw input bytes  →  BLAKE3 == job.input_hash    (else refuse)
+--stub-response →  raw output bytes →  BLAKE3 == result.response_hash (else refuse)
+canonical_spec  →  EXPECTED_SPEC_HASH (embedded at compile time)   (else refuse)
+                    │
+                    └─→ Halo2ReferenceProofBackend.prove(model, input, output)
+                            │
+                            └─→ ProofArtifactBody JSON @ --emit-halo2-reference-proof
+```
+
+No SNIP fetch; no network; no chain RPC.
+
+**Workflow recipe:**
+
+```sh
+# Single invocation produces both a ContributorResult JSON and the
+# sidecar proof artifact.
+cargo run -p omni-node --features halo2-reference-prove -- \
+  operator contributor run-job \
+  --job          /path/to/canonical-halo2-mlp-v1-job.json \
+  --seed-file    /path/to/contributor.seed \
+  --runner       stub \
+  --stub-input   /path/to/input.bin \
+  --stub-response /path/to/output.bin \
+  --out          /path/to/result.json \
+  --emit-halo2-reference-proof /path/to/sidecar_proof.json
+
+# Verify the sidecar with the existing Stage 11b.1.b verifier path.
+cargo run -p omni-node --features halo2-reference-prove -- \
+  operator verify-proof --proof-artifact /path/to/sidecar_proof.json
+```
+
+**Mainnet posture (unchanged from Stage 14.1):**
+
+The sidecar artifact sets `testnet_or_dev_only = Some(true)` + `proof_system = Stage11bHalo2Reference` + `model_format = Halo2ReferenceMlp`. Submission on mainnet is hard-refused at `omni_zkml::check_mainnet_eligible` layers 1 + 3 + 6; `--allow-mainnet-submit` cannot override.
+
+**Limitations (operator-facing):**
+
+- Halo2 proving for the bounded MLP takes ~5–10 seconds per call on a typical operator host. The flag is opt-in per invocation; do not enable on hot paths.
+- StubRunner-only in Stage 14.2; ExternalCommandRunner wiring is a later stage.
+- The canonical halo2-mlp-v1 job is the only supported model shape today. Arbitrary models await Stage 14.4+ ezkl integration.
+- The `ContributorResult` JSON shape is unchanged (`schema_version: 1`, `Evidence::AttestationOnly`). The sidecar artifact is a separate file; the result itself does NOT mention the proof.
+- `produced_at_utc` on the contributor result uses wall-clock time, so two invocations against the same job do not produce byte-identical result JSONs (semantic equality is the invariant — schema, hashes, evidence, accounting all match).
+
+**Implementation reference:** [`docs/stage14.2-contributor-halo2-reference-proof.md`](stage14.2-contributor-halo2-reference-proof.md) — scope, locks D1–D6, surface map, test inventory, future outlook.
