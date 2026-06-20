@@ -3951,7 +3951,7 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
         args.no_prune_state_on_start,
     )?;
 
-    let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let mut relay = OmniNetRelay::new(net.clone(), handle);
         let mut source = NetworkSource::new(&mut relay, &snip_adapter);
         let mut emitter = StdoutEmitter;
@@ -4032,8 +4032,7 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
         Ok(())
     })
     .await
-    .map_err(|e| anyhow!("watch-network-jobs join: {e}"))?;
-    run_result
+    .map_err(|e| anyhow!("watch-network-jobs join: {e}"))?
 }
 
 async fn run_announce_result(args: AnnounceResultArgs) -> Result<()> {
@@ -4161,7 +4160,7 @@ async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> 
         args.no_prune_state_on_start,
     )?;
 
-    let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let mut relay = OmniNetRelay::new(net.clone(), handle);
         loop {
             if let Some(max) = args.max_polls {
@@ -4319,8 +4318,7 @@ async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> 
         }
     })
     .await
-    .map_err(|e| anyhow!("watch-network-results join: {e}"))?;
-    run_result
+    .map_err(|e| anyhow!("watch-network-results join: {e}"))?
 }
 
 // ── Stage 12.3 — session subcommand handlers ─────────────────────────────
@@ -5511,6 +5509,7 @@ async fn run_send_handoff(args: SendHandoffArgs) -> Result<()> {
 /// activation across the configured transport. The runner is the
 /// only source of truth for dtype + shape; the CLI never invents
 /// either. (Review #1 closed the prior F16/1-D fallback hole.)
+#[allow(clippy::too_many_arguments)]
 async fn live_send_activation<T: omni_contributor::TensorTransport>(
     transport: &mut T,
     session: &omni_contributor::ExecutionSession,
@@ -5804,7 +5803,7 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
         args.no_prune_state_on_start,
     )?;
 
-    let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let mut relay = OmniNetRelay::new(net, handle);
         // Session cache: needed so the assignment processor can
         // verify each assignment's coordinator signature against
@@ -5981,8 +5980,7 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
         }
     })
     .await
-    .map_err(|e| anyhow!("watch-sessions join: {e}"))?;
-    run_result
+    .map_err(|e| anyhow!("watch-sessions join: {e}"))?
 }
 
 // ── watch-sessions per-topic handlers (in-process; print bare-stdout events).
@@ -6294,6 +6292,7 @@ fn handle_assignment<A: omni_store::SnipV2Adapter + ?Sized>(
 /// Otherwise the announcement is accepted on its own (announcer
 /// sig + body schema + body-sig + drift); aggregate verification
 /// re-checks the references later.
+#[allow(clippy::too_many_arguments)]
 fn handle_assignment_supersession<A: omni_store::SnipV2Adapter + ?Sized>(
     snip: &A,
     out_dir: &std::path::Path,
@@ -6929,7 +6928,7 @@ async fn run_watch_peer_adverts(args: WatchPeerAdvertsArgs) -> Result<()> {
     let mut polls_done: u64 = 0;
     let mut adverts_written: u64 = 0;
 
-    let run_result = tokio::task::spawn_blocking(move || -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let mut relay = OmniNetRelay::new(net, handle);
         loop {
             if let Some(max) = args.max_polls {
@@ -7052,8 +7051,7 @@ async fn run_watch_peer_adverts(args: WatchPeerAdvertsArgs) -> Result<()> {
         }
     })
     .await
-    .map_err(|e| anyhow!("watch-peer-adverts join: {e}"))?;
-    run_result
+    .map_err(|e| anyhow!("watch-peer-adverts join: {e}"))?
 }
 
 fn stringify_peer_advert_outcome(
@@ -7455,6 +7453,7 @@ async fn run_assign_session_plan(args: AssignSessionPlanArgs) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use clap::Parser;
@@ -10772,8 +10771,8 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
     if !report.invalid_artifacts.is_empty() {
         println!("Invalid artifacts:");
         println!(
-            "  {:<22} {:<32} {}",
-            "kind", "reason_tag", "id"
+            "  {:<22} {:<32} id",
+            "kind", "reason_tag"
         );
         for entry in &report.invalid_artifacts {
             let (kind, id, reason_tag) = match entry {

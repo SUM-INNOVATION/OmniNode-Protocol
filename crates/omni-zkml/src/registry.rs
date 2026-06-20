@@ -323,7 +323,7 @@ impl AttestationRegistry {
                 })?;
             records.push(record);
         }
-        records.sort_by(|a, b| a.id.to_hex().cmp(&b.id.to_hex()));
+        records.sort_by_key(|r| r.id.to_hex());
         Ok(records)
     }
 
