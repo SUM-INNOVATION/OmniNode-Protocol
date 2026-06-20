@@ -3641,3 +3641,57 @@ The sidecar artifact sets `testnet_or_dev_only = Some(true)` + `proof_system = S
 - `produced_at_utc` on the contributor result uses wall-clock time, so two invocations against the same job do not produce byte-identical result JSONs (semantic equality is the invariant — schema, hashes, evidence, accounting all match).
 
 **Implementation reference:** [`docs/stage14.2-contributor-halo2-reference-proof.md`](stage14.2-contributor-halo2-reference-proof.md) — scope, locks D1–D6, surface map, test inventory, future outlook.
+
+### Stage 14.3 — ExternalCommandRunner sidecar proof emission
+
+**Use when:** you want the contributor `run-job` flow to emit a halo2-reference sidecar proof **while using an external inference command** (e.g. a Python script, a vendor binary, a `sum-mlx-inference` wrapper) instead of the StubRunner. Stage 14.3 extends Stage 14.2's emit flag to the ExternalCommandRunner path.
+
+**Requires:** `--features halo2-reference-prove` (same feature as Stage 14.2 — no new flag).
+
+**What changed vs. Stage 14.2:**
+
+- **`--emit-halo2-reference-proof` now works with `--runner external`** (Stage 14.2 refused).
+- **`--stub-input` is no longer needed for the external runner.** The bytes the runner sees are captured at the `InferenceRunner::run` trait boundary by a thin `ByteCapturingRunner` wrapper inside the CLI. The captured bytes are passed straight to the prover, so the operator does not duplicate the input/response file paths.
+- **`--stub-input` is still required for `--runner stub`** — Stage 14.2 contract preserved.
+- **Mechanism shift, same user contract:** the Stage 14.2 clap-layer `requires = "stub_input"` was replaced by an early runtime check inside `run-job`. If you set `--emit-…` with `--runner stub` and forget `--stub-input`, the command still fails fast with the same operator-facing message; the failure happens microseconds after CLI parse instead of at clap-parse time. No work runs.
+
+**Byte provenance rule:** the proof binds the **exact** `&[u8]` argument the runner saw via its `InferenceRunner::run` parameter and the **exact** `RunOutput.response_bytes` the runner returned. These are the same bytes `run_job` hashes for `result.input_hash` and `result.response_hash`. Hash bindings are tautological by construction.
+
+**Failure modes (D4 — no new event taxonomy):**
+
+| Symptom | Cause | Sidecar written? |
+|---|---|---|
+| External command exits non-zero | runner returns Err; `run_job` propagates Err before any sidecar code runs | ❌ no |
+| External command's stdout envelope is malformed | runner returns `ExternalEnvelopeMalformed`; same path as above | ❌ no |
+| External command's response bytes do not match `canonical_evaluate(input)` | the halo2 adapter's defense-in-depth check refuses before halo2 work; no sidecar | ❌ no |
+| `job.model_hash` is not the canonical halo2-mlp-v1 spec hash | runtime refusal inside the assembler | ❌ no |
+
+In every failure case the `ContributorResult` file is **also absent** (Stage 12.0 `run_job` Err returns before publishing). The CLI exits non-zero through the existing `OperatorError::ContributorWorkflow(String)` catch-all; **no new `event=…_failed` line is added**.
+
+**Workflow recipe (external runner):**
+
+```sh
+# Stage 14.3 — single invocation with --runner external.
+cargo run -p omni-node --features halo2-reference-prove -- \
+  operator contributor run-job \
+  --job          /path/to/canonical-halo2-mlp-v1-job.json \
+  --seed-file    /path/to/contributor.seed \
+  --runner       external \
+  --external-command /path/to/inference-runner \
+  --out          /path/to/result.json \
+  --emit-halo2-reference-proof /path/to/sidecar_proof.json
+# Note: no --stub-input, no --stub-response needed.
+
+# Same verify command as Stage 14.2.
+cargo run -p omni-node --features halo2-reference-prove -- \
+  operator verify-proof --proof-artifact /path/to/sidecar_proof.json
+```
+
+**Limitations:**
+
+- **Job-binding requirement unchanged:** the `--job` must be a canonical `halo2-mlp-v1` job (`job.model_hash == BLAKE3(canonical_spec.json)`). Arbitrary models / GGUF / ONNX jobs are out of scope (Stage 14.4+ ezkl).
+- **`run_with_activations` (Stage 12.4 live handoff) is out of scope (D7).** The wrapper covers only `InferenceRunner::run`. Stage 14.3 makes **no claim** about activation handoff proof binding; the default-impl forward chain is incidental, not a guarantee.
+- **`ContributorResult` semantic equality, not byte equality.** Two invocations against the same job (with or without `--emit-…`) produce results whose hashes / evidence / accounting all match but whose `produced_at_utc` differs (wall-clock time). Verifier scripts should compare structural fields, not raw JSON bytes.
+- Mainnet refusal unchanged from Stage 14.2 (3 independent layers fire on every emitted artifact).
+
+**Stage 14.3 engineering doc:** [`docs/stage14.3-external-command-runner-halo2-reference-proof.md`](stage14.3-external-command-runner-halo2-reference-proof.md) — scope, locks D1–D7, byte-capture lifecycle, surface map, test inventory, Stage 14.4 outlook.
