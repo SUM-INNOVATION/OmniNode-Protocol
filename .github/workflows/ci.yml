@@ -449,8 +449,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Bash string matching (no pipe to grep -q) avoids SIGPIPE
+          # tripping pipefail when grep finds a match and closes the
+          # pipe early.
           tree_out="$(cargo tree -p omni-node --features halo2-reference-prove)"
-          if ! echo "$tree_out" | grep -Eq 'halo2_proofs'; then
+          if [[ "$tree_out" != *'halo2_proofs'* ]]; then
             {
               echo "::error::--features halo2-reference-prove no longer pulls halo2_proofs."
               echo "The Stage 14.1 feature has gone inert; re-check the"
@@ -459,7 +462,7 @@ jobs:
             } >&2
             exit 1
           fi
-          if ! echo "$tree_out" | grep -Eq 'rand_chacha'; then
+          if [[ "$tree_out" != *'rand_chacha'* ]]; then
             {
               echo "::error::--features halo2-reference-prove no longer pulls rand_chacha."
               echo "The Stage 14.1 prover-side RNG dep is missing; either the"
