@@ -565,6 +565,121 @@ jobs:
           fi
           echo "stage11d-production-verify tree: halo2_proofs + production-mlp present as expected."
 
+  # ── Stage 14.5: stage11d-production-prove build + test ─────────────────────
+  #
+  # Prover + verifier: builds `omni-proofs-halo2-production-mlp` with the
+  # `prove` feature (superset of `verify`, adds `rand_chacha` for the
+  # deterministic transcript) and runs:
+  #   1. the lib unit tests (includes Stage 14.5's 6 new adapter tests)
+  #   2. the prove → verify roundtrip integration test
+  #      (`tests/halo2_production_mlp_prove_verify_roundtrip.rs`)
+  #   3. the Stage 14.5 omni-node CLI tests under
+  #      `--features stage11d-production-prove`
+  # The Mock artifact verification path is asserted to stay green
+  # under the new feature combination (coexistence pin), and the
+  # generated production artifact is mainnet-refused via layer 6
+  # (empty allowlist) — pinning the Stage 11d.3 dependency.
+  #
+  # `RUST_MIN_STACK` is raised here for the same reason as
+  # stage11d-production-verify-build-test: the production circuit's
+  # constraint-system walker exceeds the default 2 MB test stack.
+  stage11d-production-prove-build-test:
+    name: --features stage11d-production-prove — prover-and-verifier build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git / target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-stage11dprove-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stage11dprove-
+
+      - name: cargo build -p omni-node --features stage11d-production-prove
+        run: cargo build -p omni-node --features stage11d-production-prove
+
+      - name: cargo test -p omni-proofs-halo2-production-mlp --features prove --features verify
+        env:
+          RUST_MIN_STACK: "67108864"
+        run: |
+          cargo test \
+            -p omni-proofs-halo2-production-mlp \
+            --features prove --features verify
+
+      - name: cargo test -p omni-node --features stage11d-production-prove
+        env:
+          RUST_MIN_STACK: "67108864"
+        run: |
+          cargo test \
+            -p omni-node \
+            --features stage11d-production-prove \
+            --bins
+
+  # ── Stage 14.5: opt-in prove-side tree-check ───────────────────────────────
+  #
+  # HARD GATE: with `--features stage11d-production-prove`, `omni-node`
+  # MUST pull BOTH `halo2_proofs` AND `rand_chacha` (the prover's
+  # deterministic transcript RNG) AND `omni-proofs-halo2-production-mlp`.
+  # Either missing means the feature has silently gone inert.
+  stage11d-production-prove-tree-check:
+    name: stage11d-production-prove tree — must contain halo2_proofs + rand_chacha + production-mlp
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-tree-stage11dprove-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tree-stage11dprove-
+
+      - name: Assert `omni-node --features stage11d-production-prove` tree contains halo2_proofs + rand_chacha + production-mlp
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Bash string matching (no pipe to grep -q) avoids SIGPIPE
+          # tripping pipefail when grep finds a match and closes the
+          # pipe early. Same pattern as the Stage 14.1
+          # halo2-reference-prove tree-check.
+          tree_out="$(cargo tree -p omni-node --features stage11d-production-prove)"
+          if [[ "$tree_out" != *'halo2_proofs'* ]]; then
+            {
+              echo "::error::--features stage11d-production-prove no longer pulls halo2_proofs."
+              echo "The Stage 14.5 feature has gone inert."
+            } >&2
+            exit 1
+          fi
+          if [[ "$tree_out" != *'rand_chacha'* ]]; then
+            {
+              echo "::error::--features stage11d-production-prove no longer pulls rand_chacha."
+              echo "The Stage 14.5 prover-side RNG dep is missing."
+            } >&2
+            exit 1
+          fi
+          if [[ "$tree_out" != *'omni-proofs-halo2-production-mlp'* ]]; then
+            {
+              echo "::error::--features stage11d-production-prove no longer pulls omni-proofs-halo2-production-mlp."
+              echo "The Stage 14.5 feature gating is broken."
+            } >&2
+            exit 1
+          fi
+          echo "stage11d-production-prove tree: halo2_proofs + rand_chacha + production-mlp present as expected."
+
   # ── Stage 12.0: omni-contributor build + test ──────────────────────────────
   #
   # AttestationOnly contributor workflow. Default features only — there

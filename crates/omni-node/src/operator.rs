@@ -244,6 +244,30 @@ pub(crate) enum OperatorError {
         source: std::io::Error,
     },
 
+    /// Stage 14.5: `operator generate-production-mlp-proof` could
+    /// not parse the `--input-i16` argument as sixteen
+    /// comma-separated `i16` values.
+    #[cfg(feature = "stage11d-production-prove")]
+    #[error("--input-i16 must be sixteen comma-separated i16 values: {0}")]
+    ProductionMlpProofInputParse(String),
+
+    /// Stage 14.5: `operator generate-production-mlp-proof` failed
+    /// inside the halo2 production-MLP prover (canonical-spec drift,
+    /// halo2 internal failure, …).
+    #[cfg(feature = "stage11d-production-prove")]
+    #[error("halo2 production-MLP prover failure: {0}")]
+    ProductionMlpProofProver(String),
+
+    /// Stage 14.5: `operator generate-production-mlp-proof` could
+    /// not write the artifact JSON to the requested `--output-path`.
+    #[cfg(feature = "stage11d-production-prove")]
+    #[error("failed to write --output-path {path}: {source}")]
+    ProductionMlpProofWrite {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[cfg(feature = "submit")]
     #[error(
         "smoke needs an attestation source: pass --attestation-json, or \
@@ -718,6 +742,20 @@ enum OperatorCmd {
     #[cfg(feature = "halo2-reference-prove")]
     GenerateReferenceProof(GenerateReferenceProofArgs),
 
+    /// Stage 14.5 — generate a halo2 production-MLP proof artifact
+    /// for a `[i16; 16]` input. Gated by the
+    /// `stage11d-production-prove` feature; runs entirely on the
+    /// operator host (deterministic halo2 prover with seeded
+    /// transcript). The produced artifact has `proof_system =
+    /// Stage11dProductionFixedPointMlp` and **`testnet_or_dev_only
+    /// = Some(false)`** — production-shape contract. Submission to
+    /// `chain_id == 1` is hard-refused at `check_mainnet_eligible`
+    /// **layer 6 only** (the empty
+    /// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` allowlist). Symmetric
+    /// with `verify-proof`'s production-MLP dispatch arm.
+    #[cfg(feature = "stage11d-production-prove")]
+    GenerateProductionMlpProof(GenerateProductionMlpProofArgs),
+
     /// Stage 12.0 — Contributor Inference Node workflow subcommands.
     /// Off-chain only. Reachable on the default build. AttestationOnly
     /// evidence mode only in 12.0.
@@ -799,6 +837,28 @@ struct GenerateReferenceProofArgs {
     /// `operator verify-proof --proof-artifact <path>` under the
     /// same `--features halo2-reference-prove` (or
     /// `--features halo2-reference-verify`) build.
+    #[arg(long)]
+    output_path: PathBuf,
+}
+
+#[cfg(feature = "stage11d-production-prove")]
+#[derive(Args)]
+struct GenerateProductionMlpProofArgs {
+    /// Sixteen `i16` values, comma-separated (Stage 14.5 mirrors
+    /// Stage 14.1's flag shape — 16 values is still acceptable on
+    /// a single CLI invocation, and the surface stays narrow). The
+    /// canonical evaluator derives the 8-element output
+    /// deterministically; the produced proof binds the
+    /// `(canonical_production_spec, input, output)` triple under
+    /// the Stage 11d.2 production-MLP circuit.
+    #[arg(long)]
+    input_i16: String,
+
+    /// Destination JSON file. The on-disk shape is
+    /// [`omni_zkml::ProofArtifactBody`] — directly consumable by
+    /// `operator verify-proof --proof-artifact <path>` under the
+    /// same `--features stage11d-production-prove` (or
+    /// `--features stage11d-production-verify`) build.
     #[arg(long)]
     output_path: PathBuf,
 }
@@ -1070,6 +1130,10 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
         #[cfg(feature = "halo2-reference-prove")]
         OperatorCmd::GenerateReferenceProof(a) => {
             generate_reference_proof_core(a.input_i16, a.output_path).await?;
+        }
+        #[cfg(feature = "stage11d-production-prove")]
+        OperatorCmd::GenerateProductionMlpProof(a) => {
+            generate_production_mlp_proof_core(a.input_i16, a.output_path).await?;
         }
         OperatorCmd::Contributor(a) => {
             // Stage 12.0 — off-chain contributor workflow. Maps any
@@ -1856,6 +1920,8 @@ fn subcommand_name(c: &OperatorCmd) -> &'static str {
         OperatorCmd::VerifyProof(_) => "verify-proof",
         #[cfg(feature = "halo2-reference-prove")]
         OperatorCmd::GenerateReferenceProof(_) => "generate-reference-proof",
+        #[cfg(feature = "stage11d-production-prove")]
+        OperatorCmd::GenerateProductionMlpProof(_) => "generate-production-mlp-proof",
         OperatorCmd::Contributor(_) => "contributor",
         OperatorCmd::EvidenceAnchor(_) => "evidence-anchor",
     }
@@ -2169,6 +2235,126 @@ fn hex_lower(bytes: &[u8; 32]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+// ── Stage 14.5: generate-production-mlp-proof ────────────────────────────────
+
+/// Stage 14.5 — produce a `ProofArtifactBody` JSON for the given
+/// `[i16; 16]` input, signed off by the halo2 production-MLP
+/// prover. The artifact is directly consumable by
+/// `operator verify-proof` under the same
+/// `--features stage11d-production-verify` build, and is hard-refused
+/// on `chain_id == 1` at `check_mainnet_eligible` **layer 6 only**
+/// — production artifacts declare `testnet_or_dev_only=Some(false)`,
+/// so layer 1 does NOT fire (distinct from Stage 14.1's reference
+/// path which fires both layer 1 and layer 6). The empty
+/// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` allowlist is the sole
+/// mainnet gate; Stage 11d.3 lands the chain-team-reviewed allowlist
+/// entry that would lift it.
+#[cfg(feature = "stage11d-production-prove")]
+async fn generate_production_mlp_proof_core(
+    input_i16_str: String,
+    output_path: PathBuf,
+) -> Result<(), OperatorError> {
+    run_blocking(move || -> Result<(), OperatorError> {
+        let input_i16 = parse_input_16xi16(&input_i16_str)?;
+
+        let model_bytes: &[u8] = include_bytes!(
+            "../../omni-proofs-halo2-production-mlp/assets/canonical_spec.json"
+        );
+        let output_i16 =
+            omni_proofs_halo2_production_mlp::canonical_evaluate(input_i16);
+        let input_bytes =
+            omni_proofs_halo2_production_mlp::encode_canonical_input(&input_i16);
+        let output_bytes =
+            omni_proofs_halo2_production_mlp::encode_canonical_output(&output_i16);
+
+        use omni_zkml::ProofBackend;
+        let backend =
+            omni_proofs_halo2_production_mlp::Halo2ProductionMlpProofBackend::new();
+        let proof_bytes = backend
+            .prove(model_bytes, &input_bytes, &output_bytes)
+            .map_err(|e| OperatorError::ProductionMlpProofProver(e.to_string()))?;
+
+        // Production verifier requires `circuit_id_hex` AND
+        // `verification_key_hex` to be present (not optional);
+        // both must equal the pinned constants. The verifier
+        // refuses on None or drift (verifier.rs lines 302-334).
+        let model_hash_hex = blake3::hash(model_bytes).to_hex().to_string();
+        let input_hash_hex = blake3::hash(&input_bytes).to_hex().to_string();
+        let output_hash_hex = blake3::hash(&output_bytes).to_hex().to_string();
+        let public_inputs_json = serde_json::json!({
+            "input":  input_i16.to_vec(),
+            "output": output_i16.to_vec(),
+        });
+
+        let metadata = omni_zkml::ProofMetadata {
+            backend_id: backend.backend_id().to_string(),
+            model_hash: model_hash_hex,
+            input_hash: input_hash_hex,
+            response_hash: output_hash_hex,
+            model_format: Some(omni_zkml::ModelFormat::ProductionFixedPointMlp),
+            proof_system: Some(omni_zkml::ProofSystem::Stage11dProductionFixedPointMlp),
+            circuit_id_hex: Some(
+                omni_proofs_halo2_production_mlp::EXPECTED_CIRCUIT_ID_HEX
+                    .to_string(),
+            ),
+            verification_key_hex: Some(
+                omni_proofs_halo2_production_mlp::EXPECTED_VK_HASH_HEX.to_string(),
+            ),
+            public_inputs: Some(public_inputs_json),
+            // Stage 14.5 production-shape contract: `Some(false)`,
+            // NOT `Some(true)` like the reference path. Mainnet
+            // refusal lands at layer 6 (empty allowlist), not
+            // layer 1.
+            testnet_or_dev_only: Some(false),
+            model_framework: Some(omni_zkml::ModelFramework::FrameworkAgnostic),
+        };
+        let body =
+            omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes);
+        let body_bytes = serde_json::to_vec_pretty(&body).map_err(|e| {
+            OperatorError::ProductionMlpProofProver(format!(
+                "serialising ProofArtifactBody: {e}"
+            ))
+        })?;
+        std::fs::write(&output_path, &body_bytes).map_err(|e| {
+            OperatorError::ProductionMlpProofWrite {
+                path: output_path.display().to_string(),
+                source: e,
+            }
+        })?;
+
+        println!(
+            "event=halo2_production_mlp_proof_generated \
+             output_path={} proof_system=Stage11dProductionFixedPointMlp \
+             backend_id={} proof_bytes_len={} testnet_or_dev_only=false",
+            output_path.display(),
+            backend.backend_id(),
+            proof_bytes.len(),
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(feature = "stage11d-production-prove")]
+fn parse_input_16xi16(s: &str) -> Result<[i16; 16], OperatorError> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if parts.len() != 16 {
+        return Err(OperatorError::ProductionMlpProofInputParse(format!(
+            "expected 16 comma-separated values; got {}",
+            parts.len()
+        )));
+    }
+    let mut out = [0i16; 16];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = p.parse::<i16>().map_err(|e| {
+            OperatorError::ProductionMlpProofInputParse(format!(
+                "value {i} = {p:?}: {e}"
+            ))
+        })?;
+    }
+    Ok(out)
 }
 
 // ── registry list / show (Stage 9a) ───────────────────────────────────────────
@@ -4253,6 +4439,168 @@ mod tests {
         verify_proof_core(path).await.expect(
             "Mock-backend artifact must still verify under \
              --features halo2-reference-prove",
+        );
+    }
+
+    // ── Stage 14.5 — generate-production-mlp-proof CLI tests ────────────────
+
+    /// Canonical 16-int production input, comma-separated to
+    /// match what an operator would type on the CLI.
+    #[cfg(feature = "stage11d-production-prove")]
+    const CANONICAL_INPUT_16_STR: &str =
+        "-5,10,20,-100,7,-3,14,25,-8,1,11,-22,4,-1,17,9";
+
+    #[cfg(feature = "stage11d-production-prove")]
+    #[test]
+    fn parse_input_16xi16_accepts_canonical_value() {
+        let out = parse_input_16xi16(CANONICAL_INPUT_16_STR).unwrap();
+        assert_eq!(
+            out,
+            omni_proofs_halo2_production_mlp::CANONICAL_INPUT,
+            "canonical input string must round-trip into CANONICAL_INPUT"
+        );
+    }
+
+    #[cfg(feature = "stage11d-production-prove")]
+    #[test]
+    fn parse_input_16xi16_tolerates_whitespace_around_separators() {
+        // 16 values with extra whitespace.
+        let s = " -5 , 10 , 20 , -100 , 7 , -3 , 14 , 25 , -8 , 1 , 11 , -22 , 4 , -1 , 17 , 9 ";
+        let out = parse_input_16xi16(s).unwrap();
+        assert_eq!(out[0], -5);
+        assert_eq!(out[15], 9);
+    }
+
+    #[cfg(feature = "stage11d-production-prove")]
+    #[test]
+    fn parse_input_16xi16_refuses_wrong_arity() {
+        let err = parse_input_16xi16("1,2,3").unwrap_err();
+        match err {
+            OperatorError::ProductionMlpProofInputParse(msg) => {
+                assert!(msg.contains("expected 16"), "got: {msg}");
+            }
+            other => panic!("expected ProductionMlpProofInputParse, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "stage11d-production-prove")]
+    #[test]
+    fn parse_input_16xi16_refuses_non_i16_value() {
+        // 16 values, first is out of i16 range.
+        let err = parse_input_16xi16(
+            "999999,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0",
+        )
+        .unwrap_err();
+        match err {
+            OperatorError::ProductionMlpProofInputParse(msg) => {
+                assert!(msg.contains("value 0"), "got: {msg}");
+            }
+            other => panic!("expected ProductionMlpProofInputParse, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "stage11d-production-prove")]
+    #[tokio::test]
+    async fn generate_production_mlp_proof_writes_artifact_that_verify_proof_accepts() {
+        // End-to-end CLI roundtrip: generate-production-mlp-proof
+        // writes an artifact at `--output-path`; verify-proof then
+        // accepts it under the same build's verifier dispatch arm.
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("stage14_5_artifact.json");
+
+        generate_production_mlp_proof_core(
+            CANONICAL_INPUT_16_STR.to_string(),
+            out_path.clone(),
+        )
+        .await
+        .expect(
+            "generate-production-mlp-proof must succeed for canonical input",
+        );
+
+        assert!(out_path.is_file());
+        let body_bytes = std::fs::read(&out_path).unwrap();
+        let body: omni_zkml::ProofArtifactBody =
+            serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            body.metadata.proof_system,
+            Some(omni_zkml::ProofSystem::Stage11dProductionFixedPointMlp)
+        );
+        // Stage 14.5 production-shape contract: testnet_or_dev_only
+        // is `Some(false)`, NOT `Some(true)` like the reference path.
+        assert_eq!(body.metadata.testnet_or_dev_only, Some(false));
+        assert!(!body.proof_bytes_hex.is_empty());
+
+        verify_proof_core(out_path).await.expect(
+            "verify-proof must accept the artifact produced by \
+             generate-production-mlp-proof",
+        );
+    }
+
+    #[cfg(feature = "stage11d-production-prove")]
+    #[tokio::test]
+    async fn generate_production_mlp_proof_refuses_when_input_parse_fails_before_invoking_prover()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("never_written.json");
+        let err = generate_production_mlp_proof_core(
+            "bogus-not-sixteen-ints".to_string(),
+            out_path.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::ProductionMlpProofInputParse(_)),
+            "expected ProductionMlpProofInputParse, got {err:?}"
+        );
+        assert!(
+            !out_path.exists(),
+            "no artifact must be written when input parsing fails"
+        );
+    }
+
+    /// Stage 14.5 mainnet-posture pin: the production artifact
+    /// MUST still be refused under `check_mainnet_eligible`.
+    /// Distinct from Stage 14.1: production-shape declares
+    /// `testnet_or_dev_only=Some(false)`, so layer 1 does NOT
+    /// fire. The empty `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`
+    /// allowlist at layer 6 is the sole mainnet refusal — pinning
+    /// it here documents the Stage 11d.3 dependency.
+    #[cfg(feature = "stage11d-production-prove")]
+    #[tokio::test]
+    async fn generated_production_mlp_artifact_is_mainnet_refused_at_layer_6_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("stage14_5_mainnet_check.json");
+        generate_production_mlp_proof_core(
+            CANONICAL_INPUT_16_STR.to_string(),
+            out_path.clone(),
+        )
+        .await
+        .unwrap();
+        let body: omni_zkml::ProofArtifactBody =
+            serde_json::from_slice(&std::fs::read(&out_path).unwrap()).unwrap();
+        // Production-shape: testnet_or_dev_only is Some(false), so
+        // layer 1 does NOT refuse.
+        assert_eq!(body.metadata.testnet_or_dev_only, Some(false));
+        // But check_mainnet_eligible still refuses via layer 6
+        // (empty MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES).
+        let refusal = omni_zkml::check_mainnet_eligible(&body.metadata);
+        assert!(
+            refusal.is_err(),
+            "Stage 14.5 production artifact MUST be mainnet-refused; \
+             got Ok (Stage 11d.3 allowlist landed?)"
+        );
+    }
+
+    /// Stage 14.5 coexistence pin: the Mock-backend verification
+    /// flow stays green under the new feature combination.
+    #[cfg(feature = "stage11d-production-prove")]
+    #[tokio::test]
+    async fn mock_artifact_verify_path_still_accepts_under_stage11d_production_prove_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_stage11a_mock_proof_artifact(dir.path());
+        verify_proof_core(path).await.expect(
+            "Mock-backend artifact must still verify under \
+             --features stage11d-production-prove",
         );
     }
 }

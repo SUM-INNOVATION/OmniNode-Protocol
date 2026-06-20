@@ -3695,3 +3695,73 @@ cargo run -p omni-node --features halo2-reference-prove -- \
 - Mainnet refusal unchanged from Stage 14.2 (3 independent layers fire on every emitted artifact).
 
 **Stage 14.3 engineering doc:** [`docs/stage14.3-external-command-runner-halo2-reference-proof.md`](stage14.3-external-command-runner-halo2-reference-proof.md) — scope, locks D1–D7, byte-capture lifecycle, surface map, test inventory, Stage 14.4 outlook.
+
+### Stage 14.5 — halo2 production-MLP prover reachable from `omni-node`
+
+**Use when:** you want to generate a real Stage 11d.2 halo2 **production** proof for the canonical `16 → 32 → 16 → 8` fixed-point MLP from the operator binary, then verify it through the existing `operator verify-proof` surface. Closes the production-prover gap that Stage 11d.2 left open (the production verifier shell shipped at Stage 11d.2 with no prover sibling).
+
+**What was already in place (Stage 11d.2):**
+
+- [`omni-proofs-halo2-production-mlp`](../crates/omni-proofs-halo2-production-mlp/) ships a verifier (behind `feature = "verify"`) AND a developer-host prover (behind `feature = "prove"`), both bound to the same [`ProductionMlpCircuit`](../crates/omni-proofs-halo2-production-mlp/src/circuit.rs).
+- `ProofSystem::Stage11dProductionFixedPointMlp` is already a closed variant; the mainnet allowlist `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` stays empty — submission to `chain_id == 1` is hard-refused at [`omni_zkml::check_mainnet_eligible`](../crates/omni-zkml/src/proof.rs) **layer 6 only**.
+- `prove_canonical` is byte-deterministic via a fixed `ChaCha20Rng` seed; fixtures `params.bin` (131 140 bytes), `proof.bin`, and `proof_artifact.json` are committed under [`fixtures/halo2/`](../crates/omni-proofs-halo2-production-mlp/fixtures/halo2/).
+
+**What Stage 14.5 added:**
+
+- [`Halo2ProductionMlpProofBackend`](../crates/omni-proofs-halo2-production-mlp/src/prover.rs) — a thin `omni_zkml::ProofBackend` adapter over `prove_canonical`. Validates the `(model, input, output)` byte triple against the canonical spec and the neutral canonical evaluator before invoking the halo2 prover.
+- New `omni-node` feature `stage11d-production-prove` (superset of `stage11d-production-verify`) that opts into the production crate's `prove` feature.
+- New subcommand `operator generate-production-mlp-proof` (gated by the new feature) that emits a `ProofArtifactBody` JSON directly consumable by `operator verify-proof`.
+- New CI tree gate `stage11d-production-prove tree — must contain halo2_proofs + rand_chacha + production-mlp`.
+
+**Critical contract difference vs. Stage 14.1 (reference prover):**
+
+| Aspect | Stage 14.1 reference | **Stage 14.5 production** |
+| --- | --- | --- |
+| `testnet_or_dev_only` on artifact | `Some(true)` | **`Some(false)`** — production-shape contract |
+| Mainnet refusal layers fired | 1 + 3 + 6 (three independent gates) | **6 only** (sole gate — empty allowlist) |
+| `circuit_id_hex` / `verification_key_hex` | optional | **required, must equal pinned constants** (`593d027d…` / `2ec18fae…`) |
+| `model_format` | `Halo2ReferenceMlp` | `ProductionFixedPointMlp` |
+| Input / output arity | `[i16; 4]` / `[i16; 4]` | `[i16; 16]` / `[i16; 8]` |
+| `HALO2_K` | 10 | 11 |
+
+The Stage 14.5 mainnet refusal is **single-layer (layer 6) only.** That's by design: the artifact is production-shape, so layer 1 (testnet/dev refusal) does not fire. Lifting the refusal requires landing a chain-team-reviewed allowlist entry — that's the separate Stage 11d.3 deliverable. **No Stage 14.x change touches `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`.**
+
+**Default-build posture unchanged:** `cargo build -p omni-node` (no features) pulls zero halo2 / pasta / `omni-proofs-halo2-production-mlp` / `rand_chacha` (as a direct prover dep). The Mock-backend verification flow still works end-to-end. Both invariants are pinned by CI tree gates (existing Stage 11d.2 default-tree isolation guard + Stage 14.5 prove-tree positive check).
+
+**Workflow recipe:**
+
+```sh
+# 1. Generate a production-MLP proof for the canonical 16-int input.
+#    Output is a ProofArtifactBody JSON.
+cargo run -p omni-node --features stage11d-production-prove -- \
+  operator generate-production-mlp-proof \
+  --input-i16   "-5,10,20,-100,7,-3,14,25,-8,1,11,-22,4,-1,17,9" \
+  --output-path /tmp/halo2_prod_proof.json
+
+# 2. Verify the same artifact under the same build. The verifier's
+#    embedded params.bin + the deterministic prover seed mean
+#    proof bytes are byte-stable across regen runs.
+cargo run -p omni-node --features stage11d-production-prove -- \
+  operator verify-proof \
+  --proof-artifact /tmp/halo2_prod_proof.json
+```
+
+The roundtrip is exercised hermetically in CI by [`crates/omni-proofs-halo2-production-mlp/tests/halo2_production_mlp_prove_verify_roundtrip.rs`](../crates/omni-proofs-halo2-production-mlp/tests/halo2_production_mlp_prove_verify_roundtrip.rs) (4 tests: canonical roundtrip, byte-determinism, tamper rejection, production-shape contract pin) and by `operator::tests::generate_production_mlp_proof_writes_artifact_that_verify_proof_accepts` (+ 5 other Stage 14.5 CLI tests).
+
+**Mainnet posture:**
+
+| Layer | Behavior for Stage 14.5 artifact |
+| --- | --- |
+| Layer 1 (`testnet_or_dev_only == Some(true)`) | **Does NOT fire** — production artifact declares `Some(false)` |
+| Layer 6 (`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`) | **Refuses** — allowlist empty until Stage 11d.3 chain-team sign-off |
+
+The mainnet refusal is sole-source. Lift requires the Stage 11d.3 PR; Stage 14.5 does not block on it.
+
+**Limitations:**
+
+- Circuit shape locked to the canonical 16-int input / 8-int output. Arbitrary models / GGUF / ONNX remain out of scope.
+- Operator-supplied `--input-i16` must be 16 comma-separated values in `i16` range. Canonical evaluator derives the 8-int output deterministically; attacker-chosen outputs are refused.
+- Proving cost: ~30 seconds per call on a typical operator host (the production circuit is wider than the reference's 4 → 8 → 4). CI runs the suite with `RUST_MIN_STACK=67108864` (64 MB) to give the constraint-system walker enough stack.
+- Stage 11d.3 mainnet allowlist entry is the dependency for chain-side mainnet eligibility — **separate track, chain-team-reviewed.**
+
+**Stage 14.5 engineering doc:** [`docs/stage14.5-halo2-production-mlp-prove.md`](stage14.5-halo2-production-mlp-prove.md) — scope, surface map, contract diff vs Stage 14.1, CI gates, test inventory, Stage 14.6+ outlook.

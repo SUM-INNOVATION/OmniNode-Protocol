@@ -48,6 +48,24 @@ stage11d-production-verify = ["dep:omni-proofs-halo2-production-mlp"]
 # `Stage11bHalo2Reference` is still hard-refused on `chain_id == 1`
 # at `check_mainnet_eligible` layers 1 + 3 + 6.
 halo2-reference-prove = ["halo2-reference-verify", "omni-proofs-halo2-reference/prove"]
+# Stage 14.5 — opt-in feature that pulls the halo2 PRODUCTION-MLP
+# PROVER (in addition to the verifier) into the operator binary so
+# operators can generate Stage11dProductionFixedPointMlp proofs in
+# dev / testnet. Superset of `stage11d-production-verify`: the
+# underlying crate's `prove` feature is a superset of `verify`,
+# and the operator-side prove path is only useful alongside the
+# verify path. Pulls `rand_chacha` (deterministic prover RNG)
+# transitively. Default-OFF; mainnet posture unchanged —
+# `Stage11dProductionFixedPointMlp` is still hard-refused on
+# `chain_id == 1` at `check_mainnet_eligible` layer 6
+# (`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` empty). Distinct from
+# Stage 14.1: production artifacts declare
+# `testnet_or_dev_only=Some(false)`, so layer 1 does NOT fire —
+# layer 6 is the sole mainnet refusal.
+stage11d-production-prove = [
+    "stage11d-production-verify",
+    "omni-proofs-halo2-production-mlp/prove",
+]
 
 [dependencies]
 omni-types         = { workspace = true }
