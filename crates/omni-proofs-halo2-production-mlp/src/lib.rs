@@ -64,3 +64,11 @@ pub use verifier::{
     derive_vk_identity_from_params, live_circuit_id_hex, live_vk_hash_hex, vk_canonical_bytes,
     Halo2ProductionMlpVerifier,
 };
+
+// Stage 14.5 — operator-reachable prover. The adapter exposes
+// `prove_canonical` through `omni_zkml::ProofBackend` so
+// `omni-node`'s `stage11d-production-prove` feature can dispatch
+// proof generation through the same trait seam Stage 14.1 uses
+// for `Halo2ReferenceProofBackend`.
+#[cfg(feature = "prove")]
+pub use prover::Halo2ProductionMlpProofBackend;
