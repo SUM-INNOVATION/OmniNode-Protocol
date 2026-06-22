@@ -465,15 +465,54 @@ struct RunJobArgs {
     /// `--stub-input` is **not** required (the bytes are captured
     /// at the `InferenceRunner::run` trait boundary).
     #[cfg(feature = "halo2-reference-prove")]
-    #[arg(long)]
+    #[cfg_attr(
+        feature = "stage11d-production-prove",
+        arg(long, conflicts_with = "emit_production_mlp_proof")
+    )]
+    #[cfg_attr(
+        not(feature = "stage11d-production-prove"),
+        arg(long)
+    )]
     emit_halo2_reference_proof: Option<PathBuf>,
 
+    /// Stage 14.6 — write a sidecar
+    /// [`omni_zkml::ProofArtifactBody`] alongside the contributor
+    /// result, signed off by the halo2 PRODUCTION-MLP prover. The
+    /// proof binds `(canonical production-fixedpoint-mlp-v1 spec,
+    /// stub_input, stub_response)`. Requires `--stub-input <PATH>`
+    /// when `--runner stub` so the prover sees the exact same input
+    /// bytes the runner saw; for `--runner external` the bytes are
+    /// captured at the `InferenceRunner::run` trait boundary by
+    /// [`ByteCapturingRunner`]. **Production-shape contract**: the
+    /// emitted artifact declares `testnet_or_dev_only=Some(false)`,
+    /// `circuit_id_hex` AND `verification_key_hex` must equal the
+    /// Stage 11d.2 pinned constants, and the input/output sizes are
+    /// 32 / 16 bytes (16-i16 / 8-i16 LE). Mainnet refusal lands at
+    /// `check_mainnet_eligible` **layer 6 only** (empty
+    /// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`). Mutually exclusive
+    /// with `--emit-halo2-reference-proof` at the clap layer (Stage
+    /// 14.6 Q3 lock — declare on both fields for defensive symmetry,
+    /// gated by `cfg_attr` so single-feature builds compile).
+    /// Feature-gated by `stage11d-production-prove`.
+    #[cfg(feature = "stage11d-production-prove")]
+    #[cfg_attr(
+        feature = "halo2-reference-prove",
+        arg(long, conflicts_with = "emit_halo2_reference_proof")
+    )]
+    #[cfg_attr(
+        not(feature = "halo2-reference-prove"),
+        arg(long)
+    )]
+    emit_production_mlp_proof: Option<PathBuf>,
+
     /// Stage 14.2 — `stub` runner: path to the raw input bytes
-    /// the runner saw. Required when `--emit-halo2-reference-proof`
-    /// is set **and** `--runner stub`; ignored for
-    /// `--runner external` (Stage 14.3 captures input bytes at
-    /// the trait boundary). Feature-gated by `halo2-reference-prove`.
-    #[cfg(feature = "halo2-reference-prove")]
+    /// the runner saw. Required when **either**
+    /// `--emit-halo2-reference-proof` (Stage 14.2) **or**
+    /// `--emit-production-mlp-proof` (Stage 14.6) is set **and**
+    /// `--runner stub`; ignored for `--runner external` (Stage
+    /// 14.3 captures input bytes at the trait boundary). Available
+    /// in any build with at least one prover feature enabled.
+    #[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
     #[arg(long)]
     stub_input: Option<PathBuf>,
 }
@@ -3423,14 +3462,13 @@ fn run_validate_job(args: ValidateJobArgs) -> Result<()> {
 }
 
 fn run_run_job(args: RunJobArgs) -> Result<()> {
-    // Stage 14.3 D1 Alpha — runtime check for the
-    // `--emit-halo2-reference-proof + --runner stub` pairing.
-    // The static `requires = "stub_input"` clap attribute was
-    // removed in Stage 14.3 so the ExternalRunner emit path
-    // does not falsely require `--stub-input`. The runtime check
-    // here fires BEFORE any work runs, preserving the Stage 14.2
-    // user-observable contract: missing `--stub-input` with
-    // `--emit-…` and `--runner stub` fails fast with a clear error.
+    // Stage 14.3 D1 Alpha + Stage 14.6 — runtime check for the
+    // `--emit-…-proof + --runner stub` pairing. Stage 14.3 moved
+    // the StubRunner `--stub-input` requirement off of clap's
+    // static `requires` so the ExternalRunner emit path does not
+    // falsely require it. Stage 14.6 extends the runtime check to
+    // cover the new `--emit-production-mlp-proof` flag so the same
+    // user-observable contract holds for both prove paths.
     #[cfg(feature = "halo2-reference-prove")]
     if args.emit_halo2_reference_proof.is_some()
         && args.runner == RunnerChoice::Stub
@@ -3438,6 +3476,15 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
     {
         bail!(
             "--emit-halo2-reference-proof with --runner stub requires --stub-input <PATH>"
+        );
+    }
+    #[cfg(feature = "stage11d-production-prove")]
+    if args.emit_production_mlp_proof.is_some()
+        && args.runner == RunnerChoice::Stub
+        && args.stub_input.is_none()
+    {
+        bail!(
+            "--emit-production-mlp-proof with --runner stub requires --stub-input <PATH>"
         );
     }
 
@@ -3460,7 +3507,13 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
     // bytes-based sidecar helper. Captured bytes (`Option`s
     // returned by the wrapper) are extracted here and threaded
     // through to the emission helper below.
-    #[cfg(feature = "halo2-reference-prove")]
+    // Stage 14.6 — the captured-bytes slot serves BOTH the
+    // halo2-reference (Stage 14.3) and the production-MLP (Stage 14.6)
+    // External-runner emit paths. Broadened from
+    // `cfg(halo2-reference-prove)` so single-feature builds with only
+    // stage11d-production-prove can still capture for the production
+    // emit path.
+    #[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
     let mut captured_external_bytes: Option<(Vec<u8>, Vec<u8>)> = None;
 
     let result = match args.runner {
@@ -3483,29 +3536,44 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
             );
             runner.extra_args = args.external_args;
             runner.env_allowlist = args.external_env_allow;
-            #[cfg(feature = "halo2-reference-prove")]
-            if args.emit_halo2_reference_proof.is_some() {
+
+            // Stage 14.3 + 14.6 — determine whether any emit flag
+            // is set so we know to wrap the runner in
+            // `ByteCapturingRunner`. The clap `conflicts_with`
+            // attribute guarantees at most one of the two emit
+            // flags is set; the wrap predicate is the OR of both.
+            #[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
+            let needs_capture = {
+                let mut v = false;
+                #[cfg(feature = "halo2-reference-prove")]
+                {
+                    v |= args.emit_halo2_reference_proof.is_some();
+                }
+                #[cfg(feature = "stage11d-production-prove")]
+                {
+                    v |= args.emit_production_mlp_proof.is_some();
+                }
+                v
+            };
+
+            #[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
+            if needs_capture {
                 // Wrap the runner so bytes are captured at the
-                // `InferenceRunner::run` trait boundary (D6
-                // lifecycle). Post-run we extract the slots
-                // before they go out of scope.
+                // `InferenceRunner::run` trait boundary (Stage
+                // 14.3 D6 lifecycle). Post-run we extract the
+                // slots before they go out of scope.
                 let capturing = ByteCapturingRunner::new(&runner);
                 let r = run_external_with_runner(&job, &adapter, &capturing, opts)?;
-                // D6 — both slots MUST be `Some` after a
-                // successful inner run. A defensive
-                // double-check here keeps the helper's
-                // expectations tight; the bytes-based wrapper
-                // refuses cleanly if either is missing.
                 let ci = capturing.take_captured_input().ok_or_else(|| {
                     anyhow!(
-                        "halo2-reference proof emission: runner did not capture \
-                         input bytes (likely a pre-runner refusal); no sidecar written"
+                        "proof emission: runner did not capture input bytes \
+                         (likely a pre-runner refusal); no sidecar written"
                     )
                 })?;
                 let co = capturing.take_captured_output().ok_or_else(|| {
                     anyhow!(
-                        "halo2-reference proof emission: runner did not capture \
-                         output bytes (runner returned Err or never produced response); \
+                        "proof emission: runner did not capture output bytes \
+                         (runner returned Err or never produced response); \
                          no sidecar written"
                     )
                 })?;
@@ -3514,7 +3582,7 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
             } else {
                 run_external_with_runner(&job, &adapter, &runner, opts)?
             }
-            #[cfg(not(feature = "halo2-reference-prove"))]
+            #[cfg(not(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove")))]
             {
                 run_external_with_runner(&job, &adapter, &runner, opts)?
             }
@@ -3561,6 +3629,38 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
                 // captured_external_bytes (or returns Err earlier).
                 bail!(
                     "halo2-reference proof emission: External-runner byte capture \
+                     slot empty; this is an internal invariant violation"
+                );
+            }
+        }
+        println!("proof_artifact_path={}", proof_path.display());
+    }
+
+    // Stage 14.6 — production-MLP sidecar emission. Clap's
+    // `conflicts_with` guarantees the reference block above and this
+    // block are mutually exclusive (at most one emit flag is set per
+    // invocation).
+    #[cfg(feature = "stage11d-production-prove")]
+    if let Some(ref proof_path) = args.emit_production_mlp_proof {
+        match (args.runner, captured_external_bytes.as_ref()) {
+            (RunnerChoice::Stub, _) => {
+                emit_production_mlp_proof_sidecar(
+                    &job,
+                    &result,
+                    args.runner,
+                    args.stub_input.as_deref(),
+                    args.stub_response.as_deref(),
+                    proof_path,
+                )?;
+            }
+            (RunnerChoice::External, Some((ci, co))) => {
+                emit_production_mlp_proof_sidecar_from_bytes(
+                    &job, &result, ci, co, proof_path,
+                )?;
+            }
+            (RunnerChoice::External, None) => {
+                bail!(
+                    "production-MLP proof emission: External-runner byte capture \
                      slot empty; this is an internal invariant violation"
                 );
             }
@@ -3786,6 +3886,204 @@ fn assemble_and_write_sidecar(
     Ok(())
 }
 
+// ── Stage 14.6: production-MLP sidecar emission ──────────────────────────────
+
+/// Stage 14.6 path — file-based sidecar emission for the StubRunner
+/// (operator supplies `--stub-input` + `--stub-response` files whose
+/// bytes hash to the contributor's committed hashes). Delegates the
+/// actual proof + artifact write to
+/// [`assemble_and_write_production_sidecar`]. Parallel to Stage 14.2's
+/// [`emit_halo2_reference_proof_sidecar`] but with the production-
+/// specific metadata contract.
+#[cfg(feature = "stage11d-production-prove")]
+fn emit_production_mlp_proof_sidecar(
+    job: &ContributorJob,
+    result: &ContributorResult,
+    runner: RunnerChoice,
+    stub_input: Option<&std::path::Path>,
+    stub_response: Option<&std::path::Path>,
+    proof_path: &std::path::Path,
+) -> Result<()> {
+    if runner != RunnerChoice::Stub {
+        bail!(
+            "emit_production_mlp_proof_sidecar is the StubRunner path; \
+             ExternalCommandRunner emission must go through \
+             emit_production_mlp_proof_sidecar_from_bytes"
+        );
+    }
+    let stub_input_path = stub_input.ok_or_else(|| {
+        anyhow!(
+            "--emit-production-mlp-proof with --runner stub requires --stub-input <PATH>"
+        )
+    })?;
+    let stub_response_path = stub_response.ok_or_else(|| {
+        anyhow!(
+            "--emit-production-mlp-proof with --runner stub requires --stub-response <PATH> \
+             (the runner already required it for --runner stub)"
+        )
+    })?;
+
+    let stub_input_bytes = std::fs::read(stub_input_path).with_context(|| {
+        format!("read --stub-input {}", stub_input_path.display())
+    })?;
+    let stub_response_bytes = std::fs::read(stub_response_path).with_context(|| {
+        format!("read --stub-response {}", stub_response_path.display())
+    })?;
+    assemble_and_write_production_sidecar(
+        job, result, &stub_input_bytes, &stub_response_bytes, proof_path,
+    )
+}
+
+/// Stage 14.6 path — bytes-based sidecar emission for the
+/// ExternalCommandRunner (bytes captured at the
+/// [`InferenceRunner::run`] trait boundary via the shared
+/// [`ByteCapturingRunner`] from Stage 14.3). Same proof + artifact
+/// path as [`emit_production_mlp_proof_sidecar`]; both delegate to
+/// [`assemble_and_write_production_sidecar`].
+#[cfg(feature = "stage11d-production-prove")]
+fn emit_production_mlp_proof_sidecar_from_bytes(
+    job: &ContributorJob,
+    result: &ContributorResult,
+    captured_input: &[u8],
+    captured_output: &[u8],
+    proof_path: &std::path::Path,
+) -> Result<()> {
+    assemble_and_write_production_sidecar(
+        job, result, captured_input, captured_output, proof_path,
+    )
+}
+
+/// Stage 14.6 — production-MLP assembler. Parallel to Stage 14.2/14.3's
+/// [`assemble_and_write_sidecar`] but pins the **Stage 11d.2 production
+/// metadata contract**:
+///
+/// - `canonical_spec` from the production crate's `assets/canonical_spec.json`;
+///   `job.model_hash` MUST equal `BLAKE3(canonical_spec)`.
+/// - `input` is exactly 32 bytes (16 × i16 LE); `output` exactly 16 bytes
+///   (8 × i16 LE) — the production adapter refuses on size mismatch.
+/// - `proof_system = Stage11dProductionFixedPointMlp`.
+/// - `model_format = ProductionFixedPointMlp`.
+/// - `circuit_id_hex = EXPECTED_CIRCUIT_ID_HEX` AND
+///   `verification_key_hex = EXPECTED_VK_HASH_HEX` — both **required**
+///   on production artifacts (the verifier refuses `None`).
+/// - `testnet_or_dev_only = Some(false)` — production-shape contract.
+///
+/// Mainnet refusal lands at `check_mainnet_eligible` **layer 6 only**:
+/// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty; layer 1 does NOT fire
+/// because the artifact correctly declares `Some(false)`. Lifting the
+/// refusal requires the separate Stage 11d.3 chain-team-reviewed
+/// allowlist PR.
+///
+/// The `public_inputs` JSON carries `contributor_job_id` as an extra
+/// key beyond `input`/`output`; the production verifier's
+/// `decode_public_inputs_json` reads only the two arrays and tolerates
+/// extras — same pattern Stage 14.2 pinned for the reference verifier.
+#[cfg(feature = "stage11d-production-prove")]
+fn assemble_and_write_production_sidecar(
+    job: &ContributorJob,
+    result: &ContributorResult,
+    input_bytes: &[u8],
+    output_bytes: &[u8],
+    proof_path: &std::path::Path,
+) -> Result<()> {
+    let canonical_spec: &[u8] = include_bytes!(
+        "../../omni-proofs-halo2-production-mlp/assets/canonical_spec.json"
+    );
+    let expected_spec_hash_hex = blake3::hash(canonical_spec).to_hex().to_string();
+    if job.model_hash != expected_spec_hash_hex {
+        bail!(
+            "--emit-production-mlp-proof refused: job.model_hash {} does not \
+             match the canonical production-fixedpoint-mlp-v1 spec hash {}",
+            job.model_hash,
+            expected_spec_hash_hex
+        );
+    }
+
+    // Hash bindings — tautological for the ExternalRunner path (the
+    // captured bytes are exactly what `run_job` hashed); defensive
+    // for the StubRunner path (catches operator typos / file
+    // substitution before any halo2 work).
+    let input_hash_hex = blake3::hash(input_bytes).to_hex().to_string();
+    if input_hash_hex != job.input_hash {
+        bail!(
+            "input bytes BLAKE3 {} does not match job.input_hash {}",
+            input_hash_hex,
+            job.input_hash
+        );
+    }
+    let output_hash_hex = blake3::hash(output_bytes).to_hex().to_string();
+    if output_hash_hex != result.response_hash {
+        bail!(
+            "output bytes BLAKE3 {} does not match result.response_hash {}",
+            output_hash_hex,
+            result.response_hash
+        );
+    }
+
+    // Drive the prover through the Stage 14.5 adapter. The adapter
+    // pins (a) the canonical-spec hash, (b) the 32-byte input
+    // length, and (c) the canonical-evaluator output binding —
+    // refusing before any halo2 work runs on size or content drift.
+    use omni_zkml::ProofBackend;
+    let backend =
+        omni_proofs_halo2_production_mlp::Halo2ProductionMlpProofBackend::new();
+    let proof_bytes = backend
+        .prove(canonical_spec, input_bytes, output_bytes)
+        .map_err(|e| anyhow!("halo2 production-MLP prover failure: {e}"))?;
+
+    // Decode the i16 tensors for the artifact's public_inputs JSON.
+    // The production canonical input is 16 i16; output is 8 i16.
+    let input_i16 =
+        omni_proofs_halo2_production_mlp::decode_canonical_input(input_bytes)
+            .map_err(|e| anyhow!("decode input as canonical_input: {e}"))?;
+    let output_i16 =
+        omni_proofs_halo2_production_mlp::decode_canonical_output(output_bytes)
+            .map_err(|e| anyhow!("decode output as canonical_output: {e}"))?;
+
+    // Stage 14.2 D2 pattern extended to the production verifier:
+    // `contributor_job_id` is an extra JSON key beyond `input`/`output`.
+    // The production verifier's `decode_public_inputs_json` tolerates
+    // extras (test pin below).
+    let public_inputs_json = serde_json::json!({
+        "input":  input_i16.to_vec(),
+        "output": output_i16.to_vec(),
+        "contributor_job_id": result.job_id,
+    });
+
+    // Production verifier requires `circuit_id_hex` AND
+    // `verification_key_hex` to be present AND equal the pinned
+    // constants. Setting them from the omni-proofs crate's exported
+    // constants pins drift at compile time.
+    let metadata = omni_zkml::ProofMetadata {
+        backend_id: backend.backend_id().to_string(),
+        model_hash: expected_spec_hash_hex,
+        input_hash: input_hash_hex,
+        response_hash: output_hash_hex,
+        model_format: Some(omni_zkml::ModelFormat::ProductionFixedPointMlp),
+        proof_system: Some(omni_zkml::ProofSystem::Stage11dProductionFixedPointMlp),
+        circuit_id_hex: Some(
+            omni_proofs_halo2_production_mlp::EXPECTED_CIRCUIT_ID_HEX.to_string(),
+        ),
+        verification_key_hex: Some(
+            omni_proofs_halo2_production_mlp::EXPECTED_VK_HASH_HEX.to_string(),
+        ),
+        public_inputs: Some(public_inputs_json),
+        // Production-shape contract: Some(false), NOT Some(true)
+        // like the Stage 14.2/14.3 reference path. Mainnet refusal
+        // lands at layer 6 only (empty allowlist).
+        testnet_or_dev_only: Some(false),
+        model_framework: Some(omni_zkml::ModelFramework::FrameworkAgnostic),
+    };
+    let body =
+        omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes);
+    let body_bytes = serde_json::to_vec_pretty(&body)
+        .context("serialize halo2 production-MLP ProofArtifactBody")?;
+    std::fs::write(proof_path, &body_bytes).with_context(|| {
+        format!("write --emit-production-mlp-proof {}", proof_path.display())
+    })?;
+    Ok(())
+}
+
 // ── Stage 14.3: ByteCapturingRunner ──────────────────────────────────────────
 
 /// Stage 14.3 — thin `InferenceRunner` wrapper that captures the
@@ -3811,14 +4109,14 @@ fn assemble_and_write_sidecar(
 /// forward-through-`run` implementation is incidental, not relied
 /// upon. Stage 12.4 activation handoff paths are out of Stage 14.3
 /// scope and have no proof binding.
-#[cfg(feature = "halo2-reference-prove")]
+#[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
 struct ByteCapturingRunner<'a, R: InferenceRunner + ?Sized> {
     inner: &'a R,
     captured_input: std::cell::RefCell<Option<Vec<u8>>>,
     captured_output: std::cell::RefCell<Option<Vec<u8>>>,
 }
 
-#[cfg(feature = "halo2-reference-prove")]
+#[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
 impl<'a, R: InferenceRunner + ?Sized> ByteCapturingRunner<'a, R> {
     fn new(inner: &'a R) -> Self {
         Self {
@@ -3837,7 +4135,7 @@ impl<'a, R: InferenceRunner + ?Sized> ByteCapturingRunner<'a, R> {
     }
 }
 
-#[cfg(feature = "halo2-reference-prove")]
+#[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
 impl<'a, R: InferenceRunner + ?Sized> InferenceRunner for ByteCapturingRunner<'a, R> {
     fn run(
         &self,
@@ -11905,6 +12203,605 @@ mod tests {
             assert!(wrapper.take_captured_output().is_some());
             // Stage 14.3 makes NO claim about `run_with_activations`.
             // The default-impl forward chain is incidental.
+        }
+    }
+
+    // ── Stage 14.6 — production-MLP contributor sidecar proof ─────────────
+
+    #[cfg(feature = "stage11d-production-prove")]
+    mod stage_14_6_production_mlp_sidecar_proof {
+        use super::*;
+        use omni_contributor::{
+            BaseUnitRewardPolicy, ContributorJob, ContributorResult, Evidence,
+            JobAccounting, MeasuredAccounting, StageContribution,
+            VerificationRequirement,
+        };
+
+        // ── Production-spec fixture helpers ────────────────────────────────
+
+        const PRODUCTION_CANONICAL_SPEC: &[u8] = include_bytes!(
+            "../../omni-proofs-halo2-production-mlp/assets/canonical_spec.json"
+        );
+
+        fn production_spec_hash_hex() -> String {
+            blake3::hash(PRODUCTION_CANONICAL_SPEC).to_hex().to_string()
+        }
+
+        fn canonical_input_bytes() -> Vec<u8> {
+            omni_proofs_halo2_production_mlp::encode_canonical_input(
+                &omni_proofs_halo2_production_mlp::CANONICAL_INPUT,
+            )
+        }
+
+        fn canonical_output_bytes() -> Vec<u8> {
+            omni_proofs_halo2_production_mlp::encode_canonical_output(
+                &omni_proofs_halo2_production_mlp::canonical_evaluate(
+                    omni_proofs_halo2_production_mlp::CANONICAL_INPUT,
+                ),
+            )
+        }
+
+        fn hex64(b: u8) -> String {
+            let mut s = String::with_capacity(64);
+            for _ in 0..32 {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        }
+
+        fn snip_root_hex(seed: u8) -> String {
+            format!("0x{}", hex64(seed))
+        }
+
+        fn sig_hex(seed: u8) -> String {
+            let mut s = String::with_capacity(128);
+            for _ in 0..64 {
+                s.push_str(&format!("{seed:02x}"));
+            }
+            s
+        }
+
+        fn build_canonical_production_job(
+            input_hash_hex: String,
+            model_hash_hex: String,
+        ) -> ContributorJob {
+            ContributorJob {
+                schema_version: 1,
+                job_id: hex64(0x11),
+                model_hash: model_hash_hex,
+                manifest_snip_root: snip_root_hex(0x22),
+                input_snip_root: snip_root_hex(0x33),
+                input_hash: input_hash_hex,
+                verification_requirement: VerificationRequirement::AttestationOnly,
+                accounting: JobAccounting {
+                    tokenizer_hash: hex64(0x44),
+                    tokenizer_id: "test-tokenizer".to_string(),
+                    input_token_count: 1,
+                    max_output_token_count: 1,
+                    base_unit_reward_policy: BaseUnitRewardPolicy::Unspecified,
+                },
+                dispatched_at_utc: "2026-06-22T00:00:00Z".to_string(),
+                expires_at_utc: None,
+                dispatcher_pubkey_hex: None,
+                dispatcher_signature_hex: None,
+                notes: None,
+            }
+        }
+
+        fn build_canonical_production_result(
+            job: &ContributorJob,
+            response_hash_hex: String,
+        ) -> ContributorResult {
+            ContributorResult {
+                schema_version: 1,
+                job_id: job.job_id.clone(),
+                job_hash: job.job_id.clone(),
+                job_snip_root: None,
+                model_hash: job.model_hash.clone(),
+                input_hash: job.input_hash.clone(),
+                response_snip_root: snip_root_hex(0x55),
+                response_hash: response_hash_hex,
+                evidence: Evidence::AttestationOnly,
+                measured_accounting: MeasuredAccounting {
+                    tokenizer_hash: job.accounting.tokenizer_hash.clone(),
+                    input_token_count: 1,
+                    output_token_count: 1,
+                    total_base_units: 2,
+                    stage_contributions: vec![StageContribution {
+                        contributor_pubkey_hex: hex64(0x66),
+                        stage_label: "stub-runner".to_string(),
+                        work_unit_kind: omni_contributor::WorkUnitKind::DecodeTokens,
+                        work_units: 2,
+                    }],
+                },
+                produced_at_utc: "2026-06-22T00:00:01Z".to_string(),
+                contributor_pubkey_hex: hex64(0x66),
+                contributor_signature_hex: sig_hex(0x77),
+                notes: None,
+            }
+        }
+
+        fn write_temp(dir: &std::path::Path, name: &str, bytes: &[u8]) -> PathBuf {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        }
+
+        struct ProductionFixture {
+            _dir: tempfile::TempDir,
+            job: ContributorJob,
+            result: ContributorResult,
+            stub_input_path: PathBuf,
+            stub_response_path: PathBuf,
+            proof_path: PathBuf,
+        }
+
+        fn build_canonical_production_fixture() -> ProductionFixture {
+            let dir = tempfile::tempdir().unwrap();
+            let in_bytes = canonical_input_bytes();
+            let out_bytes = canonical_output_bytes();
+            let input_hash = blake3::hash(&in_bytes).to_hex().to_string();
+            let output_hash = blake3::hash(&out_bytes).to_hex().to_string();
+            let model_hash = production_spec_hash_hex();
+            let job = build_canonical_production_job(input_hash, model_hash);
+            let result = build_canonical_production_result(&job, output_hash);
+            let stub_input_path = write_temp(dir.path(), "stub_input.bin", &in_bytes);
+            let stub_response_path =
+                write_temp(dir.path(), "stub_response.bin", &out_bytes);
+            let proof_path = dir.path().join("sidecar_proof.json");
+            ProductionFixture {
+                _dir: dir,
+                job,
+                result,
+                stub_input_path,
+                stub_response_path,
+                proof_path,
+            }
+        }
+
+        // ── Test 1: StubRunner happy path ──────────────────────────────────
+
+        #[test]
+        fn stub_runner_with_emit_flag_writes_production_sidecar_artifact_under_canonical_production_spec_job()
+        {
+            let f = build_canonical_production_fixture();
+            emit_production_mlp_proof_sidecar(
+                &f.job,
+                &f.result,
+                RunnerChoice::Stub,
+                Some(&f.stub_input_path),
+                Some(&f.stub_response_path),
+                &f.proof_path,
+            )
+            .expect("sidecar emission on canonical production fixture must succeed");
+            assert!(f.proof_path.is_file());
+            let bytes = std::fs::read(&f.proof_path).unwrap();
+            let body: omni_zkml::ProofArtifactBody =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body.metadata.proof_system,
+                Some(omni_zkml::ProofSystem::Stage11dProductionFixedPointMlp)
+            );
+            // Production-shape contract: testnet_or_dev_only=Some(false).
+            assert_eq!(body.metadata.testnet_or_dev_only, Some(false));
+            assert!(!body.proof_bytes_hex.is_empty());
+        }
+
+        // ── Test 2: D6 — sidecar does not mutate ContributorResult bytes ───
+
+        #[test]
+        fn emit_production_sidecar_does_not_mutate_contributor_result_bytes_on_disk() {
+            let f = build_canonical_production_fixture();
+            let result_path = f._dir.path().join("result.json");
+            let result_bytes = serde_json::to_vec_pretty(&f.result).unwrap();
+            std::fs::write(&result_path, &result_bytes).unwrap();
+            let before = std::fs::read(&result_path).unwrap();
+            emit_production_mlp_proof_sidecar(
+                &f.job,
+                &f.result,
+                RunnerChoice::Stub,
+                Some(&f.stub_input_path),
+                Some(&f.stub_response_path),
+                &f.proof_path,
+            )
+            .unwrap();
+            let after = std::fs::read(&result_path).unwrap();
+            assert_eq!(before, after);
+            assert!(f.proof_path.is_file());
+        }
+
+        // ── Test 3: non-canonical model_hash refused ───────────────────────
+
+        #[test]
+        fn run_job_refuses_emit_production_flag_when_job_model_hash_is_not_canonical_production_spec()
+        {
+            let mut f = build_canonical_production_fixture();
+            f.job.model_hash = hex64(0xaa);
+            let err = emit_production_mlp_proof_sidecar(
+                &f.job,
+                &f.result,
+                RunnerChoice::Stub,
+                Some(&f.stub_input_path),
+                Some(&f.stub_response_path),
+                &f.proof_path,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("canonical production-fixedpoint-mlp-v1 spec hash"),
+                "expected production-spec refusal; got: {err}"
+            );
+            assert!(
+                !f.proof_path.exists(),
+                "no sidecar must be written when job is non-canonical"
+            );
+        }
+
+        // ── Test 4: hash-binding refusal on stub_input ─────────────────────
+
+        #[test]
+        fn run_job_refuses_emit_production_flag_when_stub_input_hash_mismatches_job_input_hash()
+        {
+            let f = build_canonical_production_fixture();
+            let bad_input = f._dir.path().join("bad_input.bin");
+            // 32 bytes (correct length) but wrong content → wrong hash.
+            std::fs::write(&bad_input, vec![0u8; 32]).unwrap();
+            let err = emit_production_mlp_proof_sidecar(
+                &f.job,
+                &f.result,
+                RunnerChoice::Stub,
+                Some(&bad_input),
+                Some(&f.stub_response_path),
+                &f.proof_path,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("does not match job.input_hash"));
+            assert!(!f.proof_path.exists());
+        }
+
+        // ── Test 5: production-shape arity refusal ─────────────────────────
+
+        #[test]
+        fn run_job_refuses_emit_production_flag_when_stub_input_byte_length_is_wrong() {
+            // Stage 14.2 reference path uses 8-byte input; production
+            // path requires exactly 32 bytes (16 × i16 LE). Bytes
+            // with the WRONG length must be refused. The hash binding
+            // catches this first (the wrong-length file won't hash to
+            // job.input_hash), so the refusal surfaces at the hash
+            // check; the assembler's 32-byte adapter check is a
+            // belt-and-suspenders backstop. We verify the refusal
+            // happens with no sidecar written.
+            let f = build_canonical_production_fixture();
+            let too_short = f._dir.path().join("too_short.bin");
+            // 8 bytes — Stage 14.2 reference shape; wrong for production.
+            std::fs::write(&too_short, vec![0u8; 8]).unwrap();
+            let err = emit_production_mlp_proof_sidecar(
+                &f.job,
+                &f.result,
+                RunnerChoice::Stub,
+                Some(&too_short),
+                Some(&f.stub_response_path),
+                &f.proof_path,
+            )
+            .unwrap_err();
+            // Either the hash check or the adapter's size check fires;
+            // both are correct refusals. Pin the broader invariant:
+            // no sidecar gets written.
+            let _ = err;
+            assert!(
+                !f.proof_path.exists(),
+                "no sidecar must be written when stub_input is wrong size for production"
+            );
+        }
+
+        // ── Test 6: end-to-end — verifier accepts the contributor sidecar ─
+
+        #[test]
+        fn production_mlp_verifier_accepts_contributor_emitted_sidecar() {
+            let f = build_canonical_production_fixture();
+            emit_production_mlp_proof_sidecar(
+                &f.job,
+                &f.result,
+                RunnerChoice::Stub,
+                Some(&f.stub_input_path),
+                Some(&f.stub_response_path),
+                &f.proof_path,
+            )
+            .unwrap();
+            let body_bytes = std::fs::read(&f.proof_path).unwrap();
+            let body: omni_zkml::ProofArtifactBody =
+                serde_json::from_slice(&body_bytes).unwrap();
+            use omni_zkml::ProofVerifier;
+            let verifier =
+                omni_proofs_halo2_production_mlp::Halo2ProductionMlpVerifier::from_embedded_fixtures()
+                    .expect("verifier construction from embedded fixtures");
+            let verified = verifier
+                .verify_artifact(&body)
+                .expect("verifier should run without internal error");
+            assert!(
+                verified,
+                "halo2 production-MLP verifier must accept the contributor-emitted sidecar"
+            );
+        }
+
+        // ── Test 7: clap conflicts_with mutual exclusion ──────────────────
+
+        /// Stage 14.6 Q3 lock — clap declares `conflicts_with` on
+        /// BOTH emit flags. This pin only applies when both prover
+        /// features are simultaneously enabled (the conflict is a
+        /// no-op for single-feature builds because one of the flags
+        /// doesn't exist).
+        #[cfg(all(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
+        #[test]
+        fn clap_refuses_both_emit_flags_simultaneously() {
+            let parse = TestRoot::try_parse_from([
+                "omni-node",
+                "run-job",
+                "--job",
+                "/tmp/phantom_job.json",
+                "--out",
+                "/tmp/phantom_result.json",
+                "--seed-file",
+                "/tmp/phantom_seed",
+                "--stub-response",
+                "/tmp/phantom_response.bin",
+                "--stub-input",
+                "/tmp/phantom_input.bin",
+                "--emit-halo2-reference-proof",
+                "/tmp/ref_proof.json",
+                "--emit-production-mlp-proof",
+                "/tmp/prod_proof.json",
+            ]);
+            let msg = match parse {
+                Ok(_) => panic!(
+                    "clap MUST refuse setting both --emit-halo2-reference-proof \
+                     and --emit-production-mlp-proof on the same invocation"
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains("cannot be used with")
+                    || msg.contains("emit-halo2-reference-proof")
+                    || msg.contains("emit-production-mlp-proof"),
+                "expected clap usage error about mutual exclusion; got: {msg}"
+            );
+        }
+
+        // ── Test 8: mainnet refusal at layer 6 only ────────────────────────
+
+        #[test]
+        fn generated_production_sidecar_artifact_is_mainnet_refused_at_layer_6_only() {
+            let f = build_canonical_production_fixture();
+            emit_production_mlp_proof_sidecar(
+                &f.job,
+                &f.result,
+                RunnerChoice::Stub,
+                Some(&f.stub_input_path),
+                Some(&f.stub_response_path),
+                &f.proof_path,
+            )
+            .unwrap();
+            let body: omni_zkml::ProofArtifactBody =
+                serde_json::from_slice(&std::fs::read(&f.proof_path).unwrap()).unwrap();
+            // Production-shape contract: testnet_or_dev_only=Some(false)
+            // → layer 1 does NOT fire.
+            assert_eq!(body.metadata.testnet_or_dev_only, Some(false));
+            assert_eq!(
+                body.metadata.proof_system,
+                Some(omni_zkml::ProofSystem::Stage11dProductionFixedPointMlp)
+            );
+            // But the artifact is still refused on mainnet via layer 6
+            // (empty MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES). Stage 11d.3
+            // is the separate chain-team-reviewed allowlist PR.
+            let refusal = omni_zkml::check_mainnet_eligible(&body.metadata);
+            assert!(
+                refusal.is_err(),
+                "Stage 14.6 production sidecar MUST be mainnet-refused; got Ok \
+                 (Stage 11d.3 allowlist landed?)"
+            );
+        }
+
+        // ── Test 9: public_inputs carries contributor_job_id ──────────────
+
+        #[test]
+        fn production_sidecar_public_inputs_carry_contributor_job_id() {
+            let f = build_canonical_production_fixture();
+            emit_production_mlp_proof_sidecar(
+                &f.job,
+                &f.result,
+                RunnerChoice::Stub,
+                Some(&f.stub_input_path),
+                Some(&f.stub_response_path),
+                &f.proof_path,
+            )
+            .unwrap();
+            let body: omni_zkml::ProofArtifactBody =
+                serde_json::from_slice(&std::fs::read(&f.proof_path).unwrap()).unwrap();
+            let pi = body
+                .metadata
+                .public_inputs
+                .expect("public_inputs must be populated");
+            let job_id_value = pi
+                .get("contributor_job_id")
+                .expect("public_inputs must carry contributor_job_id key");
+            assert_eq!(job_id_value.as_str(), Some(f.result.job_id.as_str()));
+            // Production shape: 16-int input, 8-int output.
+            assert_eq!(pi.get("input").and_then(|v| v.as_array()).unwrap().len(), 16);
+            assert_eq!(pi.get("output").and_then(|v| v.as_array()).unwrap().len(), 8);
+        }
+
+        // ── Test 10: D2 production extra-key tolerance regression pin ─────
+
+        #[test]
+        fn production_verifier_tolerates_extra_contributor_job_id_key_in_public_inputs() {
+            // Mirror Stage 14.2 D2 regression pin for the production
+            // verifier. Plant a SECOND extra key that the verifier
+            // has never seen; assert verify still succeeds.
+            let f = build_canonical_production_fixture();
+            emit_production_mlp_proof_sidecar(
+                &f.job,
+                &f.result,
+                RunnerChoice::Stub,
+                Some(&f.stub_input_path),
+                Some(&f.stub_response_path),
+                &f.proof_path,
+            )
+            .unwrap();
+            let mut body: omni_zkml::ProofArtifactBody =
+                serde_json::from_slice(&std::fs::read(&f.proof_path).unwrap()).unwrap();
+            // Confirm contributor_job_id is present.
+            assert!(body
+                .metadata
+                .public_inputs
+                .as_ref()
+                .and_then(|v| v.get("contributor_job_id"))
+                .is_some());
+            // Add a SECOND unknown key.
+            if let Some(pi) = body.metadata.public_inputs.as_mut() {
+                if let Some(obj) = pi.as_object_mut() {
+                    obj.insert(
+                        "stage_14_6_synthetic_extra_key".to_string(),
+                        serde_json::json!({ "anything": [1, 2, 3] }),
+                    );
+                }
+            }
+            use omni_zkml::ProofVerifier;
+            let verifier =
+                omni_proofs_halo2_production_mlp::Halo2ProductionMlpVerifier::from_embedded_fixtures()
+                    .unwrap();
+            let verified = verifier
+                .verify_artifact(&body)
+                .expect("verifier must not error on extra public_inputs keys");
+            assert!(
+                verified,
+                "production verifier must accept artifacts whose public_inputs \
+                 carries additional keys beyond input + output"
+            );
+        }
+
+        // ── Test 11: real ExternalCommandRunner subprocess end-to-end ─────
+
+        /// Tiny stdlib-only base64 encoder (mirrors the Stage 14.3
+        /// pattern — avoids pulling `base64` into `omni-node` deps).
+        fn base64_encode(bytes: &[u8]) -> String {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+            let mut i = 0;
+            while i + 3 <= bytes.len() {
+                let n = ((bytes[i] as u32) << 16)
+                    | ((bytes[i + 1] as u32) << 8)
+                    | (bytes[i + 2] as u32);
+                out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+                out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+                out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+                out.push(ALPHABET[(n & 0x3f) as usize] as char);
+                i += 3;
+            }
+            let rem = bytes.len() - i;
+            if rem == 1 {
+                let n = (bytes[i] as u32) << 16;
+                out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+                out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+                out.push('=');
+                out.push('=');
+            } else if rem == 2 {
+                let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+                out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+                out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+                out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+                out.push('=');
+            }
+            out
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn external_command_runner_real_subprocess_end_to_end_writes_verifiable_production_sidecar()
+        {
+            // Mirrors Stage 14.3's real-subprocess test but for the
+            // production-MLP path. Spawns a real ExternalCommandRunner
+            // against a #[cfg(unix)] shell script emitting a valid
+            // ExternalRunnerEnvelope with the canonical 16-byte
+            // production response_b64. Drives through
+            // ByteCapturingRunner; calls
+            // emit_production_mlp_proof_sidecar_from_bytes; verifies.
+            use std::os::unix::fs::PermissionsExt;
+            use omni_contributor::ExternalCommandRunner;
+
+            let dir = tempfile::tempdir().unwrap();
+            let output_bytes = canonical_output_bytes();
+            let response_b64 = base64_encode(&output_bytes);
+
+            let envelope_json = format!(
+                r#"{{"response_b64":"{response_b64}","measured_input_tokens":1,"measured_output_tokens":1,"stage_contributions":[{{"contributor_pubkey_hex":"{}","stage_label":"external-prod-test","work_unit_kind":"decode_tokens","work_units":1}}]}}"#,
+                hex64(0x66)
+            );
+            let script_body =
+                format!("#!/bin/sh\ncat <<'EOF'\n{envelope_json}\nEOF\n");
+            let script_path = dir.path().join("production-inference-runner.sh");
+            std::fs::write(&script_path, script_body).unwrap();
+            let mut perms =
+                std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+
+            let manifest_path = dir.path().join("manifest.bin");
+            std::fs::write(&manifest_path, b"unused-manifest-bytes").unwrap();
+
+            let runner = ExternalCommandRunner::new(script_path.clone());
+            let wrapper = ByteCapturingRunner::new(&runner);
+
+            let input_bytes = canonical_input_bytes();
+            let run_output = wrapper
+                .run(&manifest_path, &input_bytes)
+                .expect("external subprocess must succeed against our envelope");
+
+            let captured_input = wrapper
+                .take_captured_input()
+                .expect("input must be captured on Ok inner");
+            let captured_output = wrapper
+                .take_captured_output()
+                .expect("output must be captured on Ok inner");
+            assert_eq!(captured_input, input_bytes);
+            assert_eq!(captured_output, run_output.response_bytes);
+            assert_eq!(captured_output, output_bytes);
+
+            // Build a canonical (job, result) whose hashes match the
+            // captured bytes. The captured bytes ARE the canonical
+            // bytes (the script always returns canonical_output_bytes),
+            // so the fixture's job.input_hash / result.response_hash
+            // already match.
+            let f = build_canonical_production_fixture();
+            let sidecar_path = dir.path().join("sidecar_proof.json");
+            emit_production_mlp_proof_sidecar_from_bytes(
+                &f.job,
+                &f.result,
+                &captured_input,
+                &captured_output,
+                &sidecar_path,
+            )
+            .expect(
+                "sidecar emission from captured external-runner bytes (production)",
+            );
+
+            let body: omni_zkml::ProofArtifactBody = serde_json::from_slice(
+                &std::fs::read(&sidecar_path).unwrap(),
+            )
+            .unwrap();
+            use omni_zkml::ProofVerifier;
+            let verifier =
+                omni_proofs_halo2_production_mlp::Halo2ProductionMlpVerifier::from_embedded_fixtures()
+                    .unwrap();
+            let verified =
+                verifier.verify_artifact(&body).expect("verifier must not error");
+            assert!(
+                verified,
+                "production sidecar produced via real external runner subprocess must verify"
+            );
+            assert_eq!(body.metadata.input_hash, f.job.input_hash);
+            assert_eq!(body.metadata.response_hash, f.result.response_hash);
+            assert_eq!(body.metadata.testnet_or_dev_only, Some(false));
         }
     }
 }

@@ -3765,3 +3765,88 @@ The mainnet refusal is sole-source. Lift requires the Stage 11d.3 PR; Stage 14.5
 - Stage 11d.3 mainnet allowlist entry is the dependency for chain-side mainnet eligibility — **separate track, chain-team-reviewed.**
 
 **Stage 14.5 engineering doc:** [`docs/stage14.5-halo2-production-mlp-prove.md`](stage14.5-halo2-production-mlp-prove.md) — scope, surface map, contract diff vs Stage 14.1, CI gates, test inventory, Stage 14.6+ outlook.
+
+### Stage 14.6 — contributor production-MLP sidecar proof emission
+
+**Use when:** you want the `contributor run-job` flow to emit a **production-MLP** sidecar proof alongside the produced `ContributorResult`. Parallel to Stage 14.2/14.3 reference-sidecar emission but uses the Stage 14.5 production prover and the stricter production metadata contract.
+
+**Requires:** `--features stage11d-production-prove` (same feature as Stage 14.5 — no new feature is added).
+
+**What changed:**
+
+- New CLI flag on `contributor run-job`: `--emit-production-mlp-proof <PATH>`. Mutually exclusive with Stage 14.2's `--emit-halo2-reference-proof` at the clap layer (clap declares `conflicts_with` on both fields for defensive symmetry).
+- `--stub-input <PATH>` is **reused** — same flag as Stage 14.2/14.3. For production it must contain exactly 32 bytes (16 × i16 LE) hashing to `job.input_hash`; the matching `--stub-response` must contain exactly 16 bytes (8 × i16 LE) hashing to `result.response_hash`. The production adapter refuses on size or content mismatch.
+- StubRunner **and** ExternalCommandRunner both supported in this slice (bundle decision Q1). The bytes-based path reuses Stage 14.3's `ByteCapturingRunner` unchanged.
+- Sidecar `metadata.public_inputs` carries `input` (16 ints) + `output` (8 ints) + `contributor_job_id` (extra key, verifier-tolerated).
+
+**Required job shape:** the contributor `--job` MUST be a canonical `production-fixedpoint-mlp-v1` job, i.e. `job.model_hash == BLAKE3(production-mlp/canonical_spec.json)`. Arbitrary models / GGUF / ONNX jobs are out of scope.
+
+**Bytes flow (StubRunner):**
+
+```
+--stub-input    →  raw 32 bytes (16 × i16 LE)  →  BLAKE3 == job.input_hash    (else refuse)
+--stub-response →  raw 16 bytes (8  × i16 LE)  →  BLAKE3 == result.response_hash (else refuse)
+production canonical_spec → EXPECTED_PRODUCTION_SPEC_HASH (embedded)         (else refuse)
+                              │
+                              └─→ Halo2ProductionMlpProofBackend.prove(model, input, output)
+                                      │
+                                      └─→ ProofArtifactBody JSON @ --emit-production-mlp-proof
+```
+
+**Bytes flow (ExternalCommandRunner):** identical to Stage 14.3 — `ByteCapturingRunner` captures input + response bytes at the `InferenceRunner::run` trait boundary; no `--stub-input` needed.
+
+**Workflow recipe:**
+
+```sh
+# StubRunner — operator supplies stub bytes.
+cargo run -p omni-node --features stage11d-production-prove -- \
+  operator contributor run-job \
+  --job          /path/to/canonical-production-mlp-v1-job.json \
+  --seed-file    /path/to/contributor.seed \
+  --runner       stub \
+  --stub-input   /path/to/input_32_bytes.bin \
+  --stub-response /path/to/output_16_bytes.bin \
+  --out          /path/to/result.json \
+  --emit-production-mlp-proof /path/to/sidecar_proof.json
+
+# ExternalCommandRunner — bytes captured at the trait boundary.
+cargo run -p omni-node --features stage11d-production-prove -- \
+  operator contributor run-job \
+  --job          /path/to/canonical-production-mlp-v1-job.json \
+  --seed-file    /path/to/contributor.seed \
+  --runner       external \
+  --external-command /path/to/inference-runner \
+  --out          /path/to/result.json \
+  --emit-production-mlp-proof /path/to/sidecar_proof.json
+
+# Verify (same command for both paths).
+cargo run -p omni-node --features stage11d-production-prove -- \
+  operator verify-proof --proof-artifact /path/to/sidecar_proof.json
+```
+
+**Mainnet posture:** unchanged from Stage 14.5. The sidecar declares `testnet_or_dev_only=Some(false)` and `proof_system=Stage11dProductionFixedPointMlp`. `check_mainnet_eligible` refuses at **layer 6 only** (empty allowlist). Lifting requires the separate **Stage 11d.3** chain-team-reviewed allowlist PR.
+
+**Difference from Stage 14.2/14.3 reference sidecar:**
+
+| Aspect | Stage 14.2/14.3 reference | **Stage 14.6 production** |
+|---|---|---|
+| Feature | `halo2-reference-prove` | `stage11d-production-prove` |
+| Flag | `--emit-halo2-reference-proof` | `--emit-production-mlp-proof` |
+| `proof_system` | `Stage11bHalo2Reference` | `Stage11dProductionFixedPointMlp` |
+| `model_format` | `Halo2ReferenceMlp` | `ProductionFixedPointMlp` |
+| Input bytes | 8 (4 × i16 LE) | 32 (16 × i16 LE) |
+| Output bytes | 8 (4 × i16 LE) | 16 (8 × i16 LE) |
+| `testnet_or_dev_only` | `Some(true)` | **`Some(false)`** |
+| `circuit_id_hex` / `verification_key_hex` | optional | **required, pinned** |
+| Mainnet refusal layers | 1 + 3 + 6 | **6 only** |
+
+The two emit flags are clap-layer mutually exclusive — operator gets a usage error if both are set.
+
+**Limitations:**
+
+- Canonical-`production-fixedpoint-mlp-v1` jobs only. Arbitrary models / ONNX / GGUF out of scope.
+- StubRunner-supplied byte files must match production sizes exactly (32 / 16 bytes). Reference-shape files (8 / 8 bytes) are refused.
+- `ContributorResult` JSON shape is unchanged (`schema_version: 1`, `Evidence::AttestationOnly`). The sidecar is a separate file.
+- Stage 11d.3 mainnet allowlist entry remains the chain-team-reviewed dependency for chain-side eligibility.
+
+**Implementation reference:** [`docs/stage14.6-contributor-production-mlp-proof.md`](stage14.6-contributor-production-mlp-proof.md) — scope, contract diff vs Stage 14.2/14.3, surface map, test inventory.
