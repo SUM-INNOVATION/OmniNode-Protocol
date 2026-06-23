@@ -4603,4 +4603,385 @@ mod tests {
              --features stage11d-production-prove",
         );
     }
+
+    // ── Stage 14.7 — proof-generation acceptance hardening ──────────────────
+    //
+    // Cross-family acceptance umbrella for the Stage 14.x track. Pins:
+    //
+    //   1. metadata contract diff between reference and production paths
+    //   2. mainnet refusal landing at layers 1 + 3 + 6 for reference
+    //   3. mainnet refusal landing at layer 6 only for production
+    //   4. dispatch routing for Mock + reference + production under both
+    //      prove features
+    //
+    // Per the Stage 14.7 design lock, no per-stage test is duplicated:
+    // each per-stage suite already pins its own scenarios. The umbrella
+    // adds the **cross-family** stitch that's missing from those suites.
+    //
+    // Prover invocations are amortized via `std::sync::OnceLock`: each
+    // family's artifact is built at most once per cargo test binary
+    // run. Within the same compilation unit, sibling tests reuse the
+    // cached artifact at no additional prover cost.
+    //
+    // CI coverage:
+    //   - Tests gated on `feature = "halo2-reference-prove"` run in the
+    //     existing `halo2-reference-prove-build-test` job.
+    //   - Tests gated on `feature = "stage11d-production-prove"` run in
+    //     the existing `stage11d-production-prove-build-test` job.
+    //   - Tests gated on `cfg(all(both features))` are LOCAL-only
+    //     (no CI job runs both features together today — same gap as
+    //     Stage 14.6 test 7).
+
+    #[cfg(feature = "halo2-reference-prove")]
+    fn cached_reference_artifact() -> &'static omni_zkml::ProofArtifactBody {
+        use omni_zkml::ProofBackend;
+        static CELL: std::sync::OnceLock<omni_zkml::ProofArtifactBody> =
+            std::sync::OnceLock::new();
+        CELL.get_or_init(|| {
+            let backend = omni_proofs_halo2_reference::Halo2ReferenceProofBackend::new();
+            let canonical_spec: &[u8] = include_bytes!(
+                "../../omni-proofs-halo2-reference/assets/canonical_spec.json"
+            );
+            let input_i16 = omni_proofs_halo2_reference::CANONICAL_INPUT;
+            let output_i16 =
+                omni_proofs_halo2_reference::canonical_evaluate(input_i16);
+            let input_bytes =
+                omni_proofs_halo2_reference::encode_canonical_input(&input_i16);
+            let output_bytes =
+                omni_proofs_halo2_reference::encode_canonical_output(&output_i16);
+            let proof_bytes = backend
+                .prove(canonical_spec, &input_bytes, &output_bytes)
+                .expect("reference prover succeeds on canonical input");
+            let circuit_id_hex = backend
+                .circuit_id()
+                .map(|id| {
+                    let mut s = String::with_capacity(64);
+                    for b in &id {
+                        s.push_str(&format!("{b:02x}"));
+                    }
+                    s
+                })
+                .expect("reference backend always exposes circuit_id");
+            let metadata = omni_zkml::ProofMetadata {
+                backend_id: backend.backend_id().to_string(),
+                model_hash: blake3::hash(canonical_spec).to_hex().to_string(),
+                input_hash: blake3::hash(&input_bytes).to_hex().to_string(),
+                response_hash: blake3::hash(&output_bytes).to_hex().to_string(),
+                model_format: Some(omni_zkml::ModelFormat::Halo2ReferenceMlp),
+                proof_system: Some(omni_zkml::ProofSystem::Stage11bHalo2Reference),
+                circuit_id_hex: Some(circuit_id_hex),
+                verification_key_hex: None,
+                public_inputs: Some(serde_json::json!({
+                    "input":  [input_i16[0],  input_i16[1],  input_i16[2],  input_i16[3]],
+                    "output": [output_i16[0], output_i16[1], output_i16[2], output_i16[3]],
+                })),
+                testnet_or_dev_only: Some(true),
+                model_framework: Some(omni_zkml::ModelFramework::FrameworkAgnostic),
+            };
+            omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes)
+        })
+    }
+
+    #[cfg(feature = "stage11d-production-prove")]
+    fn cached_production_artifact() -> &'static omni_zkml::ProofArtifactBody {
+        use omni_zkml::ProofBackend;
+        static CELL: std::sync::OnceLock<omni_zkml::ProofArtifactBody> =
+            std::sync::OnceLock::new();
+        CELL.get_or_init(|| {
+            let backend =
+                omni_proofs_halo2_production_mlp::Halo2ProductionMlpProofBackend::new();
+            let canonical_spec: &[u8] = include_bytes!(
+                "../../omni-proofs-halo2-production-mlp/assets/canonical_spec.json"
+            );
+            let input_i16 = omni_proofs_halo2_production_mlp::CANONICAL_INPUT;
+            let output_i16 =
+                omni_proofs_halo2_production_mlp::canonical_evaluate(input_i16);
+            let input_bytes =
+                omni_proofs_halo2_production_mlp::encode_canonical_input(&input_i16);
+            let output_bytes =
+                omni_proofs_halo2_production_mlp::encode_canonical_output(&output_i16);
+            let proof_bytes = backend
+                .prove(canonical_spec, &input_bytes, &output_bytes)
+                .expect("production prover succeeds on canonical input");
+            let metadata = omni_zkml::ProofMetadata {
+                backend_id: backend.backend_id().to_string(),
+                model_hash: blake3::hash(canonical_spec).to_hex().to_string(),
+                input_hash: blake3::hash(&input_bytes).to_hex().to_string(),
+                response_hash: blake3::hash(&output_bytes).to_hex().to_string(),
+                model_format: Some(omni_zkml::ModelFormat::ProductionFixedPointMlp),
+                proof_system: Some(
+                    omni_zkml::ProofSystem::Stage11dProductionFixedPointMlp,
+                ),
+                circuit_id_hex: Some(
+                    omni_proofs_halo2_production_mlp::EXPECTED_CIRCUIT_ID_HEX
+                        .to_string(),
+                ),
+                verification_key_hex: Some(
+                    omni_proofs_halo2_production_mlp::EXPECTED_VK_HASH_HEX
+                        .to_string(),
+                ),
+                public_inputs: Some(serde_json::json!({
+                    "input":  input_i16.to_vec(),
+                    "output": output_i16.to_vec(),
+                })),
+                testnet_or_dev_only: Some(false),
+                model_framework: Some(omni_zkml::ModelFramework::FrameworkAgnostic),
+            };
+            omni_zkml::ProofArtifactBody::from_components(metadata, &proof_bytes)
+        })
+    }
+
+    // ── Test 1: cross-family metadata contract diff (cfg(all(...))) ─────────
+
+    /// Stage 14.7 — pins the metadata contract diff between the
+    /// reference and production proof families documented in
+    /// `docs/operator-runbook.md`'s comparison table. Pinning every
+    /// listed field by exact value ensures any future drift in the
+    /// pinned constants (`EXPECTED_CIRCUIT_ID_HEX`,
+    /// `EXPECTED_VK_HASH_HEX`) or the documented contract surfaces
+    /// here even if per-stage tests pass.
+    ///
+    /// Gated on both prove features; local-only (no CI job runs both
+    /// features today — same gap as Stage 14.6 test 7).
+    #[cfg(all(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
+    #[test]
+    fn reference_and_production_artifacts_have_distinct_proof_systems_and_opposite_testnet_flags()
+    {
+        let r = cached_reference_artifact();
+        let p = cached_production_artifact();
+
+        // proof_system distinct
+        assert_eq!(
+            r.metadata.proof_system,
+            Some(omni_zkml::ProofSystem::Stage11bHalo2Reference)
+        );
+        assert_eq!(
+            p.metadata.proof_system,
+            Some(omni_zkml::ProofSystem::Stage11dProductionFixedPointMlp)
+        );
+        assert_ne!(r.metadata.proof_system, p.metadata.proof_system);
+
+        // model_format distinct
+        assert_eq!(
+            r.metadata.model_format,
+            Some(omni_zkml::ModelFormat::Halo2ReferenceMlp)
+        );
+        assert_eq!(
+            p.metadata.model_format,
+            Some(omni_zkml::ModelFormat::ProductionFixedPointMlp)
+        );
+
+        // backend_id distinct + matches the constants the verifiers
+        // require.
+        assert_eq!(
+            r.metadata.backend_id,
+            omni_proofs_halo2_reference::BACKEND_ID
+        );
+        assert_eq!(
+            p.metadata.backend_id,
+            omni_proofs_halo2_production_mlp::BACKEND_ID
+        );
+
+        // testnet_or_dev_only is OPPOSITE between the two families.
+        // Reference: Some(true) (toy circuit, layer 1 fires).
+        // Production: Some(false) (production-shape, layer 1 passes).
+        assert_eq!(r.metadata.testnet_or_dev_only, Some(true));
+        assert_eq!(p.metadata.testnet_or_dev_only, Some(false));
+
+        // Reference: circuit_id_hex present (from backend.circuit_id());
+        // verification_key_hex is None (verifier doesn't check it).
+        assert!(r.metadata.circuit_id_hex.is_some());
+        assert_eq!(r.metadata.verification_key_hex, None);
+
+        // Production: both required. circuit_id_hex MUST equal
+        // EXPECTED_CIRCUIT_ID_HEX exactly; verification_key_hex MUST
+        // equal EXPECTED_VK_HASH_HEX exactly. The pinned constants
+        // are the Stage 11d.2 chain-team-reviewed identity for the
+        // production circuit.
+        assert_eq!(
+            p.metadata.circuit_id_hex.as_deref(),
+            Some(omni_proofs_halo2_production_mlp::EXPECTED_CIRCUIT_ID_HEX)
+        );
+        assert_eq!(
+            p.metadata.verification_key_hex.as_deref(),
+            Some(omni_proofs_halo2_production_mlp::EXPECTED_VK_HASH_HEX)
+        );
+
+        // Both: model_framework FrameworkAgnostic; both have
+        // non-empty proof bytes; both populate public_inputs JSON.
+        assert_eq!(
+            r.metadata.model_framework,
+            Some(omni_zkml::ModelFramework::FrameworkAgnostic)
+        );
+        assert_eq!(
+            p.metadata.model_framework,
+            Some(omni_zkml::ModelFramework::FrameworkAgnostic)
+        );
+        assert!(!r.proof_bytes_hex.is_empty());
+        assert!(!p.proof_bytes_hex.is_empty());
+        assert!(r.metadata.public_inputs.is_some());
+        assert!(p.metadata.public_inputs.is_some());
+
+        // Tensor arity diff in public_inputs: reference 4/4 vs
+        // production 16/8.
+        let r_pi = r.metadata.public_inputs.as_ref().unwrap();
+        let p_pi = p.metadata.public_inputs.as_ref().unwrap();
+        assert_eq!(
+            r_pi.get("input").and_then(|v| v.as_array()).unwrap().len(),
+            4
+        );
+        assert_eq!(
+            r_pi.get("output").and_then(|v| v.as_array()).unwrap().len(),
+            4
+        );
+        assert_eq!(
+            p_pi.get("input").and_then(|v| v.as_array()).unwrap().len(),
+            16
+        );
+        assert_eq!(
+            p_pi.get("output").and_then(|v| v.as_array()).unwrap().len(),
+            8
+        );
+    }
+
+    // ── Test 2: reference mainnet refusal at layers 1 + 3 + 6 ──────────────
+
+    /// Stage 14.7 — pins which mainnet refusal layers fire for the
+    /// reference proof family. The reference artifact (as committed)
+    /// fires layer 1 (TestnetOrDevOnly). Mutating one field at a time
+    /// to bypass each earlier layer confirms layers 3 (BoundedReference)
+    /// and 6 (NotInMainnetAllowlist) would also fire. This pins the
+    /// "defense in depth: three layers fire" property documented in
+    /// the Stage 14.x section of the operator runbook.
+    ///
+    /// No prover re-invocation — operates on metadata copies only.
+    #[cfg(feature = "halo2-reference-prove")]
+    #[test]
+    fn reference_artifact_is_mainnet_refused_at_layers_1_3_and_6_with_distinct_reasons() {
+        use omni_zkml::MainnetRefusalReason;
+        let r = cached_reference_artifact();
+
+        // Layer 1 — testnet_or_dev_only=Some(true) → TestnetOrDevOnly.
+        let l1 = omni_zkml::check_mainnet_eligible(&r.metadata)
+            .expect_err("reference artifact MUST be mainnet-refused");
+        assert!(
+            matches!(l1, MainnetRefusalReason::TestnetOrDevOnly { .. }),
+            "layer 1 (TestnetOrDevOnly) must fire first for the reference artifact; got {l1:?}"
+        );
+
+        // Bypass layer 1: clear the testnet flag (Some(false) makes
+        // layer 1 pass). Now layer 3 (BoundedReference) MUST fire
+        // because proof_system=Stage11bHalo2Reference is classified
+        // BoundedReference.
+        let mut meta_l3 = r.metadata.clone();
+        meta_l3.testnet_or_dev_only = Some(false);
+        let l3 = omni_zkml::check_mainnet_eligible(&meta_l3)
+            .expect_err("with layer 1 bypassed, layer 3 MUST refuse the reference");
+        assert!(
+            matches!(l3, MainnetRefusalReason::BoundedReference { .. }),
+            "layer 3 (BoundedReference) must fire after layer 1 is bypassed; got {l3:?}"
+        );
+
+        // Bypass layers 1 + 3: change proof_system to something NOT in
+        // the BoundedReference set (Ezkl is preserved in the enum but
+        // not BoundedReference). Layer 6 (NotInMainnetAllowlist) must
+        // fire because MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES is empty.
+        let mut meta_l6 = meta_l3.clone();
+        meta_l6.proof_system = Some(omni_zkml::ProofSystem::Ezkl);
+        let l6 = omni_zkml::check_mainnet_eligible(&meta_l6)
+            .expect_err("with layers 1 + 3 bypassed, layer 6 MUST refuse the artifact");
+        assert!(
+            matches!(l6, MainnetRefusalReason::NotInMainnetAllowlist { .. }),
+            "layer 6 (NotInMainnetAllowlist) must fire after layers 1 + 3 are bypassed; got {l6:?}"
+        );
+    }
+
+    // ── Test 3: production mainnet refusal at layer 6 only ─────────────────
+
+    /// Stage 14.7 — pins the "layer 6 only" mainnet refusal property
+    /// for the production proof family. The production artifact passes
+    /// layer 1 (testnet_or_dev_only=Some(false)) by design AND is NOT
+    /// classified BoundedReference (Stage11dProductionFixedPointMlp is
+    /// distinct), so layers 1 and 3 do not fire. Layer 6 is the SOLE
+    /// gate — `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty until
+    /// Stage 11d.3 lands the chain-team-reviewed allowlist entry.
+    ///
+    /// We additionally prove layer 1 WOULD fire if the artifact were
+    /// mis-declared as testnet_or_dev_only=Some(true), so the
+    /// production-shape declaration is load-bearing.
+    #[cfg(feature = "stage11d-production-prove")]
+    #[test]
+    fn production_artifact_is_mainnet_refused_at_layer_6_only_with_layer_1_passing() {
+        use omni_zkml::MainnetRefusalReason;
+        let p = cached_production_artifact();
+
+        // The pristine production artifact: refusal is layer 6
+        // (NotInMainnetAllowlist).
+        let r = omni_zkml::check_mainnet_eligible(&p.metadata)
+            .expect_err("production artifact MUST be mainnet-refused");
+        assert!(
+            matches!(r, MainnetRefusalReason::NotInMainnetAllowlist { .. }),
+            "production artifact must be refused at layer 6 only; got {r:?}"
+        );
+
+        // Sanity: if we mis-declared the artifact as
+        // testnet_or_dev_only=Some(true), layer 1 would fire first.
+        // This proves the production-shape declaration is the reason
+        // layer 1 does NOT fire on the pristine artifact.
+        let mut meta_layer1 = p.metadata.clone();
+        meta_layer1.testnet_or_dev_only = Some(true);
+        let r1 = omni_zkml::check_mainnet_eligible(&meta_layer1)
+            .expect_err("with testnet_or_dev_only mis-declared as Some(true), layer 1 fires");
+        assert!(
+            matches!(r1, MainnetRefusalReason::TestnetOrDevOnly { .. }),
+            "layer 1 (TestnetOrDevOnly) must fire when production artifact is mis-declared; got {r1:?}"
+        );
+    }
+
+    // ── Test 4: dispatch routes Mock + reference + production correctly ────
+
+    /// Stage 14.7 — pins that `operator verify-proof` correctly
+    /// dispatches all three proof systems when both prove features
+    /// are enabled. Mock + reference + production artifacts all
+    /// verify under the same build. Closes the cross-family
+    /// coexistence gap left by per-stage tests, which each only pin
+    /// Mock + their own system.
+    ///
+    /// Local-only (`cfg(all(...))`).
+    #[cfg(all(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
+    #[tokio::test]
+    async fn verify_proof_dispatch_routes_mock_reference_and_production_artifacts_correctly()
+    {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) Mock — fast, no prover.
+        let mock_path = write_stage11a_mock_proof_artifact(dir.path());
+        verify_proof_core(mock_path)
+            .await
+            .expect("Mock artifact must verify under both prove features");
+
+        // (b) Reference — uses the OnceLock-cached artifact; serialise
+        //     to disk and dispatch through the same verify-proof core
+        //     the operator CLI uses.
+        let r_path = dir.path().join("reference_artifact.json");
+        std::fs::write(
+            &r_path,
+            serde_json::to_vec_pretty(cached_reference_artifact()).unwrap(),
+        )
+        .unwrap();
+        verify_proof_core(r_path)
+            .await
+            .expect("reference artifact must verify under both prove features");
+
+        // (c) Production — same pattern, OnceLock-cached.
+        let p_path = dir.path().join("production_artifact.json");
+        std::fs::write(
+            &p_path,
+            serde_json::to_vec_pretty(cached_production_artifact()).unwrap(),
+        )
+        .unwrap();
+        verify_proof_core(p_path)
+            .await
+            .expect("production artifact must verify under both prove features");
+    }
 }
