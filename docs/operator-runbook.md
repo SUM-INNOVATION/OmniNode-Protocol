@@ -3850,3 +3850,40 @@ The two emit flags are clap-layer mutually exclusive — operator gets a usage e
 - Stage 11d.3 mainnet allowlist entry remains the chain-team-reviewed dependency for chain-side eligibility.
 
 **Implementation reference:** [`docs/stage14.6-contributor-production-mlp-proof.md`](stage14.6-contributor-production-mlp-proof.md) — scope, contract diff vs Stage 14.2/14.3, surface map, test inventory.
+
+### Stage 14.x — proof family comparison
+
+By Stage 14.7 the operator binary supports two parallel proof families. They are orthogonal at the feature, flag, and dispatch level — both can be enabled simultaneously, but only one can be emitted per CLI invocation (the contributor `--emit-…-proof` flags are clap-layer mutually exclusive). This section is the single canonical comparison; consult the per-stage sections above for stage-specific details.
+
+| Aspect | Reference (Stages 14.1 / 14.2 / 14.3) | **Production** (Stages 14.5 / 14.6) |
+| --- | --- | --- |
+| Feature flag | `halo2-reference-prove` | `stage11d-production-prove` |
+| Operator CLI subcommand | `operator generate-reference-proof` | `operator generate-production-mlp-proof` |
+| Contributor CLI flag | `--emit-halo2-reference-proof <PATH>` | `--emit-production-mlp-proof <PATH>` |
+| Input × output arity | 4 × i16 / 4 × i16 (8 / 8 bytes LE) | 16 × i16 / 8 × i16 (32 / 16 bytes LE) |
+| StubRunner sidecar | ✅ Stage 14.2 | ✅ Stage 14.6 |
+| ExternalCommandRunner sidecar | ✅ Stage 14.3 | ✅ Stage 14.6 |
+| `proof_system` | `Stage11bHalo2Reference` | `Stage11dProductionFixedPointMlp` |
+| `model_format` | `Halo2ReferenceMlp` | `ProductionFixedPointMlp` |
+| `backend_id` | `"halo2-reference-mlp-v1"` | `"production-fixedpoint-mlp-v1"` |
+| `testnet_or_dev_only` | `Some(true)` | **`Some(false)`** |
+| `circuit_id_hex` | optional, from `backend.circuit_id()` | **required**, equals `EXPECTED_CIRCUIT_ID_HEX` |
+| `verification_key_hex` | `None` | **required**, equals `EXPECTED_VK_HASH_HEX` |
+| Mainnet refusal layers fired | **1 + 3 + 6** (defense in depth) | **6 only** (sole gate) |
+| Proof cost per call (CPU host, dev hardware) | ~10 s | ~30 s |
+| Cleared for mainnet today? | No — Stage 11b architecture-validation only | No — Stage 11d.3 chain-team allowlist PR is the dependency |
+
+#### When to choose which
+
+- **Use the reference path** when you're validating the architecture seam end-to-end (operator → verifier → contributor → sidecar → verifier), running quick smoke tests, or developing against the Stage 14.x surface. The toy circuit is intentionally small; proving is fast; mainnet is hard-refused at three independent layers so there is no submission-side risk.
+- **Use the production path** when you want a real proof of the canonical `production-fixedpoint-mlp-v1` MLP for staging / testnet acceptance. The artifact declares `testnet_or_dev_only=Some(false)` (production-shape) so its mainnet refusal lands at layer 6 only — the empty `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` allowlist. Stage 11d.3 ships the chain-team-reviewed allowlist entry that lifts that refusal; until then, both paths are off-chain only.
+
+Both paths verify off-chain only. Mainnet activation for the production class lands in Stage 11d.3 via a chain-team-reviewed allowlist PR; until then, every artifact is refused on `chain_id == 1` regardless of family.
+
+#### Performance caveats
+
+- The production circuit (`16 → 32 → 16 → 8`, `HALO2_K = 11`) is wider than the reference (`4 → 8 → 4`, `HALO2_K = 10`). CI runs both prover suites with `RUST_MIN_STACK=67108864` (64 MB) so the constraint-system walker has headroom.
+- Both provers are byte-deterministic via fixed `ChaCha20Rng` seeds (`PROVER_RNG_SEED` per crate). Two invocations on the same input produce byte-identical proof bytes; this is pinned by `prove_canonical_is_byte_deterministic` in each prover crate.
+- A `halo2_proofs` version bump may shift proof bytes; fixture regen runs through the workspace-excluded tools (`tools/halo2_reference_regen/`, `tools/halo2_production_mlp_regen/`).
+
+**Stage 14.7 engineering doc:** [`docs/stage14.7-proof-generation-acceptance-hardening.md`](stage14.7-proof-generation-acceptance-hardening.md) — umbrella acceptance test scope, cached-artifact strategy, CI coverage notes, Stage 14.x track close.
