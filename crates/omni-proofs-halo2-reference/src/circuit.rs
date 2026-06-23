@@ -58,7 +58,7 @@
 //! **This is still not "production zkML" and is still
 //! `testnet_or_dev_only: Some(true)`.** The bounded 4→8→4 MLP and
 //! its committed weights/biases are an architectural-validation
-//! fixture; mainnet allowlist eligibility is a Stage 11d+
+//! fixture; mainnet eligibility registry membership is a Stage 11d+
 //! deliverable.
 
 use halo2_proofs::{

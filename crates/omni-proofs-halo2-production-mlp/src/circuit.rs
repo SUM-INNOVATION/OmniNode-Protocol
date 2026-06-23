@@ -23,8 +23,8 @@
 //! **Off-chain only.** This circuit is reachable from `omni-node`
 //! exclusively under the `stage11d-production-verify` opt-in
 //! feature. Mainnet posture: `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`
-//! is empty through Stage 11d.2; mainnet allowlist eligibility for
-//! this proof class is a Stage 11d.3 deliverable.
+//! is empty through Stage 11d.2; mainnet eligibility registry
+//! membership for this proof class is a Stage 11d.3 deliverable.
 
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},

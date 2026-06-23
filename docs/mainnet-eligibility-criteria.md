@@ -2,7 +2,7 @@
 
 **Status**: this is the authoritative criteria document for adding a proof system to `MAINNET_APPROVED_PROOF_SYSTEMS`. Adopted by Stage 11d.0; the schema refactor it implies lands in Stage 11d.1.
 
-**Wording guardrail**: Stage 11d **defines and prepares** the eligibility path. A later Stage 11d.3 entry may add the first eligible proof system after written sign-off. Stage 11d itself does not allowlist anything.
+**Wording guardrail**: Stage 11d **defines and prepares** the eligibility path. A later Stage 11d.3 entry may add the first eligible proof system after written sign-off. Stage 11d itself does not register anything for mainnet eligibility.
 
 ---
 
@@ -10,7 +10,7 @@
 
 After Stage 11c, the bounded `halo2-mlp-v1 / spec_version: 2` reference circuit is sound for arbitrary i16 inputs. That fact alone does **not** make it mainnet-eligible — a bounded reference circuit (architectural validation fixture for a tiny 4→8→4 MLP) and a production proof system (a real OmniNode inference workload) are different equivalence classes.
 
-This document defines, with no ambiguity, what a proof system must satisfy before its allowlist entry may be added. It is consulted by:
+This document defines, with no ambiguity, what a proof system must satisfy before its eligibility registry entry may be added. It is consulted by:
 - the SUM Chain review board (placeholder reviewer name until a board roster is recorded),
 - the OmniNode core team when proposing a new proof class,
 - the operator team when explaining why mainnet refusals fire,
@@ -61,10 +61,10 @@ Beyond what Stage 11b.0 already requires, an artifact whose `proof_system` claim
 | `proof_system` | `Some(<eligible-production-variant>)` — never `None`, never `Mock`, never `Stage11bOnnxReference`, never `Stage11bHalo2Reference`. |
 | `model_format` | `Some(<non-`Other`>)`. |
 | `model_framework` | `Some(<one of Rumus / PyTorch / TensorFlow / Caffe / FrameworkAgnostic>)`, recorded per the chain-team-approved framework binding. |
-| `testnet_or_dev_only` | `Some(false)` — explicit. The bare `None` is treated as `testnet_or_dev_only=true` for safety and refuses on mainnet regardless of allowlist match. |
-| `circuit_id_hex` | **REQUIRED** (not optional). 64-char lowercase hex of the verifier's compiled circuit identity. Must match the allowlist entry's `circuit_id_hex` exactly. |
-| `verification_key_hex` | **REQUIRED on the artifact side.** Existing schema field — historically ambiguously named (could be raw VK bytes hex, could be a hash). Stage 11d.1 does **not** rename this field on `ProofMetadata`; renaming is a wider schema migration deferred to a future stage. The **allowlist** side uses the unambiguously-named `verification_key_hash_hex` (see §1.7 below). Cross-validation between the artifact's `verification_key_hex` and the allowlisted `verification_key_hash_hex` is per-verifier code that lands in **Stage 11d.2** alongside the first production verifier — Stage 11d.1's layer 6 does NOT perform this cross-check. |
-| `model_hash` | 64-char lowercase hex; must match the allowlist entry's `model_hash` exactly. Pins the specific (model, weights, biases) combination. |
+| `testnet_or_dev_only` | `Some(false)` — explicit. The bare `None` is treated as `testnet_or_dev_only=true` for safety and refuses on mainnet regardless of eligibility registry match. |
+| `circuit_id_hex` | **REQUIRED** (not optional). 64-char lowercase hex of the verifier's compiled circuit identity. Must match the eligibility registry entry's `circuit_id_hex` exactly. |
+| `verification_key_hex` | **REQUIRED on the artifact side.** Existing schema field — historically ambiguously named (could be raw VK bytes hex, could be a hash). Stage 11d.1 does **not** rename this field on `ProofMetadata`; renaming is a wider schema migration deferred to a future stage. The **eligibility registry** side uses the unambiguously-named `verification_key_hash_hex` (see §1.7 below). Cross-validation between the artifact's `verification_key_hex` and the registered `verification_key_hash_hex` is per-verifier code that lands in **Stage 11d.2** alongside the first production verifier — Stage 11d.1's layer 6 does NOT perform this cross-check. |
+| `model_hash` | 64-char lowercase hex; must match the eligibility registry entry's `model_hash` exactly. Pins the specific (model, weights, biases) combination. |
 | `input_hash` | BLAKE3 of the canonical input bytes (Stage 11b.0 contract). |
 | `response_hash` | BLAKE3 of the canonical output bytes. |
 | `public_inputs` | Backend-specific JSON. Mainnet-eligible verifiers must consume this via `verify_artifact`, never via `verify(&[u8], &PublicInputs)` alone — see Stage 11b.1.b `ProofVerifierError::RequiresArtifactDispatch`. |
@@ -78,9 +78,9 @@ Beyond what Stage 11b.0 already requires, an artifact whose `proof_system` claim
 **Hard rule H3**: the production proof system MUST have a `model_hash` distinct from any committed bounded-reference spec's hash (the `EXPECTED_SPEC_HASH` for the halo2 reference, etc.).
 
 **Defense in depth (Stage 11d.1)**:
-1. Layer 3 of `check_mainnet_eligible` fires **before** the layer-6 allowlist lookup for `Stage11bOnnxReference` and `Stage11bHalo2Reference`, so a bounded reference artifact is refused regardless of allowlist contents. Pinned by the `bounded_reference_refused_before_allowlist_lookup` test.
-2. The `stage11b_halo2_reference_never_in_allowlist` test iterates **both** `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` and the legacy `MAINNET_APPROVED_PROOF_SYSTEMS` and asserts no entry has `proof_system ∈ {Stage11bOnnxReference, Stage11bHalo2Reference}`. The slice is empty today; the test is a forward-looking guard against future misconfiguration.
-3. The `every_allowlist_entry_has_required_metadata` test additionally rejects bounded-reference `proof_system` values, `Mock`, `ModelFormat::Gguf`, and `ModelFormat::Other(_)` in any allowlist entry (also forward-looking).
+1. Layer 3 of `check_mainnet_eligible` fires **before** the layer-6 eligibility registry lookup for `Stage11bOnnxReference` and `Stage11bHalo2Reference`, so a bounded reference artifact is refused regardless of eligibility registry contents. Pinned by the `bounded_reference_refused_before_eligibility_registry_lookup` test.
+2. The `stage11b_halo2_reference_never_in_eligibility_registry` test iterates **both** `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` and the legacy `MAINNET_APPROVED_PROOF_SYSTEMS` and asserts no entry has `proof_system ∈ {Stage11bOnnxReference, Stage11bHalo2Reference}`. The slice is empty today; the test is a forward-looking guard against future misconfiguration.
+3. The `every_allowlist_entry_has_required_metadata` test additionally rejects bounded-reference `proof_system` values, `Mock`, `ModelFormat::Gguf`, and `ModelFormat::Other(_)` in any eligibility registry entry (test name grandfathered; also forward-looking).
 
 ### 1.7. VK hash scheme
 
@@ -92,7 +92,7 @@ verification_key_hash = BLAKE3(MAINNET_VK_HASH_DOMAIN_SEPARATOR || canonical_vk_
 
 where:
 
-- `MAINNET_VK_HASH_DOMAIN_SEPARATOR = b"OMNINODE-VK:v1:"` — 15 ASCII bytes, no null terminator, no length prefix. The trailing `v1` allows a future migration to a new scheme without ambiguity over which hash an allowlist entry's `verification_key_hash_hex` was computed under.
+- `MAINNET_VK_HASH_DOMAIN_SEPARATOR = b"OMNINODE-VK:v1:"` — 15 ASCII bytes, no null terminator, no length prefix. The trailing `v1` allows a future migration to a new scheme without ambiguity over which hash an eligibility registry entry's `verification_key_hash_hex` was computed under.
 - `canonical_vk_bytes` is the **per-verifier** canonical serialization of its `VerifyingKey`. Each production verifier MUST document its `canonical_vk_bytes` scheme (e.g., halo2's `VerifyingKey::write` byte stream, or a backend-specific canonical encoding) and pin a stable test vector for the resulting hash.
 
 Stage 11d.1 ships the helper `omni_zkml::mainnet_vk_hash(canonical_vk_bytes: &[u8]) -> [u8; 32]` plus the `MAINNET_VK_HASH_DOMAIN_SEPARATOR` constant. The concrete `canonical_vk_bytes` extraction lives in each production verifier (Stage 11d.2+).
@@ -100,7 +100,7 @@ Stage 11d.1 ships the helper `omni_zkml::mainnet_vk_hash(canonical_vk_bytes: &[u
 **Scope of use in Stage 11d.1**:
 - `AllowlistEntry.verification_key_hash_hex` records the hex of this hash (entry-side, compile-time pinning).
 - The helper is available for per-verifier code to compute and compare.
-- Layer 6 of `check_mainnet_eligible` does **NOT** perform cross-validation of an artifact's `metadata.verification_key_hex` against the allowlist's `verification_key_hash_hex` — that cross-check requires per-verifier knowledge of `canonical_vk_bytes` extraction and lands in Stage 11d.2 with the first production verifier.
+- Layer 6 of `check_mainnet_eligible` does **NOT** perform cross-validation of an artifact's `metadata.verification_key_hex` against the eligibility registry's `verification_key_hash_hex` — that cross-check requires per-verifier knowledge of `canonical_vk_bytes` extraction and lands in Stage 11d.2 with the first production verifier.
 
 The `vk_hash_helper_is_byte_stable` and `vk_hash_helper_uses_documented_domain_separator` tests pin the formula bit-for-bit.
 
@@ -136,7 +136,7 @@ Numbered for cross-reference from the [Stage 11d.3 review packet template](stage
 
 ## 3. Allowlist mechanics summary
 
-Stage 11d.1 rewires the layer-6 refusal check to consult a structured allowlist:
+Stage 11d.1 rewires the layer-6 refusal check to consult a structured eligibility registry:
 
 ```rust
 pub struct AllowlistEntry {
@@ -157,16 +157,16 @@ pub const MAINNET_APPROVED_PROOF_SYSTEMS: &[ProofSystem] = &[];
 **Allowlist key**: `(proof_system, circuit_id_hex, model_hash)`. Layer 6 accepts an artifact only if at least one entry matches all three fields exactly. `backend_id`, `model_format`, `verification_key_hash_hex`, and `chain_team_review_ref` are recorded for audit but are not part of the matching key.
 
 **Why a triple key**:
-- `proof_system`-alone matching is dangerous: a bounded reference + a future production circuit could share a hypothetical variant and accidentally co-allowlist.
+- `proof_system`-alone matching is dangerous: a bounded reference + a future production circuit could share a hypothetical variant and accidentally co-register.
 - `(proof_system, circuit_id_hex)` is better but allows the same circuit to be re-used with different weights.
 - `(proof_system, circuit_id_hex, model_hash)` pins the exact (model + circuit + scheme) combination the chain team audited.
 
 ### 3.1. Where chain-team-approved framework bindings live
 
-The "chain-team-approved framework binding" for an allowlist entry is the `(model_framework, model_format)` pair the chain team explicitly reviewed for that specific entry. The binding is recorded in two places:
+The "chain-team-approved framework binding" for an eligibility registry entry is the `(model_framework, model_format)` pair the chain team explicitly reviewed for that specific entry. The binding is recorded in two places:
 
 - **Per-entry review packet** — Stage 11d.3 review-packet §8.1 (mainnet impact statement) lists "Approved framework bindings (chain-team-recorded)" enumerating the `(model_framework, model_format)` combinations covered by the entry. The committed `chain_team_review_ref` document path points at this record.
-- **Per-entry allowlist record** — the `AllowlistEntry.model_format` field pins the format component. The framework component is **not** in the allowlist key (the chain team accepts that two frameworks can produce byte-identical proofs for the same `(proof_system, circuit_id_hex, model_hash)` triple — the four-equal-primaries posture from Stage 11b.1.a/11c carries forward). The framework binding remains a chain-team review concern recorded in the linked document.
+- **Per-entry eligibility registry record** — the `AllowlistEntry.model_format` field pins the format component. The framework component is **not** in the eligibility registry key (the chain team accepts that two frameworks can produce byte-identical proofs for the same `(proof_system, circuit_id_hex, model_hash)` triple — the four-equal-primaries posture from Stage 11b.1.a/11c carries forward). The framework binding remains a chain-team review concern recorded in the linked document.
 
 There is **no separate `framework_bindings.json` artifact** in Stage 11d.1. If a future stage needs runtime enforcement of framework-binding mismatches (rather than runtime advisory), it requires a separate chain-team plan.
 
@@ -203,10 +203,10 @@ These do not change in Stage 11d:
 - No edits to immutable audit docs (`docs/mainnet-smoke-audit.md`, `docs/phase5-rc-audit.md`).
 - No edits to `canonical_spec.json`, the canonical evaluator, framework manifests, or `EXPECTED_SPEC_HASH` (Stage 11c source-of-truth invariant carries forward).
 - **No promotion of `Stage11bHalo2Reference` to production.** It stays a testnet/dev-only architectural-validation fixture in perpetuity.
-- **No allowlist entry lands in Stage 11d.0, 11d.1, or 11d.2.** Only Stage 11d.3 — and only with written chain-team sign-off — modifies `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` to a non-empty list.
-- **`ModelFormat::Gguf` is invalid as a Stage 11d.3 allowlist entry's `model_format`** unless a separately-reviewed GGUF strategy exists. Pinned by the `every_allowlist_entry_has_required_metadata` test.
-- **`ModelFormat::Other(_)` is invalid as a Stage 11d.3 allowlist entry's `model_format`.** The `Other(_)` escape hatch is for forward compatibility with formats that have not been chain-team-reviewed; if a real format needs to land, promote it to a first-class `ModelFormat` enum variant via a separate plan. Pinned by the same test.
-- **`ProofSystem::Stage11bOnnxReference` and `ProofSystem::Stage11bHalo2Reference` are invalid as Stage 11d.3 allowlist entries' `proof_system`** — bounded references are testnet/dev-only by hard rule H1. Pinned by `stage11b_halo2_reference_never_in_allowlist` and `every_allowlist_entry_has_required_metadata`.
+- **No eligibility registry entry lands in Stage 11d.0, 11d.1, or 11d.2.** Only Stage 11d.3 — and only with written chain-team sign-off — modifies `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` to a non-empty list.
+- **`ModelFormat::Gguf` is invalid as a Stage 11d.3 eligibility registry entry's `model_format`** unless a separately-reviewed GGUF strategy exists. Pinned by the `every_allowlist_entry_has_required_metadata` test (name grandfathered).
+- **`ModelFormat::Other(_)` is invalid as a Stage 11d.3 eligibility registry entry's `model_format`.** The `Other(_)` escape hatch is for forward compatibility with formats that have not been chain-team-reviewed; if a real format needs to land, promote it to a first-class `ModelFormat` enum variant via a separate plan. Pinned by the same test.
+- **`ProofSystem::Stage11bOnnxReference` and `ProofSystem::Stage11bHalo2Reference` are invalid as Stage 11d.3 eligibility registry entries' `proof_system`** — bounded references are testnet/dev-only by hard rule H1. Pinned by `stage11b_halo2_reference_never_in_eligibility_registry` and `every_allowlist_entry_has_required_metadata`.
 
 ---
 
@@ -228,9 +228,9 @@ These do not change in Stage 11d:
 | Substage | Status (at the time of writing) | Allowlist state |
 |---|---|---|
 | **11d.0** (this document + review packet template + FAQ) | **Active PR** | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` (does not yet exist) |
-| **11d.1** (allowlist schema refactor, no entries) | After 11d.0 merge + chain-team review | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` (new schema, still empty) |
-| **11d.2** (first production proof class — no allowlist entry yet) | After 11d.1 merge + chain-team selection of production class | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` (new ProofSystem variant exists, but not in the allowlist) |
-| **11d.3** (first allowlist entry) | **Blocked on** external-cryptographer sign-off (Claim 1.1.S2), chain-team review packet completion (R1–R8), and CODEOWNERS-style PR controls | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` adds exactly one entry |
+| **11d.1** (eligibility registry schema refactor, no entries) | After 11d.0 merge + chain-team review | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` (new schema, still empty) |
+| **11d.2** (first production proof class — no eligibility registry entry yet) | After 11d.1 merge + chain-team selection of production class | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` (new ProofSystem variant exists, but not in the eligibility registry) |
+| **11d.3** (first eligibility registry entry) | **Blocked on** external-cryptographer sign-off (Claim 1.1.S2), chain-team review packet completion (R1–R8), and CODEOWNERS-style PR controls | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` adds exactly one entry |
 
 If any required field above is `TBD` at the time of a downstream PR, the downstream PR does not land. Stage 11d follows a **halt-and-report posture**: if mid-implementation the production proof class exposes a soundness or spec gap, the implementing engineer stops and surfaces the issue to the SUM Chain review board rather than silently patching.
 

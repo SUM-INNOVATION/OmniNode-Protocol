@@ -103,7 +103,7 @@ fn build_artifact(
     // check_mainnet_eligible (Stage 11d.1 schema). Allowlist entry
     // for this proof class is a Stage 11d.3 deliverable.
     metadata.testnet_or_dev_only = Some(false);
-    // Stage 11d.1 layer-6 allowlist key. Pinned in
+    // Stage 11d.1 layer-6 eligibility registry key. Pinned in
     // `shared::EXPECTED_CIRCUIT_ID_HEX`; verifier checks for drift.
     metadata.circuit_id_hex = Some(circuit_id_hex.to_string());
     // Audit field — `mainnet_vk_hash` of the canonical VK bytes

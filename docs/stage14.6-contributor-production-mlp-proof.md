@@ -4,7 +4,7 @@
 
 ## Scope (locked v1 design packet, Q1 + Q2 + Q3)
 
-Stage 14.6 is **strictly additive on top of Stages 14.5 + 14.2 + 14.3.** No new feature flag, no new `ProofSystem`/`ModelFormat` variants, no schema additions, no chain RPCs, no mainnet allowlist changes, no `omni-contributor` modifications, no `omni-zkml` modifications.
+Stage 14.6 is **strictly additive on top of Stages 14.5 + 14.2 + 14.3.** No new feature flag, no new `ProofSystem`/`ModelFormat` variants, no schema additions, no chain RPCs, no mainnet eligibility registry changes, no `omni-contributor` modifications, no `omni-zkml` modifications.
 
 ### Locks honored
 
@@ -32,7 +32,7 @@ Stage 14.6 is **strictly additive on top of Stages 14.5 + 14.2 + 14.3.** No new 
 | No `Cargo.toml` changes | Stage 14.6 reuses the existing `stage11d-production-prove` feature |
 | No CI gate changes | Existing `stage11d-production-prove-build-test` runs `cargo test -p omni-node --features stage11d-production-prove --bins` and picks up the 11 new tests automatically |
 | Default-build dep tree unchanged | Stage 14.5 default-tree isolation gate still asserts |
-| Mainnet allowlist unchanged | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty; Stage 11d.3 remains the separate chain-team-reviewed allowlist track |
+| Mainnet eligibility registry unchanged | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty; Stage 11d.3 remains the separate chain-team-reviewed eligibility registry track |
 | Stage 14.2/14.3 reference sidecar tests pass byte-equivalent | All 21 reference-path tests still green |
 
 ## Contract diff vs Stage 14.2/14.3
@@ -94,12 +94,12 @@ Identical to Stage 14.5. The sidecar artifact:
 - `testnet_or_dev_only = Some(false)` → layer 1 does **not** fire
 - `model_format = ProductionFixedPointMlp` → also refused at layer 6
 
-**Layer 6 is the sole mainnet gate.** Stage 11d.3 lands the chain-team-reviewed allowlist entry that lifts it; Stage 14.6 does not touch the allowlist.
+**Layer 6 is the sole mainnet gate.** Stage 11d.3 lands the chain-team-reviewed eligibility registry entry that lifts it; Stage 14.6 does not touch the eligibility registry.
 
 ## Future outlook
 
 - **Stage 14.7+** — operator UX hardening for the production sidecar story: per-contributor proof signing, batch proving across multiple jobs, regen-tool consolidation.
-- **Stage 11d.3** — chain-team-reviewed mainnet allowlist entry for `Stage11dProductionFixedPointMlp`. Separate track, not blocked by Stage 14.6.
+- **Stage 11d.3** — chain-team-reviewed mainnet eligibility registry entry for `Stage11dProductionFixedPointMlp`. Separate track, not blocked by Stage 14.6.
 - **Out of scope for Stage 14.x:** production prover for any other proof system, EZKL (license still blocked per Stage 14.4), staking / slashing / reward distribution, chain-side proof verification, `Evidence` enum bump.
 
 The Stage 14.x track is approaching its natural end-state: both reference (Stage 14.1 + 14.2 + 14.3) and production (Stage 14.5 + 14.6) paths are now operator-reachable for prove + verify + contributor sidecar. After Stage 14.x closes, Phase 5 transitions to chain-side tokenomics work — chain-team dependent.

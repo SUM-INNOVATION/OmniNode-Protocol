@@ -377,7 +377,7 @@ omni-node operator verify-proof --proof-artifact ./some-proof.json
 
 Output is bare stdout, five or six lines (the sixth appears only when
 mainnet is refused — which is **every Stage 11b.0 artifact**, since
-the mainnet allowlist is empty by design):
+the mainnet eligibility registry is empty by design):
 
 ```
 backend_id=mock-v1
@@ -408,7 +408,7 @@ that's the architectural property Stage 11b.0.1 locks in for every
 future backend.
 
 **Mainnet eligibility at end of Stage 11b.0 / 11b.0.1 / 11b.1.a / 11b.1.b / 11c / 11d.0 / 11d.1: zero.**
-The mainnet allowlist (`MAINNET_APPROVED_PROOF_SYSTEMS` in
+The mainnet eligibility registry (`MAINNET_APPROVED_PROOF_SYSTEMS` in
 `omni-zkml`) is empty by design. Every proof artifact this command
 verifies will report `mainnet_eligible=false` and carry an explicit
 refusal reason from one of the six refusal layers documented in §11a.
@@ -418,7 +418,7 @@ written chain-team sign-off** — see the Stage 11d.0 authoritative
 docs:
   - [`docs/mainnet-eligibility-criteria.md`](mainnet-eligibility-criteria.md)
     — what qualifies a proof system; required `ProofArtifactBody`
-    metadata; allowlist mechanics; chain-team review packet
+    metadata; eligibility registry mechanics; chain-team review packet
     requirements; non-goals (including: `Stage11bHalo2Reference`
     stays testnet/dev-only in perpetuity).
   - [`docs/stage11d-review-packet.md`](stage11d-review-packet.md)
@@ -459,7 +459,7 @@ live under `tools/` (excluded from the workspace) so
 `cargo build -p omni-node` cannot transitively reach them. Layer 3
 of `check_mainnet_eligible` refuses both `Stage11bOnnxReference`
 AND `Stage11bHalo2Reference` (defense in depth alongside the
-testnet flag + empty allowlist).
+testnet flag + empty eligibility registry).
 
 **Stage 11b.1.b — halo2 reference verifier (opt-in feature
 `halo2-reference-verify`).** Adds a `Halo2ReferenceVerifier` to
@@ -661,7 +661,7 @@ typed taxonomy for sub-conditions like fee/balance vs. transport.
 | `BoundedReferenceProofRefusedOnMainnet` (**Stage 11b.0**) | proof_system ∈ `{Stage11bOnnxReference, Stage11bHalo2Reference}` (refusal layer 3) | yes — typed error | bounded reference fixtures are for architecture validation, not production; use a mainnet-approved producer (none ship through Stage 11c) | backend_id |
 | `GgufProofClaimRefusedOnMainnet` (**Stage 11b.0**) | `model_format == Gguf` (refusal layer 4) | yes — typed error | no GGUF inference proof backend is approved at any stage through Stage 11d.0; wait for a future Stage 11e research-track strategy + chain-team review. **Declaring GGUF prevents silent fake-GGUF claims**, which is the point. | backend_id, model_hash |
 | `UnknownModelFormatRefusedOnMainnet` (**Stage 11b.0**) | `model_format = Other(_)` or absent on a non-mock backend (refusal layer 5) | yes — typed error | promote the format to a first-class enum variant via a chain-team-reviewed PR, or use an approved format | backend_id, model_format value |
-| `ProofSystemNotMainnetApproved` (**Stage 11b.0**, schema-extended in **Stage 11d.1**) | artifact's `(proof_system, circuit_id_hex, model_hash)` triple does not match any entry in `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`, AND `proof_system` is not in the legacy `MAINNET_APPROVED_PROOF_SYSTEMS` back-compat alias (refusal layer 6) | yes — typed error | **Both lists ship empty through Stage 11d.1 / 11d.2 by design** — only a Stage 11d.3 entry with written chain-team sign-off populates the structured list. Stage 11d.1 introduced the structured `AllowlistEntry`-keyed list; the legacy `&[ProofSystem]` slice is preserved as an empty back-compat alias. See [docs/mainnet-eligibility-criteria.md](mainnet-eligibility-criteria.md). | backend_id, proof_system |
+| `ProofSystemNotMainnetApproved` (**Stage 11b.0**, schema-extended in **Stage 11d.1**) | artifact's `(proof_system, circuit_id_hex, model_hash)` triple does not match any entry in `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`, AND `proof_system` is not in the legacy `MAINNET_APPROVED_PROOF_SYSTEMS` back-compat alias (refusal layer 6) | yes — typed error | **Both lists ship empty through Stage 11d.1 / 11d.2 / 11d.3A / 11d.3B by design** — only a Stage 11d.3C+ PR, after the chain-side Proof Eligibility Registry record lands, populates the structured list. Stage 11d.1 introduced the structured `AllowlistEntry`-keyed list (the local-side mirror of the SUM Chain Proof Eligibility Registry, `sum-chain#21`); the legacy `&[ProofSystem]` slice is preserved as an empty back-compat alias. See [docs/mainnet-eligibility-criteria.md](mainnet-eligibility-criteria.md) and [docs/stage11.d.3B-proof-eligibility-registry-alignment.md](stage11.d.3B-proof-eligibility-registry-alignment.md). | backend_id, proof_system |
 | `NoVerifierForProofSystem` (**Stage 11b.0**) | `operator verify-proof` was handed an artifact whose `proof_system` has no verifier registered | yes — typed error | Stage 11b.0 ships only `MockProofVerifier`; Stage 11b.1.b/11c add `Halo2ReferenceVerifier` under the opt-in `halo2-reference-verify` feature. Other proof systems are verifier-side stubs awaiting future stages. | proof_system |
 
 > **Known limitation flagged by Stage 10a.** [`ChainClientError`](../crates/omni-zkml/src/error.rs)
@@ -688,7 +688,7 @@ The honest framing — to be repeated wherever Stage 11b/c/d is described:
   mainnet-eligibility criteria record GGUF as deferred to Stage 11e
   research. The same criteria record that any future GGUF strategy
   would require its own chain-team plan and would not auto-inherit
-  Stage 11d allowlist mechanics.
+  Stage 11d eligibility registry mechanics.
 - A future Stage 11e research track could evaluate **one or more** of
   the following strategies. None of them prove full transformer
   inference correctness:
@@ -840,7 +840,7 @@ construction.
 `ProofBackend` / `ProofVerifier` trait extensions, the `ModelFormat`
 + `ProofSystem` enums, the six-layer `check_mainnet_eligible` refusal
 helper, and the `operator verify-proof` read-only subcommand. **Stage
-11b.0 mainnet eligibility is intentionally zero** — the allowlist
+11b.0 mainnet eligibility is intentionally zero** — the eligibility registry
 ships empty, and every proof artifact `verify-proof` inspects will
 report `mainnet_eligible=false`. This is **architecture**, not
 production zkML; the criteria for "decentralized compute readiness"
@@ -3529,7 +3529,7 @@ The umbrella suite's scenario 1 (`scenario_1_happy_path_full_lifecycle_seed_reco
 **What was already in place (Stage 11b.1.b):**
 
 - [`omni-proofs-halo2-reference`](../crates/omni-proofs-halo2-reference/) ships both a verifier (behind crate-feature `verify`) and a developer-host prover (behind crate-feature `prove`), both bound to the same [`BoundedMlpCircuit`](../crates/omni-proofs-halo2-reference/src/circuit.rs).
-- `ProofSystem::Stage11bHalo2Reference` is already a closed variant; the mainnet allowlist is empty by design — submission to `chain_id == 1` is hard-refused at [`omni_zkml::check_mainnet_eligible`](../crates/omni-zkml/src/proof.rs) layers 1 + 3 + 6.
+- `ProofSystem::Stage11bHalo2Reference` is already a closed variant; the mainnet eligibility registry is empty by design — submission to `chain_id == 1` is hard-refused at [`omni_zkml::check_mainnet_eligible`](../crates/omni-zkml/src/proof.rs) layers 1 + 3 + 6.
 - `prove_canonical` is byte-deterministic via a fixed `ChaCha20Rng` seed; existing fixture `proof.bin` is committed.
 
 **What Stage 14.1 added:**
@@ -3703,7 +3703,7 @@ cargo run -p omni-node --features halo2-reference-prove -- \
 **What was already in place (Stage 11d.2):**
 
 - [`omni-proofs-halo2-production-mlp`](../crates/omni-proofs-halo2-production-mlp/) ships a verifier (behind `feature = "verify"`) AND a developer-host prover (behind `feature = "prove"`), both bound to the same [`ProductionMlpCircuit`](../crates/omni-proofs-halo2-production-mlp/src/circuit.rs).
-- `ProofSystem::Stage11dProductionFixedPointMlp` is already a closed variant; the mainnet allowlist `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` stays empty — submission to `chain_id == 1` is hard-refused at [`omni_zkml::check_mainnet_eligible`](../crates/omni-zkml/src/proof.rs) **layer 6 only**.
+- `ProofSystem::Stage11dProductionFixedPointMlp` is already a closed variant; the mainnet eligibility registry `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` stays empty — submission to `chain_id == 1` is hard-refused at [`omni_zkml::check_mainnet_eligible`](../crates/omni-zkml/src/proof.rs) **layer 6 only**.
 - `prove_canonical` is byte-deterministic via a fixed `ChaCha20Rng` seed; fixtures `params.bin` (131 140 bytes), `proof.bin`, and `proof_artifact.json` are committed under [`fixtures/halo2/`](../crates/omni-proofs-halo2-production-mlp/fixtures/halo2/).
 
 **What Stage 14.5 added:**
@@ -3718,13 +3718,13 @@ cargo run -p omni-node --features halo2-reference-prove -- \
 | Aspect | Stage 14.1 reference | **Stage 14.5 production** |
 | --- | --- | --- |
 | `testnet_or_dev_only` on artifact | `Some(true)` | **`Some(false)`** — production-shape contract |
-| Mainnet refusal layers fired | 1 + 3 + 6 (three independent gates) | **6 only** (sole gate — empty allowlist) |
+| Mainnet refusal layers fired | 1 + 3 + 6 (three independent gates) | **6 only** (sole gate — empty eligibility registry) |
 | `circuit_id_hex` / `verification_key_hex` | optional | **required, must equal pinned constants** (`593d027d…` / `2ec18fae…`) |
 | `model_format` | `Halo2ReferenceMlp` | `ProductionFixedPointMlp` |
 | Input / output arity | `[i16; 4]` / `[i16; 4]` | `[i16; 16]` / `[i16; 8]` |
 | `HALO2_K` | 10 | 11 |
 
-The Stage 14.5 mainnet refusal is **single-layer (layer 6) only.** That's by design: the artifact is production-shape, so layer 1 (testnet/dev refusal) does not fire. Lifting the refusal requires landing a chain-team-reviewed allowlist entry — that's the separate Stage 11d.3 deliverable. **No Stage 14.x change touches `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`.**
+The Stage 14.5 mainnet refusal is **single-layer (layer 6) only.** That's by design: the artifact is production-shape, so layer 1 (testnet/dev refusal) does not fire. Lifting the refusal requires landing a chain-team-reviewed eligibility registry entry — that's the separate Stage 11d.3 deliverable. **No Stage 14.x change touches `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`.**
 
 **Default-build posture unchanged:** `cargo build -p omni-node` (no features) pulls zero halo2 / pasta / `omni-proofs-halo2-production-mlp` / `rand_chacha` (as a direct prover dep). The Mock-backend verification flow still works end-to-end. Both invariants are pinned by CI tree gates (existing Stage 11d.2 default-tree isolation guard + Stage 14.5 prove-tree positive check).
 
@@ -3753,7 +3753,7 @@ The roundtrip is exercised hermetically in CI by [`crates/omni-proofs-halo2-prod
 | Layer | Behavior for Stage 14.5 artifact |
 | --- | --- |
 | Layer 1 (`testnet_or_dev_only == Some(true)`) | **Does NOT fire** — production artifact declares `Some(false)` |
-| Layer 6 (`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`) | **Refuses** — allowlist empty until Stage 11d.3 chain-team sign-off |
+| Layer 6 (`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`) | **Refuses** — eligibility registry empty until Stage 11d.3 chain-team sign-off |
 
 The mainnet refusal is sole-source. Lift requires the Stage 11d.3 PR; Stage 14.5 does not block on it.
 
@@ -3762,7 +3762,7 @@ The mainnet refusal is sole-source. Lift requires the Stage 11d.3 PR; Stage 14.5
 - Circuit shape locked to the canonical 16-int input / 8-int output. Arbitrary models / GGUF / ONNX remain out of scope.
 - Operator-supplied `--input-i16` must be 16 comma-separated values in `i16` range. Canonical evaluator derives the 8-int output deterministically; attacker-chosen outputs are refused.
 - Proving cost: ~30 seconds per call on a typical operator host (the production circuit is wider than the reference's 4 → 8 → 4). CI runs the suite with `RUST_MIN_STACK=67108864` (64 MB) to give the constraint-system walker enough stack.
-- Stage 11d.3 mainnet allowlist entry is the dependency for chain-side mainnet eligibility — **separate track, chain-team-reviewed.**
+- Stage 11d.3 mainnet eligibility registry entry is the dependency for chain-side mainnet eligibility — **separate track, chain-team-reviewed.**
 
 **Stage 14.5 engineering doc:** [`docs/stage14.5-halo2-production-mlp-prove.md`](stage14.5-halo2-production-mlp-prove.md) — scope, surface map, contract diff vs Stage 14.1, CI gates, test inventory, Stage 14.6+ outlook.
 
@@ -3824,7 +3824,7 @@ cargo run -p omni-node --features stage11d-production-prove -- \
   operator verify-proof --proof-artifact /path/to/sidecar_proof.json
 ```
 
-**Mainnet posture:** unchanged from Stage 14.5. The sidecar declares `testnet_or_dev_only=Some(false)` and `proof_system=Stage11dProductionFixedPointMlp`. `check_mainnet_eligible` refuses at **layer 6 only** (empty allowlist). Lifting requires the separate **Stage 11d.3** chain-team-reviewed allowlist PR.
+**Mainnet posture:** unchanged from Stage 14.5. The sidecar declares `testnet_or_dev_only=Some(false)` and `proof_system=Stage11dProductionFixedPointMlp`. `check_mainnet_eligible` refuses at **layer 6 only** (empty eligibility registry). Lifting requires the separate **Stage 11d.3** chain-team-reviewed eligibility registry PR.
 
 **Difference from Stage 14.2/14.3 reference sidecar:**
 
@@ -3847,7 +3847,7 @@ The two emit flags are clap-layer mutually exclusive — operator gets a usage e
 - Canonical-`production-fixedpoint-mlp-v1` jobs only. Arbitrary models / ONNX / GGUF out of scope.
 - StubRunner-supplied byte files must match production sizes exactly (32 / 16 bytes). Reference-shape files (8 / 8 bytes) are refused.
 - `ContributorResult` JSON shape is unchanged (`schema_version: 1`, `Evidence::AttestationOnly`). The sidecar is a separate file.
-- Stage 11d.3 mainnet allowlist entry remains the chain-team-reviewed dependency for chain-side eligibility.
+- Stage 11d.3 mainnet eligibility registry entry remains the chain-team-reviewed dependency for chain-side eligibility.
 
 **Implementation reference:** [`docs/stage14.6-contributor-production-mlp-proof.md`](stage14.6-contributor-production-mlp-proof.md) — scope, contract diff vs Stage 14.2/14.3, surface map, test inventory.
 
@@ -3871,14 +3871,14 @@ By Stage 14.7 the operator binary supports two parallel proof families. They are
 | `verification_key_hex` | `None` | **required**, equals `EXPECTED_VK_HASH_HEX` |
 | Mainnet refusal layers fired | **1 + 3 + 6** (defense in depth) | **6 only** (sole gate) |
 | Proof cost per call (CPU host, dev hardware) | ~10 s | ~30 s |
-| Cleared for mainnet today? | No — Stage 11b architecture-validation only | No — Stage 11d.3 chain-team allowlist PR is the dependency |
+| Cleared for mainnet today? | No — Stage 11b architecture-validation only | No — Stage 11d.3 chain-team eligibility registry PR is the dependency |
 
 #### When to choose which
 
 - **Use the reference path** when you're validating the architecture seam end-to-end (operator → verifier → contributor → sidecar → verifier), running quick smoke tests, or developing against the Stage 14.x surface. The toy circuit is intentionally small; proving is fast; mainnet is hard-refused at three independent layers so there is no submission-side risk.
-- **Use the production path** when you want a real proof of the canonical `production-fixedpoint-mlp-v1` MLP for staging / testnet acceptance. The artifact declares `testnet_or_dev_only=Some(false)` (production-shape) so its mainnet refusal lands at layer 6 only — the empty `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` allowlist. Stage 11d.3 ships the chain-team-reviewed allowlist entry that lifts that refusal; until then, both paths are off-chain only.
+- **Use the production path** when you want a real proof of the canonical `production-fixedpoint-mlp-v1` MLP for staging / testnet acceptance. The artifact declares `testnet_or_dev_only=Some(false)` (production-shape) so its mainnet refusal lands at layer 6 only — the empty `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` eligibility registry. Stage 11d.3 ships the chain-team-reviewed eligibility registry entry that lifts that refusal; until then, both paths are off-chain only.
 
-Both paths verify off-chain only. Mainnet activation for the production class lands in Stage 11d.3 via a chain-team-reviewed allowlist PR; until then, every artifact is refused on `chain_id == 1` regardless of family.
+Both paths verify off-chain only. Mainnet activation for the production class lands in Stage 11d.3 via a chain-team-reviewed eligibility registry PR; until then, every artifact is refused on `chain_id == 1` regardless of family.
 
 #### Performance caveats
 
@@ -3887,3 +3887,25 @@ Both paths verify off-chain only. Mainnet activation for the production class la
 - A `halo2_proofs` version bump may shift proof bytes; fixture regen runs through the workspace-excluded tools (`tools/halo2_reference_regen/`, `tools/halo2_production_mlp_regen/`).
 
 **Stage 14.7 engineering doc:** [`docs/stage14.7-proof-generation-acceptance-hardening.md`](stage14.7-proof-generation-acceptance-hardening.md) — umbrella acceptance test scope, cached-artifact strategy, CI coverage notes, Stage 14.x track close.
+
+### Stage 11d.3A — production proof eligibility evidence bundle
+
+**Status: docs / evidence only.** No eligibility registry mutation, no code activation, no chain RPC changes. The production proof family (`ProofSystem::Stage11dProductionFixedPointMlp`) **remains dormant / not mainnet-eligible** at the end of this stage.
+
+Stage 11d.3A is the OmniNode-side evidence bundle requested by chain-team after the dormant **Proof Eligibility Registry** design package landed at `sum-chain#21` (`docs/SUBPROTOCOLS/PROOF-ELIGIBILITY-REGISTRY.md` + `…-ACTIVATION.md`). It surfaces the candidate identity tuple, hash derivations / provenance, implementation map, metadata contract, test matrix, current mainnet-refusal behavior, and the architectural fork (register-only vs. chain-side proof verification) — with OmniNode's recommended v1 being **register-only**.
+
+The bundle exists to unblock chain-team / governance review; it does not grant eligibility. Until written sign-off lands answers to its §9 questions (especially the value of `chain_team_review_ref`, the audit-requirement decision, and the activation / rollback semantics), `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty and every production artifact is refused at layer 6 of `check_mainnet_eligible`.
+
+**Stage 11d.3A engineering doc:** [`docs/stage11.d.3A-production-proof-eligibility-evidence.md`](stage11.d.3A-production-proof-eligibility-evidence.md) — candidate identity tuple, hash provenance, implementation evidence, metadata contract, test / acceptance matrix, current refusal behavior, register-only vs. chain-side-verify fork, open chain-team questions, rollback / regeneration assumptions, out-of-scope enumeration.
+
+### Stage 11d.3B — Proof Eligibility Registry terminology + dormant-policy alignment
+
+**Status: docs + cosmetic rename only.** No behavior change. No activation. No `Active` record anywhere. `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty (`&[]`).
+
+Stage 11d.3B aligns OmniNode terminology with the SUM Chain **Proof Eligibility Registry** subprotocol (`sum-chain#21`'s dormant `docs/SUBPROTOCOLS/PROOF-ELIGIBILITY-REGISTRY.md` + `…-ACTIVATION.md`) and normalizes the copyright attribution on the workspace LICENSE files to `SUM INNOVATION INC` (all caps, no period).
+
+Lock summary (verbatim from chain-team confirmation): the chain-side mechanism is a **registry**, not an allowlist; it is append-only and superseding; the first `Stage11dProductionFixedPointMlp` chain-side record must be `CandidateRefused` (not `Active`) at merge time; v1 is **register-only** with no chain-side SNARK verification; `proof_eligibility_enabled_from_height: Option<u64> = None` is dormant by default. OmniNode owns proof generation + verification correctness; the chain admits / refuses by exact proof-profile identity match only.
+
+OmniNode-side consumption of chain registry state is deferred to **Stage 11d.3C**, which itself depends on the chain-side `CandidateRefused` record landing first. Stage 11d.3B does not write any consumption code and does not change behavior on either side. Public-API identifiers (`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`, `MAINNET_APPROVED_PROOF_SYSTEMS`, `AllowlistEntry`, `MainnetRefusalReason::NotInMainnetAllowlist`) are grandfathered with doc-comment pointers; any rename is deferred to a separate housekeeping stage.
+
+**Stage 11d.3B engineering doc:** [`docs/stage11.d.3B-proof-eligibility-registry-alignment.md`](stage11.d.3B-proof-eligibility-registry-alignment.md) — chain-team confirmation summary, register-only v1 model, `CandidateRefused`-first requirement, terminology canonicalization (Proof Eligibility Registry / eligibility registry / grandfathered identifiers / `env_allowlist` exclusion), license normalization, Stage 11d.3C dependency, out-of-scope enumeration, future outlook.

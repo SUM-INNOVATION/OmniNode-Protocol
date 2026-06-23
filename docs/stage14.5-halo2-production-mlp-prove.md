@@ -13,7 +13,7 @@ Pair the existing `omni-proofs-halo2-production-mlp` verifier (Stage 11d.2) with
 | `crates/omni-zkml/src/error.rs` untouched | Existing `ProofBackendError::BackendInternal` covers all new validation failures. |
 | `ProofSystem` enum untouched | Reuses the already-shipped `ProofSystem::Stage11dProductionFixedPointMlp` variant. |
 | `ModelFormat` enum untouched | Reuses `ModelFormat::ProductionFixedPointMlp`. |
-| Mainnet allowlist unchanged | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty; **Stage 11d.3 separate track** for the chain-team-reviewed allowlist entry. |
+| Mainnet eligibility registry unchanged | `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty; **Stage 11d.3 separate track** for the chain-team-reviewed eligibility registry entry. |
 | Verifier API untouched | `Halo2ProductionMlpVerifier::verify_artifact` consumes the new artifact byte-for-byte through its existing dispatch — recon verified the contract is satisfiable without expanding the verifier. |
 | `ProofArtifactBody` schema untouched | All metadata fields the generator writes already exist (Stage 11b.0 + 11d.2). |
 | `omni-sumchain` untouched | No chain RPCs added. |
@@ -35,14 +35,14 @@ The Stage 14.5 production-MLP path mirrors Stage 14.1's structure but the artifa
 | `testnet_or_dev_only` | `Some(true)` | **`Some(false)`** ← production-shape contract |
 | `circuit_id_hex` | Optional (None tolerated by verifier) | **Required**, must equal pinned `EXPECTED_CIRCUIT_ID_HEX = "593d027d…"` |
 | `verification_key_hex` | None (verifier doesn't check) | **Required**, must equal pinned `EXPECTED_VK_HASH_HEX = "2ec18fae…"` |
-| Mainnet refusal layers | 1 + 3 + 6 (three independent gates) | **6 only** (sole gate — empty allowlist) |
+| Mainnet refusal layers | 1 + 3 + 6 (three independent gates) | **6 only** (sole gate — empty eligibility registry) |
 | Input shape | `[i16; 4]` (8 bytes LE) | `[i16; 16]` (32 bytes LE) |
 | Output shape | `[i16; 4]` (8 bytes LE) | `[i16; 8]` (16 bytes LE) |
 | `HALO2_K` | 10 (1 024 rows) | 11 (2 048 rows) |
 | `PROVER_RNG_SEED` | `*b"OmniNode/Stage11b.1.b/prover-rng"` | `*b"OmniNode/Stage11d.2/prover-rngv1"` (distinct) |
 | CI `RUST_MIN_STACK` | default | **64 MB** required (constraint-system walker needs headroom for the wider circuit) |
 
-The production refusal landing at **layer 6 only** is the key Stage 11d.x design: production-shape artifacts pass layer 1 (they correctly declare `testnet_or_dev_only=Some(false)`), and the only thing keeping them off mainnet is the empty allowlist that Stage 11d.3 will fill via a chain-team-reviewed PR. Stage 14.5 does **not** modify the allowlist; the production prover ships under the existing empty-allowlist refusal.
+The production refusal landing at **layer 6 only** is the key Stage 11d.x design: production-shape artifacts pass layer 1 (they correctly declare `testnet_or_dev_only=Some(false)`), and the only thing keeping them off mainnet is the empty eligibility registry that Stage 11d.3 will fill via a chain-team-reviewed PR. Stage 14.5 does **not** modify the eligibility registry; the production prover ships under the existing empty-registry refusal.
 
 ## Surface map
 
@@ -57,7 +57,7 @@ The production refusal landing at **layer 6 only** is the key Stage 11d.x design
 | [`docs/operator-runbook.md`](operator-runbook.md) | New Stage 14.5 sub-section. |
 | This doc | Engineering doc. |
 
-**Zero changes** to: `crates/omni-zkml`, `crates/omni-sumchain`, `crates/omni-contributor`, `crates/omni-proofs-halo2-reference`, mainnet allowlist, `ProofSystem` enum, `ModelFormat` enum, `ProofArtifactBody` schema, `Halo2ProductionMlpVerifier` API.
+**Zero changes** to: `crates/omni-zkml`, `crates/omni-sumchain`, `crates/omni-contributor`, `crates/omni-proofs-halo2-reference`, mainnet eligibility registry, `ProofSystem` enum, `ModelFormat` enum, `ProofArtifactBody` schema, `Halo2ProductionMlpVerifier` API.
 
 ## Test inventory
 
@@ -104,7 +104,7 @@ Existing gates unchanged: default-tree (already isolates `omni-proofs-halo2-prod
 The Stage 14.5 production prover ships with the **same** mainnet refusal as Stage 11d.2's verifier: every artifact is refused on `chain_id == 1` because `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]`. Lifting that refusal requires:
 
 1. **Stage 11d.3 review packet** — chain-team-reviewed mainnet eligibility criteria for `ProofSystem::Stage11dProductionFixedPointMlp`.
-2. **Stage 11d.3 allowlist PR** — adds an `AllowlistEntry` with the pinned `circuit_id_hex` and `verification_key_hash_hex` already present in [`shared.rs`](../crates/omni-proofs-halo2-production-mlp/src/shared.rs).
+2. **Stage 11d.3 eligibility registry PR** — adds an `AllowlistEntry` with the pinned `circuit_id_hex` and `verification_key_hash_hex` already present in [`shared.rs`](../crates/omni-proofs-halo2-production-mlp/src/shared.rs).
 3. **External-cryptographer sign-off** (per the Stage 11d.0 criteria).
 
 Stage 14.5 does **not** unblock or touch any of these. The production prover is shippable today under the existing testnet-or-dev posture; Stage 11d.3 lands separately whenever the chain-team-side review concludes.
@@ -112,7 +112,7 @@ Stage 14.5 does **not** unblock or touch any of these. The production prover is 
 ## Future outlook
 
 - **Stage 14.6+** — operator UX hardening: cross-input batch proving, per-circuit performance docs, regen-tool consolidation.
-- **Stage 11d.3** — chain-team-reviewed mainnet allowlist entry. Separate track, not blocked by Stage 14.5.
+- **Stage 11d.3** — chain-team-reviewed mainnet eligibility registry entry. Separate track, not blocked by Stage 14.5.
 - **Stage 14.x track end-state** — once both the reference and production halo2 paths are operator-reachable for prove + verify + contributor sidecar, Phase 5 transitions to the chain-side tokenomics work. The Stage 14.x track does **not** include staking / slashing / reward distribution — those require chain-team contract specs.
 
 EZKL remains rejected (license/supply-chain posture unchanged from the 2026-05-22 spike); Stage 14.4 honestly reported that and pivoted to this production-MLP slice. Any future EZKL revisit requires upstream license changes.

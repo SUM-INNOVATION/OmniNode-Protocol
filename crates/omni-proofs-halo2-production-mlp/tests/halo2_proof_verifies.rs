@@ -105,7 +105,7 @@ fn committed_artifact_refused_on_mainnet() {
     // one) is refused on mainnet through Stage 11d.2 because
     // MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES is empty. This test
     // pins that posture for the production proof class — any
-    // accidental allowlist-table population would fail here.
+    // accidental eligibility-registry population would fail here.
     let body = load_committed_artifact();
     let outcome = omni_zkml::check_mainnet_eligible(&body.metadata);
     match outcome {

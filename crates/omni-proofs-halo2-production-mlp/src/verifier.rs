@@ -20,8 +20,8 @@
 //! (`testnet_or_dev_only: Some(false)`). However, the
 //! `check_mainnet_eligible` layer 6 still hard-refuses because
 //! `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` through Stage
-//! 11d.2. Mainnet allowlist entry for this proof class is a
-//! Stage 11d.3 deliverable (R1–R9 sign-off gate).
+//! 11d.2. Mainnet eligibility registry entry for this proof class is
+//! a Stage 11d.3 deliverable (R1–R9 sign-off gate).
 //!
 //! ## Verification pipeline (verify_artifact)
 //!
@@ -93,7 +93,7 @@ fn hex(bytes: &[u8]) -> String {
 /// `circuit_id_hex` for the production circuit. Derived from
 /// `vk_canonical_bytes` via bare BLAKE3 (no domain separator);
 /// pinned in `shared::EXPECTED_CIRCUIT_ID_HEX`. Used by Stage 11d.1
-/// allowlist matching at layer 6 of `check_mainnet_eligible`.
+/// eligibility registry matching at layer 6 of `check_mainnet_eligible`.
 pub fn live_circuit_id_hex(vk: &VerifyingKey<EqAffine>) -> String {
     let bytes = vk_canonical_bytes(vk);
     blake3::hash(&bytes).to_hex().to_string()
@@ -294,8 +294,8 @@ impl ProofVerifier for Halo2ProductionMlpVerifier {
                 meta.backend_id
             )));
         }
-        // Stage 11d.1 allowlist key — pinned in shared.rs. The
-        // future `AllowlistEntry` (Stage 11d.3) will carry the
+        // Stage 11d.1 eligibility registry key — pinned in shared.rs.
+        // The future `AllowlistEntry` (Stage 11d.3) will carry the
         // same string; any artifact whose `circuit_id_hex` drifts
         // from `EXPECTED_CIRCUIT_ID_HEX` is rejected here, before
         // SNARK verification.

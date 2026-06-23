@@ -11,7 +11,7 @@
 //! enum in this crate.
 //!
 //! No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest`
-//! / on-chain verification / proof-system allowlist touched. Stage 11d.3
+//! / on-chain verification / proof-system eligibility registry touched. Stage 11d.3
 //! reframe posture preserved: the chain remains neutral; proof acceptance
 //! is a local verifier policy decision, and this crate's verifier is one
 //! such local policy gate.

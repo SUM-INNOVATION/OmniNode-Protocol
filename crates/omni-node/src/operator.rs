@@ -175,13 +175,13 @@ pub(crate) enum OperatorError {
     UnknownModelFormatRefusedOnMainnet { backend_id: String },
 
     /// Stage 11b.0 layer 6 — proof_system is not in
-    /// [`omni_zkml::MAINNET_APPROVED_PROOF_SYSTEMS`]. The allowlist is
-    /// empty by design at end of Stage 11b.0; mainnet eligibility is
-    /// a Stage 11c+ deliverable with chain-team review.
+    /// [`omni_zkml::MAINNET_APPROVED_PROOF_SYSTEMS`]. The eligibility
+    /// registry is empty by design at end of Stage 11b.0; mainnet
+    /// eligibility is a Stage 11c+ deliverable with chain-team review.
     #[cfg(feature = "submit")]
     #[error(
-        "proof system not in the mainnet allowlist (backend_id = {backend_id:?}): \
-         Stage 11b ships with the allowlist empty by design — mainnet \
+        "proof system not in the mainnet eligibility registry (backend_id = {backend_id:?}): \
+         Stage 11b ships with the eligibility registry empty by design — mainnet \
          eligibility is a Stage 11c+ deliverable"
     )]
     ProofSystemNotMainnetApproved { backend_id: String },
@@ -751,7 +751,7 @@ enum OperatorCmd {
     /// = Some(false)`** — production-shape contract. Submission to
     /// `chain_id == 1` is hard-refused at `check_mainnet_eligible`
     /// **layer 6 only** (the empty
-    /// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` allowlist). Symmetric
+    /// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` eligibility registry). Symmetric
     /// with `verify-proof`'s production-MLP dispatch arm.
     #[cfg(feature = "stage11d-production-prove")]
     GenerateProductionMlpProof(GenerateProductionMlpProofArgs),
@@ -2034,7 +2034,7 @@ async fn verify_proof_core(proof_artifact_path: PathBuf) -> Result<(), OperatorE
             // or neither may be enabled at the operator-binary level.
             // Mainnet posture is preserved by the always-evaluated
             // `check_mainnet_eligible` call below, which refuses
-            // this proof_system through layer 6 (empty allowlist).
+            // this proof_system through layer 6 (empty eligibility registry).
             #[cfg(feature = "stage11d-production-verify")]
             Some(omni_zkml::ProofSystem::Stage11dProductionFixedPointMlp) => {
                 use omni_zkml::ProofVerifier;
@@ -2061,7 +2061,7 @@ async fn verify_proof_core(proof_artifact_path: PathBuf) -> Result<(), OperatorE
 
         // Always-evaluated: mainnet refusal reason. Stage 11b.0
         // invariant — `check_mainnet_eligible` returns Err for every
-        // input, since the allowlist is empty.
+        // input, since the eligibility registry is empty.
         let mainnet = omni_zkml::check_mainnet_eligible(&body.metadata);
         let mainnet_refusal_str = match &mainnet {
             Ok(()) => "ok".to_string(), // unreachable in Stage 11b.0
@@ -2113,8 +2113,8 @@ async fn verify_proof_core(proof_artifact_path: PathBuf) -> Result<(), OperatorE
 /// `[i16; 4]` input, signed off by the halo2-reference prover.
 /// The artifact is directly consumable by `operator verify-proof`
 /// under the same `--features halo2-reference-verify` build, and
-/// is hard-refused on `chain_id == 1` by the same allowlist that
-/// already gates the verifier (no new mainnet-eligibility surface).
+/// is hard-refused on `chain_id == 1` by the same eligibility registry
+/// that already gates the verifier (no new mainnet-eligibility surface).
 #[cfg(feature = "halo2-reference-prove")]
 async fn generate_reference_proof_core(
     input_i16_str: String,
@@ -2248,9 +2248,9 @@ fn hex_lower(bytes: &[u8; 32]) -> String {
 /// — production artifacts declare `testnet_or_dev_only=Some(false)`,
 /// so layer 1 does NOT fire (distinct from Stage 14.1's reference
 /// path which fires both layer 1 and layer 6). The empty
-/// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` allowlist is the sole
-/// mainnet gate; Stage 11d.3 lands the chain-team-reviewed allowlist
-/// entry that would lift it.
+/// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` eligibility registry is
+/// the sole mainnet gate; Stage 11d.3 lands the chain-team-reviewed
+/// eligibility registry entry that would lift it.
 #[cfg(feature = "stage11d-production-prove")]
 async fn generate_production_mlp_proof_core(
     input_i16_str: String,
@@ -2305,8 +2305,8 @@ async fn generate_production_mlp_proof_core(
             public_inputs: Some(public_inputs_json),
             // Stage 14.5 production-shape contract: `Some(false)`,
             // NOT `Some(true)` like the reference path. Mainnet
-            // refusal lands at layer 6 (empty allowlist), not
-            // layer 1.
+            // refusal lands at layer 6 (empty eligibility registry),
+            // not layer 1.
             testnet_or_dev_only: Some(false),
             model_framework: Some(omni_zkml::ModelFramework::FrameworkAgnostic),
         };
@@ -4563,8 +4563,8 @@ mod tests {
     /// Distinct from Stage 14.1: production-shape declares
     /// `testnet_or_dev_only=Some(false)`, so layer 1 does NOT
     /// fire. The empty `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`
-    /// allowlist at layer 6 is the sole mainnet refusal — pinning
-    /// it here documents the Stage 11d.3 dependency.
+    /// eligibility registry at layer 6 is the sole mainnet refusal —
+    /// pinning it here documents the Stage 11d.3 dependency.
     #[cfg(feature = "stage11d-production-prove")]
     #[tokio::test]
     async fn generated_production_mlp_artifact_is_mainnet_refused_at_layer_6_only() {
@@ -4587,7 +4587,7 @@ mod tests {
         assert!(
             refusal.is_err(),
             "Stage 14.5 production artifact MUST be mainnet-refused; \
-             got Ok (Stage 11d.3 allowlist landed?)"
+             got Ok (Stage 11d.3 eligibility registry landed?)"
         );
     }
 
@@ -4904,7 +4904,7 @@ mod tests {
     /// classified BoundedReference (Stage11dProductionFixedPointMlp is
     /// distinct), so layers 1 and 3 do not fire. Layer 6 is the SOLE
     /// gate — `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty until
-    /// Stage 11d.3 lands the chain-team-reviewed allowlist entry.
+    /// Stage 11d.3 lands the chain-team-reviewed eligibility registry entry.
     ///
     /// We additionally prove layer 1 WOULD fire if the artifact were
     /// mis-declared as testnet_or_dev_only=Some(true), so the

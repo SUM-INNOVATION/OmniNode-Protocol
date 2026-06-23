@@ -24,7 +24,7 @@ Stage 14.2 is **strictly additive on top of Stage 14.1.** No new feature flag, n
 | --- | --- |
 | `crates/omni-zkml/src/error.rs` untouched | `git diff main` empty |
 | `ProofSystem` enum untouched | Reuses `Stage11bHalo2Reference` |
-| Mainnet allowlist unchanged | `MAINNET_APPROVED_PROOF_SYSTEMS` stays empty |
+| Mainnet eligibility registry unchanged | `MAINNET_APPROVED_PROOF_SYSTEMS` stays empty |
 | Verifier API untouched | `Halo2ReferenceVerifier` not modified |
 | `ProofArtifactBody` schema untouched | Only the opaque `public_inputs` JSON value grows a new key (extra-key tolerance pinned by Test 10) |
 | `Evidence` enum / `ContributorResult` schema unchanged | `schema_version: 1`, `Evidence::AttestationOnly` only |
@@ -65,7 +65,7 @@ Default-build regression (no new tests needed): the existing Stage 14.1 `halo2-r
 ## Mainnet posture
 
 Identical to Stage 14.1. Sidecar artifact metadata:
-- `proof_system = Stage11bHalo2Reference` → refused at `check_mainnet_eligible` layer 3 (BoundedReference class) and layer 6 (empty allowlist)
+- `proof_system = Stage11bHalo2Reference` → refused at `check_mainnet_eligible` layer 3 (BoundedReference class) and layer 6 (empty eligibility registry)
 - `testnet_or_dev_only = Some(true)` → refused at layer 1
 
 Three independent refusal layers fire on the same artifact. `--allow-mainnet-submit` cannot override.

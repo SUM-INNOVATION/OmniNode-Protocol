@@ -13,7 +13,7 @@ Stage 14.7 is **not a new capability stage.** Goal: pin the cross-family invaria
 - ❌ No `ProofArtifactBody` schema changes.
 - ❌ No `ContributorResult` / `Evidence` schema changes.
 - ❌ No chain RPC changes; no `omni-sumchain` changes.
-- ❌ No mainnet allowlist changes (`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty).
+- ❌ No mainnet eligibility registry changes (`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty).
 - ❌ No `crates/omni-zkml/src/error.rs` changes.
 - ❌ No default-build prover dep leakage.
 - ❌ No prover/verifier internal refactor (helpers reused as-is).
@@ -29,7 +29,7 @@ Stage 14.7 is **not a new capability stage.** Goal: pin the cross-family invaria
 | CI green on every merge | ✅ 11–15 checks across the track |
 | Open incidents touching the 14.x surface | none |
 | New chain contract changes pending | none |
-| Mainnet allowlist still empty | ✅ — Stage 11d.3 separate track |
+| Mainnet eligibility registry still empty | ✅ — Stage 11d.3 separate track |
 | Pre-existing clippy warnings on 14.x crates | inventoried previously; none introduced by 14.1–14.6 |
 
 Halt rule satisfied. Stage 14.7 proceeded as planned.
@@ -105,7 +105,7 @@ Stage 14.7 closes the proof-generation track that opened with Stage 14.1. End-st
 | Runbook documentation | ✅ Stages 14.1–14.6 per-stage | ✅ **Stage 14.7 canonical comparison** |
 
 The remaining items in the Phase 5 zkML scope are:
-- **Stage 11d.3** — chain-team-reviewed mainnet allowlist entry for `Stage11dProductionFixedPointMlp`. Separate track, chain-team-dependent.
+- **Stage 11d.3** — chain-team-reviewed mainnet eligibility registry entry for `Stage11dProductionFixedPointMlp`. Separate track, chain-team-dependent.
 - **Chain-side proof verification** — requires chain-team contract specs; explicitly deferred.
 - **Staking / slashing / reward distribution** — requires Stage 11d.3 + chain-side verification first.
 - **Real model proving beyond the canonical reference/production MLPs** — out of scope for Phase 5; would require EZKL (license-blocked per Stage 14.4) or a separately-vetted Rust prover.
@@ -118,6 +118,6 @@ If the user wants to revisit:
 
 - **Stage 14.8 (candidate)** — Combined-features CI job. Would activate `--features halo2-reference-prove --features stage11d-production-prove` in CI; cover Stage 14.6 test 7 + Stage 14.7 tests 1 + 4. Small CI cost (~1 new job, prover time amortized by OnceLock caches). Deferred as housekeeping; not in 14.7 scope.
 - **Stage 14.x housekeeping** — Pre-existing clippy warnings on `omni-proofs-halo2-production-mlp::circuit.rs` (manual `Range::contains`, `loop variable used to index`, etc.). All pre-Stage-14 and out of scope.
-- **Stage 11d.3** — Chain-team-reviewed mainnet allowlist entry; lifts the production family's layer-6 refusal. Separate chain-side track.
+- **Stage 11d.3** — Chain-team-reviewed mainnet eligibility registry entry; lifts the production family's layer-6 refusal. Separate chain-side track.
 
 Stage 14.7 is the recommended last "feature-adjacent" stage in the 14.x range. After this, Phase 5 work shifts to chain-side dependencies (Stage 11d.3) and Phase 5 release packaging (Stage 10b).

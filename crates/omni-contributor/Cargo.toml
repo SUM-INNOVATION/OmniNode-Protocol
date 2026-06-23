@@ -13,7 +13,7 @@ rust-version.workspace = true
 # SNIP → run local inference → produce response + evidence artifact →
 # deliver/publish response). No chain wire / Stage 7b tx / SUM Chain
 # RPC / `InferenceAttestationDigest` / chain-side verification /
-# proof-system allowlist touched.
+# proof-system eligibility registry touched.
 #
 # Stage 11d.3 reframe posture preserved: chain remains neutral; proof
 # acceptance is a local verifier policy decision; this crate's
