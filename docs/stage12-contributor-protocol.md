@@ -342,7 +342,7 @@ omni-node operator contributor publish-result-link \
 
 ## Posture (unchanged)
 
-No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. AttestationOnly only. No on-chain verification, no chain proof allowlist. SNIP only. Default `omni-node` build still pulls zero halo2/prover/framework runtimes (CI re-asserts).
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. AttestationOnly only. No on-chain verification, no chain proof eligibility registry. SNIP only. Default `omni-node` build still pulls zero halo2/prover/framework runtimes (CI re-asserts).
 
 ## What the mesh carries
 
@@ -499,7 +499,7 @@ omni-node operator contributor watch-network-results \
 
 ## Posture (verbatim, unchanged)
 
-No chain wire, no Stage 7b tx, no SUM Chain RPC, no `InferenceAttestationDigest`, no payment/reward/staking/slashing, no marketplace/auction/pricing/bid logic, no exclusive claim or lease model, no proof mode, no on-chain verification, no chain proof allowlist, no A–F flow. SNIP only. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes (CI re-asserts).
+No chain wire, no Stage 7b tx, no SUM Chain RPC, no `InferenceAttestationDigest`, no payment/reward/staking/slashing, no marketplace/auction/pricing/bid logic, no exclusive claim or lease model, no proof mode, no on-chain verification, no chain proof eligibility registry, no A–F flow. SNIP only. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes (CI re-asserts).
 
 The coordinator is a **process role**, not a chain authority. Contributors decide locally whether to join; verifiers decide locally whether to trust an aggregate. Assignments are cooperation hints within a session — multiple coordinators can run parallel sessions for the same `posted_id` with overlapping work.
 
@@ -819,7 +819,7 @@ omni-node operator contributor send-handoff
 
 ## Posture (unchanged)
 
-No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid logic. No proof mode / on-chain verification / chain proof allowlist. SNIP only for durable storage; mesh announcements are pointer-only. Default `omni-node` build still pulls zero halo2/prover/framework runtimes.
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid logic. No proof mode / on-chain verification / chain proof eligibility registry. SNIP only for durable storage; mesh announcements are pointer-only. Default `omni-node` build still pulls zero halo2/prover/framework runtimes.
 
 ## What 12.5 actually is
 
@@ -955,7 +955,7 @@ Returns a typed `PeerAdvertisementOutcome` whose failure variants map 1:1 to ope
 
 ## Posture (unchanged)
 
-No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid logic. No proof mode / on-chain verification / chain proof allowlist. SNIP only for contributor artifacts. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes. No Stage 12.0–12.5 schema or canonical-byte changes.
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid logic. No proof mode / on-chain verification / chain proof eligibility registry. SNIP only for contributor artifacts. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes. No Stage 12.0–12.5 schema or canonical-byte changes.
 
 ## Problem
 
@@ -1039,7 +1039,7 @@ Stage 12.6 stabilizes the PeerId across restart, but advertisements still expire
 
 ## Posture (unchanged)
 
-No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid logic. No proof mode / on-chain verification / chain proof allowlist. SNIP only for contributor artifacts. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes. No Stage 12.0–12.6 schema or canonical-byte changes. No omni-net changes.
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid logic. No proof mode / on-chain verification / chain proof eligibility registry. SNIP only for contributor artifacts. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes. No Stage 12.0–12.6 schema or canonical-byte changes. No omni-net changes.
 
 ## Problem
 
@@ -1183,7 +1183,7 @@ Either way, the state-dir is purely local. Delete it to force a clean re-fetch; 
 
 ## Posture (unchanged)
 
-No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing logic. No proof mode / on-chain verification / chain proof allowlist. No omni-net change. No omni-store wire change. No Stage 12.0–12.7 schema or canonical-byte changes. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing logic. No proof mode / on-chain verification / chain proof eligibility registry. No omni-net change. No omni-store wire change. No Stage 12.0–12.7 schema or canonical-byte changes. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
 
 ## Problem
 
@@ -1375,7 +1375,7 @@ A planner that ranks contributors by available RAM is a scheduler. A planner tha
 
 ## Posture (unchanged)
 
-No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing logic. No proof mode / on-chain verification / chain proof allowlist. No omni-net change. No omni-store wire change. No Stage 12.0–12.8 schema or canonical-byte changes. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing logic. No proof mode / on-chain verification / chain proof eligibility registry. No omni-net change. No omni-store wire change. No Stage 12.0–12.8 schema or canonical-byte changes. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes.
 
 ## Problem
 
@@ -1514,7 +1514,7 @@ omni-node operator contributor session-status \
 
 ## Posture (unchanged)
 
-No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing / reputation logic. No proof mode / on-chain verification / chain proof allowlist. **No new omni-net gossipsub topic — reuses `TOPIC_SESSION_WORK_ASSIGNED`.** No omni-store wire change. No Stage 12.0–12.9 schema or canonical-byte changes. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes. **No state-dir mutation on apply.**
+No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing / reputation logic. No proof mode / on-chain verification / chain proof eligibility registry. **No new omni-net gossipsub topic — reuses `TOPIC_SESSION_WORK_ASSIGNED`.** No omni-store wire change. No Stage 12.0–12.9 schema or canonical-byte changes. Default `omni-node` tree still pulls zero halo2/prover/framework runtimes. **No state-dir mutation on apply.**
 
 ## Problem
 
@@ -1796,7 +1796,7 @@ Mesh ordering still respects the invariant that replacements must be observable 
 
 # Stage 12.12 — Invalid-partial triage for supersession
 
-**Status**: shipped at Stage 12.12. Builds on Stage 12.9 status reporter + Stage 12.11 supersession verifier + Stage 12.11 reassign CLI. Allows operators to use `apply-session-reassign --reason invalid-partial` to triage an `InvalidState` session when — and only when — every chain-link failure is a tampered partial (`SupersessionReason::InvalidPartial`) whose retiring assignment is named in the plan. Every other `InvalidState` cause (invalid session, invalid join, invalid assignment, invalid aggregate, invalid supersession, or even an invalid partial NOT in the plan) continues to refuse. No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing / reputation. No exclusive claim / lease. No proof mode / on-chain verification / chain proof allowlist. No A–F flow. SNIP only. No new gossipsub topic.
+**Status**: shipped at Stage 12.12. Builds on Stage 12.9 status reporter + Stage 12.11 supersession verifier + Stage 12.11 reassign CLI. Allows operators to use `apply-session-reassign --reason invalid-partial` to triage an `InvalidState` session when — and only when — every chain-link failure is a tampered partial (`SupersessionReason::InvalidPartial`) whose retiring assignment is named in the plan. Every other `InvalidState` cause (invalid session, invalid join, invalid assignment, invalid aggregate, invalid supersession, or even an invalid partial NOT in the plan) continues to refuse. No chain wire / Stage 7b tx / SUM Chain RPC / `InferenceAttestationDigest` change. No payment / reward / staking / slashing. No marketplace / auction / bid / pricing / reputation. No exclusive claim / lease. No proof mode / on-chain verification / chain proof eligibility registry. No A–F flow. SNIP only. No new gossipsub topic.
 
 ## What this stage is, in one sentence
 
@@ -1891,7 +1891,7 @@ This check runs after the existing `ReassignAssignment`-only check and before an
 - **Work-kind reshaping.** Replacement assignment copies `work_kind` and `expected_work_units` verbatim, same as Stage 12.11.
 - **Abandonment / cancellation.** Still v1 replacement-only.
 - **New gossipsub topic.** None added.
-- **Chain wire / `InferenceAttestationDigest` / proof mode / chain proof allowlist / A–F flow.** Untouched.
+- **Chain wire / `InferenceAttestationDigest` / proof mode / chain proof eligibility registry / A–F flow.** Untouched.
 - **`MissingPartial` / `OperatorRebalance` triage of `InvalidState`.** Refused — only `InvalidPartial` plus the tightly-scoped helper accepts.
 
 ## Test coverage map

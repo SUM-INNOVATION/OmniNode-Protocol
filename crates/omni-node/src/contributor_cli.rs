@@ -3972,7 +3972,7 @@ fn emit_production_mlp_proof_sidecar_from_bytes(
 /// `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty; layer 1 does NOT fire
 /// because the artifact correctly declares `Some(false)`. Lifting the
 /// refusal requires the separate Stage 11d.3 chain-team-reviewed
-/// allowlist PR.
+/// eligibility registry PR.
 ///
 /// The `public_inputs` JSON carries `contributor_job_id` as an extra
 /// key beyond `input`/`output`; the production verifier's
@@ -4070,7 +4070,7 @@ fn assemble_and_write_production_sidecar(
         public_inputs: Some(public_inputs_json),
         // Production-shape contract: Some(false), NOT Some(true)
         // like the Stage 14.2/14.3 reference path. Mainnet refusal
-        // lands at layer 6 only (empty allowlist).
+        // lands at layer 6 only (empty eligibility registry).
         testnet_or_dev_only: Some(false),
         model_framework: Some(omni_zkml::ModelFramework::FrameworkAgnostic),
     };
@@ -12592,12 +12592,12 @@ mod tests {
             );
             // But the artifact is still refused on mainnet via layer 6
             // (empty MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES). Stage 11d.3
-            // is the separate chain-team-reviewed allowlist PR.
+            // is the separate chain-team-reviewed eligibility registry PR.
             let refusal = omni_zkml::check_mainnet_eligible(&body.metadata);
             assert!(
                 refusal.is_err(),
                 "Stage 14.6 production sidecar MUST be mainnet-refused; got Ok \
-                 (Stage 11d.3 allowlist landed?)"
+                 (Stage 11d.3 eligibility registry landed?)"
             );
         }
 

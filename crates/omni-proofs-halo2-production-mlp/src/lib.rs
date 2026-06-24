@@ -29,8 +29,8 @@
 //!
 //! **Mainnet posture (Stage 11d.0/11d.1 invariants preserved):**
 //! `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty through
-//! Stage 11d.2. Mainnet allowlist entry for this proof class is a
-//! Stage 11d.3 deliverable (R1–R9 sign-off gate).
+//! Stage 11d.2. Mainnet eligibility registry entry for this proof
+//! class is a Stage 11d.3 deliverable (R1–R9 sign-off gate).
 
 pub mod canonical;
 pub mod encoding;

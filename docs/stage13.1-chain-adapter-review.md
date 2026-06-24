@@ -142,7 +142,7 @@ No OmniNode preference. The chain team's call — record in the decision form.
 
 ## Section 4 — Mainnet policy (Blocker D, unresolved)
 
-Stage 11b's mainnet allowlists (`MAINNET_APPROVED_PROOF_SYSTEMS`, etc.) are empty by design; chain-team approval is required for any mainnet write path. Stage 13.x anchors commit only `(artifact_hash, signer_pubkey, signed_at_unix)` — **no** proof-system semantics, **no** model claims, **no** allowlist surface. Forensic-record bytes only.
+Stage 11b's mainnet eligibility registries (`MAINNET_APPROVED_PROOF_SYSTEMS`, etc.) are empty by design; chain-team approval is required for any mainnet write path. Stage 13.x anchors commit only `(artifact_hash, signer_pubkey, signed_at_unix)` — **no** proof-system semantics, **no** model claims, **no** eligibility registry surface. Forensic-record bytes only.
 
 **Stage 13.1 makes no assumption.** Until the chain team decides, the future adapter stage:
 
@@ -152,7 +152,7 @@ Stage 11b's mainnet allowlists (`MAINNET_APPROVED_PROOF_SYSTEMS`, etc.) are empt
 
 **Asks chain team to decide:**
 - D1: are anchor submissions permitted on mainnet (chain_id 1) once Blockers A-C are resolved? Yes / No / Yes-with-conditions.
-- D2: if yes-with-conditions, list the conditions (allowlist? per-signer authorization? rate limit?). OmniNode will encode them as separate closed reason tags in the future adapter stage.
+- D2: if yes-with-conditions, list the conditions (eligibility registry? per-signer authorization? rate limit?). OmniNode will encode them as separate closed reason tags in the future adapter stage.
 
 ## Section 5 — Fee schedule (Blocker E)
 

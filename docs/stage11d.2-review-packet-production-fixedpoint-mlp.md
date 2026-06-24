@@ -1,6 +1,6 @@
 # Stage 11d.2 Review Packet — Production Fixed-Point MLP
 
-**Status**: populated for Stage 11d.2 (first production-grade proof class candidate). This packet is the audit input for the SUM Chain review board ahead of the Stage 11d.3 allowlist PR. **It does not itself allowlist anything** — `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty through Stage 11d.2.
+**Status**: populated for Stage 11d.2 (first production-grade proof class candidate). This packet is the audit input for the SUM Chain review board ahead of the Stage 11d.3 eligibility registry PR. **It does not itself register anything for mainnet eligibility** — `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` stays empty through Stage 11d.2.
 
 Sibling to [`stage11d-review-packet.md`](stage11d-review-packet.md) (the criteria template). Section numbering matches the template so each entry maps 1:1 to a criteria field. Fields marked `TBD` are explicitly deferred to Stage 11d.3 per the Stage 11d.2 plan §11 decisions #5 and #6.
 
@@ -22,7 +22,7 @@ Sibling to [`stage11d-review-packet.md`](stage11d-review-packet.md) (the criteri
 | `review_board_roster_ref` | `TBD` (Stage 11d.3) |
 | `benchmark_record_ref` | [`stage11d.2-benchmark-record.md`](stage11d.2-benchmark-record.md) |
 | Stage 11d.2 implementation PR | this PR |
-| Target Stage 11d.3 allowlist PR | `TBD` |
+| Target Stage 11d.3 eligibility registry PR | `TBD` |
 | Date submitted to SUM Chain review board | `TBD` |
 | Date of external cryptographer sign-off | `TBD` (deferred per Stage 11d.2 plan §11 decision #6) |
 | Chain-team approval status | `Not yet submitted` |
@@ -109,7 +109,7 @@ Per Stage 11d.2 plan §4.1. The architecture (`16 → 32 → 16 → 8` with ReLU
 
 - New `ProofSystem::Stage11dProductionFixedPointMlp` variant; new `ModelFormat::ProductionFixedPointMlp` variant. Both are inert in default builds.
 - `Stage11bHalo2Reference` remains permanently testnet/dev-only and cannot be reused or promoted (criteria §1.4 hard rule).
-- `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` and `MAINNET_APPROVED_PROOF_SYSTEMS = &[]`. No allowlist surface change in this PR.
+- `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]` and `MAINNET_APPROVED_PROOF_SYSTEMS = &[]`. No eligibility registry surface change in this PR.
 
 ---
 

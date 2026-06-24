@@ -119,7 +119,7 @@ fn artifact_carries_production_shape_testnet_or_dev_only_false() {
     // Stage 14.5 production-shape contract pin: the artifact
     // declares `testnet_or_dev_only=Some(false)`, distinct from
     // the Stage 14.1 reference path which declares `Some(true)`.
-    // Mainnet refusal comes from layer 6 (empty allowlist), not
+    // Mainnet refusal comes from layer 6 (empty eligibility registry), not
     // layer 1. This test pins the shape so a future refactor
     // that conflates the two paths regresses visibly.
     let body = build_artifact_for_input(CANONICAL_INPUT);

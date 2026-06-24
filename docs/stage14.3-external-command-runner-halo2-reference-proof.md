@@ -24,7 +24,7 @@ Stage 14.3 stays **strictly additive on top of Stage 14.1 + 14.2.** No new featu
 | --- | --- |
 | `crates/omni-zkml/src/error.rs` untouched | `git diff main` empty |
 | `ProofSystem` enum untouched | Reuses `Stage11bHalo2Reference` |
-| Mainnet allowlist unchanged | `MAINNET_APPROVED_PROOF_SYSTEMS` stays empty |
+| Mainnet eligibility registry unchanged | `MAINNET_APPROVED_PROOF_SYSTEMS` stays empty |
 | Verifier API untouched | `Halo2ReferenceVerifier` not modified |
 | `ProofArtifactBody` schema untouched | Only the opaque `public_inputs` JSON value carries the Stage 14.2 `contributor_job_id` extra key (already-pinned tolerance) |
 | `Evidence` enum / `ContributorResult` schema unchanged | `schema_version: 1`, `Evidence::AttestationOnly` only |
@@ -99,7 +99,7 @@ In [`contributor_cli.rs::tests::stage_14_2_sidecar_proof`](../crates/omni-node/s
 ## Mainnet posture
 
 Identical to Stage 14.1 + 14.2. Sidecar artifact metadata:
-- `proof_system = Stage11bHalo2Reference` → refused at `check_mainnet_eligible` layer 3 (BoundedReference class) and layer 6 (empty allowlist)
+- `proof_system = Stage11bHalo2Reference` → refused at `check_mainnet_eligible` layer 3 (BoundedReference class) and layer 6 (empty eligibility registry)
 - `testnet_or_dev_only = Some(true)` → refused at layer 1
 
 Three independent refusal layers fire on the same artifact. `--allow-mainnet-submit` cannot override.

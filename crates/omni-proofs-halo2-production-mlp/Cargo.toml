@@ -23,10 +23,13 @@ rust-version.workspace = true
 # pulls `halo2_proofs`; `prove` (superset) additionally pulls
 # `rand_chacha` for byte-stable proving.
 #
-# **No allowlist entry shipped by this crate.** The frozen production
-# fixture's `ProofArtifactBody` carries `testnet_or_dev_only: Some(false)`
-# (production-shape) but is still hard-refused by `check_mainnet_eligible`
-# layer 6 because `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty.
+# **No eligibility registry entry shipped by this crate.** The frozen
+# production fixture's `ProofArtifactBody` carries
+# `testnet_or_dev_only: Some(false)` (production-shape) but is still
+# hard-refused by `check_mainnet_eligible` layer 6 because
+# `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` is empty (the local-side
+# mirror of the chain-side Proof Eligibility Registry; see
+# `docs/stage11.d.3B-proof-eligibility-registry-alignment.md`).
 # Mainnet eligibility is a Stage 11d.3 deliverable.
 
 [features]

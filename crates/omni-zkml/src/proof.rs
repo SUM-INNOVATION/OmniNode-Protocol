@@ -90,7 +90,7 @@ pub enum ModelFormat {
     /// file or `Cargo.toml` `license` field); the Stage 11d.2
     /// production proof class selection remains open. ONNX
     /// requires a separately-reviewed Rust prover with a clean
-    /// license before any allowlist entry can be proposed.
+    /// license before any eligibility registry entry can be proposed.
     Onnx,
     /// GGUF (llama.cpp model format). OmniNode's canonical model
     /// format today. **No proof backend approved at any stage
@@ -99,8 +99,8 @@ pub enum ModelFormat {
     /// runbook's "GGUF proofs" section (shadow verifier circuit,
     /// partial-inference proof, replay-based attestation); none
     /// of them prove full transformer inference correctness, and
-    /// none is on the Stage 11d allowlist table. Declaring `Gguf`
-    /// is explicitly invalid for any Stage 11d.3 allowlist entry
+    /// none is on the Stage 11d eligibility registry. Declaring `Gguf`
+    /// is explicitly invalid for any Stage 11d.3 eligibility registry entry
     /// per `docs/mainnet-eligibility-criteria.md` §6. Until a
     /// separately-reviewed strategy lands, declaring `Gguf` makes
     /// the refusal explicit instead of hidden — the architecture
@@ -126,7 +126,7 @@ pub enum ModelFormat {
     /// `Halo2ProductionMlpVerifier`; never serialized into chain
     /// wire, into `InferenceAttestationDigest`, into any SUM Chain
     /// RPC, or into any validator-side verification path. Mainnet
-    /// eligibility STILL gated on a Stage 11d.3 allowlist entry
+    /// eligibility STILL gated on a Stage 11d.3 eligibility registry entry
     /// after written chain-team sign-off; until then, layer 6 of
     /// `check_mainnet_eligible` hard-refuses any artifact carrying
     /// this format because `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`
@@ -205,7 +205,7 @@ pub enum ModelFramework {
 /// [`check_mainnet_eligible`] consults this to route through layered
 /// refusals.
 ///
-/// **The mainnet allowlist `MAINNET_APPROVED_PROOF_SYSTEMS` is empty at
+/// **The mainnet eligibility registry `MAINNET_APPROVED_PROOF_SYSTEMS` is empty at
 /// end of Stage 11b.0.** No `ProofSystem` variant is mainnet-eligible
 /// in 11b.0. Stage 11c is the earliest point at which a real proof
 /// system can be added — and only after chain-team review.
@@ -244,8 +244,8 @@ pub enum ProofSystem {
     /// enum for back-compat (Stage 11b.0 schema slot) but is not
     /// targeted by any current stage. A future production ONNX
     /// prover would need a separately-reviewed Rust prover with a
-    /// clean license. Refused on mainnet by layer 6 (allowlist
-    /// empty); could be revisited as a Stage 11d.2 candidate if
+    /// clean license. Refused on mainnet by layer 6 (eligibility
+    /// registry empty); could be revisited as a Stage 11d.2 candidate if
     /// upstream license posture changes.
     Ezkl,
     /// Originally planned as a slot for a future GGUF-compatible
@@ -253,7 +253,7 @@ pub enum ProofSystem {
     /// table.** A future Stage 11e research track may evaluate the
     /// strategies documented in the operator runbook's "GGUF
     /// proofs" section. **No proof readiness claim today.**
-    /// Refused on mainnet by layer 6 (allowlist empty); if
+    /// Refused on mainnet by layer 6 (eligibility registry empty); if
     /// `model_format = Gguf`, layer 4 fires first regardless.
     GgufStrategyTbd,
     /// Stage 11d.2 — first production-grade fixed-point MLP proof
@@ -271,7 +271,7 @@ pub enum ProofSystem {
     /// into chain wire, into `InferenceAttestationDigest`, into
     /// any SUM Chain RPC, or into any validator-side verification
     /// path. Mainnet eligibility STILL gated on a Stage 11d.3
-    /// allowlist entry after written chain-team sign-off
+    /// eligibility registry entry after written chain-team sign-off
     /// (external cryptographer Claim 1.1.S2 + review packet R1–R9);
     /// until then, layer 6 of `check_mainnet_eligible` hard-refuses
     /// any artifact carrying this proof_system because
@@ -279,20 +279,29 @@ pub enum ProofSystem {
     Stage11dProductionFixedPointMlp,
 }
 
-/// Stage 11b.0 → 11d.1 — the **legacy** mainnet allowlist of proof
-/// systems. Kept as an empty back-compat alias for Stage 11d.1; the
-/// structured replacement is [`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`]
-/// below. Both must remain empty until Stage 11d.3 ships a written
-/// chain-team sign-off; layer 6 of [`check_mainnet_eligible`] accepts
-/// an artifact if EITHER list matches (so dual-empty preserves the
-/// Stage 11b.0 "refuse everything" invariant bit-for-bit).
+/// Stage 11b.0 → 11d.1 — the **legacy** mainnet eligibility registry
+/// of proof systems. Kept as an empty back-compat alias for
+/// Stage 11d.1; the structured replacement is
+/// [`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`] below. Both must remain
+/// empty until Stage 11d.3 ships a written chain-team sign-off; layer
+/// 6 of [`check_mainnet_eligible`] accepts an artifact if EITHER list
+/// matches (so dual-empty preserves the Stage 11b.0 "refuse
+/// everything" invariant bit-for-bit).
 ///
-/// The `mainnet_allowlist_is_empty_at_stage_11b0` and
+/// **Stage 11d.3B framing pointer.** This constant is the local-side
+/// mirror of the SUM Chain **Proof Eligibility Registry** subprotocol
+/// (`sum-chain#21`). The identifier is grandfathered with the
+/// historical "allowlist" name; framing canonical going forward is
+/// **Proof Eligibility Registry** for the chain-side subprotocol and
+/// **eligibility registry** for the local-side mirror. See
+/// [`docs/stage11.d.3B-proof-eligibility-registry-alignment.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/main/docs/stage11.d.3B-proof-eligibility-registry-alignment.md).
+///
+/// The `mainnet_eligibility_registry_is_empty_at_stage_11b0` and
 /// `legacy_MAINNET_APPROVED_PROOF_SYSTEMS_empty_after_stage_11d1` tests
 /// pin this invariant.
 pub const MAINNET_APPROVED_PROOF_SYSTEMS: &[ProofSystem] = &[];
 
-/// Stage 11d.1 — structured mainnet allowlist entry.
+/// Stage 11d.1 — structured eligibility registry entry.
 ///
 /// The triple `(proof_system, circuit_id_hex, model_hash)` is the
 /// matching key consulted by [`check_mainnet_eligible`] layer 6. The
@@ -303,6 +312,13 @@ pub const MAINNET_APPROVED_PROOF_SYSTEMS: &[ProofSystem] = &[];
 /// **Cannot be `Copy`** because [`ModelFormat::Other`] carries a
 /// `String`. Clone is cheap (all other fields are `&'static str` or
 /// small enums).
+///
+/// **Stage 11d.3B framing pointer.** This struct is the local-side
+/// entry shape for the SUM Chain **Proof Eligibility Registry**
+/// (`sum-chain#21`). The identifier is grandfathered with the
+/// historical name; framing canonical going forward is **eligibility
+/// registry entry**. See
+/// [`docs/stage11.d.3B-proof-eligibility-registry-alignment.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/main/docs/stage11.d.3B-proof-eligibility-registry-alignment.md).
 ///
 /// Invariants enforced by the `every_allowlist_entry_has_required_metadata`
 /// runtime test:
@@ -321,7 +337,7 @@ pub struct AllowlistEntry {
     pub model_hash: &'static str,
     pub model_format: ModelFormat,
     /// Stage 11d.1 — hex of [`mainnet_vk_hash`] applied to the
-    /// per-verifier canonical VK bytes. The allowlist-side field
+    /// per-verifier canonical VK bytes. The eligibility-registry-side field
     /// name is deliberately `verification_key_hash_hex` (NOT
     /// `verification_key_hex`) to make it unambiguous that the
     /// stored value is a hash, not a raw VK encoding. The existing
@@ -337,7 +353,7 @@ pub struct AllowlistEntry {
 /// mainnet-eligibility VK hash. Pinned at `b"OMNINODE-VK:v1:"` (15
 /// ASCII bytes, no null terminator, no length prefix). The trailing
 /// `v1` allows a future migration to a new scheme without ambiguity
-/// over which hash an allowlist entry's `verification_key_hash_hex`
+/// over which hash an eligibility registry entry's `verification_key_hash_hex`
 /// was computed under.
 pub const MAINNET_VK_HASH_DOMAIN_SEPARATOR: &[u8] = b"OMNINODE-VK:v1:";
 
@@ -355,7 +371,7 @@ pub const MAINNET_VK_HASH_DOMAIN_SEPARATOR: &[u8] = b"OMNINODE-VK:v1:";
 /// Stage 11d.1 ships only this helper + the domain separator. The
 /// concrete `canonical_vk_bytes` extraction lives in each production
 /// verifier (Stage 11d.2+). Cross-validation between an artifact's
-/// `metadata.verification_key_hex` and the allowlisted
+/// `metadata.verification_key_hex` and the registered
 /// `verification_key_hash_hex` is per-verifier business; layer 6 of
 /// [`check_mainnet_eligible`] does NOT perform that cross-check.
 pub fn mainnet_vk_hash(canonical_vk_bytes: &[u8]) -> [u8; 32] {
@@ -365,12 +381,21 @@ pub fn mainnet_vk_hash(canonical_vk_bytes: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Stage 11d.1 — structured mainnet allowlist. **Empty by design**
-/// at end of Stage 11d.1; populated only by a Stage 11d.3 PR
-/// carrying written chain-team sign-off.
+/// Stage 11d.1 — structured local-side mirror of the **Proof
+/// Eligibility Registry**. **Empty by design** at end of
+/// Stage 11d.1 / 11d.2 / 11d.3A / 11d.3B; populated only by a future
+/// Stage 11d.3C+ PR after the chain-side `CandidateRefused` →
+/// `CandidateApproved` → `Active` flow lands.
 ///
 /// Layer 6 of [`check_mainnet_eligible`] consults this list keyed
 /// on `(proof_system, circuit_id_hex, model_hash)`.
+///
+/// **Stage 11d.3B framing pointer.** This constant is the local-side
+/// mirror of the SUM Chain **Proof Eligibility Registry** subprotocol
+/// (`sum-chain#21`). The identifier is grandfathered with the
+/// historical "allowlist" name; framing canonical going forward is
+/// **eligibility registry**. See
+/// [`docs/stage11.d.3B-proof-eligibility-registry-alignment.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/main/docs/stage11.d.3B-proof-eligibility-registry-alignment.md).
 pub const MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES: &[AllowlistEntry] = &[];
 
 // ── PublicInputs ────────────────────────────────────────────────────────────
@@ -854,7 +879,7 @@ pub enum MainnetRefusalReason {
     /// backend is approved at any stage through Stage 11d.x;
     /// declaration is honest but the claim is hard-refused.
     /// `ModelFormat::Gguf` is explicitly invalid for any Stage
-    /// 11d.3 allowlist entry per `docs/mainnet-eligibility-criteria.md`
+    /// 11d.3 eligibility registry entry per `docs/mainnet-eligibility-criteria.md`
     /// §6 — a future Stage 11e research track may evaluate
     /// strategies, but none is on the current roadmap.
     #[error(
@@ -885,10 +910,16 @@ pub enum MainnetRefusalReason {
     /// Layer 6: the artifact's `(proof_system, circuit_id_hex,
     /// model_hash)` triple does not match any entry in
     /// [`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES`] (Stage 11d.1
-    /// structured allowlist), and `proof_system` is not in the
-    /// legacy [`MAINNET_APPROVED_PROOF_SYSTEMS`] back-compat alias.
-    /// **Both lists are empty at end of Stage 11d.1** — no proof
-    /// system gets through this gate yet.
+    /// structured eligibility registry), and `proof_system` is not in
+    /// the legacy [`MAINNET_APPROVED_PROOF_SYSTEMS`] back-compat
+    /// alias. **Both lists are empty at end of Stage 11d.1** — no
+    /// proof system gets through this gate yet.
+    ///
+    /// **Stage 11d.3B framing pointer.** The variant name
+    /// `NotInMainnetAllowlist` is grandfathered; framing canonical
+    /// going forward is "not in the local mirror of the SUM Chain
+    /// Proof Eligibility Registry" (`sum-chain#21`). See
+    /// [`docs/stage11.d.3B-proof-eligibility-registry-alignment.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/main/docs/stage11.d.3B-proof-eligibility-registry-alignment.md).
     #[error(
         "proof system {proof_system:?} (backend_id = {backend_id:?}) is not in the \
          structured mainnet allowlist (MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES); both that \
@@ -911,14 +942,14 @@ pub enum MainnetRefusalReason {
 /// stays consistent.
 ///
 /// **Stage 11b.0 invariant: no `(metadata)` argument returns
-/// `Ok(())`.** The mainnet allowlist
+/// `Ok(())`.** The mainnet eligibility registry
 /// [`MAINNET_APPROVED_PROOF_SYSTEMS`] is empty at end of Stage 11b.0,
 /// so layer 6 catches every proof system that escaped layers 1–5.
 /// This invariant is pinned by the
 /// `every_proof_system_is_refused_on_mainnet_at_stage_11b0` test.
 ///
 /// Mainnet eligibility lands in a future chain-team-reviewed stage
-/// (Stage 11d+); Stage 11c keeps the allowlist empty. **No Stage 11b
+/// (Stage 11d+); Stage 11c keeps the eligibility registry empty. **No Stage 11b
 /// or 11c change should ever cause this function to return `Ok(())`.**
 pub fn check_mainnet_eligible(
     meta: &ProofMetadata,
@@ -984,9 +1015,9 @@ pub fn check_mainnet_eligible(
         });
     }
 
-    // Layer 6 (Stage 11d.1): structured allowlist match on the
-    // (proof_system, circuit_id_hex, model_hash) triple, plus the
-    // legacy bare-ProofSystem alias for back-compat. Both lists
+    // Layer 6 (Stage 11d.1): structured eligibility registry match
+    // on the (proof_system, circuit_id_hex, model_hash) triple, plus
+    // the legacy bare-ProofSystem alias for back-compat. Both lists
     // are empty through Stage 11d.1 / 11d.2 by design; only a
     // Stage 11d.3 PR with written chain-team sign-off populates
     // the structured list. The OR is a deliberate back-compat
@@ -1004,8 +1035,8 @@ pub fn check_mainnet_eligible(
 }
 
 /// Layer-6 matching logic factored out so the `#[cfg(test)]` helper
-/// [`check_mainnet_eligible_with`] can inject synthetic allowlists
-/// without touching the real const slices.
+/// [`check_mainnet_eligible_with`] can inject synthetic eligibility
+/// registries without touching the real const slices.
 fn proof_system_passes_layer6(meta: &ProofMetadata, ps: ProofSystem) -> bool {
     let matches_structured = matches_structured_allowlist(
         meta,
@@ -1034,12 +1065,13 @@ fn matches_structured_allowlist(
 }
 
 /// Stage 11d.1 — test-only `check_mainnet_eligible` variant that
-/// accepts synthetic allowlist slices. Lets us exercise layer-6
-/// matching against handcrafted entries WITHOUT modifying the real
-/// const slices (which are `&[]` by design and must stay that way).
+/// accepts synthetic eligibility registry slices. Lets us exercise
+/// layer-6 matching against handcrafted entries WITHOUT modifying
+/// the real const slices (which are `&[]` by design and must stay
+/// that way).
 ///
 /// Crate-private; never re-exported. Downstream crates do not need
-/// to inject synthetic allowlists.
+/// to inject synthetic eligibility registries.
 #[cfg(test)]
 pub(crate) fn check_mainnet_eligible_with(
     meta: &ProofMetadata,
@@ -1047,8 +1079,8 @@ pub(crate) fn check_mainnet_eligible_with(
     legacy_entries: &[ProofSystem],
 ) -> std::result::Result<(), MainnetRefusalReason> {
     // Layers 1–5 mirror `check_mainnet_eligible` and are
-    // independent of allowlist contents. Re-run them inline so the
-    // helper is self-contained.
+    // independent of eligibility registry contents. Re-run them
+    // inline so the helper is self-contained.
     if meta.testnet_or_dev_only != Some(false) {
         return Err(MainnetRefusalReason::TestnetOrDevOnly {
             backend_id: meta.backend_id.clone(),
@@ -1573,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_allowlist_is_empty_at_stage_11b0() {
+    fn mainnet_eligibility_registry_is_empty_at_stage_11b0() {
         // Pinned invariant per Stage 11b.0 plan: no proof system is
         // mainnet-eligible at the end of Stage 11b.0. Adding an entry
         // here is a Stage 11c+ change subject to chain-team review.
@@ -1621,8 +1653,9 @@ mod tests {
             // Concretely: Mock → MockBackend,
             //   Stage11bOnnxReference + Stage11bHalo2Reference → BoundedReference,
             //   Ezkl + GgufStrategyTbd + Stage11dProductionFixedPointMlp →
-            //     NotInMainnetAllowlist (allowlist empty through Stage 11d.1/11d.2;
-            //     Stage 11d.2 adds the production variant but no allowlist entry).
+            //     NotInMainnetAllowlist (eligibility registry empty through
+            //     Stage 11d.1/11d.2; Stage 11d.2 adds the production variant
+            //     but no eligibility registry entry).
             match (ps, &err) {
                 (ProofSystem::Mock, MainnetRefusalReason::MockBackend { .. }) => {}
                 (
@@ -1773,9 +1806,9 @@ mod tests {
     }
 
     #[test]
-    fn refusal_layer_6_not_in_empty_allowlist() {
+    fn refusal_layer_6_not_in_empty_eligibility_registry() {
         // Non-mock, non-bounded, ONNX format → falls through to
-        // layer 6, refused because the allowlist is empty.
+        // layer 6, refused because the eligibility registry is empty.
         let meta = ProofMetadata {
             backend_id: "ezkl-onnx-prod-future".into(),
             model_hash: blake3::hash(b"m").to_hex().to_string(),
@@ -2054,19 +2087,19 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Stage 11d.1 — structured allowlist schema tests.
+    // Stage 11d.1 — structured eligibility registry schema tests.
     //
     // Stage 11d.1 ships the schema as code but commits ZERO
     // entries. These tests pin: (a) the empty-list invariants for
     // both the structured and legacy lists; (b) bounded-reference
-    // / testnet-flag refusals fire BEFORE the layer-6 allowlist
-    // lookup, so a hypothetically-misplaced bounded-reference
-    // allowlist entry can never enable a bounded artifact to pass;
-    // (c) the layer-6 matching logic on the (proof_system,
+    // / testnet-flag refusals fire BEFORE the layer-6 eligibility
+    // registry lookup, so a hypothetically-misplaced bounded-reference
+    // eligibility registry entry can never enable a bounded artifact
+    // to pass; (c) the layer-6 matching logic on the (proof_system,
     // circuit_id_hex, model_hash) triple, exercised via the
     // `#[cfg(test)] check_mainnet_eligible_with` helper against
-    // synthetic allowlists; (d) the VK hash helper is byte-stable
-    // and uses the documented domain separator.
+    // synthetic eligibility registries; (d) the VK hash helper is
+    // byte-stable and uses the documented domain separator.
     // ─────────────────────────────────────────────────────────────
 
     /// Helper: build a baseline `ProofMetadata` that passes layers
@@ -2091,7 +2124,7 @@ mod tests {
 
     /// Helper: synthetic `AllowlistEntry` matching the baseline
     /// `synthetic_production_meta()`'s triple. Used as the "would
-    /// pass" entry in test-only allowlists.
+    /// pass" entry in test-only eligibility registries.
     fn synthetic_production_entry() -> AllowlistEntry {
         AllowlistEntry {
             proof_system: ProofSystem::Ezkl,
@@ -2108,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_allowlist_entries_empty_after_stage_11d1() {
+    fn mainnet_eligibility_registry_entries_empty_after_stage_11d1() {
         assert!(
             MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES.is_empty(),
             "MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES must stay empty through Stage \
@@ -2128,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn stage11b_halo2_reference_never_in_allowlist() {
+    fn stage11b_halo2_reference_never_in_eligibility_registry() {
         // Hard rule H1 from docs/mainnet-eligibility-criteria.md
         // §1.6: bounded reference proof systems must not appear in
         // either list. The slice is empty today; this test guards
@@ -2158,12 +2191,12 @@ mod tests {
     }
 
     #[test]
-    fn bounded_reference_refused_before_allowlist_lookup() {
+    fn bounded_reference_refused_before_eligibility_registry_lookup() {
         // Construct metadata with Stage11bHalo2Reference whose
         // (proof_system, circuit_id_hex, model_hash) WOULD match
-        // a hypothetical allowlist entry. Layer 3 must fire before
-        // the layer-6 lookup, so the artifact is refused regardless
-        // of allowlist contents.
+        // a hypothetical eligibility registry entry. Layer 3 must
+        // fire before the layer-6 lookup, so the artifact is refused
+        // regardless of eligibility registry contents.
         let mut meta = synthetic_production_meta();
         meta.proof_system = Some(ProofSystem::Stage11bHalo2Reference);
         let would_match = AllowlistEntry {
@@ -2180,9 +2213,10 @@ mod tests {
     #[test]
     fn testnet_or_dev_only_refused_before_allowlist_lookup() {
         // testnet_or_dev_only: Some(true) must fire layer 1 before
-        // any allowlist match. Cross-check with a "would-match"
-        // allowlist entry to ensure the layer 6 path doesn't sneak
-        // a Some(true) artifact onto mainnet.
+        // any eligibility registry match. Cross-check with a
+        // "would-match" eligibility registry entry to ensure the
+        // layer 6 path doesn't sneak a Some(true) artifact onto
+        // mainnet.
         let mut meta = synthetic_production_meta();
         meta.testnet_or_dev_only = Some(true);
         let err = check_mainnet_eligible_with(
@@ -2208,8 +2242,9 @@ mod tests {
     /// `testnet_or_dev_only: Some(false)` EXPLICITLY for mainnet.
     /// The bare `None` (absent declaration) is treated as
     /// testnet/dev for safety. This test pins that an otherwise-
-    /// allowlist-matching artifact with `testnet_or_dev_only: None`
-    /// is refused at layer 1 — not sneaking past to layer 6.
+    /// eligibility-registry-matching artifact with
+    /// `testnet_or_dev_only: None` is refused at layer 1 — not
+    /// sneaking past to layer 6.
     #[test]
     fn absent_testnet_or_dev_only_refused_before_allowlist_lookup() {
         let mut meta = synthetic_production_meta();

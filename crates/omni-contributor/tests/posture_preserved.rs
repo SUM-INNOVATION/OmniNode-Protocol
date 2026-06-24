@@ -2,8 +2,8 @@
 //!
 //! Restates the Stage 11d.3 reframe invariant: the chain remains
 //! neutral; proof acceptance is a local verifier policy decision; no
-//! chain-side allowlist exists. Stage 12.0 does not change any of
-//! this — these tests guard against accidental drift.
+//! chain-side eligibility registry exists. Stage 12.0 does not change
+//! any of this — these tests guard against accidental drift.
 
 /// The literal `i` + `p` + `f` + `s` would be flagged by this very
 /// test if it appeared in the source. Build the needles at runtime

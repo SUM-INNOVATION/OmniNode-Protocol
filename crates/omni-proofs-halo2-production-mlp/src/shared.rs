@@ -58,9 +58,9 @@ pub const HALO2_K: u32 = 11;
 /// check loudly. **The artifact's `metadata.circuit_id_hex` MUST
 /// equal this value.**
 ///
-/// This is the layer-6 allowlist key (criteria §1.6 hard rule H2 +
-/// Stage 11d.1 structured allowlist schema). The future
-/// `AllowlistEntry` (Stage 11d.3) will carry the same string.
+/// This is the layer-6 eligibility registry key (criteria §1.6 hard
+/// rule H2 + Stage 11d.1 structured eligibility registry schema). The
+/// future `AllowlistEntry` (Stage 11d.3) will carry the same string.
 pub const EXPECTED_CIRCUIT_ID_HEX: &str =
     "593d027df3778bc582f9ec40bf453e757a1be6a9b6961243f2dfdf38fb4ea95d";
 

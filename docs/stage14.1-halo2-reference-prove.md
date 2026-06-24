@@ -12,7 +12,7 @@ Pair the existing `omni-proofs-halo2-reference` verifier (Stage 11b.1.b) with it
 | --- | --- |
 | `crates/omni-zkml/src/error.rs` untouched | Existing `ProofBackendError::BackendInternal` covers the new validation failures. |
 | `ProofSystem` enum untouched | Reuses the already-shipped `ProofSystem::Stage11bHalo2Reference` variant. |
-| Mainnet allowlist unchanged | `MAINNET_APPROVED_PROOF_SYSTEMS` stays empty; the new artifact sets `testnet_or_dev_only = Some(true)`. |
+| Mainnet eligibility registry unchanged | `MAINNET_APPROVED_PROOF_SYSTEMS` stays empty; the new artifact sets `testnet_or_dev_only = Some(true)`. |
 | Verifier API untouched | `Halo2ReferenceVerifier::verify_artifact` consumes the new artifact byte-for-byte through its existing dispatch. |
 | `ProofArtifactBody` schema untouched | All metadata fields the generator writes already exist (Stage 11b.0 + 11b.1.a). |
 | `omni-sumchain` untouched | No chain RPCs added; submission flow unchanged. |
@@ -75,7 +75,7 @@ Existing gates unchanged: default-tree, submit-tree, halo2-reference-verify tree
 
 ## Notes on naming reconciliation
 
-The Stage 14.0 design packet's APPROVE locks specified `ProofSystem::Halo2Reference`. The recon report (logged before implementation) flagged that the existing variant is `Stage11bHalo2Reference`. User confirmed reuse of the existing variant to avoid enum / allowlist / classifier / verifier dispatch churn. Stage 14.1 reuses `ProofSystem::Stage11bHalo2Reference` end-to-end.
+The Stage 14.0 design packet's APPROVE locks specified `ProofSystem::Halo2Reference`. The recon report (logged before implementation) flagged that the existing variant is `Stage11bHalo2Reference`. User confirmed reuse of the existing variant to avoid enum / eligibility registry / classifier / verifier dispatch churn. Stage 14.1 reuses `ProofSystem::Stage11bHalo2Reference` end-to-end.
 
 The "concrete, not parameterised" intent of the lock is satisfied — the variant has been concrete since Stage 11b.1, ships in `MAINNET_APPROVED_PROOF_SYSTEMS` as not-approved, and is dispatched-on by name in the verifier.
 

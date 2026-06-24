@@ -4,7 +4,7 @@
 
 **This template is the deliverable handed to the SUM Chain review board.** It cross-references the eight criteria sections in [`mainnet-eligibility-criteria.md`](mainnet-eligibility-criteria.md). Sections marked `TBD` cannot be left as `TBD` when the 11d.3 PR opens; the criteria document's §7 enumerates which fields block which substage.
 
-**Wording guardrail**: Stage 11d **defines and prepares** the eligibility path. A later Stage 11d.3 entry may add the first eligible proof system after written sign-off. This packet does not itself allowlist anything; it is the audit input that precedes the allowlist PR.
+**Wording guardrail**: Stage 11d **defines and prepares** the eligibility path. A later Stage 11d.3 entry may add the first eligible proof system after written sign-off. This packet does not itself register anything for mainnet eligibility; it is the audit input that precedes the eligibility registry PR.
 
 ---
 
@@ -24,7 +24,7 @@
 | `review_board_roster_ref` | `TBD` (path to a committed roster doc or external sign-off record naming the SUM Chain review board members who signed off; field added per Stage 11d.1 review tightening) |
 | `benchmark_record_ref` | `TBD` (path to the committed benchmark record document; see §3.5 below for required fields) |
 | Target Stage 11d.2 implementation PR | `TBD` |
-| Target Stage 11d.3 allowlist PR | `TBD` |
+| Target Stage 11d.3 eligibility registry PR | `TBD` |
 | Date submitted to SUM Chain review board | `TBD` |
 | Date of external cryptographer sign-off | `TBD` |
 | Chain-team approval status | `Not yet submitted` |
@@ -236,11 +236,11 @@ Committed at `crates/omni-proofs-.../tests/fixtures/<production>_corpus.json`. M
 | Wrong `model_hash` in metadata (mainnet path) | `check_mainnet_eligible → Err(NotInMainnetAllowlist)` (layer 6) | `TBD` |
 | Wrong `circuit_id_hex` in metadata (verifier path) | `verify_artifact → Err(VerifierInternal)` mentioning circuit_id | `TBD` |
 | Wrong `model_hash` in metadata (verifier path) | `verify_artifact → Err(VerifierInternal)` mentioning model_hash | `TBD` |
-| `testnet_or_dev_only: Some(true)` on otherwise-allowlisted artifact | `check_mainnet_eligible → Err(TestnetOrDevOnly)` (layer 1) | `TBD` |
+| `testnet_or_dev_only: Some(true)` on otherwise-registered artifact | `check_mainnet_eligible → Err(TestnetOrDevOnly)` (layer 1) | `TBD` |
 | Framework mismatch (e.g., RUMUS claim with PyTorch metadata) | `verify_artifact → Err(VerifierInternal)` mentioning framework | `TBD` |
-| Bounded-reference artifact (`Stage11bHalo2Reference`) with metadata copied from allowlist | `check_mainnet_eligible → Err(BoundedReference)` (layer 3) | `TBD` |
-| `model_format = Gguf` on otherwise-allowlisted metadata | `check_mainnet_eligible → Err(GgufClaim)` (layer 4) | `TBD` |
-| `model_format = Other("…")` on otherwise-allowlisted metadata | `check_mainnet_eligible → Err(UnknownModelFormat)` (layer 5) | `TBD` |
+| Bounded-reference artifact (`Stage11bHalo2Reference`) with metadata copied from the eligibility registry | `check_mainnet_eligible → Err(BoundedReference)` (layer 3) | `TBD` |
+| `model_format = Gguf` on otherwise-registered metadata | `check_mainnet_eligible → Err(GgufClaim)` (layer 4) | `TBD` |
+| `model_format = Other("…")` on otherwise-registered metadata | `check_mainnet_eligible → Err(UnknownModelFormat)` (layer 5) | `TBD` |
 | Production proof bytes against bounded-reference verifier | `verify_artifact → Err(VerifierInternal)` (vk mismatch) | `TBD` |
 
 ---
@@ -260,7 +260,7 @@ Committed at `crates/omni-proofs-.../tests/fixtures/<production>_corpus.json`. M
 | `TBD` (e.g., FrameworkAgnostic) | `TBD` (e.g., Halo2ReferenceMlp) | `TBD` |
 | `TBD` | `TBD` | `TBD` |
 
-The framework component is not part of the allowlist matching key (the four-equal-primaries posture from Stage 11b.1.a allows multiple frameworks to produce byte-identical proofs for the same triple), but the chain team records the reviewed bindings here for audit.
+The framework component is not part of the eligibility registry matching key (the four-equal-primaries posture from Stage 11b.1.a allows multiple frameworks to produce byte-identical proofs for the same triple), but the chain team records the reviewed bindings here for audit.
 
 ### 8.2. What this proof system explicitly does NOT cover
 
@@ -272,7 +272,7 @@ The framework component is not part of the allowlist matching key (the four-equa
 
 ### 8.3. Reversibility
 
-Describe how the entry can be removed from the allowlist if a soundness regression is later discovered. The expected path: a PR that removes the entry from `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` and bumps the snapshot fixture. Operator-facing communication path: `TBD`.
+Describe how the entry can be removed from the eligibility registry if a soundness regression is later discovered. The expected path: a PR that removes the entry from `MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES` and bumps the snapshot fixture. Operator-facing communication path: `TBD`.
 
 ---
 
