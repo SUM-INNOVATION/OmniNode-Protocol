@@ -4984,4 +4984,135 @@ mod tests {
             .await
             .expect("production artifact must verify under both prove features");
     }
+
+    /// Stage 14.8 — runbook command examples stay clap-parseable.
+    ///
+    /// Drift safety for the operator readiness checklist in
+    /// [`docs/stage14.8-proof-generation-readiness.md`](../../docs/stage14.8-proof-generation-readiness.md)
+    /// and the Stage 14 closure section of the operator runbook. If a
+    /// future PR renames any documented CLI flag long-name without
+    /// updating those docs, this test fails. Runs against the
+    /// in-process `clap` tree only — no prover is invoked, no
+    /// subprocess is spawned.
+    ///
+    /// Gated `cfg(any(halo2-reference-prove, stage11d-production-prove))`
+    /// so the existing per-feature CI jobs each exercise the slice of
+    /// the tree active under their build. No new CI gate is added.
+    #[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
+    #[test]
+    fn stage_14_8_runbook_documented_operator_cli_flags_remain_registered() {
+        use clap::{CommandFactory, Parser};
+
+        // `OperatorArgs` derives `Args` (not `Parser`) because it sits
+        // under the top-level `Cli` in `main.rs` as a subcommand. To
+        // introspect its clap tree we wrap it in a test-only `Parser`
+        // here; the wrapper's subcommands match `OperatorCmd`'s 1:1.
+        #[derive(Parser)]
+        struct OperatorTreeProbe {
+            #[command(subcommand)]
+            #[allow(dead_code)]
+            cmd: OperatorCmd,
+        }
+        let cmd = <OperatorTreeProbe as CommandFactory>::command();
+
+        // verify-proof is always-available (no feature gate). The
+        // Stage 14.8 readiness checklist documents --proof-artifact.
+        let verify_proof = cmd
+            .find_subcommand("verify-proof")
+            .expect("operator verify-proof must be a registered subcommand");
+        assert!(
+            verify_proof
+                .get_arguments()
+                .any(|a| a.get_long() == Some("proof-artifact")),
+            "operator verify-proof must accept --proof-artifact (documented in \
+             docs/stage14.8-proof-generation-readiness.md §2)"
+        );
+
+        // generate-reference-proof is gated on halo2-reference-prove
+        // and documents --input-i16 + --output-path.
+        #[cfg(feature = "halo2-reference-prove")]
+        {
+            let sub = cmd
+                .find_subcommand("generate-reference-proof")
+                .expect(
+                    "operator generate-reference-proof must be registered under \
+                     halo2-reference-prove",
+                );
+            assert!(
+                sub.get_arguments()
+                    .any(|a| a.get_long() == Some("input-i16")),
+                "operator generate-reference-proof must accept --input-i16"
+            );
+            assert!(
+                sub.get_arguments()
+                    .any(|a| a.get_long() == Some("output-path")),
+                "operator generate-reference-proof must accept --output-path"
+            );
+        }
+
+        // generate-production-mlp-proof is gated on
+        // stage11d-production-prove and documents --input-i16 +
+        // --output-path.
+        #[cfg(feature = "stage11d-production-prove")]
+        {
+            let sub = cmd
+                .find_subcommand("generate-production-mlp-proof")
+                .expect(
+                    "operator generate-production-mlp-proof must be registered under \
+                     stage11d-production-prove",
+                );
+            assert!(
+                sub.get_arguments()
+                    .any(|a| a.get_long() == Some("input-i16")),
+                "operator generate-production-mlp-proof must accept --input-i16"
+            );
+            assert!(
+                sub.get_arguments()
+                    .any(|a| a.get_long() == Some("output-path")),
+                "operator generate-production-mlp-proof must accept --output-path"
+            );
+        }
+
+        // operator contributor run-job documents --runner, --stub-input
+        // (gated on at least one prove feature, matching its own cfg),
+        // and at least one --emit-…-proof flag per active prove feature.
+        let contributor = cmd
+            .find_subcommand("contributor")
+            .expect("operator contributor subcommand must exist");
+        let run_job = contributor
+            .find_subcommand("run-job")
+            .expect("operator contributor run-job subcommand must exist");
+
+        assert!(
+            run_job
+                .get_arguments()
+                .any(|a| a.get_long() == Some("runner")),
+            "operator contributor run-job must accept --runner"
+        );
+        assert!(
+            run_job
+                .get_arguments()
+                .any(|a| a.get_long() == Some("stub-input")),
+            "operator contributor run-job must accept --stub-input under at least \
+             one prove feature"
+        );
+
+        #[cfg(feature = "halo2-reference-prove")]
+        assert!(
+            run_job
+                .get_arguments()
+                .any(|a| a.get_long() == Some("emit-halo2-reference-proof")),
+            "operator contributor run-job must accept --emit-halo2-reference-proof \
+             under halo2-reference-prove"
+        );
+
+        #[cfg(feature = "stage11d-production-prove")]
+        assert!(
+            run_job
+                .get_arguments()
+                .any(|a| a.get_long() == Some("emit-production-mlp-proof")),
+            "operator contributor run-job must accept --emit-production-mlp-proof \
+             under stage11d-production-prove"
+        );
+    }
 }

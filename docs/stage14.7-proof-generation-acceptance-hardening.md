@@ -120,4 +120,6 @@ If the user wants to revisit:
 - **Stage 14.x housekeeping** — Pre-existing clippy warnings on `omni-proofs-halo2-production-mlp::circuit.rs` (manual `Range::contains`, `loop variable used to index`, etc.). All pre-Stage-14 and out of scope.
 - **Stage 11d.3** — Chain-team-reviewed mainnet eligibility registry entry; lifts the production family's layer-6 refusal. Separate chain-side track.
 
-Stage 14.7 is the recommended last "feature-adjacent" stage in the 14.x range. After this, Phase 5 work shifts to chain-side dependencies (Stage 11d.3) and Phase 5 release packaging (Stage 10b).
+**Stage 14.8 delivered** as track closure / readiness packet — operator readiness checklist + Stage 14 completion inventory + Stage 15 conditional handoff. See [`docs/stage14.8-proof-generation-readiness.md`](stage14.8-proof-generation-readiness.md). The combined-features CI gate from the speculative bullet above was not adopted — cross-family tests remain local-only.
+
+Stage 14.8 is the actual last stage in the 14.x range. After this, Phase 5 work shifts to chain-side dependencies (Stage 11d.3C consumption when the chain-side `CandidateRefused` record lands) and Phase 5 release packaging (Stage 10b).

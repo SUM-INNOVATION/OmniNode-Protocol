@@ -3888,6 +3888,26 @@ Both paths verify off-chain only. Mainnet activation for the production class la
 
 **Stage 14.7 engineering doc:** [`docs/stage14.7-proof-generation-acceptance-hardening.md`](stage14.7-proof-generation-acceptance-hardening.md) — umbrella acceptance test scope, cached-artifact strategy, CI coverage notes, Stage 14.x track close.
 
+### Stage 14 closure — proof-generation track delivered
+
+**Status: track closed.** Stage 14.8 wraps the proof-generation track that opened with Stage 14.1. No new prover / verifier features, no new proof systems, no chain RPC changes, no eligibility activation. The local proof-generation surface is the end-state for Phase 5's off-chain proof story; lifting mainnet refusal for the production family is a chain-side dependency tracked separately under Stage 11d.3C+ (see the Stage 11d.3A / 11d.3B pointers below).
+
+What runs where (operator-host CLI matrix; `cargo run -p omni-node --features <…> -- operator …`):
+
+| Capability | Feature flag(s) | CLI |
+| --- | --- | --- |
+| Read-only verify | `halo2-reference-verify` or `stage11d-production-verify` (dispatch is feature-gated) | `verify-proof --proof-artifact <PATH>` |
+| Generate reference proof | `halo2-reference-prove` | `generate-reference-proof --input-i16 "<4 csv i16>" --output-path <PATH>` |
+| Generate production proof | `stage11d-production-prove` | `generate-production-mlp-proof --input-i16 "<16 csv i16>" --output-path <PATH>` |
+| Contributor reference sidecar (Stub) | `halo2-reference-prove` | `contributor run-job … --runner stub --stub-input <PATH> --emit-halo2-reference-proof <PATH>` |
+| Contributor reference sidecar (External) | `halo2-reference-prove` | `contributor run-job … --runner external --emit-halo2-reference-proof <PATH>` |
+| Contributor production sidecar (Stub) | `stage11d-production-prove` | `contributor run-job … --runner stub --stub-input <PATH> --emit-production-mlp-proof <PATH>` |
+| Contributor production sidecar (External) | `stage11d-production-prove` | `contributor run-job … --runner external --emit-production-mlp-proof <PATH>` |
+
+Mainnet posture at Stage 14.x close: reference artifacts refused at layers 1 + 3 + 6 (perpetual testnet/dev only); production artifacts refused at layer 6 only (`MAINNET_APPROVED_PROOF_SYSTEM_ENTRIES = &[]`). EZKL remains rejected per Stage 14.4. Default-build dep tree pulls zero halo2 / pasta / `rand_chacha` / `omni-proofs-halo2-*` — pinned by CI tree-isolation gates.
+
+**Stage 14.8 engineering doc:** [`docs/stage14.8-proof-generation-readiness.md`](stage14.8-proof-generation-readiness.md) — Stage 14 completion inventory, full operator readiness checklist with command examples for each prove / verify combination, performance caveats (incl. pointer to [`docs/stage11d.2-benchmark-record.md`](stage11d.2-benchmark-record.md)), dormant / blocked items, validation strategy, Stage 15 conditional handoff (registry consumption vs. economics / packaging discovery), out-of-scope enumeration.
+
 ### Stage 11d.3A — production proof eligibility evidence bundle
 
 **Status: docs / evidence only.** No eligibility registry mutation, no code activation, no chain RPC changes. The production proof family (`ProofSystem::Stage11dProductionFixedPointMlp`) **remains dormant / not mainnet-eligible** at the end of this stage.
