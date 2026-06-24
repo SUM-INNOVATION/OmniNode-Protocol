@@ -1,0 +1,346 @@
+# OmniNode Protocol — release artifact workflow with cosign keyless signing.
+#
+# Stage 15.2. Closes the artifact signing / provenance gap that the
+# 2026-06-24 RC audit (docs/phase5-rc-audit-2026-06-24.md §3b) rated
+# Missing. Builds two `omni-node` release binaries
+# (default + submit, x86_64-unknown-linux-gnu only), emits a single
+# canonical SHA256SUMS over every release file, and signs the
+# checksums file with cosign keyless OIDC (no long-lived private key
+# anywhere). Sigstore Fulcio mints the cert; Rekor records the
+# signing. Operators verify with `cosign verify-blob` + `sha256sum -c`.
+#
+# Governance lock (cert identity regex). Operators MUST verify against:
+#   https://github.com/SUM-INNOVATION/OmniNode-Protocol/.github/workflows/release.yml@refs/tags/v<semver>
+# The regex is pinned in docs/stage15.2-release-artifact-workflow.md
+# and applied verbatim by the `bundle-and-sign` job on real tag /
+# workflow_dispatch runs. PR dry-runs verify with a permissive
+# repo-scoped regex so the signing pipeline is exercised end-to-end
+# without requiring a tag-bound identity.
+#
+# This workflow does NOT mutate ci.yml. The existing CI matrix
+# (default + submit + halo2-reference-{verify,prove} +
+# stage11d-production-{verify,prove} + tree-isolation + fixture
+# byte-stability gates) is unchanged.
+#
+# This workflow does NOT create tags. Cutting `v0.x.y` is an operator
+# action — push the tag separately, then this workflow runs.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name (e.g. v0.1.0). Workflow does NOT create the tag; push the tag separately."
+        required: true
+        type: string
+      dry_run:
+        description: "Build + sign but do NOT publish a Release."
+        default: false
+        type: boolean
+  push:
+    tags: [ "v*" ]
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Job 1 — hard tag/version match gate ──────────────────────────────────
+  #
+  # Runs first; ~10 s. Fails the run cheaply on a tag/version mismatch
+  # before any matrix build starts. Advisory only for PR dry-runs
+  # (PR branches may legitimately diverge from a tag).
+  tag-version-gate:
+    name: Tag/version match gate
+    runs-on: ubuntu-24.04
+    outputs:
+      tag:  ${{ steps.derive.outputs.tag }}
+      mode: ${{ steps.derive.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: derive
+        name: Derive tag + mode; assert tag/version match
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            workflow_dispatch)
+              MODE="dispatch"
+              TAG="${{ inputs.tag }}"
+              ;;
+            push)
+              MODE="tag"
+              TAG="${{ github.ref_name }}"
+              ;;
+            pull_request)
+              MODE="pr"
+              TAG="v0.0.0-pr"   # synthetic; advisory only
+              ;;
+            *)
+              echo "::error::Unsupported event ${{ github.event_name }}"
+              exit 1
+              ;;
+          esac
+
+          # Tag shape: v<semver> with optional pre-release suffix.
+          if [[ "$MODE" != "pr" ]] && \
+             ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' does not match required shape v<semver>."
+            exit 1
+          fi
+
+          # Workspace version, via the omni-node package (the only [[bin]]
+          # in the workspace; its package version follows
+          # [workspace.package].version verbatim).
+          VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "omni-node") | .version')
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Could not extract omni-node version from cargo metadata"
+            exit 1
+          fi
+
+          # Strip leading 'v' from the tag for comparison.
+          TAG_VERSION="${TAG#v}"
+
+          if [[ "$MODE" == "pr" ]]; then
+            echo "PR dry-run mode: cargo workspace version=$VERSION; synthetic tag=$TAG (gate advisory)."
+          else
+            if [[ "$TAG_VERSION" != "$VERSION" ]]; then
+              echo "::error::tag/version mismatch: tag='$TAG' (parsed '$TAG_VERSION') but Cargo.toml workspace.package.version='$VERSION'"
+              exit 1
+            fi
+            echo "tag/version match OK: tag='$TAG' = cargo version='$VERSION'"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "mode=$MODE"
+          } >> "$GITHUB_OUTPUT"
+
+  # ── Job 2 — build the release matrix ─────────────────────────────────────
+  #
+  # Two variants on x86_64-unknown-linux-gnu only. aarch64, the
+  # production-prove variant, and SLSA provenance are explicit
+  # non-goals for this stage and are documented in
+  # docs/stage15.2-release-artifact-workflow.md as Stage 15.3
+  # candidates.
+  build-matrix:
+    name: Build (${{ matrix.variant.name }})
+    needs: tag-version-gate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { name: default, features: "" }
+          - { name: submit,  features: "submit" }
+    env:
+      TAG:     ${{ needs.tag-version-gate.outputs.tag }}
+      MODE:    ${{ needs.tag-version-gate.outputs.mode }}
+      VARIANT: ${{ matrix.variant.name }}
+      FEATURES: ${{ matrix.variant.features }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.variant.name }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Show toolchain (honours rust-toolchain.toml)
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: cargo build --release --locked
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          if [[ -n "$FEATURES" ]]; then
+            cargo build --release --locked \
+              --target x86_64-unknown-linux-gnu \
+              -p omni-node \
+              --features "$FEATURES"
+          else
+            cargo build --release --locked \
+              --target x86_64-unknown-linux-gnu \
+              -p omni-node
+          fi
+
+          BIN="dist/omni-node-${TAG}-x86_64-unknown-linux-gnu-${VARIANT}"
+          strip target/x86_64-unknown-linux-gnu/release/omni-node
+          mv  target/x86_64-unknown-linux-gnu/release/omni-node "$BIN"
+          chmod +x "$BIN"
+
+      - name: Capture --version + --help snapshots
+        run: |
+          set -euo pipefail
+          BIN="dist/omni-node-${TAG}-x86_64-unknown-linux-gnu-${VARIANT}"
+          "$BIN" --version > "dist/omni-node-${VARIANT}-version.txt"
+          "$BIN" --help    > "dist/omni-node-${VARIANT}-help.txt"
+
+      - name: Defense in depth — assert binary --version matches tag
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == "pr" ]]; then
+            echo "PR dry-run: skipping binary --version vs tag cross-check."
+            exit 0
+          fi
+          EXPECTED="${TAG#v}"
+          CAPTURED=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?' \
+                       "dist/omni-node-${VARIANT}-version.txt" | head -n1 || true)
+          if [[ "$CAPTURED" != "$EXPECTED" ]]; then
+            echo "::error::binary --version mismatch for ${VARIANT}: expected '$EXPECTED', got '$CAPTURED'"
+            exit 1
+          fi
+          echo "binary --version matches tag for ${VARIANT}: $CAPTURED"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.variant.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── Job 3 — bundle + cosign keyless sign ─────────────────────────────────
+  #
+  # No long-lived secret. Identity is the workflow's OIDC token,
+  # certified by Sigstore Fulcio; Rekor records the signing.
+  bundle-and-sign:
+    name: Bundle + cosign sign
+    needs: [tag-version-gate, build-matrix]
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      TAG:  ${{ needs.tag-version-gate.outputs.tag }}
+      MODE: ${{ needs.tag-version-gate.outputs.mode }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: dist/
+
+      - name: List collected artifacts
+        run: ls -la dist/
+
+      - name: Generate SHA256SUMS (sorted, deterministic)
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Sorted listing → deterministic SHA256SUMS contents.
+          # Exclude SHA256SUMS / .sig / .cert so re-runs are idempotent.
+          mapfile -t FILES < <(find . -maxdepth 1 -type f \
+            ! -name SHA256SUMS \
+            ! -name SHA256SUMS.sig \
+            ! -name SHA256SUMS.cert \
+            -printf '%f\n' | sort)
+          if [[ ${#FILES[@]} -eq 0 ]]; then
+            echo "::error::dist/ is empty after build matrix"
+            exit 1
+          fi
+          sha256sum "${FILES[@]}" > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+          echo "--- round-trip ---"
+          sha256sum -c SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: cosign sign-blob SHA256SUMS (keyless OIDC)
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.cert \
+            SHA256SUMS
+
+      - name: Verify cosign signature
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Production identity regex — pinned in
+          # docs/stage15.2-release-artifact-workflow.md.
+          PROD_REGEX='https://github\.com/SUM-INNOVATION/OmniNode-Protocol/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9\.-]+)?$'
+          if [[ "$MODE" == "tag" ]] || [[ "$MODE" == "dispatch" ]]; then
+            echo "Verifying against production cert identity regex"
+            cosign verify-blob \
+              --certificate         SHA256SUMS.cert \
+              --signature           SHA256SUMS.sig \
+              --certificate-identity-regexp "$PROD_REGEX" \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+              SHA256SUMS
+          else
+            # PR dry-run: the runtime identity is something like
+            # https://github.com/.../release.yml@refs/pull/<N>/merge,
+            # which won't match the production tag regex. Verify
+            # against a repo-scoped permissive regex so the signing
+            # pipeline is exercised end-to-end.
+            PR_REGEX='https://github\.com/SUM-INNOVATION/OmniNode-Protocol/\.github/workflows/release\.yml@.*$'
+            echo "PR dry-run: verifying against repo-scoped permissive regex"
+            cosign verify-blob \
+              --certificate         SHA256SUMS.cert \
+              --signature           SHA256SUMS.sig \
+              --certificate-identity-regexp "$PR_REGEX" \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+              SHA256SUMS
+          fi
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── Job 4 — publish draft GitHub Release on tag push ─────────────────────
+  #
+  # Only runs on `push: refs/tags/v*`. Draft only; the operator
+  # promotes to non-draft manually after verifying off the published
+  # signature on a separate host. Skipped on workflow_dispatch
+  # (dispatch is intended for dry-run / re-build of an existing tag's
+  # bundle), skipped on PRs.
+  publish-draft-release:
+    name: Publish draft Release
+    needs: [tag-version-gate, bundle-and-sign]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/
+
+      - name: List bundle
+        run: ls -la dist/
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(needs.tag-version-gate.outputs.tag, '-') }}
+          files: dist/*
+          name: ${{ needs.tag-version-gate.outputs.tag }}
+          tag_name: ${{ needs.tag-version-gate.outputs.tag }}
+          fail_on_unmatched_files: true

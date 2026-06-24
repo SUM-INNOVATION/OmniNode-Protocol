@@ -917,28 +917,59 @@ and tracked by the operator.
    `omni-node --version` on the build host and paste the output
    verbatim into the release notes.
 
-9. **SHA-256 recorded alongside the tag.** For each binary you
-   intend to distribute:
+9. **Verify the signed `SHA256SUMS` bundle from the release page.**
+   Stage 15.2 ships [`.github/workflows/release.yml`](../.github/workflows/release.yml)
+   — a cosign-keyless-signed release pipeline that, on a `v<X.Y.Z>` tag
+   push, builds two `omni-node` binaries (`default` and `submit`,
+   `x86_64-unknown-linux-gnu` only) and publishes a **draft** Release
+   with `SHA256SUMS` + `SHA256SUMS.sig` + `SHA256SUMS.cert` plus
+   per-variant `--version` / `--help` snapshots. **No long-lived
+   signing key** — identity is the workflow's GitHub OIDC token
+   certified by Sigstore Fulcio; Rekor records each signing. From a
+   separate host than the build host:
 
    ```bash
-   sha256sum target/release/omni-node
-   # paste into release notes alongside (build host, build date, feature flags)
+   # Download SHA256SUMS, SHA256SUMS.sig, SHA256SUMS.cert from the
+   # draft Release page, then verify against the pinned cert identity
+   # regex.
+   cosign verify-blob \
+     --certificate         SHA256SUMS.cert \
+     --signature           SHA256SUMS.sig \
+     --certificate-identity-regexp \
+       'https://github\.com/SUM-INNOVATION/OmniNode-Protocol/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$' \
+     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+     SHA256SUMS
+
+   # Then verify the binaries against SHA256SUMS.
+   sha256sum -c SHA256SUMS
    ```
 
-   **Signing is deferred to Stage 10b.** Until then, the SHA-256 +
-   the operator's verification of `--help` output (see §1a "Capturing
-   `--help` for verification") is the integrity path.
+   The cert identity regex is the **governance lock** — it pins the
+   repository, the workflow file, and `refs/tags/v<semver>` ref shape.
+   See [`docs/stage15.2-release-artifact-workflow.md`](stage15.2-release-artifact-workflow.md)
+   §4 for the rationale + bump policy + PR-dry-run identity contrast.
 
 10. **Default + submit `--help` snapshots committed in the release
-    notes.** Capture both via the §1a one-liners and include them
-    next to the SHA-256 so the destination operator can diff
-    locally without re-building.
+    notes.** Stage 15.2 captures these automatically as part of the
+    release bundle (`omni-node-default-help.txt` /
+    `omni-node-submit-help.txt`). The destination operator diffs
+    against locally-generated `--help` output without re-building.
 
-The checklist intentionally has no GitHub Actions automation
-binding. Stage 10b will evaluate whether a `workflow_dispatch`
-artifact build + checksum publication is the right next step; until
-that lands, items 8–10 are manual and recorded in the operator's
-release log.
+11. **Promote the draft Release to non-draft.** Stage 15.2 deliberately
+    leaves the Release in `draft` state after `release.yml` runs. The
+    promotion is a one-click GitHub UI action; **do it only after step
+    9 succeeds on a separate host than the build host**. Optionally
+    flag `latest`. Until promoted, the artifacts are visible only to
+    repo collaborators with read access — non-collaborator operators
+    cannot fetch them.
+
+The checklist's items 9–11 are now machinery-bound: the `release.yml`
+workflow produces them on `v<X.Y.Z>` tag push. Stage 10b is delivered
+as Stage 15.2; see [`docs/stage15.2-release-artifact-workflow.md`](stage15.2-release-artifact-workflow.md)
+for the workflow design, governance lock, and Stage 15.3 candidate
+follow-ups (aarch64, `production-prove` variant, SLSA build provenance).
+Item 8 (`omni-node --version` capture into release notes) remains
+useful as a sanity step before promoting the draft Release.
 
 ---
 
