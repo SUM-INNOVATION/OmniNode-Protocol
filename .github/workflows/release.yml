@@ -1,13 +1,20 @@
 # OmniNode Protocol — release artifact workflow with cosign keyless signing.
 #
-# Stage 15.2. Closes the artifact signing / provenance gap that the
-# 2026-06-24 RC audit (docs/phase5-rc-audit-2026-06-24.md §3b) rated
-# Missing. Builds two `omni-node` release binaries
-# (default + submit, x86_64-unknown-linux-gnu only), emits a single
-# canonical SHA256SUMS over every release file, and signs the
-# checksums file with cosign keyless OIDC (no long-lived private key
-# anywhere). Sigstore Fulcio mints the cert; Rekor records the
-# signing. Operators verify with `cosign verify-blob` + `sha256sum -c`.
+# Stage 15.2 originally closed the artifact signing / provenance gap
+# that the 2026-06-24 RC audit (docs/phase5-rc-audit-2026-06-24.md
+# §3b) rated Missing. Stage 15.3 expanded the build matrix to two
+# architectures × two variants = four `omni-node` release binaries:
+#
+#   - omni-node-v<TAG>-x86_64-unknown-linux-gnu-default
+#   - omni-node-v<TAG>-x86_64-unknown-linux-gnu-submit
+#   - omni-node-v<TAG>-aarch64-unknown-linux-gnu-default
+#   - omni-node-v<TAG>-aarch64-unknown-linux-gnu-submit
+#
+# emits a single canonical SHA256SUMS over every release file, and
+# signs the checksums file with cosign keyless OIDC (no long-lived
+# private key anywhere). Sigstore Fulcio mints the cert; Rekor
+# records the signing. Operators verify with `cosign verify-blob` +
+# `sha256sum -c`.
 #
 # Governance lock (cert identity regex). Operators MUST verify against:
 #   https://github.com/SUM-INNOVATION/OmniNode-Protocol/.github/workflows/release.yml@refs/tags/v<semver>
@@ -125,24 +132,29 @@ jobs:
 
   # ── Job 2 — build the release matrix ─────────────────────────────────────
   #
-  # Two variants on x86_64-unknown-linux-gnu only. aarch64, the
-  # production-prove variant, and SLSA provenance are explicit
-  # non-goals for this stage and are documented in
-  # docs/stage15.2-release-artifact-workflow.md as Stage 15.3
-  # candidates.
+  # Two architectures × two variants = 4 binaries per release.
+  # Stage 15.3 added the aarch64 axis after the Stage 15.3 probe PR #70
+  # confirmed `ubuntu-24.04-arm` is available to this repo (run
+  # 28197315331 → aarch64 native). The `production-prove` variant and
+  # SLSA provenance remain Stage 15.4+ candidates per the same plan
+  # locks.
   build-matrix:
-    name: Build (${{ matrix.variant.name }})
+    name: Build (${{ matrix.target.triple }} / ${{ matrix.variant.name }})
     needs: tag-version-gate
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.target.runner }}
     strategy:
       fail-fast: false
       matrix:
+        target:
+          - { triple: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04,     file_grep: x86-64  }
+          - { triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, file_grep: aarch64 }
         variant:
           - { name: default, features: "" }
           - { name: submit,  features: "submit" }
     env:
       TAG:     ${{ needs.tag-version-gate.outputs.tag }}
       MODE:    ${{ needs.tag-version-gate.outputs.mode }}
+      TARGET:  ${{ matrix.target.triple }}
       VARIANT: ${{ matrix.variant.name }}
       FEATURES: ${{ matrix.variant.features }}
     steps:
@@ -155,12 +167,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-${{ matrix.variant.name }}-${{ hashFiles('**/Cargo.lock') }}
+          # Cache key includes target.triple so x86_64 and aarch64
+          # caches don't collide on the same variant.
+          key: release-${{ matrix.target.triple }}-${{ matrix.variant.name }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Show toolchain (honours rust-toolchain.toml)
         run: |
           rustc --version
           cargo --version
+          uname -m
 
       - name: cargo build --release --locked
         run: |
@@ -169,24 +184,58 @@ jobs:
 
           if [[ -n "$FEATURES" ]]; then
             cargo build --release --locked \
-              --target x86_64-unknown-linux-gnu \
+              --target "$TARGET" \
               -p omni-node \
               --features "$FEATURES"
           else
             cargo build --release --locked \
-              --target x86_64-unknown-linux-gnu \
+              --target "$TARGET" \
               -p omni-node
           fi
 
-          BIN="dist/omni-node-${TAG}-x86_64-unknown-linux-gnu-${VARIANT}"
-          strip target/x86_64-unknown-linux-gnu/release/omni-node
-          mv  target/x86_64-unknown-linux-gnu/release/omni-node "$BIN"
+          BIN="dist/omni-node-${TAG}-${TARGET}-${VARIANT}"
+          strip "target/${TARGET}/release/omni-node"
+          mv "target/${TARGET}/release/omni-node" "$BIN"
           chmod +x "$BIN"
 
-      - name: Capture --version + --help snapshots
+      # Stage 15.3 Q6 — `file` ELF arch check. Runs on every matrix
+      # entry; fails the job loudly if a build emitted a wrong-arch
+      # ELF (e.g. a mis-configured `--target` flag).
+      - name: Assert ELF architecture matches matrix target
         run: |
           set -euo pipefail
-          BIN="dist/omni-node-${TAG}-x86_64-unknown-linux-gnu-${VARIANT}"
+          BIN="dist/omni-node-${TAG}-${TARGET}-${VARIANT}"
+          OUT=$(file -b "$BIN")
+          echo "file: $OUT"
+          if ! grep -qE "ELF 64-bit LSB .*${{ matrix.target.file_grep }}" <<<"$OUT"; then
+            echo "::error::ELF arch mismatch for ${BIN}: file said '$OUT' but expected '${{ matrix.target.file_grep }}'"
+            exit 1
+          fi
+          echo "ELF arch check OK: ${BIN} contains ${{ matrix.target.file_grep }}"
+
+      - name: Smoke --version (every matrix entry)
+        run: |
+          set -euo pipefail
+          BIN="dist/omni-node-${TAG}-${TARGET}-${VARIANT}"
+          # Runs the binary on the matrix host. For aarch64 jobs this
+          # exercises native aarch64 execution; for x86_64 jobs it
+          # exercises x86_64. Both runners must successfully execute
+          # their native arch's binary.
+          "$BIN" --version
+
+      # Stage 15.3 retains v0.1.0's bundle shape: only x86_64 captures
+      # --version + --help snapshots for upload. The aarch64 binaries
+      # are bit-different ELFs but their --version / --help outputs
+      # are byte-identical to x86_64's (CARGO_PKG_VERSION-based +
+      # clap-derived; both arch-independent). Deduplicating the
+      # snapshots keeps the bundle inventory at 11 files (4 binaries
+      # + 2 version + 2 help + SHA256SUMS{.sig,.cert}). aarch64
+      # runtime executability is asserted by the prior --version smoke.
+      - name: Capture --version + --help snapshots (x86_64 only)
+        if: matrix.target.triple == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          BIN="dist/omni-node-${TAG}-${TARGET}-${VARIANT}"
           "$BIN" --version > "dist/omni-node-${VARIANT}-version.txt"
           "$BIN" --help    > "dist/omni-node-${VARIANT}-help.txt"
 
@@ -197,19 +246,19 @@ jobs:
             echo "PR dry-run: skipping binary --version vs tag cross-check."
             exit 0
           fi
+          BIN="dist/omni-node-${TAG}-${TARGET}-${VARIANT}"
           EXPECTED="${TAG#v}"
-          CAPTURED=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?' \
-                       "dist/omni-node-${VARIANT}-version.txt" | head -n1 || true)
+          CAPTURED=$("$BIN" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?' | head -n1 || true)
           if [[ "$CAPTURED" != "$EXPECTED" ]]; then
-            echo "::error::binary --version mismatch for ${VARIANT}: expected '$EXPECTED', got '$CAPTURED'"
+            echo "::error::binary --version mismatch for ${TARGET}/${VARIANT}: expected '$EXPECTED', got '$CAPTURED'"
             exit 1
           fi
-          echo "binary --version matches tag for ${VARIANT}: $CAPTURED"
+          echo "binary --version matches tag for ${TARGET}/${VARIANT}: $CAPTURED"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: build-${{ matrix.variant.name }}
+          name: build-${{ matrix.target.triple }}-${{ matrix.variant.name }}
           path: dist/
           if-no-files-found: error
           retention-days: 14
