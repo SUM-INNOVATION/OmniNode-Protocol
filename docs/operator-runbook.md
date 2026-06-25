@@ -971,6 +971,47 @@ follow-ups (aarch64, `production-prove` variant, SLSA build provenance).
 Item 8 (`omni-node --version` capture into release notes) remains
 useful as a sanity step before promoting the draft Release.
 
+### Worked example — `v0.1.0` (first signed release, 2026-06-25)
+
+The inaugural cosign-keyless-signed release exercised this checklist
+end-to-end. Recorded for reference so the next operator has a concrete
+baseline:
+
+- **Tag SHA:** `820b54ee9dcb10f039bc0748e1b2a8dfa9fb403c` (annotated
+  tag at then-`origin/main` `8bb0be9`).
+- **Workflow run:** https://github.com/SUM-INNOVATION/OmniNode-Protocol/actions/runs/28185649617 (`event=push`, `conclusion=success`).
+- **Release URL (post-promotion):** https://github.com/SUM-INNOVATION/OmniNode-Protocol/releases/tag/v0.1.0.
+- **Cosign verification:** `Verified OK` against the production cert
+  identity regex; the bundled `SHA256SUMS.cert` carries SAN URI
+  `https://github.com/SUM-INNOVATION/OmniNode-Protocol/.github/workflows/release.yml@refs/tags/v0.1.0`.
+- **Independent issue trail:** [#68 — Cut and verify v0.1.0 signed
+  release](https://github.com/SUM-INNOVATION/OmniNode-Protocol/issues/68)
+  is the live runbook a teammate ran, with per-step output recorded as
+  comments. Read it before cutting `v0.1.1` (or any subsequent tag) so
+  the surprises that surfaced once don't need to surface again.
+- **Per-stage durable record:** [`docs/stage15.2-release-artifact-workflow.md`](stage15.2-release-artifact-workflow.md)
+  §9 carries the full evidence (Fulcio cert facts, verbatim
+  `SHA256SUMS`, promotion timeline, lessons learned, gotchas).
+
+#### Pre-promotion vs post-promotion `gh release view --json url`
+
+The `url` field returned by `gh release view <TAG> --json url` differs
+between draft and non-draft states:
+
+| State | `url` shape |
+| --- | --- |
+| **Draft** (pre-promotion) | `https://github.com/SUM-INNOVATION/OmniNode-Protocol/releases/tag/untagged-<hex>` |
+| **Non-draft** (post-promotion) | `https://github.com/SUM-INNOVATION/OmniNode-Protocol/releases/tag/v<X.Y.Z>` |
+
+In both states, the **`tagName`** field reads `v<X.Y.Z>` and
+`gh release view v<X.Y.Z>` successfully resolves to the same release
+object. The `untagged-<hex>` slug is a GitHub-internal pre-promotion
+URL only; it is not a workflow fault. Operators verifying step 9 should
+treat `isDraft: true` as the load-bearing assertion (it must remain
+`true` until step 11 promotes), not the URL field. See
+[`docs/stage15.2-release-artifact-workflow.md`](stage15.2-release-artifact-workflow.md)
+§10 for the durable note.
+
 ---
 
 ## Phase 5 — Contributor operations

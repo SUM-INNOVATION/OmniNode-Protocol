@@ -357,3 +357,128 @@ operator host.
   workflow + cosign keyless signing (Stage 15.2) | Complete".
 - No cutting of `v0.1.0` in this PR. The tag is a separate operator
   action.
+
+---
+
+## 9. First signed release — `v0.1.0` (2026-06-25)
+
+Appended by Stage 15.2A after the inaugural tag was cut and verified
+end-to-end. **Append only.** §1 – §8 above are untouched.
+
+### Event chain
+
+| Step | Time (UTC) | Evidence |
+| --- | --- | --- |
+| Tag pushed | 2026-06-25T16:39:* | Tag SHA `820b54ee9dcb10f039bc0748e1b2a8dfa9fb403c` (annotated tag at then-`origin/main` `8bb0be9`) |
+| `release.yml` run started | 2026-06-25T16:39:16Z | https://github.com/SUM-INNOVATION/OmniNode-Protocol/actions/runs/28185649617, `event=push`, `headBranch=v0.1.0` |
+| Workflow conclusion | shortly after | `success` — all five jobs (`Tag/version match gate`, `Build (default)`, `Build (submit)`, `Bundle + cosign sign`, `Publish draft Release`) reported `pass` |
+| Draft Release published | 2026-06-25T19:32:05Z | Pre-promotion URL slug: `…/releases/tag/untagged-96a25bff432ea2001e2f` (GitHub-internal draft slug — documented gotcha; see §10 below) |
+| Operator verification on a separate host (per [issue #68](https://github.com/SUM-INNOVATION/OmniNode-Protocol/issues/68)) | 2026-06-25T19:32:* | `cosign verify-blob` → `Verified OK`; `sha256sum -c SHA256SUMS` → all 9 OK; `--version` → `omni-node 0.1.0` on both variants; `--version` snapshots match captured files; `--help` subcommand surfaces sane |
+| Cross-verification (cert SAN inspection on another host) | 2026-06-25T19:33:* | `openssl x509 -ext subjectAltName` on `SHA256SUMS.cert` after `base64 -d` yields URI matching the production regex byte-for-byte |
+| Promotion to non-draft + `--latest` | 2026-06-25T19:32:11Z | `gh release edit v0.1.0 --draft=false --latest`; post-promotion `gh api repos/.../releases/latest` resolves to `v0.1.0` |
+
+### Fulcio cert facts
+
+| Field | Value |
+| --- | --- |
+| Subject Alternative Name (URI) | `https://github.com/SUM-INNOVATION/OmniNode-Protocol/.github/workflows/release.yml@refs/tags/v0.1.0` |
+| Matches production regex (§4)? | **Yes** — byte-for-byte |
+| Issuer | `O=sigstore.dev, CN=sigstore-intermediate` |
+| Validity | `2026-06-25T16:42:51Z` → `2026-06-25T16:52:51Z` (10-minute ephemeral, typical for cosign keyless) |
+| Serial | `3C617D73778F9FA07E1BBC59F65E6F3CB697C9E7` |
+
+The cert is base64-PEM-wrapped on disk; operators inspecting locally
+without cosign installed can run:
+
+```bash
+base64 -d < SHA256SUMS.cert > cert.pem
+openssl x509 -in cert.pem -noout -ext subjectAltName
+# Expected URI line ends in `release.yml@refs/tags/v<X.Y.Z>`
+```
+
+### `SHA256SUMS` (verbatim, `v0.1.0`)
+
+```
+975a6c412205fdcff440ffb252fcd09464f96353ff2cb99ca6266896c4caba04  omni-node-default-help.txt
+ae8a2313f93113d2b1e8f84e0369c3fd86d02002714627a23bcaf30671074f79  omni-node-default-version.txt
+b25db4527900c89e6d5719dfcc81eceb524e70c63cf19de049a6d848b9662b62  omni-node-submit-help.txt
+ae8a2313f93113d2b1e8f84e0369c3fd86d02002714627a23bcaf30671074f79  omni-node-submit-version.txt
+3f0c3f7b3c019b5a2de2013e629952dd15cb6a19246a3277e486184c481af326  omni-node-v0.1.0-x86_64-unknown-linux-gnu-default
+2a15d114e1bcd17e23b67859fc7384286b0fe0fe593304d201a37268960f2cab  omni-node-v0.1.0-x86_64-unknown-linux-gnu-submit
+```
+
+Note: the two `*-version.txt` files share a SHA-256 because both
+`--version` outputs are identical (`omni-node 0.1.0`); the `*-help.txt`
+files differ because the `submit` build adds a feature-gated subcommand
+surface (chain attestation / submit lifecycle).
+
+### Audit-finding rating change
+
+This event flips the audit finding at
+[`docs/phase5-rc-audit-2026-06-24.md`](phase5-rc-audit-2026-06-24.md)
+§3b from **Missing** to **Shipped**. **The 2026-06-24 audit doc is not
+edited** — its rating is preserved as the historical snapshot of "where
+the surface was at Stage 15.1 close." A future dated RC audit will pick
+up the new rating; this §9 entry is the durable record in the meantime.
+README row 115 is updated in the same Stage 15.2A PR.
+
+### What did *not* go to plan — `v0.1.0` lessons
+
+1. **Pre-promotion URL slug.** Issue #68 §7 listed the *post-promotion*
+   release URL (`…/releases/tag/v0.1.0`) as the expected `url` field
+   from `gh release view`. Pre-promotion, GitHub serves drafts under a
+   `…/releases/tag/untagged-<hex>` slug — the binding to the tag is
+   intact via the `tagName` field, but the URL is cosmetically
+   different. The operator's agent surfaced the mismatch rather than
+   silently continuing (per the §8 hard rule), which was the correct
+   behavior. The issue template is corrected by Stage 15.2A. The
+   workflow itself is unchanged.
+
+2. **No workflow regressions.** The release pipeline behaved correctly
+   end-to-end across `Tag/version match gate` → `Build (default)` →
+   `Build (submit)` → `Bundle + cosign sign` → `Publish draft Release`.
+
+### Cross-references
+
+- Operator runbook: [`docs/operator-runbook.md`](operator-runbook.md) §14 (release-readiness checklist, now with first-release worked example).
+- Stage 14.8 readiness packet (the closure that precedes Stage 15.x): [`docs/stage14.8-proof-generation-readiness.md`](stage14.8-proof-generation-readiness.md).
+- Stage 15.1 RC audit (immutable; rates §3b as Missing at 2026-06-24): [`docs/phase5-rc-audit-2026-06-24.md`](phase5-rc-audit-2026-06-24.md).
+- Issue #68 (the runbook the v0.1.0 operator ran): [Cut and verify v0.1.0 signed release](https://github.com/SUM-INNOVATION/OmniNode-Protocol/issues/68).
+
+---
+
+## 10. Operator gotcha — `gh release view` URL field on draft releases
+
+When `gh release view <TAG> --json url` is invoked against a **draft**
+release, the returned `url` field carries GitHub's internal slug:
+
+```
+https://github.com/<OWNER>/<REPO>/releases/tag/untagged-<hex>
+```
+
+After the draft is promoted to non-draft, the `url` flips to the public
+shape:
+
+```
+https://github.com/<OWNER>/<REPO>/releases/tag/<TAG>
+```
+
+The **binding from the git tag to the release is intact in both states**
+— `tagName` reads `<TAG>` in both, and `gh release view <TAG>`
+successfully resolves to the same release object regardless of state.
+Only the URL slug differs.
+
+This is documented GitHub behavior, not a workflow fault. Operators
+verifying `v<X.Y.Z>` should:
+
+- Treat the **`isDraft` field** as the load-bearing assertion (it must
+  be `true` pre-promotion to confirm the workflow did not promote
+  prematurely).
+- Treat the `tagName` field as the binding check (it must match the
+  intended tag).
+- **Not** rely on the `url` field for tag-vs-URL equality before
+  promotion.
+- Re-query `gh release view <TAG> --json url` post-promotion and confirm
+  it now ends in `…/releases/tag/<TAG>` before treating the release as
+  publicly resolvable.
+
