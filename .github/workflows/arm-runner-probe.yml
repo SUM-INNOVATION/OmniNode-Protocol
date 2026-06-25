@@ -1,0 +1,65 @@
+# Stage 15.3 — one-shot probe: is GitHub-hosted ubuntu-24.04-arm
+# runner available to this repo?
+#
+# This workflow is THROWAWAY. It runs once to determine whether
+# Stage 15.3 release-bundle expansion can use the native arm runner
+# label, or whether it must pivot to `cross`-based cross-compile.
+#
+# Outcome lives in the workflow run's job log:
+#   - If the job runs and prints `aarch64`, native runner is available.
+#   - If the job queues forever or errors with "label not found",
+#     native runner is NOT available; pivot Stage 15.3 to `cross`.
+#
+# This file is deleted (PR closed unmerged) once the outcome is captured.
+# It does NOT modify ci.yml or release.yml.
+
+name: ARM runner probe (Stage 15.3 throwaway)
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - '.github/workflows/arm-runner-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe ubuntu-24.04-arm runner availability
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - name: Show architecture and host info
+        run: |
+          set -euo pipefail
+          echo "=== uname ==="
+          uname -a
+          echo
+          echo "=== /etc/os-release (head) ==="
+          head -5 /etc/os-release
+          echo
+          echo "=== arch ==="
+          arch
+          echo
+          echo "=== machine ==="
+          uname -m
+          echo
+          echo "=== nproc ==="
+          nproc
+          echo
+          echo "=== rustc (may not be preinstalled) ==="
+          rustc --version || echo "no rust preinstalled (ok)"
+          echo
+          echo "=== rustup (may not be preinstalled) ==="
+          rustup --version || echo "no rustup preinstalled (ok)"
+
+      - name: Sanity-check expected arch
+        run: |
+          set -euo pipefail
+          MACHINE=$(uname -m)
+          if [[ "$MACHINE" != "aarch64" ]]; then
+            echo "::error::probe ran on $MACHINE, expected aarch64"
+            exit 1
+          fi
+          echo "OK — native aarch64 runner confirmed available."
