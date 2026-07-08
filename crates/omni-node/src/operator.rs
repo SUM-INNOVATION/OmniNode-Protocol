@@ -419,7 +419,7 @@ impl SeedSource {
     }
 }
 
-fn parse_seed_hex(h: &str) -> Result<[u8; 32], OperatorError> {
+pub(crate) fn parse_seed_hex(h: &str) -> Result<[u8; 32], OperatorError> {
     if h.len() != 64 {
         return Err(OperatorError::SeedMalformed(format!(
             "expected 64 hex chars, got {}",
