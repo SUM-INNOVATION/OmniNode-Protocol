@@ -31,6 +31,8 @@ mod evidence_anchor_cli;
 mod operator;
 #[cfg(feature = "settlement-read")]
 mod settlement_cli;
+#[cfg(feature = "settlement-read")]
+mod settlement_signer;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
