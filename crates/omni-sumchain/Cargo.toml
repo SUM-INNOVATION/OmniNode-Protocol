@@ -17,6 +17,13 @@ rust-version.workspace = true
 # required at any step (the chain crates are public on crates.io).
 default = []
 submit  = ["dep:sumchain-primitives", "dep:sumchain-crypto"]
+# Issue #83 — settlement track read surface. Dependency-neutral:
+# activates no new external crates, only compiles a new local module
+# (`crate::settlement`) with raw JSON-RPC DTOs and adapter extension
+# methods on `SumChainClient<T>` for the InferenceSettlement RPCs
+# introduced by sum-chain#76 / #86. Default builds resolve to the
+# exact same dependency tree with or without this feature.
+settlement-read = []
 
 [dependencies]
 omni-types          = { workspace = true }

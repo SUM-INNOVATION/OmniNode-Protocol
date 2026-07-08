@@ -23,6 +23,12 @@ path = "src/main.rs"
 # sources only — no GitHub credential is required at any step.
 default = []
 submit  = ["omni-sumchain/submit"]
+# Issue #83 — InferenceSettlement read surface. Dependency-neutral:
+# activates no new external crates. Downstream operator CLI (Issue
+# #84), observability markers (Issue #85), and verifier self-claim
+# (Issue #87) each build on this feature. Default builds resolve to
+# the exact same dep tree with or without this flag.
+settlement-read = ["omni-sumchain/settlement-read"]
 # Stage 11b.1.b — opt-in feature that pulls the halo2 reference
 # verifier into the operator binary's `verify-proof` dispatch.
 # Default-OFF: the operator binary's compile graph contains zero

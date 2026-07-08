@@ -289,6 +289,88 @@ jobs:
           fi
           echo "submit tree: sumchain-crypto + sumchain-primitives present as expected."
 
+  # ── Issue #83: settlement-read build + test ────────────────────────────────
+  #
+  # Read-only InferenceSettlement RPC surface (`omninode_getInference*`,
+  # `omninode_getClaimableReward`, `omninode_getVerifier`, plus the
+  # `sum_*` / `chain_*` reads already unconditional). Dependency-neutral
+  # feature — no new external crates activated. The existing
+  # `default tree — must NOT contain sumchain-(crypto|primitives)`
+  # gate above enforces the negative posture for DEFAULT builds ONLY;
+  # a distinct settlement-read-tree-check job below asserts the same
+  # for `--features settlement-read`, so future drift into the chain-
+  # signing crates via the read feature is caught explicitly.
+  settlement-read-build-test:
+    name: --features settlement-read — build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo (with settlement-read feature)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-settlement-read-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-settlement-read-
+
+      - name: cargo build -p omni-node --features settlement-read
+        run: cargo build -p omni-node --features settlement-read
+
+      - name: cargo test -p omni-sumchain --features settlement-read
+        run: cargo test -p omni-sumchain --features settlement-read
+
+      - name: cargo test -p omni-node --features settlement-read
+        run: cargo test -p omni-node --features settlement-read
+
+  # ── Issue #83: settlement-read dep-tree — NEGATIVE gate ────────────────────
+  #
+  # Feature is intended to be dependency-neutral: read-only, no signing
+  # surface. Assert `--features settlement-read` does NOT pull in
+  # `sumchain-crypto` or `sumchain-primitives`. If a future change drags
+  # them in via the read feature, this gate fails and the change must
+  # either move to `--features submit` or drop the dep.
+  settlement-read-tree-check:
+    name: settlement-read tree — must NOT contain sumchain-(crypto|primitives)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-tree-settlement-read-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tree-settlement-read-
+
+      - name: Assert `omni-node --features settlement-read` tree has NO sumchain crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree_out="$(cargo tree -p omni-node --features settlement-read)"
+          if echo "$tree_out" | grep -E 'sumchain-(crypto|primitives)'; then
+            {
+              echo "::error::--features settlement-read pulled in sumchain-crypto"
+              echo "or sumchain-primitives. settlement-read is intended to be"
+              echo "dependency-neutral (read-only, no signing surface). Either"
+              echo "move the dependency behind --features submit, or remove it."
+            } >&2
+            exit 1
+          fi
+          echo "settlement-read tree: no sumchain-(crypto|primitives) — dep-neutral posture intact."
+
   # ── Stage 11b.1.b: halo2-reference-verify build + test ──────────────────────
   #
   # Verifier-only: builds `omni-proofs-halo2-reference` with the
