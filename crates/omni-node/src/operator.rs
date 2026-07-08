@@ -772,6 +772,15 @@ enum OperatorCmd {
     /// strings that would otherwise dominate the enum's stack
     /// size.
     EvidenceAnchor(Box<crate::evidence_anchor_cli::EvidenceAnchorArgs>),
+
+    /// Issue #84 — InferenceSettlement read-only CLI. Four
+    /// subcommands (`status`, `session`, `claimable`, `verifier`)
+    /// consuming the merged `settlement-read` adapter from #83.
+    /// No writes, no signing, no claim submission. Boxed to
+    /// stay on the existing enum-size budget alongside
+    /// `EvidenceAnchor`.
+    #[cfg(feature = "settlement-read")]
+    Settlement(Box<crate::settlement_cli::SettlementArgs>),
 }
 
 #[derive(Args)]
@@ -1155,6 +1164,12 @@ pub(crate) async fn dispatch(args: OperatorArgs) -> anyhow::Result<()> {
             crate::evidence_anchor_cli::dispatch(*a)
                 .await
                 .map_err(|e| OperatorError::ContributorWorkflow(e.to_string()))?;
+        }
+        #[cfg(feature = "settlement-read")]
+        OperatorCmd::Settlement(a) => {
+            // Issue #84 — read-only settlement CLI. Anyhow errors
+            // returned by the sub-dispatch propagate as-is.
+            crate::settlement_cli::dispatch(*a).await?;
         }
     }
     Ok(())
@@ -1924,6 +1939,8 @@ fn subcommand_name(c: &OperatorCmd) -> &'static str {
         OperatorCmd::GenerateProductionMlpProof(_) => "generate-production-mlp-proof",
         OperatorCmd::Contributor(_) => "contributor",
         OperatorCmd::EvidenceAnchor(_) => "evidence-anchor",
+        #[cfg(feature = "settlement-read")]
+        OperatorCmd::Settlement(_) => "settlement",
     }
 }
 
