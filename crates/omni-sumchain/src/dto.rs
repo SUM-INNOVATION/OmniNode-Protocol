@@ -148,4 +148,32 @@ pub struct ChainParamsInfo {
     /// C resolved as Option C-new-flag).
     #[serde(default)]
     pub integrity_evidence_anchor_enabled_from_height: Option<u64>,
+
+    // ── Settlement track (Issue #83) — three independent gates ────────
+    //
+    // Sourced from `sum-chain#76` + `sum-chain#86`. Each gate is `None`
+    // by default so parsing succeeds against chain mirrors that predate
+    // the settlement subprotocol. Locally-enforced dormancy is the
+    // source of truth — see `crate::settlement::dormancy`.
+    /// InferenceSettlement base subprotocol activation height. `None` =
+    /// dormant; `Some(N)` with `head < N` = scheduled but not yet
+    /// reached; `Some(N)` with `head >= N` = active. Read RPCs under
+    /// the `omninode_getInference*` namespace consult this gate first.
+    #[serde(default)]
+    pub inference_settlement_enabled_from_height: Option<u64>,
+
+    /// Consistency / plurality mode activation height. Independent of
+    /// the base settlement gate: base settlement can be active with
+    /// consistency still dormant. Required for
+    /// `omninode_getInferenceConsistency` at the RPC level and for
+    /// composing views of consistency-mode sessions.
+    #[serde(default)]
+    pub inference_settlement_consistency_enabled_from_height: Option<u64>,
+
+    /// Verifier-bonding activation height. Independent of the other
+    /// two: bonding can activate before or after consistency. Required
+    /// for `omninode_getVerifier` at the RPC level and for composing
+    /// views of bond-required sessions.
+    #[serde(default)]
+    pub inference_verifier_bonding_enabled_from_height: Option<u64>,
 }

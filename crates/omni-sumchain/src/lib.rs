@@ -61,6 +61,11 @@ pub mod dto;
 #[cfg(feature = "submit")]
 pub(crate) mod outer_sign;
 pub mod rpc;
+// Issue #83 — settlement track read surface. Feature-gated so default
+// builds compile zero settlement code. Dependency-neutral (no new
+// external crates activated).
+#[cfg(feature = "settlement-read")]
+pub mod settlement;
 pub mod status;
 #[cfg(feature = "submit")]
 pub mod tx;
