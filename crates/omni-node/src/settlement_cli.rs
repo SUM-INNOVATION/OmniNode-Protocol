@@ -42,6 +42,182 @@ use omni_sumchain::settlement::wire::VerifierRegistryRaw;
 use omni_sumchain::settlement::SettlementReadError;
 use omni_sumchain::{JsonRpcTransport, SumChainClient};
 
+// ── Issue #85 — observability markers ────────────────────────────────────────
+//
+// Stable tracing markers instrumented around the existing read-only
+// operator settlement commands from #84. NO new subcommand, NO write
+// path, NO signing surface — pure instrumentation of surfaces that
+// already exist.
+//
+// All markers appear as an `event="<name>"` structured field on a
+// `tracing` event. The constant names below are the ONLY grep targets
+// for the marker taxonomy; consumers of this module must not
+// hard-code the string values.
+
+pub(crate) mod markers {
+    /// Emitted at the start of every `operator settlement …` subcommand
+    /// dispatch. Carries `subcommand`, and (when applicable)
+    /// `session_id` / `address` fields.
+    pub(crate) const QUERY: &str = "settlement_query";
+
+    /// Emitted on the successful return path of every subcommand,
+    /// including active-empty reads (`session found=false`,
+    /// `verifier found=false`). Carries the same context fields as
+    /// `QUERY`.
+    pub(crate) const QUERY_OK: &str = "settlement_query_ok";
+
+    /// Emitted when a subcommand encountered a locally-enforced
+    /// dormant gate. Carries `gate` (chain-param name), `observed`
+    /// (Option<u64> as `Some(N)` or `None`), and `head` alongside
+    /// the subcommand context.
+    pub(crate) const DORMANT: &str = "settlement_dormant";
+
+    /// Emitted when a subcommand produced a normalized view that
+    /// requires an additional chain-side gate to be active OR
+    /// requires the caller to have fetched additional DTOs. Carries
+    /// `gate` (the missing one), `session_id`, and `reason`.
+    pub(crate) const VIEW_INCOMPLETE: &str = "settlement_view_incomplete";
+
+    /// Emitted on RPC transport failure or wire-parse failure — the
+    /// two `SettlementReadError` variants that are neither dormant
+    /// nor view-incomplete. Carries `category` (`"chain_rpc"` or
+    /// `"chain_response_malformed"`) and `error`.
+    pub(crate) const QUERY_FAILED: &str = "settlement_query_failed";
+}
+
+fn emit_query_start(
+    subcommand: &str,
+    session_id: Option<&str>,
+    address: Option<&str>,
+) {
+    tracing::info!(
+        event = markers::QUERY,
+        subcommand = subcommand,
+        session_id = session_id.unwrap_or(""),
+        address = address.unwrap_or(""),
+        "settlement query start"
+    );
+}
+
+fn emit_query_ok(
+    subcommand: &str,
+    session_id: Option<&str>,
+    address: Option<&str>,
+) {
+    tracing::info!(
+        event = markers::QUERY_OK,
+        subcommand = subcommand,
+        session_id = session_id.unwrap_or(""),
+        address = address.unwrap_or(""),
+        "settlement query ok"
+    );
+}
+
+/// Inspect the [`SettlementReadError`] variant and emit the matching
+/// terminal marker. Called by [`err_to_anyhow_with_marker`] on every
+/// error propagation site in the four `run_*` functions.
+fn emit_failure_marker(
+    err: &SettlementReadError,
+    subcommand: &str,
+    session_id: Option<&str>,
+    address: Option<&str>,
+) {
+    match err {
+        SettlementReadError::Dormant { gate, observed, head } => {
+            let observed_display = match observed {
+                None => "None".to_string(),
+                Some(n) => format!("Some({n})"),
+            };
+            tracing::warn!(
+                event = markers::DORMANT,
+                subcommand = subcommand,
+                session_id = session_id.unwrap_or(""),
+                address = address.unwrap_or(""),
+                gate = gate.param_field_name(),
+                observed = %observed_display,
+                head = head,
+                "settlement RPC gate dormant"
+            );
+        }
+        SettlementReadError::ViewIncomplete {
+            missing_gate,
+            session_id: sid,
+            reason,
+        } => {
+            tracing::warn!(
+                event = markers::VIEW_INCOMPLETE,
+                subcommand = subcommand,
+                session_id = %sid,
+                address = address.unwrap_or(""),
+                gate = missing_gate.param_field_name(),
+                reason = %reason,
+                "settlement view incomplete"
+            );
+        }
+        SettlementReadError::Rpc(inner) => {
+            tracing::error!(
+                event = markers::QUERY_FAILED,
+                subcommand = subcommand,
+                session_id = session_id.unwrap_or(""),
+                address = address.unwrap_or(""),
+                category = "chain_rpc",
+                error = %inner,
+                "settlement RPC failure"
+            );
+        }
+        SettlementReadError::WireParse(msg) => {
+            tracing::error!(
+                event = markers::QUERY_FAILED,
+                subcommand = subcommand,
+                session_id = session_id.unwrap_or(""),
+                address = address.unwrap_or(""),
+                category = "chain_response_malformed",
+                error = %msg,
+                "settlement wire parse failure"
+            );
+        }
+    }
+}
+
+/// Emit the failure marker AND convert the typed error to `anyhow`.
+/// Use this wherever the existing `run_*` functions call
+/// `settlement_read_error_to_anyhow`.
+fn err_to_anyhow_with_marker(
+    err: SettlementReadError,
+    subcommand: &str,
+    session_id: Option<&str>,
+    address: Option<&str>,
+) -> anyhow::Error {
+    emit_failure_marker(&err, subcommand, session_id, address);
+    settlement_read_error_to_anyhow(err)
+}
+
+/// Emit `settlement_query_failed` for a NON-typed direct RPC failure
+/// (`chain_getChainParams`, `chain_getBlockHeight`,
+/// `sum_listInferenceAttestations`). These paths don't produce a
+/// [`SettlementReadError`] but still need the same marker + field
+/// contract as `err_to_anyhow_with_marker` — including the
+/// `session_id=""` / `address=""` empty-when-absent convention.
+///
+/// Called from `run_status` and `run_session`'s pre-compose RPCs.
+fn emit_query_failed(
+    subcommand: &str,
+    session_id: Option<&str>,
+    address: Option<&str>,
+    category: &str,
+    error: &dyn std::fmt::Display,
+) {
+    tracing::error!(
+        event = markers::QUERY_FAILED,
+        subcommand = subcommand,
+        session_id = session_id.unwrap_or(""),
+        address = address.unwrap_or(""),
+        category = category,
+        error = %error,
+        "settlement RPC failure"
+    );
+}
+
 // ── Public arg types ─────────────────────────────────────────────────────────
 
 #[derive(Args, Debug, Clone)]
@@ -147,12 +323,21 @@ fn run_status<T: JsonRpcTransport>(
     client: &SumChainClient<T>,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let params = client
-        .get_chain_params()
-        .map_err(|e| anyhow::anyhow!("chain_getChainParams: {e}"))?;
+    let subcommand = "status";
+    emit_query_start(subcommand, None, None);
+
+    let params = client.get_chain_params().map_err(|e| {
+        let err = anyhow::anyhow!("chain_getChainParams: {e}");
+        emit_query_failed(subcommand, None, None, "chain_rpc", &err);
+        err
+    })?;
     let head = client
         .get_block_height(BlockFinality::Latest)
-        .map_err(|e| anyhow::anyhow!("chain_getBlockHeight: {e}"))?
+        .map_err(|e| {
+            let err = anyhow::anyhow!("chain_getBlockHeight: {e}");
+            emit_query_failed(subcommand, None, None, "chain_rpc", &err);
+            err
+        })?
         .height;
 
     writeln!(out, "chain_id={}", params.chain_id)?;
@@ -173,6 +358,8 @@ fn run_status<T: JsonRpcTransport>(
     ] {
         writeln!(out, "{name} = {}", render_gate_state(observed, head))?;
     }
+
+    emit_query_ok(subcommand, None, None);
     Ok(())
 }
 
@@ -193,7 +380,9 @@ fn run_session<T: JsonRpcTransport>(
     args: &SessionArgs,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let subcommand = "session";
     let session_id = &args.session_id;
+    emit_query_start(subcommand, Some(session_id), None);
 
     // Session lookup surfaces settlement-gate dormancy directly.
     let session = match client.omninode_get_inference_session(session_id) {
@@ -211,30 +400,46 @@ fn run_session<T: JsonRpcTransport>(
             } else {
                 writeln!(out, "session_id={session_id} found=false")?;
             }
+            emit_query_ok(subcommand, Some(session_id), None);
             return Ok(());
         }
-        Err(e) => return Err(settlement_read_error_to_anyhow(e)),
+        Err(e) => {
+            return Err(err_to_anyhow_with_marker(
+                e,
+                subcommand,
+                Some(session_id),
+                None,
+            ));
+        }
     };
 
     let claims = client
         .omninode_get_inference_claims(session_id)
-        .map_err(settlement_read_error_to_anyhow)?;
+        .map_err(|e| err_to_anyhow_with_marker(e, subcommand, Some(session_id), None))?;
     let disputes = client
         .omninode_get_inference_disputes(session_id)
-        .map_err(settlement_read_error_to_anyhow)?;
+        .map_err(|e| err_to_anyhow_with_marker(e, subcommand, Some(session_id), None))?;
 
     // Attestations RPC is unconditional (no gate) and already lives
     // on SumChainClient.
     let attestations = client.list_attestations(session_id).map_err(|e| {
-        anyhow::anyhow!("sum_listInferenceAttestations: {e}")
+        let err = anyhow::anyhow!("sum_listInferenceAttestations: {e}");
+        emit_query_failed(subcommand, Some(session_id), None, "chain_rpc", &err);
+        err
     })?;
 
-    let params = client
-        .get_chain_params()
-        .map_err(|e| anyhow::anyhow!("chain_getChainParams: {e}"))?;
+    let params = client.get_chain_params().map_err(|e| {
+        let err = anyhow::anyhow!("chain_getChainParams: {e}");
+        emit_query_failed(subcommand, Some(session_id), None, "chain_rpc", &err);
+        err
+    })?;
     let head = client
         .get_block_height(BlockFinality::Latest)
-        .map_err(|e| anyhow::anyhow!("chain_getBlockHeight: {e}"))?
+        .map_err(|e| {
+            let err = anyhow::anyhow!("chain_getBlockHeight: {e}");
+            emit_query_failed(subcommand, Some(session_id), None, "chain_rpc", &err);
+            err
+        })?
         .height;
     let consistency_gate_active = params
         .inference_settlement_consistency_enabled_from_height
@@ -249,7 +454,9 @@ fn run_session<T: JsonRpcTransport>(
         Some(
             client
                 .omninode_get_inference_consistency(session_id)
-                .map_err(settlement_read_error_to_anyhow)?,
+                .map_err(|e| {
+                    err_to_anyhow_with_marker(e, subcommand, Some(session_id), None)
+                })?,
         )
     } else {
         None
@@ -271,10 +478,9 @@ fn run_session<T: JsonRpcTransport>(
         }
         let mut entries: Vec<VerifierRegistryRaw> = Vec::new();
         for addr in set {
-            if let Some(r) = client
-                .omninode_get_verifier(&addr)
-                .map_err(settlement_read_error_to_anyhow)?
-            {
+            if let Some(r) = client.omninode_get_verifier(&addr).map_err(|e| {
+                err_to_anyhow_with_marker(e, subcommand, Some(session_id), Some(&addr))
+            })? {
                 entries.push(r);
             }
         }
@@ -293,13 +499,15 @@ fn run_session<T: JsonRpcTransport>(
         consistency_gate_active,
         bonding_gate_active,
     )
-    .map_err(settlement_read_error_to_anyhow)?;
+    .map_err(|e| err_to_anyhow_with_marker(e, subcommand, Some(session_id), None))?;
 
     if args.json {
         writeln!(out, "{}", serde_json::to_string_pretty(&view_to_json(&view))?)?;
     } else {
         render_session_view_human(out, &view)?;
     }
+
+    emit_query_ok(subcommand, Some(session_id), None);
     Ok(())
 }
 
@@ -526,9 +734,16 @@ fn run_claimable<T: JsonRpcTransport>(
     args: &ClaimableArgs,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let subcommand = "claimable";
+    let session_id = &args.session_id;
+    let verifier = &args.verifier;
+    emit_query_start(subcommand, Some(session_id), Some(verifier));
+
     let r = client
-        .omninode_get_claimable_reward(&args.session_id, &args.verifier)
-        .map_err(settlement_read_error_to_anyhow)?;
+        .omninode_get_claimable_reward(session_id, verifier)
+        .map_err(|e| {
+            err_to_anyhow_with_marker(e, subcommand, Some(session_id), Some(verifier))
+        })?;
     writeln!(out, "session_id={}", r.session_id)?;
     writeln!(out, "verifier_address={}", r.verifier_address)?;
     writeln!(out, "reward_amount={}", r.reward_amount)?;
@@ -542,6 +757,8 @@ fn run_claimable<T: JsonRpcTransport>(
         "escrow_available={} cap_available={} dispute_clear={} claimable_now={}",
         r.escrow_available, r.cap_available, r.dispute_clear, r.claimable_now
     )?;
+
+    emit_query_ok(subcommand, Some(session_id), Some(verifier));
     Ok(())
 }
 
@@ -552,12 +769,15 @@ fn run_verifier<T: JsonRpcTransport>(
     args: &VerifierArgs,
     out: &mut dyn Write,
 ) -> Result<()> {
-    match client
-        .omninode_get_verifier(&args.address)
-        .map_err(settlement_read_error_to_anyhow)?
-    {
+    let subcommand = "verifier";
+    let address = &args.address;
+    emit_query_start(subcommand, None, Some(address));
+
+    match client.omninode_get_verifier(address).map_err(|e| {
+        err_to_anyhow_with_marker(e, subcommand, None, Some(address))
+    })? {
         None => {
-            writeln!(out, "address={} found=false", args.address)?;
+            writeln!(out, "address={} found=false", address)?;
         }
         Some(v) => {
             writeln!(out, "address={}", v.address)?;
@@ -572,6 +792,8 @@ fn run_verifier<T: JsonRpcTransport>(
             writeln!(out, "slash_history_len={}", v.slash_history.len())?;
         }
     }
+
+    emit_query_ok(subcommand, None, Some(address));
     Ok(())
 }
 
@@ -1210,6 +1432,403 @@ mod tests {
                 .get_arguments()
                 .any(|a| a.get_long() == Some("verifier")),
             "operator settlement claimable must accept --verifier"
+        );
+    }
+
+    // ── Issue #85 — observability marker tests ─────────────────────────
+
+    /// Shared-buffer `MakeWriter` for capturing tracing output inside a
+    /// test scope. Each test constructs one, sets it as the current
+    /// tracing subscriber via `tracing::subscriber::with_default`, runs
+    /// `dispatch_core`, and then greps the captured bytes for marker
+    /// strings.
+    #[derive(Clone)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+        fn as_string(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    struct CapturedLogsWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogsWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogsWriter(self.0.clone())
+        }
+    }
+
+    /// Run `dispatch_core` inside a scoped tracing subscriber that
+    /// captures every event into a `CapturedLogs`. Returns the
+    /// captured tracing bytes as a `String` PLUS the `dispatch_core`
+    /// result, so the same test can inspect both.
+    fn run_with_capture(
+        args: SettlementArgs,
+        client: &SumChainClient<FakeJsonRpcTransport>,
+    ) -> (String, Vec<u8>, Result<(), anyhow::Error>) {
+        let logs = CapturedLogs::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let mut stdout_buf = Vec::new();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            dispatch_core(args, client, &mut stdout_buf)
+        });
+        (logs.as_string(), stdout_buf, result)
+    }
+
+    // ── Marker constant pin ────────────────────────────────────────────
+
+    #[test]
+    fn marker_constant_names_are_pinned() {
+        // These string values are the operator-visible marker names.
+        // Renaming any of them is a coordinated observability change
+        // that must update runbooks + dashboards + tests. Do NOT
+        // change the right-hand sides without a matching runbook /
+        // downstream update.
+        assert_eq!(markers::QUERY, "settlement_query");
+        assert_eq!(markers::QUERY_OK, "settlement_query_ok");
+        assert_eq!(markers::DORMANT, "settlement_dormant");
+        assert_eq!(markers::VIEW_INCOMPLETE, "settlement_view_incomplete");
+        assert_eq!(markers::QUERY_FAILED, "settlement_query_failed");
+    }
+
+    // ── Happy path — status emits QUERY + QUERY_OK ─────────────────────
+
+    #[test]
+    fn status_happy_path_emits_query_and_query_ok_markers() {
+        let (client, fake) = make_client();
+        seed_params(&fake, params_all_gates_active(0));
+        seed_head(&fake, 500_000);
+
+        let (logs, _stdout, result) = run_with_capture(args_status(), &client);
+        result.expect("status happy path must succeed");
+
+        assert!(
+            logs.contains("event=\"settlement_query\""),
+            "must emit QUERY marker; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("event=\"settlement_query_ok\""),
+            "must emit QUERY_OK marker; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("subcommand=\"status\""),
+            "must record subcommand field; logs=\n{logs}"
+        );
+        // Failure markers must NOT appear on the happy path.
+        for banned in [
+            "settlement_dormant",
+            "settlement_view_incomplete",
+            "settlement_query_failed",
+        ] {
+            assert!(
+                !logs.contains(&format!("event=\"{banned}\"")),
+                "happy path must not emit {banned}; logs=\n{logs}"
+            );
+        }
+    }
+
+    // ── Dormant branch — settlement dormant on `session` ───────────────
+
+    #[test]
+    fn session_dormant_emits_dormant_marker_with_gate_observed_head() {
+        let (client, fake) = make_client();
+        seed_params(&fake, params_all_dormant());
+        seed_head(&fake, 100_000);
+
+        let (logs, _stdout, result) = run_with_capture(args_session("s-1"), &client);
+        result.expect_err("dormant must produce non-Ok result");
+
+        assert!(
+            logs.contains("event=\"settlement_dormant\""),
+            "must emit DORMANT marker; logs=\n{logs}"
+        );
+        // Required structured fields per #85 spec:
+        assert!(
+            logs.contains("subcommand=\"session\""),
+            "DORMANT marker must carry subcommand field; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("session_id=\"s-1\""),
+            "DORMANT marker must carry session_id field; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("gate=\"inference_settlement_enabled_from_height\""),
+            "DORMANT marker must carry gate field; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("observed=\"None\"") || logs.contains("observed=None"),
+            "DORMANT marker must carry observed=None; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("head=100000"),
+            "DORMANT marker must carry head field; logs=\n{logs}"
+        );
+        // QUERY_OK must NOT appear.
+        assert!(
+            !logs.contains("event=\"settlement_query_ok\""),
+            "dormant path must not emit QUERY_OK; logs=\n{logs}"
+        );
+    }
+
+    // ── View-incomplete branch ─────────────────────────────────────────
+
+    #[test]
+    fn session_view_incomplete_emits_view_incomplete_marker() {
+        // Settlement gate active + consistency gate DORMANT, and the
+        // session is consistency-mode. The `omninode_getInferenceConsistency`
+        // RPC would be gated at RPC level (dormant), so the CLI's
+        // session pipeline hits ViewIncomplete when the consistency
+        // fetch fails first. Instead: settlement + consistency BOTH
+        // active but the session is bond-required and bonding is
+        // dormant → ViewIncomplete { Bonding, .. } via compose guard.
+        //
+        // Simplest path: settlement + consistency active, bonding
+        // dormant; session marked bond_required=true. compose fires
+        // the view-incomplete branch after the RPCs succeed.
+        let (client, fake) = make_client();
+        seed_params(
+            &fake,
+            json!({
+                "finality_depth": 12,
+                "min_fee": 100,
+                "chain_id": 1_800_100,
+                "inference_settlement_enabled_from_height": 0,
+                "inference_settlement_consistency_enabled_from_height": 0,
+                // bonding intentionally omitted → dormant
+            }),
+        );
+        seed_head(&fake, 500_000);
+        fake.set_response(
+            "omninode_getInferenceSession",
+            Ok(json!({
+                "session_id": "s-vi",
+                "consistency_required": false,
+                "bond_required": true,
+                "max_verifiers": 3,
+                "escrow_total": "1000",
+                "escrow_remaining": "1000",
+                "claims_count": 0,
+                "lifecycle": "active",
+                "created_at_height": 400_000,
+            })),
+        );
+        fake.set_response(
+            "omninode_getInferenceClaims",
+            Ok(json!({ "session_id": "s-vi", "claims": [] })),
+        );
+        fake.set_response(
+            "omninode_getInferenceDisputes",
+            Ok(json!({ "session_id": "s-vi", "disputes": [] })),
+        );
+        fake.set_response("sum_listInferenceAttestations", Ok(json!([])));
+
+        let (logs, _stdout, result) = run_with_capture(args_session("s-vi"), &client);
+        result.expect_err("view-incomplete must produce non-Ok result");
+
+        assert!(
+            logs.contains("event=\"settlement_view_incomplete\""),
+            "must emit VIEW_INCOMPLETE marker; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("subcommand=\"session\""),
+            "VIEW_INCOMPLETE marker must carry subcommand; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("session_id=\"s-vi\""),
+            "VIEW_INCOMPLETE marker must carry session_id; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("gate=\"inference_verifier_bonding_enabled_from_height\""),
+            "VIEW_INCOMPLETE marker must carry missing gate; logs=\n{logs}"
+        );
+        assert!(
+            !logs.contains("event=\"settlement_query_ok\""),
+            "view-incomplete path must not emit QUERY_OK; logs=\n{logs}"
+        );
+    }
+
+    // ── Query-failed branch — RPC error ────────────────────────────────
+
+    #[test]
+    fn claimable_rpc_error_emits_query_failed_marker() {
+        use omni_zkml::ChainClientError;
+        let (client, fake) = make_client();
+        seed_params(&fake, params_all_gates_active(0));
+        seed_head(&fake, 500_000);
+        fake.set_response(
+            "omninode_getClaimableReward",
+            Err(ChainClientError::Other("simulated RPC outage".into())),
+        );
+
+        let (logs, _stdout, result) = run_with_capture(
+            args_claimable("s-1", "v-mature"),
+            &client,
+        );
+        result.expect_err("RPC error must produce non-Ok result");
+
+        assert!(
+            logs.contains("event=\"settlement_query_failed\""),
+            "must emit QUERY_FAILED marker; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("subcommand=\"claimable\""),
+            "QUERY_FAILED marker must carry subcommand; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("session_id=\"s-1\""),
+            "QUERY_FAILED marker must carry session_id; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("address=\"v-mature\""),
+            "QUERY_FAILED marker must carry address; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("category=\"chain_rpc\""),
+            "QUERY_FAILED marker must carry category='chain_rpc'; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("simulated RPC outage"),
+            "QUERY_FAILED marker must include underlying error; logs=\n{logs}"
+        );
+    }
+
+    // ── Query-failed branch — wire parse error ─────────────────────────
+
+    #[test]
+    fn claimable_wire_parse_error_emits_query_failed_with_malformed_category() {
+        // Chain-active seed + malformed JSON response so the DTO
+        // deserialise fails on the claim reward, driving the
+        // `SettlementReadError::WireParse` path.
+        let (client, fake) = make_client();
+        seed_params(&fake, params_all_gates_active(0));
+        seed_head(&fake, 500_000);
+        fake.set_response(
+            "omninode_getClaimableReward",
+            Ok(json!({ "not_the_right_shape": true })),
+        );
+
+        let (logs, _stdout, result) = run_with_capture(
+            args_claimable("s-1", "v-mature"),
+            &client,
+        );
+        result.expect_err("wire parse error must produce non-Ok result");
+
+        assert!(
+            logs.contains("event=\"settlement_query_failed\""),
+            "must emit QUERY_FAILED marker; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("category=\"chain_response_malformed\""),
+            "wire parse failure must carry category='chain_response_malformed'; logs=\n{logs}"
+        );
+    }
+
+    // ── Direct RPC failure (no SettlementReadError) emits fields ──────
+
+    #[test]
+    fn status_direct_rpc_failure_emits_query_failed_with_empty_session_and_address() {
+        // `chain_getChainParams` is called BEFORE any settlement-specific
+        // gated RPC. Its failure never routes through
+        // `SettlementReadError::Rpc`; the emit_query_failed helper is
+        // the only marker source. Test pins that the emitted marker
+        // carries subcommand + session_id="" + address="" +
+        // category="chain_rpc" + error.
+        use omni_zkml::ChainClientError;
+        let (client, fake) = make_client();
+        fake.set_response(
+            "chain_getChainParams",
+            Err(ChainClientError::Other("simulated params outage".into())),
+        );
+        // `chain_getBlockHeight` also seeded so the fake doesn't fall
+        // through to its "no response configured" default if fetched.
+        seed_head(&fake, 500_000);
+
+        let (logs, _stdout, result) = run_with_capture(args_status(), &client);
+        result.expect_err("direct RPC failure must produce non-Ok result");
+
+        assert!(
+            logs.contains("event=\"settlement_query_failed\""),
+            "must emit QUERY_FAILED marker; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("subcommand=\"status\""),
+            "QUERY_FAILED marker must carry subcommand; logs=\n{logs}"
+        );
+        // The subcommand has no session_id / address context — the
+        // fields still must be emitted verbatim as empty strings so
+        // downstream grep / filter rules stay uniform.
+        assert!(
+            logs.contains("session_id=\"\""),
+            "QUERY_FAILED marker must carry empty session_id when absent; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("address=\"\""),
+            "QUERY_FAILED marker must carry empty address when absent; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("category=\"chain_rpc\""),
+            "QUERY_FAILED marker must carry category='chain_rpc'; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("simulated params outage"),
+            "QUERY_FAILED marker must carry the underlying error text; logs=\n{logs}"
+        );
+    }
+
+    // ── Verifier happy path emits markers ──────────────────────────────
+
+    #[test]
+    fn verifier_happy_path_emits_markers_with_address() {
+        let (client, fake) = make_client();
+        seed_params(&fake, params_all_gates_active(0));
+        seed_head(&fake, 500_000);
+        fake.set_response(
+            "omninode_getVerifier",
+            Ok(json!({
+                "address": "v-1",
+                "bond_amount": "10000",
+                "bond_state": "bonded",
+                "slash_history": []
+            })),
+        );
+
+        let (logs, _stdout, result) = run_with_capture(args_verifier("v-1"), &client);
+        result.expect("verifier happy path must succeed");
+
+        assert!(
+            logs.contains("event=\"settlement_query\""),
+            "must emit QUERY marker; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("event=\"settlement_query_ok\""),
+            "must emit QUERY_OK marker; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("subcommand=\"verifier\""),
+            "must record subcommand=verifier; logs=\n{logs}"
+        );
+        assert!(
+            logs.contains("address=\"v-1\""),
+            "must record address field; logs=\n{logs}"
         );
     }
 }
