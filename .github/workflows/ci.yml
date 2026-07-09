@@ -371,6 +371,83 @@ jobs:
           fi
           echo "settlement-read tree: no sumchain-(crypto|primitives) — dep-neutral posture intact."
 
+  # ── Issue #87: settlement-submit build + test ──────────────────────────────
+  #
+  # First settlement WRITE path. Superset of `settlement-read` + `submit`;
+  # pulls the chain primitives + crypto v0.2.0. Runs the full `--features
+  # settlement-submit` test matrix including the claim hermetic tests
+  # that pin every gate refusal + happy-path submission.
+  settlement-submit-build-test:
+    name: --features settlement-submit — build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo (with settlement-submit feature)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-settlement-submit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-settlement-submit-
+
+      - name: cargo build -p omni-node --features settlement-submit
+        run: cargo build -p omni-node --features settlement-submit
+
+      - name: cargo test -p omni-sumchain --features settlement-submit
+        run: cargo test -p omni-sumchain --features settlement-submit
+
+      - name: cargo test -p omni-node --features settlement-submit
+        run: cargo test -p omni-node --features settlement-submit
+
+  # ── Issue #87: settlement-submit dep-tree — POSITIVE gate ──────────────────
+  #
+  # `settlement-submit` intentionally pulls the chain primitives + crypto
+  # v0.2.0 (via `omni-sumchain/settlement-submit` → `submit`). Assert the
+  # positive posture so a future refactor that accidentally drops the
+  # signing infrastructure would fail this gate rather than silently
+  # producing a claim path that can't sign.
+  settlement-submit-tree-check:
+    name: settlement-submit tree — MUST contain sumchain-(crypto|primitives)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry / git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-tree-settlement-submit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tree-settlement-submit-
+
+      - name: Assert `omni-node --features settlement-submit` tree DOES contain the chain crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo tree -p omni-node --features settlement-submit | grep -Eq 'sumchain-(crypto|primitives)'; then
+            {
+              echo "::error::--features settlement-submit no longer pulls sumchain-crypto"
+              echo "or sumchain-primitives. The claim WRITE path cannot sign or"
+              echo "assemble a SignedTransaction without them. Re-check"
+              echo "omni-sumchain's [features] table and the transitive dep on"
+              echo "\`--features submit\`."
+            } >&2
+            exit 1
+          fi
+          echo "settlement-submit tree: sumchain-crypto + sumchain-primitives present as expected."
+
   # ── Stage 11b.1.b: halo2-reference-verify build + test ──────────────────────
   #
   # Verifier-only: builds `omni-proofs-halo2-reference` with the

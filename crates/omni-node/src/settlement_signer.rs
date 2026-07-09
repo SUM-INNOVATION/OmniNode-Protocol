@@ -257,6 +257,65 @@ fn _keep_settlement_read_error_referenced(e: SettlementReadError) -> ClaimSigner
     ClaimSignerError::RegistryFetchFailed(e.to_string())
 }
 
+// ── Issue #87 — settlement-submit signer extension ───────────────────────────
+//
+// `ClaimSigner` is a superset of `ClaimSignerIdentity` that ALSO
+// retains the resolved seed bytes for exactly one purpose: passing
+// them to `omni_sumchain::settlement_submit::tx::sign_and_submit` at
+// the very end of the claim pipeline (steps 11-13 of the reviewer's
+// flow). Gated on `settlement-submit` so `settlement-read`-only
+// builds still have no reachable seed accessor.
+//
+// The read-side `ClaimSignerIdentity` continues to store only the
+// derived address; nothing about #80's contract changes.
+
+#[cfg(feature = "settlement-submit")]
+pub(crate) struct ClaimSigner {
+    identity: ClaimSignerIdentity,
+    /// Retained ONLY for the one `sign_and_submit` call in the claim
+    /// pipeline. Never exposed except through
+    /// [`ClaimSigner::seed_for_signing`].
+    seed: [u8; 32],
+}
+
+#[cfg(feature = "settlement-submit")]
+impl ClaimSigner {
+    /// Resolve the seed from `source`, derive the address, and retain
+    /// the seed for a subsequent single sign call.
+    ///
+    /// **Load timing invariant**: the caller must NOT invoke
+    /// `ClaimSigner::resolve` until every precheck (dormancy,
+    /// attestation, authority, maturity, bond, builder envelope,
+    /// decoded-tx) has passed. Loading earlier violates the
+    /// separation of "identity derivation" (settlement-read,
+    /// non-retaining) from "signing seed retention" (settlement-
+    /// submit, retaining).
+    pub(crate) fn resolve(source: SeedSource) -> Result<Self, ClaimSignerError> {
+        let seed = resolve_seed(&source)?;
+        let derived_address = omni_zkml::signer_chain_address_base58(&seed)
+            .map_err(|e| ClaimSignerError::DerivationFailed(e.to_string()))?;
+        Ok(Self {
+            identity: ClaimSignerIdentity { derived_address },
+            seed,
+        })
+    }
+
+    /// Base58 verifier address.
+    pub(crate) fn address(&self) -> &str {
+        self.identity.address()
+    }
+
+    /// Handoff for the outer-sign path. The returned reference is the
+    /// ONLY way seed bytes reach the signing primitive. `ClaimSigner`
+    /// drops the seed with the struct at end-of-scope.
+    ///
+    /// Reachable only under `#[cfg(feature = "settlement-submit")]`
+    /// — the settlement-read code path has no analogous accessor.
+    pub(crate) fn seed_for_signing(&self) -> &[u8; 32] {
+        &self.seed
+    }
+}
+
 // ── Hermetic tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

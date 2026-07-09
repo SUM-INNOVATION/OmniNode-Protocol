@@ -219,7 +219,10 @@ pub(crate) fn build_and_submit_signed_transaction<T: JsonRpcTransport>(
 /// backwards compatibility with older mirrors / hermetic fixtures.
 /// Any other shape (including object missing the field, or with a
 /// non-string `tx_hash`) returns a typed `ChainClientError::Other`.
-fn parse_send_raw_transaction_result(
+// Issue #87: promoted to `pub(crate)` so the settlement claim submit
+// path (`crate::settlement_submit::tx`) can reuse this parser
+// verbatim. No public-API surface change — module-internal only.
+pub(crate) fn parse_send_raw_transaction_result(
     result: &serde_json::Value,
 ) -> std::result::Result<String, ChainClientError> {
     if let Some(s) = result.as_str() {

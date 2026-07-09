@@ -250,6 +250,13 @@ pub enum SettlementCmd {
     /// Read the verifier registry entry for the given chain address.
     /// Requires the bonding gate to be active.
     Verifier(VerifierArgs),
+
+    /// Issue #87 — verifier self-claim submission. Boxed to keep the
+    /// enum's largest variant size unchanged. Feature-gated on
+    /// `settlement-submit` so `settlement-read` builds don't compile
+    /// any of the claim code path.
+    #[cfg(feature = "settlement-submit")]
+    Claim(Box<ClaimArgs>),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -276,6 +283,34 @@ pub struct ClaimableArgs {
 pub struct VerifierArgs {
     /// Verifier chain address.
     pub address: String,
+}
+
+/// Issue #87 — argument surface for `operator settlement claim`.
+#[cfg(feature = "settlement-submit")]
+#[derive(Args, Debug, Clone)]
+pub struct ClaimArgs {
+    /// Session identifier for the attestation being claimed.
+    pub session_id: String,
+
+    /// Optional explicit-safety verifier address. When provided, MUST
+    /// equal the address derived from OMNINODE_VERIFIER_SEED_HEX;
+    /// otherwise the authority gate refuses. Provides a scripted-
+    /// invocation double-check.
+    #[arg(long)]
+    pub verifier: Option<String>,
+
+    /// Optional fee override. When absent, chain-side builder applies
+    /// its default. When present, passed through to the builder
+    /// request and asserted-equal on the returned envelope.
+    #[arg(long)]
+    pub fee: Option<u128>,
+
+    /// Run prechecks + builder RPC + envelope + decoded-tx
+    /// verification and STOP. Never loads the signing seed. Never
+    /// invokes `sum_sendRawTransaction`. Used for operator dry-runs
+    /// and CI checks.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 // ── Entry point (production) ─────────────────────────────────────────────────
@@ -314,6 +349,10 @@ pub(crate) fn dispatch_core<T: JsonRpcTransport>(
         SettlementCmd::Session(a) => run_session(client, &a, out),
         SettlementCmd::Claimable(a) => run_claimable(client, &a, out),
         SettlementCmd::Verifier(a) => run_verifier(client, &a, out),
+        #[cfg(feature = "settlement-submit")]
+        SettlementCmd::Claim(a) => {
+            run_claim(client, &a, out, crate::operator::SeedSource::Env)
+        }
     }
 }
 
@@ -826,6 +865,435 @@ fn settlement_read_error_to_anyhow(err: SettlementReadError) -> anyhow::Error {
             anyhow::anyhow!("settlement wire parse failure: {msg}")
         }
     }
+}
+
+// ── Issue #87 — claim markers + run_claim (settlement-submit-gated) ─────────
+
+#[cfg(feature = "settlement-submit")]
+pub(crate) mod claim_markers {
+    pub(crate) const CLAIM_READY: &str = "settlement_claim_ready";
+    pub(crate) const CLAIM_REFUSED_DORMANCY: &str = "settlement_claim_refused_dormancy";
+    pub(crate) const CLAIM_REFUSED_MATURITY: &str = "settlement_claim_refused_maturity";
+    pub(crate) const CLAIM_REFUSED_AUTHORITY: &str = "settlement_claim_refused_authority";
+    pub(crate) const CLAIM_REFUSED_BOND_PRECHECK: &str =
+        "settlement_claim_refused_bond_precheck";
+    pub(crate) const CLAIM_SUBMITTED: &str = "settlement_claim_submitted";
+    pub(crate) const CLAIM_FAILED: &str = "settlement_claim_failed";
+}
+
+#[cfg(feature = "settlement-submit")]
+fn run_claim<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
+    args: &ClaimArgs,
+    out: &mut dyn Write,
+    seed_source: crate::operator::SeedSource,
+) -> Result<()> {
+    use crate::settlement_signer::{
+        BondPrecheckOutcome, ClaimSignerError, ClaimSignerIdentity,
+    };
+    use omni_sumchain::dto::BlockFinality;
+    use omni_sumchain::settlement_submit::{
+        decode_unsigned_tx, sign_and_submit, verify_builder_envelope,
+        verify_decoded_transaction, BuildClaimRewardRequest,
+        SettlementSubmitError,
+    };
+
+    let session_id = args.session_id.as_str();
+    tracing::info!(
+        event = "settlement_query",
+        subcommand = "claim",
+        session_id = session_id,
+        "settlement claim start"
+    );
+
+    // ── Step 1: derive identity (settlement-read; no seed retention) ──
+    let identity = match ClaimSignerIdentity::resolve(seed_source.clone()) {
+        Ok(i) => i,
+        Err(e) => {
+            let err = anyhow::anyhow!("claim signer identity resolve: {e}");
+            tracing::error!(
+                event = claim_markers::CLAIM_FAILED,
+                subcommand = "claim",
+                session_id = session_id,
+                category = "seed_missing_or_malformed",
+                error = %err,
+                "claim signer identity resolve failed"
+            );
+            return Err(err);
+        }
+    };
+    let derived = identity.address().to_string();
+
+    // ── Step 2: params + head + settlement gate ──────────────────────
+    let params = client.get_chain_params().map_err(|e| {
+        let err = anyhow::anyhow!("chain_getChainParams: {e}");
+        tracing::error!(
+            event = claim_markers::CLAIM_FAILED,
+            subcommand = "claim",
+            session_id = session_id,
+            verifier = %derived,
+            category = "chain_rpc",
+            error = %err,
+            "chain_getChainParams failed during claim precheck"
+        );
+        err
+    })?;
+    let head = client
+        .get_block_height(BlockFinality::Latest)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("chain_getBlockHeight: {e}");
+            tracing::error!(
+                event = claim_markers::CLAIM_FAILED,
+                subcommand = "claim",
+                session_id = session_id,
+                verifier = %derived,
+                category = "chain_rpc",
+                error = %err,
+                "chain_getBlockHeight failed during claim precheck"
+            );
+            err
+        })?
+        .height;
+    let observed = params.inference_settlement_enabled_from_height;
+    let gate_active = observed.is_some_and(|n| head >= n);
+    if !gate_active {
+        let observed_display = match observed {
+            None => "None".to_string(),
+            Some(n) => format!("Some({n})"),
+        };
+        tracing::warn!(
+            event = claim_markers::CLAIM_REFUSED_DORMANCY,
+            subcommand = "claim",
+            session_id = session_id,
+            verifier = %derived,
+            gate = "inference_settlement_enabled_from_height",
+            observed = %observed_display,
+            head = head,
+            "claim refused: settlement gate dormant"
+        );
+        return Err(anyhow::anyhow!(SettlementSubmitError::Dormant {
+            observed,
+            head,
+        }));
+    }
+
+    // ── Step 3: fetch attestation for (session, derived) ─────────────
+    let attestation_opt =
+        client.get_attestation(session_id, &derived).map_err(|e| {
+            let err = anyhow::anyhow!("sum_getInferenceAttestation: {e}");
+            tracing::error!(
+                event = claim_markers::CLAIM_FAILED,
+                subcommand = "claim",
+                session_id = session_id,
+                verifier = %derived,
+                category = "chain_rpc",
+                error = %err,
+                "attestation lookup failed"
+            );
+            err
+        })?;
+    let attestation = match attestation_opt {
+        Some(a) => a,
+        None => {
+            let err_msg = format!(
+                "no attestation found for (session_id={session_id}, verifier={derived})"
+            );
+            tracing::error!(
+                event = claim_markers::CLAIM_FAILED,
+                subcommand = "claim",
+                session_id = session_id,
+                verifier = %derived,
+                category = "attestation_not_found",
+                error = %err_msg,
+                "claim refused: attestation not found"
+            );
+            return Err(anyhow::anyhow!(err_msg));
+        }
+    };
+
+    // ── Step 4: authority ────────────────────────────────────────────
+    // Uses #80's `ClaimSignerIdentity::verify_matches` — pure string
+    // compare against the derived-only identity.
+    if let Err(e) = identity.verify_matches(&attestation.verifier_address) {
+        let msg = e.to_string();
+        tracing::warn!(
+            event = claim_markers::CLAIM_REFUSED_AUTHORITY,
+            subcommand = "claim",
+            session_id = session_id,
+            verifier = %derived,
+            attestation_verifier = %attestation.verifier_address,
+            "claim refused: authority mismatch (attestation)"
+        );
+        return Err(anyhow::anyhow!(msg));
+    }
+    if let Some(explicit) = args.verifier.as_deref() {
+        if explicit != derived {
+            let msg = format!(
+                "--verifier={explicit} does not match derived signer address={derived}"
+            );
+            tracing::warn!(
+                event = claim_markers::CLAIM_REFUSED_AUTHORITY,
+                subcommand = "claim",
+                session_id = session_id,
+                verifier = %derived,
+                explicit_verifier = %explicit,
+                "claim refused: authority mismatch (--verifier flag)"
+            );
+            return Err(anyhow::anyhow!(msg));
+        }
+    }
+
+    // ── Step 5: maturity ─────────────────────────────────────────────
+    let claimable = client
+        .omninode_get_claimable_reward(session_id, &derived)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("omninode_getClaimableReward: {e}");
+            tracing::error!(
+                event = claim_markers::CLAIM_FAILED,
+                subcommand = "claim",
+                session_id = session_id,
+                verifier = %derived,
+                category = "chain_rpc",
+                error = %err,
+                "claimable-reward read failed"
+            );
+            err
+        })?;
+    if !claimable.claimable_now || head < claimable.claim_ready_block {
+        let blocks_until_ready = claimable.claim_ready_block.saturating_sub(head);
+        tracing::warn!(
+            event = claim_markers::CLAIM_REFUSED_MATURITY,
+            subcommand = "claim",
+            session_id = session_id,
+            verifier = %derived,
+            claim_ready_block = claimable.claim_ready_block,
+            head = head,
+            blocks_until_ready = blocks_until_ready,
+            "claim refused: not mature"
+        );
+        return Err(anyhow::anyhow!(SettlementSubmitError::Immature {
+            claim_ready_block: claimable.claim_ready_block,
+            head,
+            blocks_until_ready,
+        }));
+    }
+
+    // ── Step 6: bond precheck (conditional) ──────────────────────────
+    let session = client
+        .omninode_get_inference_session(session_id)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("omninode_getInferenceSession: {e}");
+            tracing::error!(
+                event = claim_markers::CLAIM_FAILED,
+                subcommand = "claim",
+                session_id = session_id,
+                verifier = %derived,
+                category = "chain_rpc",
+                error = %err,
+                "session read failed"
+            );
+            err
+        })?;
+    if let Some(s) = session.as_ref() {
+        if s.bond_required {
+            let outcome = identity
+                .precheck_bond(client, true)
+                .map_err(|e: ClaimSignerError| {
+                    let err = anyhow::anyhow!("bond precheck: {e}");
+                    tracing::error!(
+                        event = claim_markers::CLAIM_FAILED,
+                        subcommand = "claim",
+                        session_id = session_id,
+                        verifier = %derived,
+                        category = "chain_rpc",
+                        error = %err,
+                        "bond precheck RPC failed"
+                    );
+                    err
+                })?;
+            if !matches!(outcome, BondPrecheckOutcome::Bonded { .. }) {
+                let outcome_kind = format!("{outcome:?}");
+                tracing::warn!(
+                    event = claim_markers::CLAIM_REFUSED_BOND_PRECHECK,
+                    subcommand = "claim",
+                    session_id = session_id,
+                    verifier = %derived,
+                    outcome = %outcome_kind,
+                    "claim refused: bond precheck"
+                );
+                return Err(anyhow::anyhow!(
+                    SettlementSubmitError::BondPrecheckFailed { outcome_kind }
+                ));
+            }
+        }
+    }
+
+    // ── Step 7: builder RPC ──────────────────────────────────────────
+    let build_response = client
+        .omninode_build_claim_inference_reward(&BuildClaimRewardRequest {
+            from: derived.clone(),
+            session_id: session_id.to_string(),
+            fee: args.fee,
+        })
+        .map_err(|e| {
+            let err = anyhow::anyhow!("{e}");
+            tracing::error!(
+                event = claim_markers::CLAIM_FAILED,
+                subcommand = "claim",
+                session_id = session_id,
+                verifier = %derived,
+                category = "chain_rpc",
+                error = %err,
+                "omninode_buildClaimInferenceReward failed"
+            );
+            err
+        })?;
+
+    // ── Step 8: verify envelope (before hex decode) ──────────────────
+    if let Err(e) = verify_builder_envelope(
+        &build_response,
+        &derived,
+        params.chain_id,
+        args.fee,
+    ) {
+        let msg = e.to_string();
+        tracing::error!(
+            event = claim_markers::CLAIM_FAILED,
+            subcommand = "claim",
+            session_id = session_id,
+            verifier = %derived,
+            category = "builder_mismatch",
+            error = %msg,
+            "builder envelope mismatch"
+        );
+        return Err(anyhow::anyhow!(e));
+    }
+
+    // ── Step 9: decode + verify decoded TransactionV2 ────────────────
+    let tx = decode_unsigned_tx(&build_response).map_err(|e| {
+        let msg = e.to_string();
+        tracing::error!(
+            event = claim_markers::CLAIM_FAILED,
+            subcommand = "claim",
+            session_id = session_id,
+            verifier = %derived,
+            category = "wire_decode",
+            error = %msg,
+            "unsigned_tx decode failed"
+        );
+        anyhow::anyhow!(e)
+    })?;
+    if let Err(e) =
+        verify_decoded_transaction(&tx, &build_response, &derived, session_id)
+    {
+        let msg = e.to_string();
+        tracing::error!(
+            event = claim_markers::CLAIM_FAILED,
+            subcommand = "claim",
+            session_id = session_id,
+            verifier = %derived,
+            category = "builder_mismatch",
+            error = %msg,
+            "decoded transaction mismatch"
+        );
+        return Err(anyhow::anyhow!(e));
+    }
+
+    // ── CLAIM_READY marker: all prechecks + verify passed ────────────
+    tracing::info!(
+        event = claim_markers::CLAIM_READY,
+        subcommand = "claim",
+        session_id = session_id,
+        verifier = %derived,
+        chain_id = params.chain_id,
+        nonce = build_response.nonce,
+        fee = build_response.fee.to_string(),
+        claim_ready_block = claimable.claim_ready_block,
+        head = head,
+        "claim ready for submission"
+    );
+
+    // Emit human-visible summary either way.
+    writeln!(out, "session_id={session_id}")?;
+    writeln!(out, "verifier={derived}")?;
+    writeln!(out, "chain_id={}", params.chain_id)?;
+    writeln!(out, "nonce={}", build_response.nonce)?;
+    writeln!(out, "fee={}", build_response.fee)?;
+    writeln!(out, "claim_ready_block={}", claimable.claim_ready_block)?;
+    writeln!(out, "head={head}")?;
+
+    if args.dry_run {
+        writeln!(out, "dry_run=true submitted=false")?;
+        return Ok(());
+    }
+
+    // ── Steps 10-13: load signer, sign, submit ───────────────────────
+    let signer = crate::settlement_signer::ClaimSigner::resolve(seed_source)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("claim signer resolve: {e}");
+            tracing::error!(
+                event = claim_markers::CLAIM_FAILED,
+                subcommand = "claim",
+                session_id = session_id,
+                verifier = %derived,
+                category = "seed_missing_or_malformed",
+                error = %err,
+                "signer resolve failed"
+            );
+            err
+        })?;
+    // Belt-and-braces: `ClaimSigner::resolve` re-loads the seed from
+    // env. Assert its derived address matches the one we've been
+    // running prechecks against. If the env changed between §3.1 and
+    // §3.10 (e.g. a shell replaced the value), refuse before signing.
+    if signer.address() != derived.as_str() {
+        let msg = format!(
+            "signer re-derivation mismatch: prechecks used {derived}, \
+             signer would sign as {}",
+            signer.address()
+        );
+        tracing::error!(
+            event = claim_markers::CLAIM_FAILED,
+            subcommand = "claim",
+            session_id = session_id,
+            verifier = %derived,
+            category = "seed_mismatch_between_stages",
+            error = %msg,
+            "signer re-derivation disagrees with precheck-time derivation"
+        );
+        return Err(anyhow::anyhow!(msg));
+    }
+
+    let receipt =
+        sign_and_submit(client, &tx, signer.seed_for_signing(), session_id, &derived)
+            .map_err(|e| {
+                let err = anyhow::anyhow!("sign_and_submit: {e}");
+                tracing::error!(
+                    event = claim_markers::CLAIM_FAILED,
+                    subcommand = "claim",
+                    session_id = session_id,
+                    verifier = %derived,
+                    category = "chain_rpc",
+                    error = %err,
+                    "sign_and_submit failed"
+                );
+                err
+            })?;
+
+    tracing::info!(
+        event = claim_markers::CLAIM_SUBMITTED,
+        subcommand = "claim",
+        session_id = session_id,
+        verifier = derived.as_str(),
+        tx_hash = receipt.tx_hash.as_str(),
+        chain_id = receipt.chain_id,
+        nonce = receipt.nonce,
+        fee = receipt.fee.to_string().as_str(),
+        "claim submitted"
+    );
+    writeln!(out, "tx_hash={}", receipt.tx_hash)?;
+    writeln!(out, "submitted=true")?;
+    Ok(())
 }
 
 // ── Hermetic tests ───────────────────────────────────────────────────────────
@@ -1830,5 +2298,669 @@ mod tests {
             logs.contains("address=\"v-1\""),
             "must record address field; logs=\n{logs}"
         );
+    }
+
+    // ── Issue #87 — settlement claim tests ─────────────────────────────
+
+    #[cfg(feature = "settlement-submit")]
+    mod claim {
+        use super::*;
+        use crate::operator::SeedSource;
+        use omni_sumchain::settlement_submit::{
+            Address, ClaimInferenceRewardRequest, InferenceSettlementOperation,
+            InferenceSettlementTxData, SignedTransaction, TransactionV2, TxPayload,
+        };
+
+        const TEST_SEED: [u8; 32] = [7u8; 32];
+        const TEST_CHAIN_ID: u64 = 1_800_100;
+        const TEST_NONCE: u64 = 123;
+        const TEST_FEE: u128 = 1000;
+
+        // ── Test-only fixture — lives inside the omni-node test module ──
+        //
+        // Previously exposed as `omni_sumchain::settlement_submit::fixtures`,
+        // but that made the fixture reachable from any downstream consumer
+        // compiling `settlement-submit`. Moved here so the test-only surface
+        // never leaks into production API.
+        //
+        // Uses the small hex-encode helper from tx.rs (public within the
+        // crate) and the chain-primitives types re-exported by
+        // `omni_sumchain::settlement_submit`.
+
+        pub(super) struct TestClaimTx {
+            pub(super) unsigned_hex: String,
+            pub(super) signing_hash_hex: String,
+            pub(super) from_b58: String,
+            pub(super) tx: TransactionV2,
+        }
+
+        fn encode_hex_local(bytes: &[u8]) -> String {
+            use std::fmt::Write;
+            let mut s = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                let _ = write!(&mut s, "{b:02x}");
+            }
+            s
+        }
+
+        pub(super) fn build_test_claim_tx(
+            seed: &[u8; 32],
+            session_id: &str,
+            chain_id: u64,
+            nonce: u64,
+            fee: u128,
+        ) -> TestClaimTx {
+            let pubkey = omni_zkml::signer_pubkey_bytes(seed)
+                .expect("signer_pubkey_bytes");
+            let from = Address::from_public_key(&pubkey);
+            let from_b58 = from.to_base58();
+            let tx = TransactionV2 {
+                chain_id: chain_id.into(),
+                from,
+                fee: fee.into(),
+                nonce: nonce.into(),
+                payload: TxPayload::InferenceSettlement(InferenceSettlementTxData {
+                    operation: InferenceSettlementOperation::ClaimReward(
+                        ClaimInferenceRewardRequest {
+                            session_id: session_id.to_string(),
+                        },
+                    ),
+                }),
+            };
+            let unsigned_hex = format!("0x{}", encode_hex_local(&tx.to_bytes()));
+            let signing_hash = tx.signing_hash();
+            let signing_hash_hex =
+                format!("0x{}", encode_hex_local(signing_hash.as_bytes()));
+            TestClaimTx {
+                unsigned_hex,
+                signing_hash_hex,
+                from_b58,
+                tx,
+            }
+        }
+
+        fn params_settlement_active() -> serde_json::Value {
+            json!({
+                "finality_depth": 12,
+                "min_fee": 100,
+                "chain_id": TEST_CHAIN_ID,
+                "inference_settlement_enabled_from_height": 0,
+            })
+        }
+
+        fn args_claim(session_id: &str) -> Box<ClaimArgs> {
+            Box::new(ClaimArgs {
+                session_id: session_id.to_string(),
+                verifier: None,
+                fee: None,
+                dry_run: false,
+            })
+        }
+
+        fn args_claim_dry_run(session_id: &str) -> Box<ClaimArgs> {
+            Box::new(ClaimArgs {
+                session_id: session_id.to_string(),
+                verifier: None,
+                fee: None,
+                dry_run: true,
+            })
+        }
+
+        fn seed_full_happy_path(fake: &FakeJsonRpcTransport) -> TestClaimTx {
+            let fixture = build_test_claim_tx(
+                &TEST_SEED,
+                "s-1",
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            seed_params(fake, params_settlement_active());
+            seed_head(fake, 500_000);
+            fake.set_response(
+                "sum_getInferenceAttestation",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "verifier_address": fixture.from_b58,
+                    "model_hash": "0xaa",
+                    "manifest_root": "0xbb",
+                    "response_hash": "0xcc",
+                    "proof_root": "0xdd",
+                    "verifier_signature": "0xsig",
+                    "included_at_height": 440_000,
+                    "tx_hash": "0xtx-att",
+                    "finalized": true,
+                })),
+            );
+            fake.set_response(
+                "omninode_getClaimableReward",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "verifier_address": fixture.from_b58,
+                    "mature": true,
+                    "claim_ready_block": 499_000,
+                    "blocks_until_ready": 0,
+                    "escrow_available": true,
+                    "cap_available": true,
+                    "dispute_clear": true,
+                    "claimable_now": true,
+                    "reward_amount": "200"
+                })),
+            );
+            fake.set_response(
+                "omninode_getInferenceSession",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "consistency_required": false,
+                    "bond_required": false,
+                    "max_verifiers": 3,
+                    "escrow_total": "1000",
+                    "escrow_remaining": "1000",
+                    "claims_count": 0,
+                    "lifecycle": "active",
+                    "created_at_height": 400_000,
+                })),
+            );
+            fake.set_response(
+                "omninode_buildClaimInferenceReward",
+                Ok(json!({
+                    "unsigned_tx": fixture.unsigned_hex,
+                    "signing_hash": fixture.signing_hash_hex,
+                    "from": fixture.from_b58,
+                    "nonce": TEST_NONCE,
+                    "fee": TEST_FEE,
+                    "chain_id": TEST_CHAIN_ID,
+                })),
+            );
+            fake.set_response(
+                "sum_sendRawTransaction",
+                Ok(json!({ "tx_hash": "0xtxhash-happy" })),
+            );
+            fixture
+        }
+
+        fn run_with_capture_claim(
+            args: SettlementArgs,
+            client: &SumChainClient<FakeJsonRpcTransport>,
+            seed_source: SeedSource,
+        ) -> (String, Vec<u8>, Result<()>) {
+            let logs = CapturedLogs::new();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            let mut stdout_buf = Vec::new();
+            let result = tracing::subscriber::with_default(subscriber, || {
+                let SettlementArgs { cmd, .. } = args;
+                match cmd {
+                    SettlementCmd::Claim(a) => {
+                        super::super::run_claim(client, &a, &mut stdout_buf, seed_source)
+                    }
+                    _ => panic!("run_with_capture_claim called with non-Claim variant"),
+                }
+            });
+            (logs.as_string(), stdout_buf, result)
+        }
+
+        fn call_methods(fake: &FakeJsonRpcTransport) -> Vec<String> {
+            fake.calls().into_iter().map(|(m, _)| m).collect()
+        }
+
+        // ── Test 1 — dormancy refuses before builder/submit ────────
+
+        #[test]
+        fn claim_dormant_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            seed_params(&fake, params_all_dormant());
+            seed_head(&fake, 100_000);
+
+            let (logs, _stdout, result) = run_with_capture_claim(
+                SettlementArgs { rpc_url: None, cmd: SettlementCmd::Claim(args_claim("s-1")) },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect_err("dormant must produce non-Ok");
+
+            assert!(
+                logs.contains("event=\"settlement_claim_refused_dormancy\""),
+                "must emit CLAIM_REFUSED_DORMANCY; logs=\n{logs}"
+            );
+            assert!(
+                logs.contains("gate=\"inference_settlement_enabled_from_height\""),
+                "must carry gate field; logs=\n{logs}"
+            );
+            let methods = call_methods(&fake);
+            assert!(
+                !methods.iter().any(|m| m == "omninode_buildClaimInferenceReward"),
+                "builder must not be called; methods={methods:?}"
+            );
+            assert!(
+                !methods.iter().any(|m| m == "sum_sendRawTransaction"),
+                "submit must not be called; methods={methods:?}"
+            );
+        }
+
+        // ── Test 2 — missing attestation refuses before builder/submit ──
+
+        #[test]
+        fn claim_missing_attestation_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 500_000);
+            fake.set_response(
+                "sum_getInferenceAttestation",
+                Ok(serde_json::Value::Null),
+            );
+
+            let (logs, _stdout, result) = run_with_capture_claim(
+                SettlementArgs { rpc_url: None, cmd: SettlementCmd::Claim(args_claim("s-1")) },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect_err("missing attestation must produce non-Ok");
+
+            assert!(
+                logs.contains("event=\"settlement_claim_failed\""),
+                "must emit CLAIM_FAILED; logs=\n{logs}"
+            );
+            assert!(
+                logs.contains("category=\"attestation_not_found\""),
+                "must carry attestation_not_found category; logs=\n{logs}"
+            );
+            let methods = call_methods(&fake);
+            assert!(!methods.iter().any(|m| m == "omninode_buildClaimInferenceReward"));
+            assert!(!methods.iter().any(|m| m == "sum_sendRawTransaction"));
+        }
+
+        // ── Test 3 — authority mismatch refuses before builder/submit ──
+
+        #[test]
+        fn claim_authority_mismatch_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 500_000);
+            fake.set_response(
+                "sum_getInferenceAttestation",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "verifier_address": "v-someone-else",
+                    "model_hash": "0xaa",
+                    "manifest_root": "0xbb",
+                    "response_hash": "0xcc",
+                    "proof_root": "0xdd",
+                    "verifier_signature": "0xsig",
+                    "included_at_height": 440_000,
+                    "tx_hash": "0xtx-att",
+                    "finalized": true,
+                })),
+            );
+
+            let (logs, _stdout, result) = run_with_capture_claim(
+                SettlementArgs { rpc_url: None, cmd: SettlementCmd::Claim(args_claim("s-1")) },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect_err("authority mismatch must produce non-Ok");
+
+            assert!(logs.contains("event=\"settlement_claim_refused_authority\""));
+            let methods = call_methods(&fake);
+            assert!(!methods.iter().any(|m| m == "omninode_buildClaimInferenceReward"));
+            assert!(!methods.iter().any(|m| m == "sum_sendRawTransaction"));
+        }
+
+        // ── Test 4 — immature refuses before builder/submit ────────
+
+        #[test]
+        fn claim_immature_refuses_and_never_calls_builder_or_submit() {
+            let fixture =
+                build_test_claim_tx(&TEST_SEED, "s-1", TEST_CHAIN_ID, TEST_NONCE, TEST_FEE);
+            let (client, fake) = make_client();
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 400_000);
+            fake.set_response(
+                "sum_getInferenceAttestation",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "verifier_address": fixture.from_b58,
+                    "model_hash": "0xaa",
+                    "manifest_root": "0xbb",
+                    "response_hash": "0xcc",
+                    "proof_root": "0xdd",
+                    "verifier_signature": "0xsig",
+                    "included_at_height": 380_000,
+                    "tx_hash": "0xtx-att",
+                    "finalized": true,
+                })),
+            );
+            fake.set_response(
+                "omninode_getClaimableReward",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "verifier_address": fixture.from_b58,
+                    "mature": false,
+                    "claim_ready_block": 500_000,
+                    "blocks_until_ready": 100_000,
+                    "escrow_available": true,
+                    "cap_available": true,
+                    "dispute_clear": true,
+                    "claimable_now": false,
+                    "reward_amount": "200"
+                })),
+            );
+
+            let (logs, _stdout, result) = run_with_capture_claim(
+                SettlementArgs { rpc_url: None, cmd: SettlementCmd::Claim(args_claim("s-1")) },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect_err("immature must produce non-Ok");
+
+            assert!(logs.contains("event=\"settlement_claim_refused_maturity\""));
+            assert!(logs.contains("claim_ready_block=500000"));
+            assert!(logs.contains("blocks_until_ready=100000"));
+            let methods = call_methods(&fake);
+            assert!(!methods.iter().any(|m| m == "omninode_buildClaimInferenceReward"));
+            assert!(!methods.iter().any(|m| m == "sum_sendRawTransaction"));
+        }
+
+        // ── Test 5 — bond precheck failure refuses before builder/submit ──
+
+        #[test]
+        fn claim_bond_precheck_failed_refuses_and_never_calls_builder_or_submit() {
+            let fixture =
+                build_test_claim_tx(&TEST_SEED, "s-1", TEST_CHAIN_ID, TEST_NONCE, TEST_FEE);
+            let (client, fake) = make_client();
+            seed_params(
+                &fake,
+                json!({
+                    "finality_depth": 12,
+                    "min_fee": 100,
+                    "chain_id": TEST_CHAIN_ID,
+                    "inference_settlement_enabled_from_height": 0,
+                    "inference_verifier_bonding_enabled_from_height": 0,
+                }),
+            );
+            seed_head(&fake, 500_000);
+            fake.set_response(
+                "sum_getInferenceAttestation",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "verifier_address": fixture.from_b58,
+                    "model_hash": "0xaa",
+                    "manifest_root": "0xbb",
+                    "response_hash": "0xcc",
+                    "proof_root": "0xdd",
+                    "verifier_signature": "0xsig",
+                    "included_at_height": 440_000,
+                    "tx_hash": "0xtx-att",
+                    "finalized": true,
+                })),
+            );
+            fake.set_response(
+                "omninode_getClaimableReward",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "verifier_address": fixture.from_b58,
+                    "mature": true,
+                    "claim_ready_block": 499_000,
+                    "blocks_until_ready": 0,
+                    "escrow_available": true,
+                    "cap_available": true,
+                    "dispute_clear": true,
+                    "claimable_now": true,
+                    "reward_amount": "200"
+                })),
+            );
+            fake.set_response(
+                "omninode_getInferenceSession",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "consistency_required": false,
+                    "bond_required": true,          // <-- forces bond precheck
+                    "max_verifiers": 3,
+                    "escrow_total": "1000",
+                    "escrow_remaining": "1000",
+                    "claims_count": 0,
+                    "lifecycle": "active",
+                    "created_at_height": 400_000,
+                })),
+            );
+            fake.set_response(
+                "omninode_getVerifier",
+                Ok(json!({
+                    "address": fixture.from_b58,
+                    "bond_amount": "0",
+                    "bond_state": "withdrawn",       // <-- not Bonded
+                    "slash_history": []
+                })),
+            );
+
+            let (logs, _stdout, result) = run_with_capture_claim(
+                SettlementArgs { rpc_url: None, cmd: SettlementCmd::Claim(args_claim("s-1")) },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect_err("bond precheck failure must produce non-Ok");
+
+            assert!(logs.contains("event=\"settlement_claim_refused_bond_precheck\""));
+            let methods = call_methods(&fake);
+            assert!(!methods.iter().any(|m| m == "omninode_buildClaimInferenceReward"));
+            assert!(!methods.iter().any(|m| m == "sum_sendRawTransaction"));
+        }
+
+        // ── Test 6 — builder response mismatch refuses BEFORE submit ──
+
+        #[test]
+        fn claim_builder_envelope_mismatch_refuses_before_submit() {
+            let fixture = seed_full_happy_path(&FakeJsonRpcTransport::new()); // fixture only, drop the fake
+            let (client, fake) = make_client();
+            let _ = seed_full_happy_path(&fake);
+            // Overwrite builder to return the WRONG `from`:
+            fake.set_response(
+                "omninode_buildClaimInferenceReward",
+                Ok(json!({
+                    "unsigned_tx": fixture.unsigned_hex,
+                    "signing_hash": fixture.signing_hash_hex,
+                    "from": "not-the-derived-address",
+                    "nonce": TEST_NONCE,
+                    "fee": TEST_FEE,
+                    "chain_id": TEST_CHAIN_ID,
+                })),
+            );
+
+            let (logs, _stdout, result) = run_with_capture_claim(
+                SettlementArgs { rpc_url: None, cmd: SettlementCmd::Claim(args_claim("s-1")) },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect_err("envelope mismatch must produce non-Ok");
+
+            assert!(logs.contains("event=\"settlement_claim_failed\""));
+            assert!(logs.contains("category=\"builder_mismatch\""));
+            let methods = call_methods(&fake);
+            assert!(
+                methods.iter().any(|m| m == "omninode_buildClaimInferenceReward"),
+                "builder WAS called for envelope check; methods={methods:?}"
+            );
+            assert!(
+                !methods.iter().any(|m| m == "sum_sendRawTransaction"),
+                "submit MUST NOT be called after envelope mismatch; methods={methods:?}"
+            );
+        }
+
+        // ── Test 7 — dry-run calls builder but never signs/submits ──
+
+        #[test]
+        fn claim_dry_run_calls_builder_but_never_signs_or_submits() {
+            let (client, fake) = make_client();
+            let _fixture = seed_full_happy_path(&fake);
+
+            let (logs, stdout, result) = run_with_capture_claim(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::Claim(args_claim_dry_run("s-1")),
+                },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect("dry-run happy path must succeed");
+
+            assert!(
+                logs.contains("event=\"settlement_claim_ready\""),
+                "must emit CLAIM_READY; logs=\n{logs}"
+            );
+            let stdout_str = String::from_utf8(stdout).unwrap();
+            assert!(stdout_str.contains("dry_run=true submitted=false"), "{stdout_str}");
+            let methods = call_methods(&fake);
+            assert!(
+                methods.iter().any(|m| m == "omninode_buildClaimInferenceReward"),
+                "builder MUST be called on dry-run; methods={methods:?}"
+            );
+            assert!(
+                !methods.iter().any(|m| m == "sum_sendRawTransaction"),
+                "submit MUST NOT be called on dry-run; methods={methods:?}"
+            );
+            assert!(
+                !logs.contains("event=\"settlement_claim_submitted\""),
+                "no CLAIM_SUBMITTED on dry-run; logs=\n{logs}"
+            );
+        }
+
+        // ── Test 8 — happy path calls builder once + submit once ──
+
+        #[test]
+        fn claim_happy_path_calls_builder_once_and_submit_once() {
+            let (client, fake) = make_client();
+            let _fixture = seed_full_happy_path(&fake);
+
+            let (logs, stdout, result) = run_with_capture_claim(
+                SettlementArgs { rpc_url: None, cmd: SettlementCmd::Claim(args_claim("s-1")) },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect("happy path must succeed");
+
+            assert!(logs.contains("event=\"settlement_claim_ready\""));
+            assert!(logs.contains("event=\"settlement_claim_submitted\""));
+            assert!(logs.contains("tx_hash=\"0xtxhash-happy\""));
+            let stdout_str = String::from_utf8(stdout).unwrap();
+            assert!(stdout_str.contains("submitted=true"), "{stdout_str}");
+            assert!(stdout_str.contains("tx_hash=0xtxhash-happy"), "{stdout_str}");
+
+            let methods = call_methods(&fake);
+            let builder_count = methods
+                .iter()
+                .filter(|m| m.as_str() == "omninode_buildClaimInferenceReward")
+                .count();
+            let submit_count = methods
+                .iter()
+                .filter(|m| m.as_str() == "sum_sendRawTransaction")
+                .count();
+            assert_eq!(builder_count, 1, "builder called exactly once; got {builder_count}, methods={methods:?}");
+            assert_eq!(submit_count, 1, "submit called exactly once; got {submit_count}, methods={methods:?}");
+        }
+
+        // ── Test 9 — submitted raw tx round-trips through SignedTransaction::from_hex ──
+
+        #[test]
+        fn claim_submitted_hex_round_trips_via_from_hex_not_raw_concat() {
+            let (client, fake) = make_client();
+            let fixture = seed_full_happy_path(&fake);
+
+            let (_logs, _stdout, result) = run_with_capture_claim(
+                SettlementArgs { rpc_url: None, cmd: SettlementCmd::Claim(args_claim("s-1")) },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect("happy path");
+
+            // Extract the hex that was sent to sum_sendRawTransaction.
+            let calls = fake.calls();
+            let (_m, params) = calls
+                .iter()
+                .find(|(m, _)| m == "sum_sendRawTransaction")
+                .expect("submit RPC must have been called");
+            let hex_param = params
+                .as_array().expect("params array")
+                .first().expect("params[0]")
+                .as_str().expect("hex string")
+                .to_string();
+
+            // 9a. Round-trips through the canonical decoder.
+            let decoded = SignedTransaction::from_hex(&hex_param)
+                .expect("submitted hex must round-trip via SignedTransaction::from_hex");
+            // 9b. Decoded tx equals the fixture tx (proves we didn't reorder
+            //     or corrupt fields).
+            let inner_tx = decoded
+                .staking_data()
+                .map(|_| unreachable!("wrong payload"))
+                .unwrap_or(());
+            let _ = inner_tx; // silence unused-var; the assertion below is stronger.
+            // 9c. Signing hash agrees with the fixture.
+            assert_eq!(decoded.signing_hash(), fixture.tx.signing_hash());
+
+            // 10. NOT a raw concat — a raw concat would omit the
+            //     `TxInner::V2` discriminant, which bincode adds as an
+            //     enum tag byte. Verify the submitted hex is strictly
+            //     LONGER than raw concat would be.
+            let raw_concat_bytes =
+                fixture.unsigned_hex.strip_prefix("0x").unwrap().len() / 2 + 64 + 32;
+            let submitted_len = hex_param.strip_prefix("0x").map(|s| s.len()).unwrap_or(hex_param.len()) / 2;
+            assert!(
+                submitted_len > raw_concat_bytes,
+                "submitted wire ({submitted_len} bytes) must include the TxInner::V2 \
+                 enum-tag wrapper — pure concat would only be {raw_concat_bytes} bytes"
+            );
+        }
+
+        // ── Test 11 — marker constants pinned ─────────────────────
+
+        #[test]
+        fn claim_marker_constant_names_are_pinned() {
+            use super::super::claim_markers;
+            assert_eq!(claim_markers::CLAIM_READY, "settlement_claim_ready");
+            assert_eq!(claim_markers::CLAIM_REFUSED_DORMANCY, "settlement_claim_refused_dormancy");
+            assert_eq!(claim_markers::CLAIM_REFUSED_MATURITY, "settlement_claim_refused_maturity");
+            assert_eq!(claim_markers::CLAIM_REFUSED_AUTHORITY, "settlement_claim_refused_authority");
+            assert_eq!(claim_markers::CLAIM_REFUSED_BOND_PRECHECK, "settlement_claim_refused_bond_precheck");
+            assert_eq!(claim_markers::CLAIM_SUBMITTED, "settlement_claim_submitted");
+            assert_eq!(claim_markers::CLAIM_FAILED, "settlement_claim_failed");
+        }
+
+        // ── Test 12 — no claim-on-behalf / coordinator / contributor-triggered path ──
+
+        /// The public `ClaimArgs` surface + `SettlementCmd` variants
+        /// carry NO on-behalf / coordinator / contributor flags. This
+        /// test compiles as long as `ClaimArgs`'s fields are the
+        /// documented four (`session_id`, `verifier`, `fee`, `dry_run`)
+        /// and no additional variants appear on `SettlementCmd`. If a
+        /// future edit adds any of the banned surfaces, this test
+        /// fails to compile — a grep-visible guard.
+        #[test]
+        fn claim_surface_carries_no_forbidden_flags() {
+            // Compile-time destructure — any new field breaks the
+            // pattern.
+            let _ = ClaimArgs {
+                session_id: "s".to_string(),
+                verifier: None,
+                fee: None,
+                dry_run: false,
+            };
+            // Variant enumeration — if a new variant is added, the
+            // exhaustive match fails to compile.
+            fn variant_check(cmd: &SettlementCmd) -> &'static str {
+                match cmd {
+                    SettlementCmd::Status => "status",
+                    SettlementCmd::Session(_) => "session",
+                    SettlementCmd::Claimable(_) => "claimable",
+                    SettlementCmd::Verifier(_) => "verifier",
+                    SettlementCmd::Claim(_) => "claim",
+                }
+            }
+            let _ = variant_check;
+            // Runtime grep against the module source is done at code-
+            // review time; no runtime source-string check needed here.
+        }
     }
 }

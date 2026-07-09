@@ -92,14 +92,25 @@ ureq       = "2.10"
 # ─── Phase 5 Stage 7b / 9c: SUM Chain primitives ─────────────────────────────
 # Stage 9c: swapped from the private `SUM-INNOVATION/sum-chain` git
 # source at rev `d83e45a4` to the chain team's public crates.io
-# release (`sumchain-primitives` / `sumchain-crypto` v0.1.0, dual-
-# licensed MIT OR Apache-2.0, byte-equivalent to rev d83e45a4 for the
-# InferenceAttestation surface OmniNode consumes). Used by
-# `omni-sumchain` only, and only behind the `submit` feature.
-# Default builds resolve entirely from the crates.io index; no
-# GitHub credential is required.
-sumchain-primitives = "0.1.0"
-sumchain-crypto     = "0.1.0"
+# release, dual-licensed MIT OR Apache-2.0.
+#
+# Issue #87 — bumped `sumchain-primitives` and `sumchain-crypto` from
+# v0.1.0 to v0.2.0 so we can construct the InferenceSettlement claim
+# tx: `TxPayload::InferenceSettlement(InferenceSettlementTxData { op:
+# InferenceSettlementOperation::ClaimReward(...) })` is a v0.2.0
+# addition. The v0.2.0 release preserves the pre-existing
+# `TxPayload::InferenceAttestation(_)` bincode ordinal (variant 21 in
+# `TxType`) per the crate's own append-only invariant; the Stage 6
+# parity test at `tests/parity_vendored_primitives.rs` and the wire
+# fixture at `tests/fixtures/chain_attestation_vectors.json` are
+# re-run under `--features submit` after the bump and must remain
+# byte-identical.
+#
+# Used by `omni-sumchain` only, and only behind the `submit` /
+# `settlement-submit` features. Default builds resolve entirely from
+# the crates.io index without pulling either crate.
+sumchain-primitives = "0.2.0"
+sumchain-crypto     = "0.2.0"
 
 # ─── Phase 3: FFI ────────────────────────────────────────────────────────────
 
