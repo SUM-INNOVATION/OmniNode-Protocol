@@ -70,8 +70,19 @@ pub enum SessionLifecycle {
 }
 
 impl SessionLifecycle {
-    fn from_wire(s: &str) -> Self {
+    pub fn from_wire(s: &str) -> Self {
+        // Chain-team confirmed (sum-chain#110) capitalized status
+        // values on the wire (`"Open"` / `"Refunded"` / `"Settled"`).
+        // The lowercase variants remain for backward compat with
+        // older mocks / fixtures that predate the chain-team
+        // clarification. Any unrecognized value falls through to
+        // `Unknown` so the caller can still render it verbatim.
         match s {
+            // Chain-confirmed shape ─────────────────────────────
+            "Open" => Self::Active,       // "Open" is the chain's active-session status
+            "Settled" => Self::Settled,
+            "Refunded" => Self::Refunded,
+            // Legacy / pre-clarification shape ──────────────────
             "active" => Self::Active,
             "settled" => Self::Settled,
             "refunded" => Self::Refunded,

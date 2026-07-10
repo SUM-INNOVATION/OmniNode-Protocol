@@ -31,6 +31,13 @@ settlement-read = []
 # existing sum_sendRawTransaction transport already used by the
 # attestation submit flow). Adds no new crates on top of `submit`.
 settlement-submit = ["settlement-read", "submit"]
+# Issue #81 — settlement dispute open + resolve WRITE path.
+# Superset of `settlement-submit`; reuses the same tx-signing +
+# submit infrastructure plus the settlement read prechecks
+# (session/attestation/disputes reads for funder + maturity +
+# duplicate-dispute local gates). Adds no new crates on top of
+# `settlement-submit`.
+settlement-dispute = ["settlement-read", "settlement-submit"]
 
 [dependencies]
 omni-types          = { workspace = true }

@@ -233,6 +233,7 @@ fn scenario_5_multi_verifier_view_composes_two_verifiers() {
         created_at_height: 400_000,
         settled_at_height: None,
         refunded_at_height: None,
+        ..Default::default()
     };
     let claims = InferenceClaimsRaw {
         session_id: "session-mv".into(),
@@ -331,6 +332,7 @@ fn scenario_6_consistency_mode_view_requires_consistency_gate() {
         created_at_height: 400_000,
         settled_at_height: None,
         refunded_at_height: None,
+        ..Default::default()
     };
     let claims = InferenceClaimsRaw { session_id: "session-consistency".into(), claims: vec![] };
     let disputes = InferenceDisputesRaw { session_id: "session-consistency".into(), disputes: vec![] };
@@ -376,6 +378,7 @@ fn scenario_6b_consistency_mode_view_requires_consistency_data() {
         created_at_height: 400_000,
         settled_at_height: None,
         refunded_at_height: None,
+        ..Default::default()
     };
     let claims = InferenceClaimsRaw {
         session_id: "session-cm-nodto".into(),
@@ -430,6 +433,7 @@ fn scenario_6c_bond_required_view_requires_verifier_registry() {
         created_at_height: 400_000,
         settled_at_height: None,
         refunded_at_height: None,
+        ..Default::default()
     };
     let claims = InferenceClaimsRaw {
         session_id: "session-bond-nodto".into(),
@@ -484,6 +488,7 @@ fn scenario_6d_bond_required_view_composes_bond_summary_from_registry() {
         created_at_height: 400_000,
         settled_at_height: None,
         refunded_at_height: None,
+        ..Default::default()
     };
     let claims = InferenceClaimsRaw {
         session_id: "session-bond-ok".into(),
@@ -587,6 +592,7 @@ fn scenario_6e_bond_required_view_leaves_bond_summary_none_for_unregistered() {
         created_at_height: 400_000,
         settled_at_height: None,
         refunded_at_height: None,
+        ..Default::default()
     };
     let claims = InferenceClaimsRaw {
         session_id: "session-bond-partial".into(),
