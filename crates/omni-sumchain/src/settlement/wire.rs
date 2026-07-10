@@ -38,7 +38,11 @@ use serde::{Deserialize, Serialize};
 /// **The session record itself does NOT enumerate verifiers.** Multi-
 /// verifier composition happens in the view layer by unioning
 /// verifier addresses across attestation / claim / dispute reads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is derived so test fixtures + hermetic tests can
+/// spread-init only the fields under test; production callers always
+/// receive a fully-populated instance from serde deserialisation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InferenceSessionRaw {
     pub session_id: String,
 
@@ -68,8 +72,16 @@ pub struct InferenceSessionRaw {
     /// availability during claimable-reward composition.
     pub claims_count: u32,
 
-    /// One of `"active"` / `"settled"` / `"refunded"`. Anything else
-    /// maps to `SessionLifecycle::Unknown(...)` in the view layer.
+    /// Session status. Chain-team confirmed (sum-chain#110) that
+    /// `omninode_getInferenceSession` returns this field as
+    /// `"status": "Open"` / `"Refunded"` / `"Settled"` on the wire.
+    /// `#[serde(alias = "status")]` lets the DTO accept both the
+    /// canonical chain field name AND the legacy `"lifecycle"` name
+    /// still used by older mocks; either is deserialised into this
+    /// single Rust field. Anything the value-mapper doesn't
+    /// recognise ends up as `SessionLifecycle::Unknown(...)` in the
+    /// view layer.
+    #[serde(alias = "status")]
     pub lifecycle: String,
 
     /// Height at which the session record was created.
@@ -80,6 +92,26 @@ pub struct InferenceSessionRaw {
 
     #[serde(default)]
     pub refunded_at_height: Option<u64>,
+
+    // ── Issue #81 additions ──────────────────────────────────────────
+    //
+    // Chain confirmed via sum-chain#110 that the session response
+    // carries the funder base58 address and the dispute-window block
+    // count, both consumed by the OpenDispute local prechecks (funder
+    // authority + maturity). Both fields are `#[serde(default)]` so
+    // any older/mocked chain response missing them still parses; the
+    // consuming code refuses when the value is missing / zero.
+    /// Session funder base58 address. Sole legal `OpenDispute` signer.
+    #[serde(default)]
+    pub funder: String,
+
+    /// Block window between claim maturity ready-block and the last
+    /// height at which `OpenDispute` is still accepted. Combined with
+    /// `chain_getChainParams.finality_depth` and
+    /// `sum_getInferenceAttestation.included_at_height` to compute
+    /// the local dispute-window closure height.
+    #[serde(default)]
+    pub dispute_window_blocks: u64,
 }
 
 // ── Claims ────────────────────────────────────────────────────────────────────

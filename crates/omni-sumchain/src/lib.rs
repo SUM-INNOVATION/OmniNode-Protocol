@@ -74,6 +74,10 @@ pub mod tx;
 // `submit`. See `settlement_submit/mod.rs` for the module contract.
 #[cfg(feature = "settlement-submit")]
 pub mod settlement_submit;
+// Issue #81 — settlement dispute WRITE path (open + resolve).
+// Superset of `settlement-submit`; adds no new crates.
+#[cfg(feature = "settlement-dispute")]
+pub mod settlement_dispute;
 
 pub use client::SumChainClient;
 pub use dto::{

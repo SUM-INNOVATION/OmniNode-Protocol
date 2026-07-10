@@ -41,6 +41,19 @@ settlement-submit = [
     "settlement-read",
     "omni-sumchain/settlement-submit",
 ]
+# Issue #81 — settlement dispute WRITE path (open + resolve).
+# Superset of `settlement-submit` — the dispute handlers reuse
+# `omni-node/settlement-submit`'s `ClaimSigner` struct to retain
+# seed bytes for the outer-sign call. Chain-side signing
+# infrastructure comes transitively from
+# `omni-sumchain/settlement-dispute` -> submit.
+# Explicitly does NOT include `omni-node/submit` (attestation
+# smoke/loop is a distinct write flow).
+settlement-dispute = [
+    "settlement-read",
+    "settlement-submit",
+    "omni-sumchain/settlement-dispute",
+]
 # Stage 11b.1.b — opt-in feature that pulls the halo2 reference
 # verifier into the operator binary's `verify-proof` dispatch.
 # Default-OFF: the operator binary's compile graph contains zero

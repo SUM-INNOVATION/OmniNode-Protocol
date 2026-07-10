@@ -257,6 +257,13 @@ pub enum SettlementCmd {
     /// any of the claim code path.
     #[cfg(feature = "settlement-submit")]
     Claim(Box<ClaimArgs>),
+
+    /// Issue #81 — dispute open + resolve write path. Boxed for
+    /// enum-size parity with `Claim`. Feature-gated on
+    /// `settlement-dispute`; `settlement-read` / `settlement-submit`
+    /// builds don't compile any of the dispute code path.
+    #[cfg(feature = "settlement-dispute")]
+    Dispute(Box<DisputeArgs>),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -313,6 +320,81 @@ pub struct ClaimArgs {
     pub dry_run: bool,
 }
 
+// ── Issue #81 — Dispute argument surface ─────────────────────────────────────
+
+/// `operator settlement dispute { open | resolve }` argument tree.
+#[cfg(feature = "settlement-dispute")]
+#[derive(Args, Debug, Clone)]
+pub struct DisputeArgs {
+    #[command(subcommand)]
+    pub cmd: DisputeCmd,
+}
+
+#[cfg(feature = "settlement-dispute")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum DisputeCmd {
+    /// Open a dispute against a verifier's attestation. Signer must
+    /// be the session funder; local prechecks enforce this before the
+    /// builder RPC is called.
+    Open(Box<OpenDisputeArgs>),
+
+    /// Resolve an open dispute with a validator-quorum-signed approval
+    /// bundle. The submitting operator is fee payer only; authority
+    /// comes from the approvals payload. Chain evaluates quorum.
+    Resolve(Box<ResolveDisputeArgs>),
+}
+
+#[cfg(feature = "settlement-dispute")]
+#[derive(Args, Debug, Clone)]
+pub struct OpenDisputeArgs {
+    /// Session identifier of the disputed attestation.
+    pub session_id: String,
+    /// Target verifier chain address (base58).
+    #[arg(long)]
+    pub verifier: String,
+    /// 32-byte hex commitment to off-chain evidence. `0x` prefix
+    /// optional.
+    #[arg(long)]
+    pub evidence: String,
+    /// Optional fee override; passed to builder if provided.
+    #[arg(long)]
+    pub fee: Option<u128>,
+    /// Verify prechecks + builder + decoded tx and STOP before
+    /// signing/submitting.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[cfg(feature = "settlement-dispute")]
+#[derive(Args, Debug, Clone)]
+pub struct ResolveDisputeArgs {
+    /// Session identifier of the target dispute.
+    pub session_id: String,
+    /// Target verifier chain address (base58) — the one the dispute
+    /// is against.
+    #[arg(long)]
+    pub verifier: String,
+    /// `true` = allow claim to proceed; `false` = deny claim.
+    #[arg(long)]
+    pub allow_claim: bool,
+    /// Path to a JSON file of validator approvals. Format:
+    ///
+    /// ```json
+    /// [{"pubkey": "0x<64 hex>", "signature": "0x<128 hex>"}]
+    /// ```
+    ///
+    /// `0x` prefix optional per hex field.
+    #[arg(long)]
+    pub approvals: std::path::PathBuf,
+    /// Optional fee override.
+    #[arg(long)]
+    pub fee: Option<u128>,
+    /// Verify prechecks + builder + decoded tx and STOP before
+    /// signing/submitting.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 // ── Entry point (production) ─────────────────────────────────────────────────
 
 pub(crate) async fn dispatch(args: SettlementArgs) -> Result<()> {
@@ -353,6 +435,20 @@ pub(crate) fn dispatch_core<T: JsonRpcTransport>(
         SettlementCmd::Claim(a) => {
             run_claim(client, &a, out, crate::operator::SeedSource::Env)
         }
+        #[cfg(feature = "settlement-dispute")]
+        SettlementCmd::Dispute(a) => match a.cmd {
+            DisputeCmd::Open(inner) => {
+                run_dispute_open(client, &inner, out, crate::operator::SeedSource::Env)
+            }
+            DisputeCmd::Resolve(inner) => {
+                run_dispute_resolve(
+                    client,
+                    &inner,
+                    out,
+                    crate::operator::SeedSource::Env,
+                )
+            }
+        },
     }
 }
 
@@ -1294,6 +1390,868 @@ fn run_claim<T: JsonRpcTransport>(
     writeln!(out, "tx_hash={}", receipt.tx_hash)?;
     writeln!(out, "submitted=true")?;
     Ok(())
+}
+
+// ── Issue #81 — dispute markers + run_dispute_* (settlement-dispute-gated) ──
+
+#[cfg(feature = "settlement-dispute")]
+pub(crate) mod dispute_markers {
+    pub(crate) const DISPUTE_READY: &str = "settlement_dispute_ready";
+    pub(crate) const DISPUTE_REFUSED_DORMANCY: &str =
+        "settlement_dispute_refused_dormancy";
+    pub(crate) const DISPUTE_REFUSED_AUTHORITY: &str =
+        "settlement_dispute_refused_authority";
+    pub(crate) const DISPUTE_REFUSED_MATURITY: &str =
+        "settlement_dispute_refused_maturity";
+    pub(crate) const DISPUTE_REFUSED_STATE: &str = "settlement_dispute_refused_state";
+    pub(crate) const DISPUTE_SUBMITTED: &str = "settlement_dispute_submitted";
+    pub(crate) const DISPUTE_FAILED: &str = "settlement_dispute_failed";
+}
+
+// ── OpenDispute handler ─────────────────────────────────────────────────────
+
+#[cfg(feature = "settlement-dispute")]
+fn run_dispute_open<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
+    args: &OpenDisputeArgs,
+    out: &mut dyn Write,
+    seed_source: crate::operator::SeedSource,
+) -> Result<()> {
+    use crate::settlement_signer::{ClaimSignerIdentity};
+    use omni_sumchain::dto::BlockFinality;
+    use omni_sumchain::settlement_dispute::{
+        decode_unsigned_tx_open, sign_and_submit_dispute,
+        verify_open_builder_envelope, verify_open_decoded_transaction,
+        wire::{evidence_bytes_to_wire, parse_evidence_hex},
+        BuildOpenInferenceDisputeRequest, SettlementDisputeError,
+    };
+
+    let session_id = args.session_id.as_str();
+    tracing::info!(
+        event = "settlement_query",
+        subcommand = "dispute",
+        phase = "open",
+        session_id = session_id,
+        "dispute open start"
+    );
+
+    // ── Step 1: derive identity (settlement-read; no seed retention) ──
+    let identity = ClaimSignerIdentity::resolve(seed_source.clone()).map_err(|e| {
+        let err = anyhow::anyhow!("claim signer identity resolve: {e}");
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            category = "seed_missing_or_malformed",
+            error = %err,
+            "identity resolve failed"
+        );
+        err
+    })?;
+    let derived = identity.address().to_string();
+
+    // ── Step 2: params + head + settlement gate ──────────────────────
+    let params = client.get_chain_params().map_err(|e| {
+        let err = anyhow::anyhow!("chain_getChainParams: {e}");
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            category = "chain_rpc",
+            error = %err,
+            "chain_getChainParams failed"
+        );
+        err
+    })?;
+    let head = client
+        .get_block_height(BlockFinality::Latest)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("chain_getBlockHeight: {e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "open",
+                session_id = session_id,
+                category = "chain_rpc",
+                error = %err,
+                "chain_getBlockHeight failed"
+            );
+            err
+        })?
+        .height;
+    let observed = params.inference_settlement_enabled_from_height;
+    if !observed.is_some_and(|n| head >= n) {
+        let observed_display = match observed {
+            None => "None".to_string(),
+            Some(n) => format!("Some({n})"),
+        };
+        tracing::warn!(
+            event = dispute_markers::DISPUTE_REFUSED_DORMANCY,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            gate = "inference_settlement_enabled_from_height",
+            observed = %observed_display,
+            head = head,
+            "dispute open refused: settlement gate dormant"
+        );
+        return Err(anyhow::anyhow!(SettlementDisputeError::Dormant {
+            observed,
+            head,
+        }));
+    }
+
+    // ── Step 3: fetch session; refuse if absent ──────────────────────
+    let session = match client
+        .omninode_get_inference_session(session_id)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("omninode_getInferenceSession: {e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "open",
+                session_id = session_id,
+                category = "chain_rpc",
+                error = %err,
+                "session read failed"
+            );
+            err
+        })? {
+        Some(s) => s,
+        None => {
+            let msg = format!("session '{session_id}' not found on chain");
+            tracing::warn!(
+                event = dispute_markers::DISPUTE_REFUSED_STATE,
+                subcommand = "dispute",
+                phase = "open",
+                session_id = session_id,
+                reason = "session_not_found",
+                "dispute open refused: session missing"
+            );
+            return Err(anyhow::anyhow!(msg));
+        }
+    };
+
+    // ── Step 4: funder precheck ──────────────────────────────────────
+    if session.funder != derived {
+        tracing::warn!(
+            event = dispute_markers::DISPUTE_REFUSED_AUTHORITY,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            expected_funder = session.funder.as_str(),
+            derived = derived.as_str(),
+            "dispute open refused: funder mismatch"
+        );
+        return Err(anyhow::anyhow!(SettlementDisputeError::FunderMismatch {
+            derived: derived.clone(),
+            session_funder: session.funder,
+        }));
+    }
+
+    // ── Step 4b: session-open precheck ───────────────────────────────
+    // Chain-team confirmed (sum-chain#110) that `OpenDispute` is only
+    // accepted against sessions still in `Open` status. Refunded /
+    // Settled / unknown terminal states must refuse locally so the
+    // operator doesn't burn a fee on a tx the chain will reject.
+    use omni_sumchain::settlement::view::SessionLifecycle;
+    let session_lifecycle = SessionLifecycle::from_wire(&session.lifecycle);
+    if !matches!(session_lifecycle, SessionLifecycle::Active) {
+        tracing::warn!(
+            event = dispute_markers::DISPUTE_REFUSED_STATE,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            reason = "session_not_open",
+            wire_status = session.lifecycle.as_str(),
+            "dispute open refused: session is not in Open status"
+        );
+        return Err(anyhow::anyhow!(
+            "session '{session_id}' is not open: chain status='{}'",
+            session.lifecycle
+        ));
+    }
+
+    // ── Step 5: attestation lookup ───────────────────────────────────
+    let attestation = match client
+        .get_attestation(session_id, args.verifier.as_str())
+        .map_err(|e| {
+            let err = anyhow::anyhow!("sum_getInferenceAttestation: {e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "open",
+                session_id = session_id,
+                verifier = args.verifier.as_str(),
+                category = "chain_rpc",
+                error = %err,
+                "attestation lookup failed"
+            );
+            err
+        })? {
+        Some(a) => a,
+        None => {
+            let msg = format!(
+                "no attestation found for (session_id={session_id}, verifier={})",
+                args.verifier
+            );
+            tracing::warn!(
+                event = dispute_markers::DISPUTE_REFUSED_STATE,
+                subcommand = "dispute",
+                phase = "open",
+                session_id = session_id,
+                verifier = args.verifier.as_str(),
+                reason = "attestation_not_found",
+                "dispute open refused: attestation missing"
+            );
+            return Err(anyhow::anyhow!(msg));
+        }
+    };
+
+    // ── Step 6: maturity precheck ────────────────────────────────────
+    let maturity = attestation.included_at_height
+        + params.finality_depth
+        + session.dispute_window_blocks;
+    if head >= maturity {
+        tracing::warn!(
+            event = dispute_markers::DISPUTE_REFUSED_MATURITY,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            verifier = args.verifier.as_str(),
+            included_at_height = attestation.included_at_height,
+            finality_depth = params.finality_depth,
+            dispute_window_blocks = session.dispute_window_blocks,
+            maturity = maturity,
+            head = head,
+            "dispute open refused: dispute window closed"
+        );
+        return Err(anyhow::anyhow!(
+            SettlementDisputeError::MaturityWindowClosed {
+                included_at_height: attestation.included_at_height,
+                finality_depth: params.finality_depth,
+                dispute_window_blocks: session.dispute_window_blocks,
+                maturity,
+                head,
+            }
+        ));
+    }
+
+    // ── Step 7: duplicate-dispute precheck ───────────────────────────
+    let disputes = client
+        .omninode_get_inference_disputes(session_id)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("omninode_getInferenceDisputes: {e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "open",
+                session_id = session_id,
+                category = "chain_rpc",
+                error = %err,
+                "disputes read failed"
+            );
+            err
+        })?;
+    if disputes
+        .disputes
+        .iter()
+        .any(|d| d.verifier_address == args.verifier)
+    {
+        tracing::warn!(
+            event = dispute_markers::DISPUTE_REFUSED_STATE,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            verifier = args.verifier.as_str(),
+            reason = "duplicate_dispute",
+            "dispute open refused: dispute already exists for this verifier"
+        );
+        return Err(anyhow::anyhow!(SettlementDisputeError::DuplicateDispute {
+            session_id: session_id.to_string(),
+            verifier: args.verifier.clone(),
+        }));
+    }
+
+    // ── Step 8: parse evidence hex ───────────────────────────────────
+    let evidence_bytes = parse_evidence_hex(&args.evidence).map_err(|e| {
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            category = "evidence_parse",
+            error = %e,
+            "evidence hex parse failed"
+        );
+        anyhow::anyhow!(e)
+    })?;
+
+    // ── Step 9: call builder RPC ─────────────────────────────────────
+    let build_response = client
+        .omninode_build_open_inference_dispute(&BuildOpenInferenceDisputeRequest {
+            from: derived.clone(),
+            session_id: session_id.to_string(),
+            verifier: args.verifier.clone(),
+            evidence_commitment: evidence_bytes_to_wire(&evidence_bytes),
+            fee: args.fee,
+        })
+        .map_err(|e| {
+            let err = anyhow::anyhow!("{e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "open",
+                session_id = session_id,
+                category = "chain_rpc",
+                error = %err,
+                "OpenDispute builder failed"
+            );
+            err
+        })?;
+
+    // ── Step 10: verify envelope ─────────────────────────────────────
+    if let Err(e) = verify_open_builder_envelope(
+        &build_response,
+        &derived,
+        params.chain_id,
+        args.fee,
+    ) {
+        let msg = e.to_string();
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            category = "builder_mismatch",
+            error = %msg,
+            "builder envelope mismatch"
+        );
+        return Err(anyhow::anyhow!(e));
+    }
+
+    // ── Step 11: decode + verify decoded tx ─────────────────────────
+    let tx = decode_unsigned_tx_open(&build_response).map_err(|e| {
+        let msg = e.to_string();
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            category = "wire_decode",
+            error = %msg,
+            "unsigned_tx decode failed"
+        );
+        anyhow::anyhow!(e)
+    })?;
+    if let Err(e) = verify_open_decoded_transaction(
+        &tx,
+        &build_response,
+        &derived,
+        session_id,
+        args.verifier.as_str(),
+        &evidence_bytes,
+    ) {
+        let msg = e.to_string();
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            category = "builder_mismatch",
+            error = %msg,
+            "decoded transaction mismatch"
+        );
+        return Err(anyhow::anyhow!(e));
+    }
+
+    tracing::info!(
+        event = dispute_markers::DISPUTE_READY,
+        subcommand = "dispute",
+        phase = "open",
+        session_id = session_id,
+        verifier = args.verifier.as_str(),
+        chain_id = params.chain_id,
+        nonce = build_response.nonce,
+        fee = build_response.fee.to_string().as_str(),
+        maturity = maturity,
+        head = head,
+        "dispute open ready for submission"
+    );
+
+    writeln!(out, "phase=open")?;
+    writeln!(out, "session_id={session_id}")?;
+    writeln!(out, "verifier={}", args.verifier)?;
+    writeln!(out, "chain_id={}", params.chain_id)?;
+    writeln!(out, "nonce={}", build_response.nonce)?;
+    writeln!(out, "fee={}", build_response.fee)?;
+    writeln!(out, "maturity={maturity}")?;
+    writeln!(out, "head={head}")?;
+
+    if args.dry_run {
+        writeln!(out, "dry_run=true submitted=false")?;
+        return Ok(());
+    }
+
+    // ── Step 12-14: load signer, sign, submit ────────────────────────
+    let signer = crate::settlement_signer::ClaimSigner::resolve(seed_source)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("claim signer resolve: {e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "open",
+                session_id = session_id,
+                category = "seed_missing_or_malformed",
+                error = %err,
+                "signer resolve failed"
+            );
+            err
+        })?;
+    if signer.address() != derived.as_str() {
+        let msg = format!(
+            "signer re-derivation mismatch: prechecks used {derived}, signer would sign as {}",
+            signer.address()
+        );
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            category = "seed_mismatch_between_stages",
+            error = %msg,
+            "signer disagrees with precheck-time derivation"
+        );
+        return Err(anyhow::anyhow!(msg));
+    }
+    let receipt = sign_and_submit_dispute(
+        client,
+        &tx,
+        signer.seed_for_signing(),
+        "open",
+        session_id,
+        args.verifier.as_str(),
+    )
+    .map_err(|e| {
+        let err = anyhow::anyhow!("sign_and_submit_dispute: {e}");
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "open",
+            session_id = session_id,
+            category = "chain_rpc",
+            error = %err,
+            "sign_and_submit failed"
+        );
+        err
+    })?;
+
+    tracing::info!(
+        event = dispute_markers::DISPUTE_SUBMITTED,
+        subcommand = "dispute",
+        phase = "open",
+        session_id = session_id,
+        verifier = args.verifier.as_str(),
+        tx_hash = receipt.tx_hash.as_str(),
+        chain_id = receipt.chain_id,
+        nonce = receipt.nonce,
+        fee = receipt.fee.to_string().as_str(),
+        "dispute open submitted"
+    );
+    writeln!(out, "tx_hash={}", receipt.tx_hash)?;
+    writeln!(out, "submitted=true")?;
+    Ok(())
+}
+
+// ── ResolveDispute handler ──────────────────────────────────────────────────
+
+#[cfg(feature = "settlement-dispute")]
+fn run_dispute_resolve<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
+    args: &ResolveDisputeArgs,
+    out: &mut dyn Write,
+    seed_source: crate::operator::SeedSource,
+) -> Result<()> {
+    use crate::settlement_signer::ClaimSignerIdentity;
+    use omni_sumchain::dto::BlockFinality;
+    use omni_sumchain::settlement_dispute::{
+        decode_unsigned_tx_resolve, sign_and_submit_dispute,
+        verify_resolve_builder_envelope, verify_resolve_decoded_transaction,
+        wire::parse_approvals_json, BuildResolveInferenceDisputeRequest,
+        SettlementDisputeError,
+    };
+
+    let session_id = args.session_id.as_str();
+    tracing::info!(
+        event = "settlement_query",
+        subcommand = "dispute",
+        phase = "resolve",
+        session_id = session_id,
+        "dispute resolve start"
+    );
+
+    // ── Step 1: derive identity (fee-payer only, no authority) ───────
+    let identity = ClaimSignerIdentity::resolve(seed_source.clone()).map_err(|e| {
+        let err = anyhow::anyhow!("claim signer identity resolve: {e}");
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            category = "seed_missing_or_malformed",
+            error = %err,
+            "identity resolve failed"
+        );
+        err
+    })?;
+    let derived = identity.address().to_string();
+
+    // ── Step 2: params + head + settlement gate ──────────────────────
+    let params = client.get_chain_params().map_err(|e| {
+        let err = anyhow::anyhow!("chain_getChainParams: {e}");
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            category = "chain_rpc",
+            error = %err,
+            "chain_getChainParams failed"
+        );
+        err
+    })?;
+    let head = client
+        .get_block_height(BlockFinality::Latest)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("chain_getBlockHeight: {e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "resolve",
+                session_id = session_id,
+                category = "chain_rpc",
+                error = %err,
+                "chain_getBlockHeight failed"
+            );
+            err
+        })?
+        .height;
+    let observed = params.inference_settlement_enabled_from_height;
+    if !observed.is_some_and(|n| head >= n) {
+        let observed_display = match observed {
+            None => "None".to_string(),
+            Some(n) => format!("Some({n})"),
+        };
+        tracing::warn!(
+            event = dispute_markers::DISPUTE_REFUSED_DORMANCY,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            gate = "inference_settlement_enabled_from_height",
+            observed = %observed_display,
+            head = head,
+            "dispute resolve refused: settlement gate dormant"
+        );
+        return Err(anyhow::anyhow!(SettlementDisputeError::Dormant {
+            observed,
+            head,
+        }));
+    }
+
+    // ── Step 3: fetch disputes; find Open one for --verifier ─────────
+    use omni_sumchain::settlement::view::DisputeState;
+    let disputes = client
+        .omninode_get_inference_disputes(session_id)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("omninode_getInferenceDisputes: {e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "resolve",
+                session_id = session_id,
+                category = "chain_rpc",
+                error = %err,
+                "disputes read failed"
+            );
+            err
+        })?;
+    let target = disputes
+        .disputes
+        .iter()
+        .find(|d| d.verifier_address == args.verifier);
+    let is_open = match target {
+        Some(d) => matches!(
+            classify_dispute_wire_state(&d.state),
+            DisputeState::Open { .. }
+        ),
+        None => false,
+    };
+    if !is_open {
+        tracing::warn!(
+            event = dispute_markers::DISPUTE_REFUSED_STATE,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            verifier = args.verifier.as_str(),
+            reason = "dispute_not_open",
+            "dispute resolve refused: no Open dispute for verifier"
+        );
+        return Err(anyhow::anyhow!(SettlementDisputeError::DisputeNotOpen {
+            session_id: session_id.to_string(),
+            verifier: args.verifier.clone(),
+        }));
+    }
+
+    // ── Step 4: parse --approvals JSON ───────────────────────────────
+    let approvals_bytes = std::fs::read_to_string(&args.approvals).map_err(|e| {
+        let msg = format!("failed to read --approvals file {:?}: {e}", args.approvals);
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            category = "approvals_read",
+            error = %msg,
+            "approvals file read failed"
+        );
+        anyhow::anyhow!(msg)
+    })?;
+    let parsed_approvals = parse_approvals_json(&approvals_bytes).map_err(|e| {
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            category = "approvals_parse",
+            error = %e,
+            "approvals JSON parse failed"
+        );
+        anyhow::anyhow!(e)
+    })?;
+
+    // ── Step 4b: empty-approvals precheck ────────────────────────────
+    // Chain-team confirmed (sum-chain#110): an empty approvals array
+    // will BUILD but always FAIL authority at execution. Refuse
+    // locally before builder/sign/submit so the operator doesn't burn
+    // a fee on a predictably-rejected tx.
+    if parsed_approvals.is_empty() {
+        tracing::warn!(
+            event = dispute_markers::DISPUTE_REFUSED_STATE,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            reason = "approvals_empty",
+            "dispute resolve refused: empty approvals array cannot meet validator quorum"
+        );
+        return Err(anyhow::anyhow!(SettlementDisputeError::ApprovalsEmpty));
+    }
+
+    let wire_approvals: Vec<_> = parsed_approvals.iter().map(|p| p.to_wire()).collect();
+
+    // ── Step 5: call builder RPC ─────────────────────────────────────
+    let build_response = client
+        .omninode_build_resolve_inference_dispute(
+            &BuildResolveInferenceDisputeRequest {
+                from: derived.clone(),
+                session_id: session_id.to_string(),
+                verifier: args.verifier.clone(),
+                allow_claim: args.allow_claim,
+                approvals: wire_approvals,
+                fee: args.fee,
+            },
+        )
+        .map_err(|e| {
+            let err = anyhow::anyhow!("{e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "resolve",
+                session_id = session_id,
+                category = "chain_rpc",
+                error = %err,
+                "ResolveDispute builder failed"
+            );
+            err
+        })?;
+
+    // ── Step 6: verify envelope ──────────────────────────────────────
+    if let Err(e) = verify_resolve_builder_envelope(
+        &build_response,
+        &derived,
+        params.chain_id,
+        args.fee,
+    ) {
+        let msg = e.to_string();
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            category = "builder_mismatch",
+            error = %msg,
+            "builder envelope mismatch"
+        );
+        return Err(anyhow::anyhow!(e));
+    }
+
+    // ── Step 7: decode + verify decoded tx (order-sensitive approvals) ──
+    let tx = decode_unsigned_tx_resolve(&build_response).map_err(|e| {
+        let msg = e.to_string();
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            category = "wire_decode",
+            error = %msg,
+            "unsigned_tx decode failed"
+        );
+        anyhow::anyhow!(e)
+    })?;
+    if let Err(e) = verify_resolve_decoded_transaction(
+        &tx,
+        &build_response,
+        &derived,
+        session_id,
+        args.verifier.as_str(),
+        args.allow_claim,
+        &parsed_approvals,
+    ) {
+        let msg = e.to_string();
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            category = "builder_mismatch",
+            error = %msg,
+            "decoded transaction mismatch"
+        );
+        return Err(anyhow::anyhow!(e));
+    }
+
+    tracing::info!(
+        event = dispute_markers::DISPUTE_READY,
+        subcommand = "dispute",
+        phase = "resolve",
+        session_id = session_id,
+        verifier = args.verifier.as_str(),
+        allow_claim = args.allow_claim,
+        approvals_count = parsed_approvals.len(),
+        chain_id = params.chain_id,
+        nonce = build_response.nonce,
+        fee = build_response.fee.to_string().as_str(),
+        "dispute resolve ready for submission"
+    );
+
+    writeln!(out, "phase=resolve")?;
+    writeln!(out, "session_id={session_id}")?;
+    writeln!(out, "verifier={}", args.verifier)?;
+    writeln!(out, "allow_claim={}", args.allow_claim)?;
+    writeln!(out, "approvals_count={}", parsed_approvals.len())?;
+    writeln!(out, "chain_id={}", params.chain_id)?;
+    writeln!(out, "nonce={}", build_response.nonce)?;
+    writeln!(out, "fee={}", build_response.fee)?;
+
+    if args.dry_run {
+        writeln!(out, "dry_run=true submitted=false")?;
+        return Ok(());
+    }
+
+    // ── Step 8-10: load signer, sign, submit ─────────────────────────
+    let signer = crate::settlement_signer::ClaimSigner::resolve(seed_source)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("claim signer resolve: {e}");
+            tracing::error!(
+                event = dispute_markers::DISPUTE_FAILED,
+                subcommand = "dispute",
+                phase = "resolve",
+                session_id = session_id,
+                category = "seed_missing_or_malformed",
+                error = %err,
+                "signer resolve failed"
+            );
+            err
+        })?;
+    if signer.address() != derived.as_str() {
+        let msg = format!(
+            "signer re-derivation mismatch: prechecks used {derived}, signer would sign as {}",
+            signer.address()
+        );
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            category = "seed_mismatch_between_stages",
+            error = %msg,
+            "signer disagrees with precheck-time derivation"
+        );
+        return Err(anyhow::anyhow!(msg));
+    }
+    let receipt = sign_and_submit_dispute(
+        client,
+        &tx,
+        signer.seed_for_signing(),
+        "resolve",
+        session_id,
+        args.verifier.as_str(),
+    )
+    .map_err(|e| {
+        let err = anyhow::anyhow!("sign_and_submit_dispute: {e}");
+        tracing::error!(
+            event = dispute_markers::DISPUTE_FAILED,
+            subcommand = "dispute",
+            phase = "resolve",
+            session_id = session_id,
+            category = "chain_rpc",
+            error = %err,
+            "sign_and_submit failed"
+        );
+        err
+    })?;
+
+    tracing::info!(
+        event = dispute_markers::DISPUTE_SUBMITTED,
+        subcommand = "dispute",
+        phase = "resolve",
+        session_id = session_id,
+        verifier = args.verifier.as_str(),
+        tx_hash = receipt.tx_hash.as_str(),
+        chain_id = receipt.chain_id,
+        nonce = receipt.nonce,
+        fee = receipt.fee.to_string().as_str(),
+        "dispute resolve submitted"
+    );
+    writeln!(out, "tx_hash={}", receipt.tx_hash)?;
+    writeln!(out, "submitted=true")?;
+    Ok(())
+}
+
+/// Local helper: turn the raw wire state string into a
+/// `DisputeState` variant. Only cares about `Open` vs everything else
+/// for the resolve precheck; unknown states map to `UnknownWire`.
+#[cfg(feature = "settlement-dispute")]
+fn classify_dispute_wire_state(
+    state: &str,
+) -> omni_sumchain::settlement::view::DisputeState {
+    use omni_sumchain::settlement::view::DisputeState;
+    match state {
+        "open" => DisputeState::Open { opened_at_height: 0 },
+        "resolved_approved" => DisputeState::ResolvedApproved {
+            resolved_at_height: None,
+            approve_bps: None,
+            deny_bps: None,
+        },
+        "resolved_denied" => DisputeState::ResolvedDenied {
+            resolved_at_height: None,
+            approve_bps: None,
+            deny_bps: None,
+        },
+        other => DisputeState::UnknownWire(other.to_string()),
+    }
 }
 
 // ── Hermetic tests ───────────────────────────────────────────────────────────
@@ -2956,11 +3914,1036 @@ mod tests {
                     SettlementCmd::Claimable(_) => "claimable",
                     SettlementCmd::Verifier(_) => "verifier",
                     SettlementCmd::Claim(_) => "claim",
+                    #[cfg(feature = "settlement-dispute")]
+                    SettlementCmd::Dispute(_) => "dispute",
                 }
             }
             let _ = variant_check;
             // Runtime grep against the module source is done at code-
             // review time; no runtime source-string check needed here.
+        }
+    }
+
+    // ── Issue #81 — settlement dispute tests ────────────────────────
+
+    #[cfg(feature = "settlement-dispute")]
+    mod dispute {
+        use super::*;
+        use crate::operator::SeedSource;
+        use omni_sumchain::settlement_dispute::{
+            Address, InferenceSettlementOperation, InferenceSettlementTxData,
+            OpenInferenceDisputeRequest, ResolveInferenceDisputeRequest,
+            SignedTransaction, TransactionV2, TxPayload, ValidatorApproval,
+        };
+
+        const TEST_SEED: [u8; 32] = [11u8; 32];
+        const TEST_CHAIN_ID: u64 = 1_800_100;
+        const TEST_NONCE: u64 = 7;
+        const TEST_FEE: u128 = 1000;
+
+        // ── Inline fixtures (test-only, not exposed via public API) ──
+
+        fn encode_hex_local(bytes: &[u8]) -> String {
+            use std::fmt::Write;
+            let mut s = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                let _ = write!(&mut s, "{b:02x}");
+            }
+            s
+        }
+
+        struct TestOpenTx {
+            unsigned_hex: String,
+            signing_hash_hex: String,
+            from_b58: String,
+            tx: TransactionV2,
+        }
+
+        fn build_test_open_tx(
+            seed: &[u8; 32],
+            session_id: &str,
+            verifier_b58: &str,
+            evidence: [u8; 32],
+            chain_id: u64,
+            nonce: u64,
+            fee: u128,
+        ) -> TestOpenTx {
+            let pubkey = omni_zkml::signer_pubkey_bytes(seed).unwrap();
+            let from = Address::from_public_key(&pubkey);
+            let from_b58 = from.to_base58();
+            let verifier_addr = Address::from_base58(verifier_b58).unwrap();
+            let tx = TransactionV2 {
+                chain_id: chain_id.into(),
+                from,
+                fee: fee.into(),
+                nonce: nonce.into(),
+                payload: TxPayload::InferenceSettlement(InferenceSettlementTxData {
+                    operation: InferenceSettlementOperation::OpenDispute(
+                        OpenInferenceDisputeRequest {
+                            session_id: session_id.to_string(),
+                            verifier: verifier_addr,
+                            evidence_commitment: evidence,
+                        },
+                    ),
+                }),
+            };
+            let unsigned_hex = format!("0x{}", encode_hex_local(&tx.to_bytes()));
+            let signing_hash_hex =
+                format!("0x{}", encode_hex_local(tx.signing_hash().as_bytes()));
+            TestOpenTx {
+                unsigned_hex,
+                signing_hash_hex,
+                from_b58,
+                tx,
+            }
+        }
+
+        struct TestResolveTx {
+            unsigned_hex: String,
+            signing_hash_hex: String,
+            from_b58: String,
+            tx: TransactionV2,
+        }
+
+        fn build_test_resolve_tx(
+            seed: &[u8; 32],
+            session_id: &str,
+            verifier_b58: &str,
+            allow_claim: bool,
+            approvals: Vec<ValidatorApproval>,
+            chain_id: u64,
+            nonce: u64,
+            fee: u128,
+        ) -> TestResolveTx {
+            let pubkey = omni_zkml::signer_pubkey_bytes(seed).unwrap();
+            let from = Address::from_public_key(&pubkey);
+            let from_b58 = from.to_base58();
+            let verifier_addr = Address::from_base58(verifier_b58).unwrap();
+            let tx = TransactionV2 {
+                chain_id: chain_id.into(),
+                from,
+                fee: fee.into(),
+                nonce: nonce.into(),
+                payload: TxPayload::InferenceSettlement(InferenceSettlementTxData {
+                    operation: InferenceSettlementOperation::ResolveDispute(
+                        ResolveInferenceDisputeRequest {
+                            session_id: session_id.to_string(),
+                            verifier: verifier_addr,
+                            allow_claim,
+                            approvals,
+                        },
+                    ),
+                }),
+            };
+            let unsigned_hex = format!("0x{}", encode_hex_local(&tx.to_bytes()));
+            let signing_hash_hex =
+                format!("0x{}", encode_hex_local(tx.signing_hash().as_bytes()));
+            TestResolveTx {
+                unsigned_hex,
+                signing_hash_hex,
+                from_b58,
+                tx,
+            }
+        }
+
+        // ── Derive a fake verifier address for tests. ───────────────
+
+        fn derived_addr_from_seed(seed: &[u8; 32]) -> String {
+            omni_zkml::signer_chain_address_base58(seed).unwrap()
+        }
+
+        // ── Fixture: verifier we're targeting on-chain ──────────────
+        const VERIFIER_SEED: [u8; 32] = [22u8; 32];
+
+        fn verifier_b58() -> String {
+            derived_addr_from_seed(&VERIFIER_SEED)
+        }
+
+        const EVIDENCE_HEX: &str =
+            "0xdeadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+
+        fn evidence_bytes() -> [u8; 32] {
+            let mut out = [0u8; 32];
+            let body = EVIDENCE_HEX.trim_start_matches("0x");
+            for i in 0..32 {
+                out[i] = u8::from_str_radix(&body[i * 2..i * 2 + 2], 16).unwrap();
+            }
+            out
+        }
+
+        // ── Fake-transport helper (mirrors #87 shape) ───────────────
+
+        fn params_settlement_active() -> serde_json::Value {
+            json!({
+                "finality_depth": 12,
+                "min_fee": 100,
+                "chain_id": TEST_CHAIN_ID,
+                "inference_settlement_enabled_from_height": 0,
+            })
+        }
+
+        fn args_open() -> Box<OpenDisputeArgs> {
+            Box::new(OpenDisputeArgs {
+                session_id: "s-1".to_string(),
+                verifier: verifier_b58(),
+                evidence: EVIDENCE_HEX.to_string(),
+                fee: None,
+                dry_run: false,
+            })
+        }
+
+        fn args_open_dry_run() -> Box<OpenDisputeArgs> {
+            Box::new(OpenDisputeArgs {
+                session_id: "s-1".to_string(),
+                verifier: verifier_b58(),
+                evidence: EVIDENCE_HEX.to_string(),
+                fee: None,
+                dry_run: true,
+            })
+        }
+
+        fn seed_open_happy_path(fake: &FakeJsonRpcTransport) -> TestOpenTx {
+            let derived = derived_addr_from_seed(&TEST_SEED);
+            let fixture = build_test_open_tx(
+                &TEST_SEED,
+                "s-1",
+                &verifier_b58(),
+                evidence_bytes(),
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            seed_params(fake, params_settlement_active());
+            seed_head(fake, 500_000);
+            fake.set_response(
+                "omninode_getInferenceSession",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "consistency_required": false,
+                    "bond_required": false,
+                    "max_verifiers": 3,
+                    "escrow_total": "1000",
+                    "escrow_remaining": "1000",
+                    "claims_count": 0,
+                    "status": "Open",
+                    "created_at_height": 400_000,
+                    "funder": derived,
+                    "dispute_window_blocks": 5_000,
+                })),
+            );
+            fake.set_response(
+                "sum_getInferenceAttestation",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "verifier_address": verifier_b58(),
+                    "model_hash": "0xaa",
+                    "manifest_root": "0xbb",
+                    "response_hash": "0xcc",
+                    "proof_root": "0xdd",
+                    "verifier_signature": "0xsig",
+                    "included_at_height": 495_000,      // maturity = 495_000 + 12 + 5_000 = 500_012
+                    "tx_hash": "0xtxatt",
+                    "finalized": true,
+                })),
+            );
+            fake.set_response(
+                "omninode_getInferenceDisputes",
+                Ok(json!({ "session_id": "s-1", "disputes": [] })),
+            );
+            fake.set_response(
+                "omninode_buildOpenInferenceDispute",
+                Ok(json!({
+                    "unsigned_tx": fixture.unsigned_hex,
+                    "signing_hash": fixture.signing_hash_hex,
+                    "from": fixture.from_b58,
+                    "nonce": TEST_NONCE,
+                    "fee": TEST_FEE,
+                    "chain_id": TEST_CHAIN_ID,
+                })),
+            );
+            fake.set_response(
+                "sum_sendRawTransaction",
+                Ok(json!({ "tx_hash": "0xtxhash-open-happy" })),
+            );
+            fixture
+        }
+
+        fn run_open_with_capture(
+            args: Box<OpenDisputeArgs>,
+            client: &SumChainClient<FakeJsonRpcTransport>,
+            seed_source: SeedSource,
+        ) -> (String, Vec<u8>, Result<()>) {
+            let logs = CapturedLogs::new();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            let mut stdout_buf = Vec::new();
+            let result = tracing::subscriber::with_default(subscriber, || {
+                super::super::run_dispute_open(client, &args, &mut stdout_buf, seed_source)
+            });
+            (logs.as_string(), stdout_buf, result)
+        }
+
+        fn run_resolve_with_capture(
+            args: Box<ResolveDisputeArgs>,
+            client: &SumChainClient<FakeJsonRpcTransport>,
+            seed_source: SeedSource,
+        ) -> (String, Vec<u8>, Result<()>) {
+            let logs = CapturedLogs::new();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            let mut stdout_buf = Vec::new();
+            let result = tracing::subscriber::with_default(subscriber, || {
+                super::super::run_dispute_resolve(
+                    client,
+                    &args,
+                    &mut stdout_buf,
+                    seed_source,
+                )
+            });
+            (logs.as_string(), stdout_buf, result)
+        }
+
+        fn call_methods_dispute(fake: &FakeJsonRpcTransport) -> Vec<String> {
+            fake.calls().into_iter().map(|(m, _)| m).collect()
+        }
+
+        // ── OPEN tests ──────────────────────────────────────────────
+
+        #[test]
+        fn open_dormant_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            seed_params(&fake, params_all_dormant());
+            seed_head(&fake, 100_000);
+            let (logs, _s, r) = run_open_with_capture(
+                args_open(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("dormant must fail");
+            assert!(logs.contains("event=\"settlement_dispute_refused_dormancy\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn open_missing_session_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 500_000);
+            fake.set_response("omninode_getInferenceSession", Ok(serde_json::Value::Null));
+            let (logs, _s, r) = run_open_with_capture(
+                args_open(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("missing session must fail");
+            assert!(logs.contains("event=\"settlement_dispute_refused_state\""));
+            assert!(logs.contains("reason=\"session_not_found\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn open_funder_mismatch_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 500_000);
+            fake.set_response(
+                "omninode_getInferenceSession",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "consistency_required": false,
+                    "bond_required": false,
+                    "max_verifiers": 3,
+                    "escrow_total": "1000",
+                    "escrow_remaining": "1000",
+                    "claims_count": 0,
+                    "status": "Open",
+                    "created_at_height": 400_000,
+                    "funder": "someone-else",       // <-- mismatched
+                    "dispute_window_blocks": 5_000,
+                })),
+            );
+            let (logs, _s, r) = run_open_with_capture(
+                args_open(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("funder mismatch must fail");
+            assert!(logs.contains("event=\"settlement_dispute_refused_authority\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        /// Chain-team confirmation (sum-chain#110): `OpenDispute` only
+        /// accepted against `Open` sessions. Refunded / Settled /
+        /// unknown terminal states must refuse locally so the operator
+        /// doesn't burn a fee on a chain-rejected tx.
+        ///
+        /// Uses the confirmed chain-team session JSON shape:
+        /// `"status": "Refunded"` (capital-cased, not the legacy
+        /// `"lifecycle": "refunded"`).
+        #[test]
+        fn open_session_not_open_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            let derived = derived_addr_from_seed(&TEST_SEED);
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 500_000);
+            fake.set_response(
+                "omninode_getInferenceSession",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "consistency_required": false,
+                    "bond_required": false,
+                    "max_verifiers": 3,
+                    "escrow_total": "1000",
+                    "escrow_remaining": "1000",
+                    "claims_count": 0,
+                    "status": "Refunded",     // <-- terminal state; refuse
+                    "created_at_height": 400_000,
+                    "funder": derived,
+                    "dispute_window_blocks": 5_000,
+                })),
+            );
+            let (logs, _s, r) = run_open_with_capture(
+                args_open(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("non-Open session must be refused");
+            assert!(
+                logs.contains("event=\"settlement_dispute_refused_state\""),
+                "must emit DISPUTE_REFUSED_STATE; logs=\n{logs}"
+            );
+            assert!(
+                logs.contains("reason=\"session_not_open\""),
+                "reason must name session_not_open; logs=\n{logs}"
+            );
+            assert!(
+                logs.contains("wire_status=\"Refunded\""),
+                "wire_status field must carry the chain's raw status verbatim; logs=\n{logs}"
+            );
+            let m = call_methods_dispute(&fake);
+            assert!(
+                !m.iter().any(|x| x == "sum_getInferenceAttestation"),
+                "attestation lookup NOT reached (comes after status precheck); methods={m:?}"
+            );
+            assert!(
+                !m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"),
+                "builder MUST NOT be called; methods={m:?}"
+            );
+            assert!(
+                !m.iter().any(|x| x == "sum_sendRawTransaction"),
+                "submit MUST NOT be called; methods={m:?}"
+            );
+        }
+
+        /// Chain-team shape pin: an `Open` session with the confirmed
+        /// `"status": "Open"` wire field passes the open-status
+        /// precheck and reaches the builder. This test also exercises
+        /// the `#[serde(alias = "status")]` DTO reader — the fake
+        /// response uses `"status"`, not `"lifecycle"`.
+        #[test]
+        fn open_session_status_open_wire_shape_reaches_builder() {
+            let (client, fake) = make_client();
+            let _fixture = seed_open_happy_path(&fake);
+            // seed_open_happy_path already uses "status": "Open" per
+            // the reviewer's #81 test-JSON update; assert it flows
+            // through to CLAIM_READY (the marker emitted right after
+            // envelope + decoded-tx verification pass).
+            let (logs, _s, r) = run_open_with_capture(
+                args_open_dry_run(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect("`status: Open` session must pass the open-status precheck");
+            assert!(
+                logs.contains("event=\"settlement_dispute_ready\""),
+                "must emit DISPUTE_READY; logs=\n{logs}"
+            );
+            let m = call_methods_dispute(&fake);
+            assert!(
+                m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"),
+                "builder MUST be called; methods={m:?}"
+            );
+        }
+
+        #[test]
+        fn open_missing_attestation_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            let derived = derived_addr_from_seed(&TEST_SEED);
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 500_000);
+            fake.set_response(
+                "omninode_getInferenceSession",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "consistency_required": false,
+                    "bond_required": false,
+                    "max_verifiers": 3,
+                    "escrow_total": "1000",
+                    "escrow_remaining": "1000",
+                    "claims_count": 0,
+                    "status": "Open",
+                    "created_at_height": 400_000,
+                    "funder": derived,
+                    "dispute_window_blocks": 5_000,
+                })),
+            );
+            fake.set_response("sum_getInferenceAttestation", Ok(serde_json::Value::Null));
+            let (logs, _s, r) = run_open_with_capture(
+                args_open(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("missing attestation must fail");
+            assert!(logs.contains("event=\"settlement_dispute_refused_state\""));
+            assert!(logs.contains("reason=\"attestation_not_found\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn open_maturity_elapsed_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            let derived = derived_addr_from_seed(&TEST_SEED);
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 600_000);
+            fake.set_response(
+                "omninode_getInferenceSession",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "consistency_required": false,
+                    "bond_required": false,
+                    "max_verifiers": 3,
+                    "escrow_total": "1000",
+                    "escrow_remaining": "1000",
+                    "claims_count": 0,
+                    "status": "Open",
+                    "created_at_height": 400_000,
+                    "funder": derived,
+                    "dispute_window_blocks": 5_000,
+                })),
+            );
+            fake.set_response(
+                "sum_getInferenceAttestation",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "verifier_address": verifier_b58(),
+                    "model_hash": "0xaa",
+                    "manifest_root": "0xbb",
+                    "response_hash": "0xcc",
+                    "proof_root": "0xdd",
+                    "verifier_signature": "0xsig",
+                    // maturity = 400_000 + 12 + 5_000 = 405_012 < head 600_000
+                    "included_at_height": 400_000,
+                    "tx_hash": "0xtxatt",
+                    "finalized": true,
+                })),
+            );
+            let (logs, _s, r) = run_open_with_capture(
+                args_open(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("maturity elapsed must fail");
+            assert!(logs.contains("event=\"settlement_dispute_refused_maturity\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn open_duplicate_dispute_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            let _fixture = seed_open_happy_path(&fake);
+            // Overwrite disputes with an existing one for the same verifier:
+            fake.set_response(
+                "omninode_getInferenceDisputes",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "disputes": [
+                        {
+                            "verifier_address": verifier_b58(),
+                            "opened_at_height": 400_500,
+                            "state": "open"
+                        }
+                    ]
+                })),
+            );
+            let (logs, _s, r) = run_open_with_capture(
+                args_open(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("duplicate dispute must fail");
+            assert!(logs.contains("event=\"settlement_dispute_refused_state\""));
+            assert!(logs.contains("reason=\"duplicate_dispute\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn open_invalid_evidence_hex_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            let _fixture = seed_open_happy_path(&fake);
+            let mut args = args_open();
+            args.evidence = "0xNOT_HEX".to_string();
+            let (logs, _s, r) = run_open_with_capture(
+                args,
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("bad evidence hex must fail");
+            assert!(logs.contains("event=\"settlement_dispute_failed\""));
+            assert!(logs.contains("category=\"evidence_parse\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn open_builder_envelope_mismatch_refuses_before_submit() {
+            let (client, fake) = make_client();
+            let fixture = seed_open_happy_path(&fake);
+            fake.set_response(
+                "omninode_buildOpenInferenceDispute",
+                Ok(json!({
+                    "unsigned_tx": fixture.unsigned_hex,
+                    "signing_hash": fixture.signing_hash_hex,
+                    "from": "not-the-derived-address",  // <-- mismatch
+                    "nonce": TEST_NONCE,
+                    "fee": TEST_FEE,
+                    "chain_id": TEST_CHAIN_ID,
+                })),
+            );
+            let (logs, _s, r) = run_open_with_capture(
+                args_open(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("envelope mismatch must fail");
+            assert!(logs.contains("event=\"settlement_dispute_failed\""));
+            assert!(logs.contains("category=\"builder_mismatch\""));
+            let m = call_methods_dispute(&fake);
+            assert!(m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn open_dry_run_calls_builder_but_never_signs_or_submits() {
+            let (client, fake) = make_client();
+            let _fixture = seed_open_happy_path(&fake);
+            let (logs, stdout, r) = run_open_with_capture(
+                args_open_dry_run(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect("dry-run must succeed");
+            assert!(logs.contains("event=\"settlement_dispute_ready\""));
+            assert!(!logs.contains("event=\"settlement_dispute_submitted\""));
+            let stdout_str = String::from_utf8(stdout).unwrap();
+            assert!(stdout_str.contains("dry_run=true submitted=false"));
+            let m = call_methods_dispute(&fake);
+            assert!(m.iter().any(|x| x == "omninode_buildOpenInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn open_happy_path_calls_builder_once_and_submit_once_round_trips() {
+            let (client, fake) = make_client();
+            let fixture = seed_open_happy_path(&fake);
+            let (logs, stdout, r) = run_open_with_capture(
+                args_open(),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect("happy path");
+            assert!(logs.contains("event=\"settlement_dispute_ready\""));
+            assert!(logs.contains("event=\"settlement_dispute_submitted\""));
+            let m = call_methods_dispute(&fake);
+            let bcount = m.iter().filter(|x| x.as_str() == "omninode_buildOpenInferenceDispute").count();
+            let scount = m.iter().filter(|x| x.as_str() == "sum_sendRawTransaction").count();
+            assert_eq!(bcount, 1, "builder exactly once");
+            assert_eq!(scount, 1, "submit exactly once");
+
+            // Round-trip: SignedTransaction::from_hex on the submitted hex.
+            let calls = fake.calls();
+            let (_m, params) = calls.iter().find(|(m, _)| m == "sum_sendRawTransaction").unwrap();
+            let hex_param = params.as_array().unwrap()[0].as_str().unwrap().to_string();
+            let decoded = SignedTransaction::from_hex(&hex_param)
+                .expect("submitted hex must round-trip via SignedTransaction::from_hex");
+            assert_eq!(decoded.signing_hash(), fixture.tx.signing_hash());
+
+            let stdout_str = String::from_utf8(stdout).unwrap();
+            assert!(stdout_str.contains("submitted=true"));
+        }
+
+        // ── RESOLVE tests ───────────────────────────────────────────
+
+        fn write_approvals_json(approvals: &[ValidatorApproval]) -> std::path::PathBuf {
+            let items: Vec<_> = approvals
+                .iter()
+                .map(|a| {
+                    json!({
+                        "pubkey":    format!("0x{}", encode_hex_local(&a.pubkey)),
+                        "signature": format!("0x{}", encode_hex_local(&a.signature)),
+                    })
+                })
+                .collect();
+            let body = serde_json::to_string(&items).unwrap();
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "omninode-test-approvals-{}.json",
+                std::process::id()
+            ));
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+
+        fn make_test_approvals() -> Vec<ValidatorApproval> {
+            vec![ValidatorApproval {
+                pubkey: [3u8; 32],
+                signature: [5u8; 64],
+            }]
+        }
+
+        fn args_resolve(approvals_path: std::path::PathBuf, allow_claim: bool) -> Box<ResolveDisputeArgs> {
+            Box::new(ResolveDisputeArgs {
+                session_id: "s-1".to_string(),
+                verifier: verifier_b58(),
+                allow_claim,
+                approvals: approvals_path,
+                fee: None,
+                dry_run: false,
+            })
+        }
+
+        fn args_resolve_dry(approvals_path: std::path::PathBuf) -> Box<ResolveDisputeArgs> {
+            Box::new(ResolveDisputeArgs {
+                session_id: "s-1".to_string(),
+                verifier: verifier_b58(),
+                allow_claim: true,
+                approvals: approvals_path,
+                fee: None,
+                dry_run: true,
+            })
+        }
+
+        fn seed_resolve_happy_path(fake: &FakeJsonRpcTransport, approvals: &[ValidatorApproval]) -> TestResolveTx {
+            let fixture = build_test_resolve_tx(
+                &TEST_SEED,
+                "s-1",
+                &verifier_b58(),
+                true,
+                approvals.to_vec(),
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            seed_params(fake, params_settlement_active());
+            seed_head(fake, 500_000);
+            fake.set_response(
+                "omninode_getInferenceDisputes",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "disputes": [{
+                        "verifier_address": verifier_b58(),
+                        "opened_at_height": 400_500,
+                        "state": "open"
+                    }]
+                })),
+            );
+            fake.set_response(
+                "omninode_buildResolveInferenceDispute",
+                Ok(json!({
+                    "unsigned_tx": fixture.unsigned_hex,
+                    "signing_hash": fixture.signing_hash_hex,
+                    "from": fixture.from_b58,
+                    "nonce": TEST_NONCE,
+                    "fee": TEST_FEE,
+                    "chain_id": TEST_CHAIN_ID,
+                })),
+            );
+            fake.set_response(
+                "sum_sendRawTransaction",
+                Ok(json!({ "tx_hash": "0xtxhash-resolve-happy" })),
+            );
+            fixture
+        }
+
+        #[test]
+        fn resolve_dormant_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            let approvals = make_test_approvals();
+            let path = write_approvals_json(&approvals);
+            seed_params(&fake, params_all_dormant());
+            seed_head(&fake, 100_000);
+            let (logs, _s, r) = run_resolve_with_capture(
+                args_resolve(path, true),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("dormant must fail");
+            assert!(logs.contains("event=\"settlement_dispute_refused_dormancy\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildResolveInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn resolve_dispute_not_open_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            let approvals = make_test_approvals();
+            let path = write_approvals_json(&approvals);
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 500_000);
+            fake.set_response(
+                "omninode_getInferenceDisputes",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "disputes": [{
+                        "verifier_address": verifier_b58(),
+                        "opened_at_height": 400_500,
+                        "state": "resolved_approved"       // <-- not open
+                    }]
+                })),
+            );
+            let (logs, _s, r) = run_resolve_with_capture(
+                args_resolve(path, true),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("dispute not open must fail");
+            assert!(logs.contains("event=\"settlement_dispute_refused_state\""));
+            assert!(logs.contains("reason=\"dispute_not_open\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildResolveInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn resolve_malformed_approvals_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 500_000);
+            fake.set_response(
+                "omninode_getInferenceDisputes",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "disputes": [{
+                        "verifier_address": verifier_b58(),
+                        "opened_at_height": 400_500,
+                        "state": "open"
+                    }]
+                })),
+            );
+            // Write bad JSON — non-hex chars in pubkey.
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "omninode-test-bad-approvals-{}.json",
+                std::process::id()
+            ));
+            std::fs::write(
+                &path,
+                r#"[{"pubkey": "0xNOT_HEX", "signature": "0x00"}]"#,
+            )
+            .unwrap();
+
+            let (logs, _s, r) = run_resolve_with_capture(
+                args_resolve(path, true),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("malformed approvals must fail");
+            assert!(logs.contains("event=\"settlement_dispute_failed\""));
+            assert!(logs.contains("category=\"approvals_parse\""));
+            let m = call_methods_dispute(&fake);
+            assert!(!m.iter().any(|x| x == "omninode_buildResolveInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        /// Chain-team confirmed (sum-chain#110): an empty approvals
+        /// array will BUILD but always FAIL authority at execution
+        /// because it cannot meet the validator-quorum threshold.
+        /// OmniNode refuses locally BEFORE builder/sign/submit so the
+        /// operator doesn't burn a fee on a predictably-rejected tx.
+        #[test]
+        fn resolve_empty_approvals_refuses_and_never_calls_builder_or_submit() {
+            let (client, fake) = make_client();
+            seed_params(&fake, params_settlement_active());
+            seed_head(&fake, 500_000);
+            fake.set_response(
+                "omninode_getInferenceDisputes",
+                Ok(json!({
+                    "session_id": "s-1",
+                    "disputes": [{
+                        "verifier_address": verifier_b58(),
+                        "opened_at_height": 400_500,
+                        "state": "open"
+                    }]
+                })),
+            );
+            // Well-formed but empty approvals list.
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "omninode-test-empty-approvals-{}.json",
+                std::process::id()
+            ));
+            std::fs::write(&path, "[]").unwrap();
+
+            let (logs, _s, r) = run_resolve_with_capture(
+                args_resolve(path, true),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect_err("empty approvals must refuse locally");
+
+            assert!(
+                logs.contains("event=\"settlement_dispute_refused_state\""),
+                "must emit DISPUTE_REFUSED_STATE; logs=\n{logs}"
+            );
+            assert!(
+                logs.contains("reason=\"approvals_empty\""),
+                "reason must name approvals_empty; logs=\n{logs}"
+            );
+
+            let m = call_methods_dispute(&fake);
+            assert!(
+                !m.iter().any(|x| x == "omninode_buildResolveInferenceDispute"),
+                "builder MUST NOT be called on empty approvals; methods={m:?}"
+            );
+            assert!(
+                !m.iter().any(|x| x == "sum_sendRawTransaction"),
+                "submit MUST NOT be called on empty approvals; methods={m:?}"
+            );
+        }
+
+        #[test]
+        fn resolve_approvals_json_accepts_hex_with_or_without_prefix() {
+            // Parse two entries — one with `0x`, one without — and
+            // both should yield the same bytes.
+            use omni_sumchain::settlement_dispute::wire::parse_approvals_json;
+            let with = "aa".repeat(32);
+            let without = "bb".repeat(32);
+            let sig_with = "cc".repeat(64);
+            let sig_without = "dd".repeat(64);
+            let json = format!(
+                r#"[
+                    {{ "pubkey": "0x{with}",   "signature": "0x{sig_with}" }},
+                    {{ "pubkey": "{without}",  "signature": "{sig_without}" }}
+                ]"#
+            );
+            let parsed = parse_approvals_json(&json).expect("both formats parse");
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].pubkey, [0xaa; 32]);
+            assert_eq!(parsed[1].pubkey, [0xbb; 32]);
+            assert_eq!(parsed[0].signature, [0xcc; 64]);
+            assert_eq!(parsed[1].signature, [0xdd; 64]);
+        }
+
+        #[test]
+        fn resolve_dry_run_calls_builder_but_never_signs_or_submits() {
+            let (client, fake) = make_client();
+            let approvals = make_test_approvals();
+            let _fixture = seed_resolve_happy_path(&fake, &approvals);
+            let path = write_approvals_json(&approvals);
+            let (logs, stdout, r) = run_resolve_with_capture(
+                args_resolve_dry(path),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect("dry-run must succeed");
+            assert!(logs.contains("event=\"settlement_dispute_ready\""));
+            assert!(!logs.contains("event=\"settlement_dispute_submitted\""));
+            let s = String::from_utf8(stdout).unwrap();
+            assert!(s.contains("dry_run=true submitted=false"));
+            let m = call_methods_dispute(&fake);
+            assert!(m.iter().any(|x| x == "omninode_buildResolveInferenceDispute"));
+            assert!(!m.iter().any(|x| x == "sum_sendRawTransaction"));
+        }
+
+        #[test]
+        fn resolve_happy_path_calls_builder_once_and_submit_once() {
+            let (client, fake) = make_client();
+            let approvals = make_test_approvals();
+            let fixture = seed_resolve_happy_path(&fake, &approvals);
+            let path = write_approvals_json(&approvals);
+            let (logs, _stdout, r) = run_resolve_with_capture(
+                args_resolve(path, true),
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            r.expect("happy path");
+            assert!(logs.contains("event=\"settlement_dispute_ready\""));
+            assert!(logs.contains("event=\"settlement_dispute_submitted\""));
+            let m = call_methods_dispute(&fake);
+            let bcount = m.iter().filter(|x| x.as_str() == "omninode_buildResolveInferenceDispute").count();
+            let scount = m.iter().filter(|x| x.as_str() == "sum_sendRawTransaction").count();
+            assert_eq!(bcount, 1);
+            assert_eq!(scount, 1);
+
+            // Round-trip decode.
+            let calls = fake.calls();
+            let (_m, params) = calls.iter().find(|(m, _)| m == "sum_sendRawTransaction").unwrap();
+            let hex_param = params.as_array().unwrap()[0].as_str().unwrap().to_string();
+            let decoded = SignedTransaction::from_hex(&hex_param).expect("round-trip");
+            assert_eq!(decoded.signing_hash(), fixture.tx.signing_hash());
+        }
+
+        // ── Structural tests ────────────────────────────────────────
+
+        #[test]
+        fn dispute_marker_constant_names_are_pinned() {
+            use super::super::dispute_markers;
+            assert_eq!(dispute_markers::DISPUTE_READY, "settlement_dispute_ready");
+            assert_eq!(dispute_markers::DISPUTE_REFUSED_DORMANCY, "settlement_dispute_refused_dormancy");
+            assert_eq!(dispute_markers::DISPUTE_REFUSED_AUTHORITY, "settlement_dispute_refused_authority");
+            assert_eq!(dispute_markers::DISPUTE_REFUSED_MATURITY, "settlement_dispute_refused_maturity");
+            assert_eq!(dispute_markers::DISPUTE_REFUSED_STATE, "settlement_dispute_refused_state");
+            assert_eq!(dispute_markers::DISPUTE_SUBMITTED, "settlement_dispute_submitted");
+            assert_eq!(dispute_markers::DISPUTE_FAILED, "settlement_dispute_failed");
+        }
+
+        #[test]
+        fn dispute_surface_carries_no_forbidden_flags() {
+            // Compile-time exhaustive match — any new DisputeCmd
+            // variant or OpenArgs/ResolveArgs field breaks this test.
+            fn dc_variant_check(cmd: &DisputeCmd) -> &'static str {
+                match cmd {
+                    DisputeCmd::Open(_) => "open",
+                    DisputeCmd::Resolve(_) => "resolve",
+                }
+            }
+            let _ = dc_variant_check;
+            let _ = OpenDisputeArgs {
+                session_id: "s".to_string(),
+                verifier: "v".to_string(),
+                evidence: "0x".to_string(),
+                fee: None,
+                dry_run: false,
+            };
+            let _ = ResolveDisputeArgs {
+                session_id: "s".to_string(),
+                verifier: "v".to_string(),
+                allow_claim: false,
+                approvals: std::path::PathBuf::from("/tmp/x"),
+                fee: None,
+                dry_run: false,
+            };
         }
     }
 }
