@@ -11,23 +11,38 @@ record see [`mainnet-smoke-audit.md`](./mainnet-smoke-audit.md).
 
 ---
 
-## 1. Build matrix (Stage 9a + 9c)
+## 1. Build matrix
 
-OmniNode separates **read-only** operator commands from **submit**
-commands at the cargo-feature level. A default build's binary
-contains only the read-only subcommands; submit subcommands appear
-only with `--features submit`. Both builds resolve entirely from
-public sources (crates.io); **no GitHub credential is required for
-either build** as of Stage 9c.
+OmniNode separates read-only from write-capable operator commands at
+the cargo-feature level. A default build's binary contains only the
+read-only subcommands; each write surface (attestation submit,
+settlement claim, settlement dispute) appears only under its
+corresponding feature. All builds resolve entirely from public sources
+(crates.io); no GitHub credential is required at any step.
 
-| Invocation | Compiled subcommands | `sumchain-primitives` / `sumchain-crypto` source |
+| Invocation | Compiled subcommands | Chain-primitives dependency |
 |---|---|---|
-| `cargo build -p omni-node` (default) | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) | absent from compile graph (Stage 9a feature gate keeps them out) |
-| `cargo build -p omni-node --features submit` | All of the above plus `smoke` and `loop --allow-submit [--allow-mainnet-submit]` | crates.io `v0.1.0` (dual-licensed MIT OR Apache-2.0, byte-equivalent to chain rev `d83e45a4` for the InferenceAttestation surface) |
+| `cargo build -p omni-node` (default) | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) | absent from compile graph (feature gate keeps `sumchain-primitives` / `sumchain-crypto` out) |
+| `cargo build -p omni-node --features submit` | above plus `smoke` and `loop --allow-submit [--allow-mainnet-submit]` (attestation submit) | crates.io `sumchain-primitives` v0.2.0 + `sumchain-crypto` v0.2.0 (dual-licensed MIT OR Apache-2.0) |
+| `cargo build -p omni-node --features settlement-read` | above default plus `operator settlement { status, session, claimable, verifier }` | absent from compile graph (dependency-neutral vs default; no chain crates pulled) |
+| `cargo build -p omni-node --features settlement-submit` | superset of `settlement-read` plus `operator settlement claim <session_id>` (verifier self-claim) | `sumchain-primitives` v0.2.0 + `sumchain-crypto` v0.2.0 via `omni-sumchain/settlement-submit` → `submit` |
+| `cargo build -p omni-node --features settlement-dispute` | superset of `settlement-submit` plus `operator settlement dispute { open, resolve }` | `sumchain-primitives` v0.2.0 + `sumchain-crypto` v0.2.0 via `omni-sumchain/settlement-dispute` → `settlement-submit` → `submit` |
 
-Read-only operator binaries stay small and submit code is an
-explicit operator choice; both halves are enforced as HARD GATES by
-the Stage 9c CI workflow on every push / PR.
+Read-only operator binaries stay small; every write surface is an
+explicit operator choice. Both halves are enforced as HARD GATES in
+CI: the default and `settlement-read` trees MUST NOT contain the
+chain crates; the `submit`, `settlement-submit`, and
+`settlement-dispute` trees MUST positively contain them. Historical
+Stage 9c CI arc (private git → crates.io) is preserved in §1d below;
+the current CI matrix runs all five settlement / submit gates on
+every push / PR.
+
+Every settlement write path is **activation-gated**: OmniNode's local
+prechecks refuse to build / sign / submit against a chain where the
+corresponding `chain_getChainParams` gate is dormant. See
+[`inference-settlement-protocol-reference.md`](./inference-settlement-protocol-reference.md)
+for the five gates and the eligibility model, and §7 below for the
+`event=` marker taxonomy.
 
 ### 1a. Choosing the right build — `--help` discoverability
 
@@ -165,7 +180,7 @@ naming convention is reserved here for future use.
 | Variable / flag | Purpose |
 |---|---|
 | `OMNINODE_SUMCHAIN_RPC_URL` (or `--rpc-url`) | RPC endpoint. Required for any chain-touching command. |
-| `OMNINODE_VERIFIER_SEED_HEX` | 64-char hex Ed25519 seed for the funded verifier. Required by `smoke`, `loop --allow-submit`, `derive-address`. Never read by `watch-activation` / `query` / `registry`. |
+| `OMNINODE_VERIFIER_SEED_HEX` | 64-char hex Ed25519 seed for the funded verifier. Required by `smoke`, `loop --allow-submit`, `derive-address`, **and by every settlement write path**: `operator settlement claim` (settlement-submit) reads it as the claim signer; `operator settlement dispute open` reads it as the funder signer; `operator settlement dispute resolve` reads it as the fee-payer signer. Never read by `watch-activation` / `query` / `registry` / `operator settlement { status, session, claimable, verifier }` (settlement-read only surfaces). |
 | `--expect-chain-id <N>` | Hard guardrail: refuses to act if `chain_getChainParams.chain_id != <N>`. Required on every chain-touching operator command. SUM Chain mainnet is `1`; local mirror is `31337`. |
 | `--registry-path <P>` | Local attestation registry (a directory of JSON files). Required by `smoke`, `loop`, `registry list/show`. |
 | `RUST_LOG` | Tracing filter. See § 7. |
@@ -801,8 +816,8 @@ deployment. Build the binary appropriately for the desired mode:
 cargo build --release -p omni-node
 sudo install -m 0755 target/release/omni-node /usr/local/bin/omni-node
 
-# Retry-enabled (also crates.io only; Stage 9c — no GitHub access
-# required; the chain primitives ship from public crates.io v0.1.0):
+# Retry-enabled (also crates.io only; no GitHub access required;
+# the chain primitives ship from public crates.io v0.2.0):
 cargo build --release -p omni-node --features submit
 sudo install -m 0755 target/release/omni-node /usr/local/bin/omni-node
 ```
@@ -827,6 +842,13 @@ sudo install -m 0755 target/release/omni-node /usr/local/bin/omni-node
 | Monitor-only loop | `operator loop` | no |
 | Submit one attestation | `operator smoke ... --allow-submit --allow-mainnet-submit` | **yes** |
 | Retry-enabled loop | `operator loop ... --allow-submit --allow-mainnet-submit` | **yes** |
+| Print chain gate status (settlement, consistency, bonding) + head | `operator settlement status` | `settlement-read` |
+| Compose a multi-verifier session view (auto-fetches consistency + registry when applicable) | `operator settlement session <id> [--json]` | `settlement-read` |
+| Chain-side claimable-reward precheck for one verifier | `operator settlement claimable <id> --verifier <addr>` | `settlement-read` |
+| Read a verifier registry entry (bond amount + state + slash-history count) | `operator settlement verifier <addr>` | `settlement-read` |
+| Submit a verifier self-claim (all local prechecks first; `--dry-run` STOPs before signing/submitting) | `operator settlement claim <id> [--verifier <addr>] [--fee <koppa>] [--dry-run]` | `settlement-submit` |
+| Open a dispute against a verifier's attestation (funder-signed; enforces open-status + maturity + duplicate prechecks locally) | `operator settlement dispute open <id> --verifier <addr> --evidence <32-byte-hex> [--fee <koppa>] [--dry-run]` | `settlement-dispute` |
+| Resolve an open dispute with a validator-quorum approvals bundle (submitter is fee payer only) | `operator settlement dispute resolve <id> --verifier <addr> --allow-claim <true\|false> --approvals <json-file> [--fee <koppa>] [--dry-run]` | `settlement-dispute` |
 
 Stage 9a is operations hardening, not protocol work. The SUM Chain
 wire format is unchanged from Stage 7b; Stage 6's
@@ -873,13 +895,16 @@ and tracked by the operator.
    # must be empty
    ```
 
-3. **Local test parity.** On the build host, both feature
-   configurations green:
+3. **Local test parity.** On the build host, every feature
+   configuration green:
 
    ```bash
    cargo test -p omni-sumchain --features submit
    cargo test -p omni-node
    cargo test -p omni-node --features submit
+   cargo test -p omni-node --features settlement-read
+   cargo test -p omni-node --features settlement-submit
+   cargo test -p omni-node --features settlement-dispute
    ```
 
    The `parity_vendored_primitives` (5 tests) and

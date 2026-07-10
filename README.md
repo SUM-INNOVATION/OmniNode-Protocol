@@ -26,7 +26,7 @@ The protocol is built on four pillars:
 | **Compute** | Pipeline parallelism shards model layers across devices, routing hidden state tensors over a low-latency P2P mesh | Consumer devices pool their unified memory to run models that no single device could hold |
 | **Storage** | Model weights (GGUF files) are chunked by transformer block, content-addressed (BLAKE3 → CIDv1), and distributed via a custom 64 MiB sliding-window protocol over libp2p request-response | No centralized model hosting. Weights are resilient, deduplicated, and globally available |
 | **Privacy** | Federated Learning allows contributors to train locally on private data, uploading only mathematical weight gradients — never raw data | Data sovereignty is preserved. No central entity sees user data |
-| **Incentives** | zkML (Zero-Knowledge Machine Learning) cryptographically proves correct inference. A Financial RLHF system stakes tokens, rewards quality, and slashes dishonest nodes | Trustless verification. Economic alignment between node operators and end users |
+| **Incentives** | Off-chain proof artifacts + verifier attestations anchor contribution commitments. SUM Chain settlement enforces escrow-funded eligibility, signatures, maturity, disputes, and — where activated / configured — consistency and bond rules. On-chain zkML / Halo2 verification and semantic AI-correctness verification are not part of the shipped settlement subprotocol. See [`docs/inference-settlement-protocol-reference.md`](docs/inference-settlement-protocol-reference.md) | Attestation identity + funder-escrowed rewards. Chain enforcement of the eligibility / dispute / bond mechanics that are shipped; separation between what the chain mechanically enforces and what remains off-chain proof / trust |
 
 For the delivery record — every phase, every stage, what actually shipped —
 see [`docs/project-status.md`](docs/project-status.md).
@@ -44,12 +44,22 @@ at any step.
 |---|---|---|
 | Watch activation, query the chain, inspect your local registry, derive an address, run the lifecycle loop **monitor-only** | `cargo build -p omni-node` | `watch-activation`, `preflight`, `query` (incl. `--tx-hash`), `derive-address`, `registry list/show`, `loop` (monitor-only) |
 | Submit attestations, run the lifecycle loop with retry | `cargo build -p omni-node --features submit` | all of the above **plus** `smoke` and `loop --allow-submit [--allow-mainnet-submit]` |
+| Read InferenceSettlement state (sessions, claims, disputes, verifier registry, consistency groups) | `cargo build -p omni-node --features settlement-read` | all read-only surface **plus** `operator settlement { status, session, claimable, verifier }` |
+| Submit a verifier self-claim (activation-gated; enforces local dormancy / attestation / authority / maturity / bond prechecks) | `cargo build -p omni-node --features settlement-submit` | superset of `settlement-read`; adds `operator settlement claim <session_id> [--verifier <addr>] [--fee <koppa>] [--dry-run]` |
+| Submit dispute open (funder) or dispute resolve (validator-quorum approvals; submitter is fee payer) | `cargo build -p omni-node --features settlement-dispute` | superset of `settlement-submit`; adds `operator settlement dispute { open, resolve }` |
 
 Default builds keep `sumchain-primitives` / `sumchain-crypto` out of the
-compile graph entirely (the operator binary stays small and the submit code
-path is an explicit operator choice). CI gates enforce both halves of this
-on every push / PR. See [`docs/operator-runbook.md`](docs/operator-runbook.md)
-for the full operator runbook.
+compile graph entirely (the operator binary stays small and every submit /
+settlement-write code path is an explicit operator choice). `settlement-read`
+is dependency-neutral against default; `settlement-submit` and
+`settlement-dispute` pull the chain primitives + crypto via the same
+`submit` transport used by attestation submit. CI gates enforce all halves
+(default and read stay clean; submit / settlement-submit / settlement-dispute
+must positively contain the chain crates) on every push / PR. See
+[`docs/operator-runbook.md`](docs/operator-runbook.md) for the full operator
+runbook and
+[`docs/inference-settlement-protocol-reference.md`](docs/inference-settlement-protocol-reference.md)
+for the settlement subprotocol contract.
 
 ---
 
@@ -156,8 +166,23 @@ path because the eligibility registry is empty by design.
                                     NO halo2 / omni-proofs-halo2-* / rand_chacha
                                     (CI default-tree gate enforces)
 
-   +submit                          adds SUM Chain submit path
+   +submit                          adds SUM Chain attestation submit path
                                     (sumchain-crypto / sumchain-primitives)
+
+   +settlement-read                 adds InferenceSettlement read RPCs +
+                                    `operator settlement { status, session,
+                                    claimable, verifier }`; NO chain crates
+                                    (dependency-neutral vs default)
+
+   +settlement-submit               superset of settlement-read; adds
+                                    verifier self-claim
+                                    `operator settlement claim`; pulls
+                                    sumchain-crypto / sumchain-primitives via
+                                    the same signing infrastructure as submit
+
+   +settlement-dispute              superset of settlement-submit; adds
+                                    `operator settlement dispute {open,resolve}`
+                                    against the chain builder RPCs
 
    +stage11d-production-verify      adds Halo2 production-MLP verifier
                                     (halo2_proofs + omni-proofs-halo2-production-mlp)
@@ -254,6 +279,7 @@ Deeper docs live in [`docs/`](docs/). Common entry points:
 | Doc | Use it when … |
 | --- | --- |
 | [`operator-runbook.md`](docs/operator-runbook.md) | You are running `omni-node` in production and need the complete operator surface: build modes, subcommands, observability, release-readiness checklist. |
+| [`inference-settlement-protocol-reference.md`](docs/inference-settlement-protocol-reference.md) | You need the current-state protocol reference for the SUM Chain `InferenceSettlement` subprotocol: activation gates, claim eligibility rules, validator-quorum dispute model, verifier registry + bonds, consistency / plurality mode, sponsored-attestation boundary, canonical terminology. |
 | [`production-mlp-proof.md`](docs/production-mlp-proof.md) | You need the operator + integrator guide for the Halo2 production MLP proof: feature flags, math contract, pinned constants, verifier drift-detection, dependency posture. |
 | [`project-status.md`](docs/project-status.md) | You want the durable delivery record — every phase, every stage, what actually shipped. Formerly the bulk of this README. |
 | [`stage14.8-proof-generation-readiness.md`](docs/stage14.8-proof-generation-readiness.md) | You need the closure and readiness packet for the Stage 14 proof-generation track (reference + production paths, StubRunner + ExternalCommandRunner sidecars, acceptance hardening). |
