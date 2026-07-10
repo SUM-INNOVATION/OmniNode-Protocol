@@ -69,6 +69,11 @@ pub mod settlement;
 pub mod status;
 #[cfg(feature = "submit")]
 pub mod tx;
+// Issue #87 — settlement claim WRITE path. Superset of
+// `settlement-read` + `submit`; adds no new crates on top of
+// `submit`. See `settlement_submit/mod.rs` for the module contract.
+#[cfg(feature = "settlement-submit")]
+pub mod settlement_submit;
 
 pub use client::SumChainClient;
 pub use dto::{

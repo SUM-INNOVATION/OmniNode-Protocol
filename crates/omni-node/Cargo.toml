@@ -29,6 +29,18 @@ submit  = ["omni-sumchain/submit"]
 # (Issue #87) each build on this feature. Default builds resolve to
 # the exact same dep tree with or without this flag.
 settlement-read = ["omni-sumchain/settlement-read"]
+# Issue #87 — settlement claim WRITE path. Superset of
+# `settlement-read`. Pulls the chain primitives + crypto via
+# `omni-sumchain/settlement-submit`, which in turn pulls
+# `omni-sumchain/submit`. Explicitly does NOT include `omni-node/submit`:
+# the attestation smoke/loop path is a distinct write flow and is
+# not required by the claim submission code path. Operators who want
+# both must combine features (e.g. `--features 'submit
+# settlement-submit'`).
+settlement-submit = [
+    "settlement-read",
+    "omni-sumchain/settlement-submit",
+]
 # Stage 11b.1.b — opt-in feature that pulls the halo2 reference
 # verifier into the operator binary's `verify-proof` dispatch.
 # Default-OFF: the operator binary's compile graph contains zero

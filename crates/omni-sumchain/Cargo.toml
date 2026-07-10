@@ -24,6 +24,13 @@ submit  = ["dep:sumchain-primitives", "dep:sumchain-crypto"]
 # introduced by sum-chain#76 / #86. Default builds resolve to the
 # exact same dependency tree with or without this feature.
 settlement-read = []
+# Issue #87 — settlement claim WRITE path. Superset of
+# `settlement-read` (needs the settlement read RPCs for prechecks) and
+# `submit` (needs sumchain-primitives + sumchain-crypto for
+# `TransactionV2` decode + `SignedTransaction::to_hex()` + the
+# existing sum_sendRawTransaction transport already used by the
+# attestation submit flow). Adds no new crates on top of `submit`.
+settlement-submit = ["settlement-read", "submit"]
 
 [dependencies]
 omni-types          = { workspace = true }
