@@ -164,11 +164,12 @@ pub struct InferenceDisputesRaw {
 ///    party challengers cannot open disputes at the RPC level.
 /// 2. Validator quorum votes on the dispute; non-signing validators
 ///    are abstentions (see sum-chain#86, terminology preserved in
-///    `docs/inference-settlement-v1-evidence.md`).
-/// 3. Chain resolves to approved (claim proceeds) or denied (claim
-///    refused; slashing may follow ONLY for bond-required sessions
-///    where the chain owns the slashing logic — reward denial alone
-///    is NOT slashing).
+///    `docs/inference-settlement-protocol-reference.md`).
+/// 3. Chain resolves to `ResolvedAllowClaim` (claim proceeds) or
+///    `ResolvedDenyClaim` (claim refused). Bond penalty may follow
+///    ONLY for bond-required sessions where the chain owns the
+///    penalty logic — reward denial alone is NOT bond penalty.
+///    See `docs/inference-settlement-protocol-reference.md` §6.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InferenceDisputeRaw {
     /// Chain address of the verifier this dispute targets.
@@ -207,8 +208,8 @@ pub struct ClaimableRewardRaw {
 
     /// Maturity: `finalized_at_height + dispute_window_blocks <= head`.
     /// Chain applies the formula from
-    /// `docs/inference-settlement-v1-evidence.md` (never double-counts
-    /// finality).
+    /// `docs/inference-settlement-protocol-reference.md` §3 rule 5
+    /// (never double-counts finality).
     pub mature: bool,
 
     /// The absolute chain height at which the reward becomes claimable.
