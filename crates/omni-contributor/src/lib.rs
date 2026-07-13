@@ -46,8 +46,6 @@ pub mod error;
 pub mod handoff;
 pub mod handoff_verify;
 pub mod integrity;
-pub mod integrity_evidence_bundle;
-pub mod integrity_evidence_chain;
 pub mod job;
 pub mod net;
 pub mod peer_advert;
@@ -59,10 +57,6 @@ pub mod repair;
 pub mod restore;
 pub mod result;
 pub mod resume;
-pub mod signed_baseline;
-pub mod signed_bundle;
-pub mod signed_chain;
-pub mod signed_diff;
 pub mod run;
 pub mod runner;
 pub mod session;
@@ -79,11 +73,9 @@ pub mod watch;
 
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
-    ArchiveError, CanonicalError, ChainVerifyError, CleanupError, ContributorError,
-    DiscoverError, EvidenceBundleError, IntegrityDiffError, IntegrityError,
-    PlannerError, QuarantineRestoreError, RelayError, RepairError, RestoreError,
-    RunnerError, SchemaError, SignedBaselineError, SignedIntegrityDiffError,
-    SignedIntegrityEvidenceBundleError, SignedIntegrityEvidenceChainReportError,
+    ArchiveError, CanonicalError, CleanupError, ContributorError, DiscoverError,
+    IntegrityDiffError, IntegrityError, PlannerError, QuarantineRestoreError,
+    RelayError, RepairError, RestoreError, RunnerError, SchemaError,
     SigningError, SnipError, StatusError, VerifyError,
 };
 pub use repair::{
@@ -118,22 +110,6 @@ pub use integrity::{
     SessionIntegritySummary, StateIntegrityDiffReport, StateIntegrityReport,
     STATE_INTEGRITY_DIFF_SCHEMA_VERSION, STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
 };
-pub use integrity_evidence_bundle::{
-    build_integrity_evidence_bundle, read_integrity_evidence_bundle_from_path,
-    verify_integrity_evidence_bundle, write_integrity_evidence_bundle_atomic,
-    BundleArtifactKind, BundleBuilderInput, BundleBuilderOptions, BundleEntry,
-    BundleEntryOutcome, BundleEntryVerifyOutcome, BundleVerifyReport,
-    IntegrityEvidenceBundle, VerifyOptions as BundleVerifyOptions,
-    BUNDLE_ENTRY_MAX_BYTES, BUNDLE_LABEL_MAX, BUNDLE_MAX_ENTRIES, BUNDLE_NOTES_MAX,
-    INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION,
-};
-pub use integrity_evidence_chain::{
-    baseline_child_reason_tag, diff_child_reason_tag,
-    verify_integrity_evidence_chain,
-    write_integrity_evidence_chain_report_atomic, ChainChildEntryOutcome,
-    ChainStepOutcome, ChainVerifyOptions, IntegrityEvidenceChainReport,
-    INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION,
-};
 pub use cleanup::{
     apply_state_cleanup, cleanup_plan_hash_hex, plan_state_cleanup,
     restore_state_cleanup_quarantine, source_integrity_hash_hex,
@@ -143,34 +119,6 @@ pub use cleanup::{
     QuarantineRestoreOptions, QuarantineRestoreOutcome, QuarantineRestoreReport,
     QuarantineRestoreSource, StateCleanupPlan, CLEANUP_PLAN_SCHEMA_VERSION,
     QUARANTINE_MANIFEST_SCHEMA_VERSION,
-};
-pub use signed_baseline::{
-    read_signed_baseline_from_path, sign_state_integrity_baseline,
-    signed_baseline_signing_input, verify_signed_state_integrity_baseline,
-    write_signed_baseline_atomic, BaselineSignerRole, SignedStateIntegrityBaseline,
-    SIGNED_BASELINE_SCHEMA_VERSION,
-};
-pub use signed_diff::{
-    read_signed_integrity_diff_from_path, sign_state_integrity_diff,
-    signed_integrity_diff_signing_input, verify_signed_state_integrity_diff,
-    write_signed_integrity_diff_atomic, SignedStateIntegrityDiff,
-    SIGNED_INTEGRITY_DIFF_SCHEMA_VERSION,
-};
-pub use signed_bundle::{
-    read_signed_integrity_evidence_bundle_from_path,
-    sign_integrity_evidence_bundle, signed_integrity_evidence_bundle_signing_input,
-    verify_signed_integrity_evidence_bundle,
-    write_signed_integrity_evidence_bundle_atomic, SignedIntegrityEvidenceBundle,
-    SIGNED_INTEGRITY_EVIDENCE_BUNDLE_SCHEMA_VERSION,
-};
-pub use signed_chain::{
-    read_signed_integrity_evidence_chain_report_from_path,
-    sign_integrity_evidence_chain_report,
-    signed_integrity_evidence_chain_report_signing_input,
-    verify_signed_integrity_evidence_chain_report,
-    write_signed_integrity_evidence_chain_report_atomic,
-    SignedIntegrityEvidenceChainReport,
-    SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_SCHEMA_VERSION,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,

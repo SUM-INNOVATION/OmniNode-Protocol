@@ -48,7 +48,6 @@ pub mod attestation;
 pub mod chain;
 pub mod chain_wire;
 pub mod error;
-pub mod evidence_anchor;
 pub mod orchestration;
 pub mod proof;
 pub mod registry;
@@ -70,58 +69,9 @@ pub use chain_wire::{
 };
 pub use error::{
     AttestationError, AttestationResult, ChainClientError, ChainWireError, ChainWireResult,
-    EvidenceAnchorError, EvidenceAnchorResult, ProofArtifactError, ProofBackendError,
-    ProofPipelineError, ProofVerifierError, RegistryError, RegistryResult, Result, SignerError,
+    ProofArtifactError, ProofBackendError, ProofPipelineError, ProofVerifierError,
+    RegistryError, RegistryResult, Result, SignerError,
 };
-pub use evidence_anchor::{
-    anchor_hex_lower, anchor_signer_pubkey_bytes, anchor_signing_input_bytes,
-    anchor_signing_input_for_digest, apply_anchor_archive, apply_anchor_cleanup,
-    apply_anchor_export, apply_anchor_export_import,
-    bincode1_serialize_anchor_tx_data, build_anchor_consistency_report,
-    build_anchor_digest, canonical_anchor_bytes,
-    check_evidence_anchor_registry_health, evidence_anchor_reason_tag,
-    list_evidence_anchors_by_status, list_stale_submitted_or_included,
-    local_status_from_chain, lookup_anchor_by_tuple_workflow, parse_anchor_hex_32,
-    plan_anchor_archive, plan_anchor_cleanup, plan_anchor_export,
-    plan_anchor_export_import, query_evidence_anchor_workflow,
-    reconcile_evidence_anchors_workflow, restore_anchor_archive,
-    restore_anchor_cleanup_quarantine,
-    sign_anchor_digest, submit_evidence_anchor_workflow,
-    verify_anchor_against_registry, verify_anchor_export,
-    verify_anchor_file_against_artifact_bytes, verify_anchor_tx_data,
-    AnchorApplyOptions, AnchorArchiveAction, AnchorArchiveActionKind,
-    AnchorArchiveActionOutcome, AnchorArchiveApplyOptions, AnchorArchiveEntry,
-    AnchorArchiveManifest, AnchorArchivePlan, AnchorArchivePlanOptions,
-    AnchorArchiveReport, AnchorArchiveRestoreOptions, AnchorArchiveRestoreOutcome,
-    AnchorArchiveRestoreReport, AnchorArchiveSelection, AnchorCleanupAction,
-    AnchorCleanupActionKind, AnchorCleanupActionOutcome, AnchorCleanupPlan,
-    AnchorCleanupReport, AnchorExportEntry, AnchorExportEntryKind,
-    AnchorExportManifest, AnchorExportOptions, AnchorExportPlan,
-    AnchorExportReport, AnchorExportSelection, AnchorExportVerifyOptions,
-    AnchorExportVerifyReport, AnchorImportActionOutcome, AnchorImportOptions,
-    AnchorImportPlan, AnchorImportReport, AnchorImportSelection,
-    AnchorConsistencyFinding, AnchorConsistencyFindingKind,
-    AnchorConsistencyOptions, AnchorConsistencyReport,
-    AnchorConsistencySeverity, AnchorConsistencySummary, AnchorPlanOptions,
-    AnchorQuarantineEntry, AnchorQuarantineManifest,
-    AnchorQuarantineRestoreOutcome, AnchorQuarantineRestoreReport, AnchorRecord,
-    AnchorRestoreOptions, AnchorSelector, AnchorStatus, AnchorStatusReport,
-    AnchorSubmissionReceipt, AnchoredArtifactKind, ArtifactBytesInclusion,
-    BatchStatusItem, EvidenceAnchorChainClient,
-    EvidenceAnchorRegistryHealth, EvidenceAnchorRegistrySummary,
-    IntegrityEvidenceAnchorDigest, IntegrityEvidenceAnchorTxData,
-    LocalAnchorStatus, LocalEvidenceAnchorRegistry, PlannedImportAction,
-    QueryAnchorOutcome, StaleAnchorInfo, StubEvidenceAnchorChainClient,
-    TupleLookupOutcome, TupleLookupResult, VerifiedWrapperMetadata,
-    ANCHOR_ARCHIVE_MANIFEST_SCHEMA_VERSION,
-    ANCHOR_ARCHIVE_PLAN_SCHEMA_VERSION, ANCHOR_CLEANUP_PLAN_SCHEMA_VERSION,
-    ANCHOR_CONSISTENCY_REPORT_SCHEMA_VERSION,
-    ANCHOR_QUARANTINE_MANIFEST_SCHEMA_VERSION, EVIDENCE_ANCHOR_DOMAIN,
-    ANCHOR_STATUS_BATCH_MAX, EVIDENCE_ANCHOR_EXPORT_MANIFEST_SCHEMA_VERSION,
-    EXPORT_MANIFEST_FILENAME, FAILED_REASON_NULL_FALLBACK,
-    INTEGRITY_EVIDENCE_ANCHOR_SCHEMA_VERSION,
-};
-pub use evidence_anchor::canonicalize_tx_hash;
 pub use proof::{
     check_mainnet_eligible, mainnet_vk_hash, produce_proof_artifact, AllowlistEntry,
     MainnetRefusalReason, MockProofBackend, MockProofVerifier, ModelFormat, ModelFramework,

@@ -517,41 +517,6 @@ pub const PARTIAL_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-PARTIAL:v1:";
 /// 35 ASCII bytes.
 pub const AGGREGATED_DOMAIN: &[u8] = b"OMNINODE-CONTRIBUTOR-AGGREGATED:v1:";
 
-/// Stage 12.20 — domain separator for the local-only signed
-/// integrity-baseline wrapper. Mirrors the existing wire-envelope
-/// convention but is consumed only by `signed_baseline.rs` —
-/// no protocol surface, no gossipsub topic, no SNIP wire.
-pub const SIGNED_BASELINE_DOMAIN: &[u8] =
-    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-BASELINE:v1:";
-
-/// Stage 12.21 — domain separator for the local-only signed
-/// integrity-diff wrapper. Same posture as
-/// `SIGNED_BASELINE_DOMAIN`: consumed only by `signed_diff.rs`;
-/// no protocol surface, no gossipsub topic, no SNIP wire.
-pub const SIGNED_INTEGRITY_DIFF_DOMAIN: &[u8] =
-    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-DIFF:v1:";
-
-/// Stage 12.23 — domain separator for the local-only signed
-/// integrity-evidence-bundle wrapper. Same posture as
-/// `SIGNED_BASELINE_DOMAIN` / `SIGNED_INTEGRITY_DIFF_DOMAIN`:
-/// consumed only by `signed_bundle.rs`; no protocol surface,
-/// no gossipsub topic, no SNIP wire. Distinct from the
-/// baseline and diff domains so the three signed-artifact
-/// families can't be cross-substituted.
-pub const SIGNED_INTEGRITY_EVIDENCE_BUNDLE_DOMAIN: &[u8] =
-    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-EVIDENCE-BUNDLE:v1:";
-
-/// Stage 12.25 — domain separator for the local-only signed
-/// integrity-evidence-chain-report wrapper. Same posture as
-/// the Stage 12.20/12.21/12.23 sibling domains: consumed only
-/// by `signed_chain.rs`; no protocol surface, no gossipsub
-/// topic, no SNIP wire. Distinct from `SIGNED_BASELINE_DOMAIN`,
-/// `SIGNED_INTEGRITY_DIFF_DOMAIN`, and
-/// `SIGNED_INTEGRITY_EVIDENCE_BUNDLE_DOMAIN` so the four
-/// signed-artifact families can't be cross-substituted.
-pub const SIGNED_INTEGRITY_EVIDENCE_CHAIN_REPORT_DOMAIN: &[u8] =
-    b"OMNINODE-CONTRIBUTOR-SIGNED-INTEGRITY-EVIDENCE-CHAIN-REPORT:v1:";
-
 // --- ExecutionSession ---
 
 #[derive(Debug, Serialize)]

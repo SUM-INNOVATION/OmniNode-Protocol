@@ -18,16 +18,14 @@ use std::collections::HashMap;
 
 use omni_zkml::ChainClientError;
 
-// ── Stage 13.2 — Pinned error-prefix constants + typed classifier ────────────
+// ── Pinned error-prefix constants + typed classifier ─────────────────────────
 
-/// Stage 13.2 — pinned `ChainClientError::Other(_)` message
-/// prefixes produced by `UreqTransport::call` and (additively)
-/// by [`crate::client::SumChainClient`]'s `EvidenceAnchorChainClient`
-/// impl. These strings are stable for the lifetime of Stage 13.x;
-/// bumping any of them is a coordinated wire-classification
-/// change that requires updating consumers (OmniNode's CLI
-/// reason-tag mapper) AND the
-/// `tests/error_prefix_classification_is_stable.rs` regression.
+/// Pinned `ChainClientError::Other(_)` message prefixes produced
+/// by `UreqTransport::call`. These strings are stable; bumping any
+/// of them is a coordinated wire-classification change that
+/// requires updating consumers (OmniNode's CLI reason-tag mapper)
+/// AND the `tests/error_prefix_classification_is_stable.rs`
+/// regression.
 ///
 /// Consumers MUST go through [`classify_chain_client_error`]
 /// rather than inspecting these strings directly — the typed
@@ -40,25 +38,6 @@ pub mod error_prefixes {
     pub const MISSING_RESULT_FIELD: &str =
         "JSON-RPC response missing required `result` field";
     pub const JSONRPC_ERROR: &str = "JSON-RPC error: ";
-
-    // ── Stage 13.2 adapter-layer additions ───────────────────────────
-    pub const ADAPTER_NOT_ACTIVATED: &str = "integrity_evidence_anchor not activated";
-    pub const ADAPTER_SAME_KEY_FAIL: &str = "same-key submitter check: ";
-    pub const ADAPTER_MALFORMED_SUBMIT_RESP: &str =
-        "malformed sum_submitIntegrityEvidenceAnchor response: ";
-    pub const ADAPTER_MALFORMED_STATUS_RESP: &str =
-        "malformed sum_getIntegrityEvidenceAnchorStatus response: ";
-    pub const ADAPTER_UNRECOGNIZED_STATUS: &str = "unrecognized anchor status: ";
-
-    // ── Stage 13.9 adapter-layer additions ───────────────────────────
-    pub const ADAPTER_MALFORMED_STATUS_BATCH_RESP: &str =
-        "malformed sum_getIntegrityEvidenceAnchorStatusBatch response: ";
-    pub const ADAPTER_BATCH_ORDER_MISMATCH: &str =
-        "batch response order mismatch: ";
-    pub const ADAPTER_BATCH_LENGTH_MISMATCH: &str =
-        "batch response length mismatch: ";
-    pub const ADAPTER_MALFORMED_BY_TUPLE_RESP: &str =
-        "malformed sum_getIntegrityEvidenceAnchorByTuple response: ";
 }
 
 /// Closed-set category for `ChainClientError::Other(_)` produced
@@ -76,17 +55,6 @@ pub enum ChainErrorCategory {
     /// Chain returned a JSON-RPC error object. Surfaces to CLI
     /// as `reason=chain_submit_refused`.
     JsonRpcError,
-    /// Success response shape parse failure OR unrecognized
-    /// enum string (e.g. status="foo"). Surfaces to CLI as
-    /// `reason=chain_response_malformed`.
-    Malformed,
-    /// Adapter activation gate refused pre-POST. Surfaces to
-    /// CLI as `reason=not_activated`.
-    AdapterNotActivated,
-    /// Adapter same-key gate refused pre-POST. Surfaces to CLI
-    /// as `reason=chain_rpc` (catch-all — upstream workflow
-    /// should have caught this).
-    AdapterSameKeyFail,
     /// Anything we don't recognize. CLI emits `reason=chain_rpc`
     /// for safety.
     Unknown,
@@ -101,27 +69,6 @@ pub fn classify_chain_client_error(err: &ChainClientError) -> ChainErrorCategory
     let msg = match err {
         ChainClientError::Other(s) => s.as_str(),
     };
-    // Adapter-layer prefixes (Stage 13.2 — these are emitted by
-    // omni-sumchain BEFORE any transport call, so they take
-    // precedence over the transport prefixes in the match order.
-    // None of the transport prefixes start with these strings,
-    // so ordering is for clarity, not correctness).
-    if msg.starts_with(ADAPTER_NOT_ACTIVATED) {
-        return ChainErrorCategory::AdapterNotActivated;
-    }
-    if msg.starts_with(ADAPTER_SAME_KEY_FAIL) {
-        return ChainErrorCategory::AdapterSameKeyFail;
-    }
-    if msg.starts_with(ADAPTER_MALFORMED_SUBMIT_RESP)
-        || msg.starts_with(ADAPTER_MALFORMED_STATUS_RESP)
-        || msg.starts_with(ADAPTER_UNRECOGNIZED_STATUS)
-        || msg.starts_with(ADAPTER_MALFORMED_STATUS_BATCH_RESP)
-        || msg.starts_with(ADAPTER_BATCH_ORDER_MISMATCH)
-        || msg.starts_with(ADAPTER_BATCH_LENGTH_MISMATCH)
-        || msg.starts_with(ADAPTER_MALFORMED_BY_TUPLE_RESP)
-    {
-        return ChainErrorCategory::Malformed;
-    }
     // Transport / JSON-RPC envelope prefixes.
     if msg.starts_with(JSONRPC_ERROR) {
         return ChainErrorCategory::JsonRpcError;
