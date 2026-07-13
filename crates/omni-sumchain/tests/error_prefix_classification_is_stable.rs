@@ -33,19 +33,6 @@ fn pinned_prefix_values_are_unchanged() {
         "JSON-RPC response missing required `result` field"
     );
     assert_eq!(JSONRPC_ERROR, "JSON-RPC error: ");
-
-    // Stage 13.2 adapter-layer additions.
-    assert_eq!(ADAPTER_NOT_ACTIVATED, "integrity_evidence_anchor not activated");
-    assert_eq!(ADAPTER_SAME_KEY_FAIL, "same-key submitter check: ");
-    assert_eq!(
-        ADAPTER_MALFORMED_SUBMIT_RESP,
-        "malformed sum_submitIntegrityEvidenceAnchor response: "
-    );
-    assert_eq!(
-        ADAPTER_MALFORMED_STATUS_RESP,
-        "malformed sum_getIntegrityEvidenceAnchorStatus response: "
-    );
-    assert_eq!(ADAPTER_UNRECOGNIZED_STATUS, "unrecognized anchor status: ");
 }
 
 // ── Transport prefixes → Transport ───────────────────────────────────────────
@@ -105,56 +92,6 @@ fn jsonrpc_error_object_classifies_as_jsonrpc_error() {
             "{JSONRPC_ERROR}{{\"code\":-32601,\"message\":\"method not found\"}}"
         ))),
         ChainErrorCategory::JsonRpcError
-    );
-}
-
-// ── Adapter-layer prefixes → corresponding categories ────────────────────────
-
-#[test]
-fn adapter_not_activated_classifies_as_adapter_not_activated() {
-    assert_eq!(
-        classify_chain_client_error(&err(ADAPTER_NOT_ACTIVATED)),
-        ChainErrorCategory::AdapterNotActivated
-    );
-}
-
-#[test]
-fn adapter_same_key_fail_classifies_as_adapter_same_key_fail() {
-    assert_eq!(
-        classify_chain_client_error(&err(&format!(
-            "{ADAPTER_SAME_KEY_FAIL}seed derives a, digest declares b"
-        ))),
-        ChainErrorCategory::AdapterSameKeyFail
-    );
-}
-
-#[test]
-fn adapter_malformed_submit_response_classifies_as_malformed() {
-    assert_eq!(
-        classify_chain_client_error(&err(&format!(
-            "{ADAPTER_MALFORMED_SUBMIT_RESP}null"
-        ))),
-        ChainErrorCategory::Malformed
-    );
-}
-
-#[test]
-fn adapter_malformed_status_response_classifies_as_malformed() {
-    assert_eq!(
-        classify_chain_client_error(&err(&format!(
-            "{ADAPTER_MALFORMED_STATUS_RESP}missing field 'status'"
-        ))),
-        ChainErrorCategory::Malformed
-    );
-}
-
-#[test]
-fn adapter_unrecognized_status_classifies_as_malformed() {
-    assert_eq!(
-        classify_chain_client_error(&err(&format!(
-            "{ADAPTER_UNRECOGNIZED_STATUS}\"foo\""
-        ))),
-        ChainErrorCategory::Malformed
     );
 }
 

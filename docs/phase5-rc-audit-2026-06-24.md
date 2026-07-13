@@ -209,17 +209,17 @@ not repeated.
 | 11d.3B | Proof Eligibility Registry terminology + license normalization | Complete | [`docs/stage11.d.3B-proof-eligibility-registry-alignment.md`](stage11.d.3B-proof-eligibility-registry-alignment.md) |
 | 11d.3C | OmniNode-side consumption of chain registry state | **Not started** — blocked on chain-side `CandidateRefused` record landing | — |
 | 12.16–12.26 | Signed integrity baseline / diff / evidence bundle / evidence chain / signed reports / docs prefix | Complete | folded into [`docs/stage12-contributor-protocol.md`](stage12-contributor-protocol.md) (~1900 lines) |
-| 13.0 | Chain anchoring for integrity evidence (stub + wire spec) | Complete | [`docs/stage13-evidence-anchor-spec.md`](stage13-evidence-anchor-spec.md) |
-| 13.1 | Chain-team review packet + wire fixtures | Complete | [`docs/stage13.1-chain-adapter-review.md`](stage13.1-chain-adapter-review.md) |
-| 13.2 | Real SUM Chain adapter for integrity-evidence anchors | Complete | [`docs/stage13.2-chain-adapter.md`](stage13.2-chain-adapter.md) |
-| 13.3 | Operator hardening for anchor lifecycle (summary, watch) | Complete | [`docs/stage13.3-anchor-operations.md`](stage13.3-anchor-operations.md) |
-| 13.4 | Anchor-registry cleanup with quarantine and restore | Complete | [`docs/stage13.4-anchor-cleanup.md`](stage13.4-anchor-cleanup.md) |
-| 13.5 | Local-only anchor export with portable manifest | Complete | [`docs/stage13.5-anchor-export.md`](stage13.5-anchor-export.md) |
-| 13.6 | Anchor export import / registry restore | Complete | [`docs/stage13.6-anchor-import.md`](stage13.6-anchor-import.md) |
-| 13.7 | Local terminal-anchor archive and restore | Complete | [`docs/stage13.7-anchor-archive.md`](stage13.7-anchor-archive.md) |
-| 13.8 | Local integrity-evidence-anchor consistency report | Complete | [`docs/stage13.8-anchor-consistency-report.md`](stage13.8-anchor-consistency-report.md) |
-| 13.9 | SUM Chain read/reconcile integration | Complete | [`docs/stage13.9-chain-read-reconcile.md`](stage13.9-chain-read-reconcile.md) |
-| 13.10 | Operator acceptance umbrella for the 13.x track | Complete | [`docs/stage13.10-acceptance.md`](stage13.10-acceptance.md) |
+| 13.0 | Chain anchoring for integrity evidence (stub + wire spec) | Complete | [`docs/stage13-evidence-anchor-spec.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13-evidence-anchor-spec.md) |
+| 13.1 | Chain-team review packet + wire fixtures | Complete | [`docs/stage13.1-chain-adapter-review.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.1-chain-adapter-review.md) |
+| 13.2 | Real SUM Chain adapter for integrity-evidence anchors | Complete | [`docs/stage13.2-chain-adapter.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.2-chain-adapter.md) |
+| 13.3 | Operator hardening for anchor lifecycle (summary, watch) | Complete | [`docs/stage13.3-anchor-operations.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.3-anchor-operations.md) |
+| 13.4 | Anchor-registry cleanup with quarantine and restore | Complete | [`docs/stage13.4-anchor-cleanup.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.4-anchor-cleanup.md) |
+| 13.5 | Local-only anchor export with portable manifest | Complete | [`docs/stage13.5-anchor-export.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.5-anchor-export.md) |
+| 13.6 | Anchor export import / registry restore | Complete | [`docs/stage13.6-anchor-import.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.6-anchor-import.md) |
+| 13.7 | Local terminal-anchor archive and restore | Complete | [`docs/stage13.7-anchor-archive.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.7-anchor-archive.md) |
+| 13.8 | Local integrity-evidence-anchor consistency report | Complete | [`docs/stage13.8-anchor-consistency-report.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.8-anchor-consistency-report.md) |
+| 13.9 | SUM Chain read/reconcile integration | Complete | [`docs/stage13.9-chain-read-reconcile.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.9-chain-read-reconcile.md) |
+| 13.10 | Operator acceptance umbrella for the 13.x track | Complete | [`docs/stage13.10-acceptance.md`](https://github.com/SUM-INNOVATION/OmniNode-Protocol/blob/590d9263bb621b5f2af9e8da34e289bce5534860/docs/stage13.10-acceptance.md) |
 | 13.x housekeeping | Pre-existing clippy cleanup + Stage 6 byte-stability honoring | Complete | merged via PR #57 (commits `8cf6bbe`, `603f6a3`) |
 | 14.1 | Halo2 reference operator prover | Complete | [`docs/stage14.1-halo2-reference-prove.md`](stage14.1-halo2-reference-prove.md) |
 | 14.2 | Reference contributor StubRunner sidecar | Complete | [`docs/stage14.2-contributor-halo2-reference-proof.md`](stage14.2-contributor-halo2-reference-proof.md) |
