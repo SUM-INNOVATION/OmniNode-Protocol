@@ -6,24 +6,26 @@
 use std::path::Path;
 
 use omni_contributor::{
-    apply_state_cleanup,
     canonical::{
         aggregated_result_signing_input, assignment_id_hex,
         canonical_partial_result_bytes, contributor_join_signing_input,
-        execution_session_signing_input, hex_lower, partial_result_signing_input,
-        session_id_hex, work_assignment_signing_input,
+        execution_session_signing_input, hex_lower,
+        partial_result_signing_input, session_id_hex,
+        work_assignment_signing_input,
     },
-    plan_state_cleanup,
     result::{MeasuredAccounting, StageContribution, WorkUnitKind},
-    restore_state_cleanup_quarantine, scan_state_integrity_with_audit_orphans,
     session::{
         AggregatedContributorResult, AggregatedPartialRef, ContributorJoin,
         ExecutionSession, PartialContributorResult, WorkAssignment, WorkKind,
     },
-    verify_quarantine_manifest, CleanupApplyOptions, CleanupPlanOptions,
-    ContributorSigner, ContributorStateStore, CoordinatorSigner, FindingKind,
-    QuarantineRestoreOptions, QuarantineRestoreSource, ScanOptions,
+    ContributorSigner, ContributorStateStore, CoordinatorSigner,
     SESSION_SCHEMA_VERSION,
+};
+use omni_ops::{
+    apply_state_cleanup, plan_state_cleanup, restore_state_cleanup_quarantine,
+    scan_state_integrity_with_audit_orphans, verify_quarantine_manifest,
+    CleanupApplyOptions, CleanupPlanOptions, FindingKind,
+    QuarantineRestoreOptions, QuarantineRestoreSource, ScanOptions,
 };
 
 const COORD_SEED: [u8; 32] = *b"stage12.18-restore-coord-seed-32";
@@ -785,7 +787,7 @@ fn orphan_assignment_entry_requires_allow_flag() {
 
 #[test]
 fn rollback_restores_pre_cleanup_source_integrity_hash() {
-    use omni_contributor::source_integrity_hash_hex;
+    use omni_ops::source_integrity_hash_hex;
     let state_dir = fresh_dir();
     let store = open_store(state_dir.path());
     let session = seed_aggregated_session(&store);
@@ -822,12 +824,12 @@ fn rollback_restores_pre_cleanup_source_integrity_hash() {
         .iter()
         .all(|a| matches!(
             a.kind,
-            omni_contributor::CleanupActionKind::QuarantineVerifiedFile
-                | omni_contributor::CleanupActionKind::QuarantineAndUnmarkJoin
-                | omni_contributor::CleanupActionKind::QuarantineAndUnmarkAssignment
-                | omni_contributor::CleanupActionKind::QuarantineAndUnmarkPartial
-                | omni_contributor::CleanupActionKind::QuarantineAndUnmarkSupersession
-                | omni_contributor::CleanupActionKind::QuarantineAndUnmarkOrphanAssignment
+            omni_ops::CleanupActionKind::QuarantineVerifiedFile
+                | omni_ops::CleanupActionKind::QuarantineAndUnmarkJoin
+                | omni_ops::CleanupActionKind::QuarantineAndUnmarkAssignment
+                | omni_ops::CleanupActionKind::QuarantineAndUnmarkPartial
+                | omni_ops::CleanupActionKind::QuarantineAndUnmarkSupersession
+                | omni_ops::CleanupActionKind::QuarantineAndUnmarkOrphanAssignment
         )), "{:?}", plan.actions.iter().map(|a| a.kind).collect::<Vec<_>>());
     let quarantine = fresh_dir();
     let mut apply_options = apply_opts(quarantine.path(), NOW_UTC);

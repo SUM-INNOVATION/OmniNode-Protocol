@@ -8,24 +8,27 @@
 use std::path::Path;
 
 use omni_contributor::{
-    apply_state_cleanup, archive_session,
     canonical::{
         aggregated_result_signing_input, assignment_id_hex,
         canonical_partial_result_bytes, contributor_join_signing_input,
-        execution_session_signing_input, hex_lower, partial_result_signing_input,
-        session_id_hex, work_assignment_signing_input,
+        execution_session_signing_input, hex_lower,
+        partial_result_signing_input, session_id_hex,
+        work_assignment_signing_input,
     },
-    cleanup_plan_hash_hex, plan_state_cleanup,
     result::{MeasuredAccounting, StageContribution, WorkUnitKind},
-    scan_state_integrity, scan_state_integrity_with_audit_orphans,
     session::{
         AggregatedContributorResult, AggregatedPartialRef, ContributorJoin,
         ExecutionSession, PartialContributorResult, WorkAssignment, WorkKind,
     },
-    source_integrity_hash_hex, ArchiveMode, ArchiveOptions, ArchiveStatusRequirement,
-    CleanupActionKind, CleanupApplyOptions, CleanupPlanOptions, ContributorSigner,
-    ContributorStateStore, CoordinatorSigner, FindingKind, ScanOptions,
+    ContributorSigner, ContributorStateStore, CoordinatorSigner,
     SESSION_SCHEMA_VERSION,
+};
+use omni_ops::{
+    apply_state_cleanup, archive_session, cleanup_plan_hash_hex,
+    plan_state_cleanup, scan_state_integrity,
+    scan_state_integrity_with_audit_orphans, source_integrity_hash_hex,
+    ArchiveMode, ArchiveOptions, ArchiveStatusRequirement, CleanupActionKind,
+    CleanupApplyOptions, CleanupPlanOptions, FindingKind, ScanOptions,
 };
 
 const COORD_SEED: [u8; 32] = *b"stage12.17-cleanup-coord-seed-32";
@@ -727,7 +730,7 @@ fn plan_json_roundtrip_preserves_hash() {
             .unwrap();
     let plan = plan_state_cleanup(&report, &orphans, &plan_opts(NOW_UTC)).unwrap();
     let s = serde_json::to_string(&plan).unwrap();
-    let round: omni_contributor::StateCleanupPlan =
+    let round: omni_ops::StateCleanupPlan =
         serde_json::from_str(&s).unwrap();
     assert_eq!(round.cleanup_plan_hash, plan.cleanup_plan_hash);
     assert_eq!(round.source_integrity_hash, plan.source_integrity_hash);

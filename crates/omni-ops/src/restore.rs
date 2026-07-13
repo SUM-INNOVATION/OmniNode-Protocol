@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use crate::archive::{ArchiveManifest, ARCHIVE_MANIFEST_SCHEMA_VERSION};
 use crate::error::RestoreError;
-use crate::state::{ContributorStateStore, STATE_VERSION};
+use omni_contributor::state::{ContributorStateStore, STATE_VERSION};
 
 /// Stage 12.15 — where the archive lives on disk. Operators can
 /// supply either the full session subdirectory or the archive

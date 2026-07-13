@@ -56,18 +56,23 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StatusError;
-use crate::peer_advert::ContributorPeerAdvertisement;
-use crate::peer_routing::{verify_peer_advertisement_body, PeerAdvertisementOutcome};
-use crate::result::WorkUnitKind;
-use crate::session::{
-    AggregatedContributorResult, ContributorJoin, ExecutionSession, PartialContributorResult,
-    WorkAssignment, WorkKind,
+use omni_contributor::peer_advert::ContributorPeerAdvertisement;
+use omni_contributor::peer_routing::{
+    verify_peer_advertisement_body, PeerAdvertisementOutcome,
 };
-use crate::session_verify::{
-    check_not_expired, verify_contributor_join, verify_execution_session,
-    verify_partial_result, verify_work_assignment, SessionVerifyOutcome,
+use omni_contributor::result::WorkUnitKind;
+use omni_contributor::session::{
+    AggregatedContributorResult, ContributorJoin, ExecutionSession,
+    PartialContributorResult, WorkAssignment, WorkKind,
 };
-use crate::state::{ContributorStateStore, StateObjectKind};
+use omni_contributor::session_verify::{
+    check_not_expired, verify_aggregated_result_with_supersessions,
+    verify_contributor_join, verify_execution_session, verify_partial_result,
+    verify_work_assignment, SessionVerifyOutcome,
+};
+use omni_contributor::state::{ContributorStateStore, StateObjectKind};
+use omni_contributor::supersession::WorkAssignmentSupersession;
+use omni_contributor::supersession_verify::verify_assignment_supersession;
 
 /// Stage 12.12 bump: v2 → v3. v3 adds **structured** chain-failure
 /// diagnostics via `invalid_artifacts: Vec<InvalidArtifactStatus>`
@@ -158,7 +163,7 @@ pub struct SupersessionStatus {
     pub supersession_id: String,
     pub superseded_assignment_ids: Vec<String>,
     pub replacement_assignment_ids: Vec<String>,
-    pub reason: crate::supersession::SupersessionReason,
+    pub reason: omni_contributor::supersession::SupersessionReason,
     /// `true` iff `verify_assignment_supersession` returned `Ok`
     /// against the loaded session + assignments.
     pub valid: bool,
@@ -409,14 +414,14 @@ pub fn build_session_status_report(
     // told us it didn't need to be valid.
     let raw_supersessions = store.list_verified_supersessions_for(session_id)?;
     let mut supersession_statuses: Vec<SupersessionStatus> = Vec::new();
-    let mut verified_supersessions: Vec<crate::supersession::WorkAssignmentSupersession> =
+    let mut verified_supersessions: Vec<WorkAssignmentSupersession> =
         Vec::new();
     // Map: assignment_id → the supersession_id that supersedes it
     // (for per-assignment status reporting).
     let mut superseded_by: HashMap<String, String> = HashMap::new();
     let mut seen_superseded: HashSet<String> = HashSet::new();
     for s in raw_supersessions {
-        let outcome = crate::supersession_verify::verify_assignment_supersession(
+        let outcome = verify_assignment_supersession(
             &session,
             &assignments,
             &s,
@@ -573,7 +578,7 @@ pub fn build_session_status_report(
                 .cloned()
                 .collect();
             let outcome =
-                crate::session_verify::verify_aggregated_result_with_supersessions(
+                verify_aggregated_result_with_supersessions(
                     &session,
                     &joins,
                     &assignments,
@@ -754,7 +759,7 @@ fn empty_no_session_report(session_id: &str, now_utc: &str) -> SessionStatusRepo
 }
 
 fn stringify_advert_outcome(o: &PeerAdvertisementOutcome) -> String {
-    use crate::peer_routing::PeerAdvertisementOutcome as O;
+    use omni_contributor::peer_routing::PeerAdvertisementOutcome as O;
     match o {
         O::Verified { .. } => "verified".into(),
         O::AnnouncementSchemaMalformed(s) => format!("ann_schema_malformed:{s}"),

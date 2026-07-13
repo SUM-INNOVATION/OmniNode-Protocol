@@ -10,19 +10,22 @@ use omni_contributor::{
     canonical::{
         aggregated_result_signing_input, assignment_id_hex,
         canonical_partial_result_bytes, contributor_join_signing_input,
-        execution_session_signing_input, hex_lower, partial_result_signing_input,
-        session_id_hex, work_assignment_signing_input,
+        execution_session_signing_input, hex_lower,
+        partial_result_signing_input, session_id_hex,
+        work_assignment_signing_input,
     },
-    diff_state_integrity_reports,
     result::{MeasuredAccounting, StageContribution, WorkUnitKind},
-    scan_state_integrity,
     session::{
         AggregatedContributorResult, AggregatedPartialRef, ContributorJoin,
         ExecutionSession, PartialContributorResult, WorkAssignment, WorkKind,
     },
-    ContributorSigner, ContributorStateStore, CoordinatorSigner, DiffOptions,
-    FindingKind, FindingSeverity, IntegrityFinding, RecommendedAction, ScanOptions,
-    SessionIntegritySummary, StateIntegrityReport, SESSION_SCHEMA_VERSION,
+    ContributorSigner, ContributorStateStore, CoordinatorSigner,
+    SESSION_SCHEMA_VERSION,
+};
+use omni_ops::{
+    diff_state_integrity_reports, scan_state_integrity, DiffOptions,
+    FindingKind, FindingSeverity, IntegrityFinding, RecommendedAction,
+    ScanOptions, SessionIntegritySummary, StateIntegrityReport,
     STATE_INTEGRITY_DIFF_SCHEMA_VERSION, STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
 };
 
@@ -405,7 +408,7 @@ fn diff_json_round_trip_preserves_report() {
     let diff = diff_state_integrity_reports(&a, &b, &diff_opts(NOW_UTC)).unwrap();
 
     let s = serde_json::to_string(&diff).unwrap();
-    let round: omni_contributor::StateIntegrityDiffReport =
+    let round: omni_ops::StateIntegrityDiffReport =
         serde_json::from_str(&s).unwrap();
     assert_eq!(round, diff);
 }
@@ -782,7 +785,7 @@ fn session_summary_diff_does_not_affect_finding_diff() {
 
 #[test]
 fn diff_presentation_view_elides_unchanged_when_summary_only() {
-    use omni_contributor::diff_presentation_view;
+    use omni_ops::diff_presentation_view;
 
     let shared = finding(
         FindingKind::InvalidJoin,

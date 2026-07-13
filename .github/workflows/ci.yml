@@ -80,6 +80,8 @@ jobs:
             -p omni-types \
             -p omni-zkml \
             -p omni-sumchain \
+            -p omni-contributor \
+            -p omni-ops \
             -p omni-node
 
   # ── (2) Default dep-tree: HARD GATE — feature gating keeps submit out ──────
@@ -216,6 +218,32 @@ jobs:
             exit 1
           fi
           echo "default tree: omni-contributor present, no halo2 — Stage 12.0 isolation intact."
+
+      # O5 (issue #103) — omni-ops is a local-disk observability crate.
+      # Its DIRECT dependencies must stay limited to omni-contributor +
+      # serde/serde_json/blake3/thiserror (dev: tempfile); it must never
+      # DECLARE a chain / RPC / networking / proof-backend / trusted-
+      # authority dependency. (The workspace-unified `cargo tree` may show
+      # omni-net via omni-node's omni-contributor `network` feature — that
+      # is feature unification, not an omni-ops dependency; this gate
+      # therefore checks omni-ops's own DIRECT edges.)
+      - name: Assert `omni-ops` direct deps carry no chain / RPC / network / proof crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='sumchain|omni-net|omni-sumchain|halo2|pasta_curves'
+          forbidden="$forbidden|omni-proofs|ureq|risc0|ezkl|omni-zkml|tokio"
+          if cargo tree -p omni-ops -e normal --depth 1 \
+               | grep -Eiq "$forbidden"; then
+            {
+              echo "::error::omni-ops declared a chain/RPC/network/proof direct dependency."
+              echo "O5 requires omni-ops to depend only on omni-contributor +"
+              echo "serde/serde_json/blake3/thiserror (dev: tempfile)."
+            } >&2
+            cargo tree -p omni-ops -e normal --depth 1 >&2
+            exit 1
+          fi
+          echo "omni-ops direct deps clean — O5 local-disk-only boundary intact."
 
   # ── (3) Submit features: full Stage 7b surface ─────────────────────────────
   #

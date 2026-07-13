@@ -16,12 +16,12 @@
 use std::path::PathBuf;
 
 use omni_contributor::{
-    archive_session,
     canonical::{
         aggregated_result_signing_input, assignment_id_hex,
         canonical_partial_result_bytes, contributor_join_signing_input,
-        execution_session_signing_input, hex_lower, partial_result_signing_input,
-        session_id_hex, supersession_id_hex, work_assignment_signing_input,
+        execution_session_signing_input, hex_lower,
+        partial_result_signing_input, session_id_hex, supersession_id_hex,
+        work_assignment_signing_input,
         work_assignment_supersession_signing_input,
     },
     result::{MeasuredAccounting, StageContribution, WorkUnitKind},
@@ -30,11 +30,14 @@ use omni_contributor::{
         ExecutionSession, PartialContributorResult, WorkAssignment, WorkKind,
     },
     supersession::{SupersessionReason, WorkAssignmentSupersession},
-    ArchiveError, ArchiveManifest, ArchiveMode, ArchiveOptions,
-    ArchiveStatusRequirement, ContributorSigner, ContributorStateStore,
-    CoordinatorSigner, RepairError as _RepairError, StateNamespace, StateObjectKind,
-    ARCHIVE_MANIFEST_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
+    ContributorSigner, ContributorStateStore, CoordinatorSigner,
+    StateNamespace, StateObjectKind, SESSION_SCHEMA_VERSION,
     SUPERSESSION_SCHEMA_VERSION,
+};
+use omni_ops::{
+    archive_session, ArchiveError, ArchiveManifest, ArchiveMode,
+    ArchiveOptions, ArchiveStatusRequirement, RepairError as _RepairError,
+    ARCHIVE_MANIFEST_SCHEMA_VERSION,
 };
 
 const COORD_SEED: [u8; 32] = *b"stage12.14-archive-coord-seed32!";

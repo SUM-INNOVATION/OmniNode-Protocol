@@ -512,7 +512,7 @@ fn restart_preload_loads_assignments_and_caches_them() {
     let (store, _) =
         ContributorStateStore::open(dir.path(), false, &now_inside_window()).unwrap();
     let (snapshot, report) =
-        omni_contributor::load_verified_restart_snapshot(&store).unwrap();
+        omni_ops::load_verified_restart_snapshot(&store).unwrap();
     assert_eq!(report.sessions_accepted, 1);
     assert_eq!(report.assignments_accepted, 3);
     assert_eq!(report.supersessions_accepted, 0);
@@ -555,7 +555,7 @@ fn restart_after_supersession_yields_same_status_report() {
     );
 
     // Build status report from the original store.
-    let report_a = omni_contributor::build_session_status_report(
+    let report_a = omni_ops::build_session_status_report(
         &store,
         &session.session_id,
         &now_inside_window(),
@@ -566,7 +566,7 @@ fn restart_after_supersession_yields_same_status_report() {
     // Reopen the same state-dir; build the status report again.
     let (store_reopen, _) =
         ContributorStateStore::open(dir.path(), false, &now_inside_window()).unwrap();
-    let report_b = omni_contributor::build_session_status_report(
+    let report_b = omni_ops::build_session_status_report(
         &store_reopen,
         &session.session_id,
         &now_inside_window(),
@@ -576,7 +576,7 @@ fn restart_after_supersession_yields_same_status_report() {
 
     // Strip the timestamp-y fields that legitimately differ; the
     // chain shape must be bit-equal.
-    let strip = |r: omni_contributor::SessionStatusReport| {
+    let strip = |r: omni_ops::SessionStatusReport| {
         let mut r = r;
         r.generated_at_utc.clear();
         r.notes.clear();
@@ -626,7 +626,7 @@ fn restart_preload_drops_corrupted_supersession_with_note() {
     let (store, _) =
         ContributorStateStore::open(dir.path(), false, &now_inside_window()).unwrap();
     let (snapshot, report) =
-        omni_contributor::load_verified_restart_snapshot(&store).unwrap();
+        omni_ops::load_verified_restart_snapshot(&store).unwrap();
     assert_eq!(report.sessions_accepted, 1);
     assert_eq!(report.supersessions_accepted, 0);
     assert_eq!(report.supersessions_rejected, 1);

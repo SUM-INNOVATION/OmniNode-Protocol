@@ -25,13 +25,13 @@
 //! reorder is a refactor whose end-to-end coverage is the
 //! existing apply-session-reassign suite.
 
-use omni_contributor::{
+use omni_contributor::{supersession::SupersessionReason};
+use omni_ops::{
     compute_audit_health, source_status_hash_hex,
     status::{
-        AssignmentStatus, SessionOverallStatus, SessionStatusReport, SupersessionStatus,
-        STATUS_SCHEMA_VERSION,
+        AssignmentStatus, SessionOverallStatus, SessionStatusReport,
+        SupersessionStatus, STATUS_SCHEMA_VERSION,
     },
-    supersession::SupersessionReason,
     AuditCoherence,
 };
 use omni_contributor::result::WorkUnitKind;
@@ -449,7 +449,7 @@ fn phase_b_partial_apply_state_drifts_source_status_hash() {
 
 #[test]
 fn audit_reports_reassign_triagable_when_only_invalid_partial_entries() {
-    use omni_contributor::InvalidArtifactStatus;
+    use omni_ops::InvalidArtifactStatus;
     let asn_id = "aa".repeat(32);
     let asn = synth_assignment(&asn_id, 0, &"01".repeat(32), false, false, None);
     let mut report = synth_report(
@@ -472,7 +472,7 @@ fn audit_reports_reassign_triagable_when_only_invalid_partial_entries() {
 
 #[test]
 fn audit_reports_not_reassign_triagable_when_invalid_join_present() {
-    use omni_contributor::InvalidArtifactStatus;
+    use omni_ops::InvalidArtifactStatus;
     let asn_id = "aa".repeat(32);
     let asn = synth_assignment(&asn_id, 0, &"01".repeat(32), false, false, None);
     let mut report = synth_report(

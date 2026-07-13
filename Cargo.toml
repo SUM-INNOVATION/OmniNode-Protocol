@@ -12,6 +12,7 @@ members = [
     "crates/omni-proofs-halo2-reference",
     "crates/omni-proofs-halo2-production-mlp",
     "crates/omni-contributor",
+    "crates/omni-ops",
 ]
 # Stage 11b.1.a: `tools/` holds developer-host manual fixture
 # generators (rumus_export, pytorch_export, tensorflow_export,
@@ -165,3 +166,8 @@ omni-proofs-halo2-production-mlp = { path = "crates/omni-proofs-halo2-production
 # Off-chain only. Default `omni-node` build includes this crate; CI's
 # default-tree-check confirms no halo2/prover deps are pulled.
 omni-contributor = { path = "crates/omni-contributor" }
+# O5 (issue #103) — operator observability report-generators extracted
+# from omni-contributor. Local-disk only; depends only on
+# omni-contributor (no chain/proof/network/RPC). omni-node → omni-ops
+# → omni-contributor.
+omni-ops = { path = "crates/omni-ops" }

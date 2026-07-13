@@ -138,6 +138,10 @@ omni-proofs-halo2-production-mlp = { workspace = true, optional = true, features
 # so this adds no halo2/prover deps to the default graph (CI's
 # default-tree-check re-asserts).
 omni-contributor = { workspace = true, features = ["network"] }
+# O5 (issue #103) — operator observability report-generators. omni-node
+# → omni-ops → omni-contributor. The 12 operator observability CLI
+# subcommands call omni-ops library functions; clap ownership stays here.
+omni-ops = { workspace = true }
 # Stage 12.0 — UTC time stamping for produced_at_utc on results.
 chrono     = { workspace = true }
 

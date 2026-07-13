@@ -10,23 +10,25 @@
 use std::path::PathBuf;
 
 use omni_contributor::{
-    archive_session,
     canonical::{
         aggregated_result_signing_input, assignment_id_hex,
         canonical_partial_result_bytes, contributor_join_signing_input,
-        execution_session_signing_input, hex_lower, partial_result_signing_input,
-        session_id_hex, work_assignment_signing_input,
+        execution_session_signing_input, hex_lower,
+        partial_result_signing_input, session_id_hex,
+        work_assignment_signing_input,
     },
-    restore_session_archive,
     result::{MeasuredAccounting, StageContribution, WorkUnitKind},
     session::{
         AggregatedContributorResult, AggregatedPartialRef, ContributorJoin,
         ExecutionSession, PartialContributorResult, WorkAssignment, WorkKind,
     },
-    verify_archive_manifest, ArchiveManifest, ArchiveMode, ArchiveOptions,
-    ArchiveStatusRequirement, ContributorSigner, ContributorStateStore,
-    CoordinatorSigner, RestoreError, RestoreOptions, RestoreSource,
+    ContributorSigner, ContributorStateStore, CoordinatorSigner,
     SESSION_SCHEMA_VERSION,
+};
+use omni_ops::{
+    archive_session, restore_session_archive, verify_archive_manifest,
+    ArchiveManifest, ArchiveMode, ArchiveOptions, ArchiveStatusRequirement,
+    RestoreError, RestoreOptions, RestoreSource,
 };
 
 const COORD_SEED: [u8; 32] = *b"stage12.15-restore-coord-seed32!";
@@ -529,7 +531,7 @@ fn restored_session_is_accepted_by_load_verified_restart_snapshot() {
     // session — the bytes are canonical-equivalent, so every
     // verifier passes.
     let (snapshot, report) =
-        omni_contributor::load_verified_restart_snapshot(&dest_store).unwrap();
+        omni_ops::load_verified_restart_snapshot(&dest_store).unwrap();
     assert_eq!(report.sessions_accepted, 1);
     assert_eq!(report.assignments_accepted, 2);
     assert!(snapshot.sessions.contains_key(&session.session_id));

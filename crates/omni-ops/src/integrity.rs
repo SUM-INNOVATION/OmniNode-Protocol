@@ -26,9 +26,11 @@ use crate::error::IntegrityError;
 use crate::resume::{
     compute_audit_health, load_verified_restart_snapshot, AuditCoherence,
 };
-use crate::session::PartialContributorResult;
-use crate::session_verify::{verify_aggregated_result_with_supersessions, verify_partial_result};
-use crate::state::{ContributorStateStore, StateNamespace};
+use omni_contributor::session::PartialContributorResult;
+use omni_contributor::session_verify::{
+    verify_aggregated_result_with_supersessions, verify_partial_result,
+};
+use omni_contributor::state::{ContributorStateStore, StateNamespace};
 use crate::status::{build_session_status_report, SessionStatusReport};
 
 /// Stage 12.16 — integrity report schema version. Tied to the
@@ -560,7 +562,7 @@ pub fn scan_state_integrity_with_audit_orphans(
         schema_version: STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
         generated_at_utc: opts.now_utc.to_string(),
         state_dir: store.root().to_string_lossy().replace('\\', "/"),
-        state_version: crate::state::STATE_VERSION,
+        state_version: omni_contributor::state::STATE_VERSION,
         omni_contributor_version: env!("CARGO_PKG_VERSION").to_string(),
         sessions_scanned,
         sessions_verified,
@@ -1227,7 +1229,9 @@ fn scan_archive_dir(
     opts: &ScanOptions<'_>,
     findings: &mut Vec<IntegrityFinding>,
 ) -> Result<(), IntegrityError> {
-    use crate::restore::{restore_session_archive, RestoreOptions, RestoreSource};
+    use crate::restore::{
+        restore_session_archive, RestoreOptions, RestoreSource,
+    };
 
     if !archive_dir.is_dir() {
         return Ok(());

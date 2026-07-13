@@ -11,22 +11,25 @@
 use std::path::Path;
 
 use omni_contributor::{
-    archive_session,
     canonical::{
         aggregated_result_signing_input, assignment_id_hex,
         canonical_partial_result_bytes, contributor_join_signing_input,
-        execution_session_signing_input, hex_lower, partial_result_signing_input,
-        session_id_hex, work_assignment_signing_input,
+        execution_session_signing_input, hex_lower,
+        partial_result_signing_input, session_id_hex,
+        work_assignment_signing_input,
     },
     result::{MeasuredAccounting, StageContribution, WorkUnitKind},
-    scan_state_integrity,
     session::{
         AggregatedContributorResult, AggregatedPartialRef, ContributorJoin,
         ExecutionSession, PartialContributorResult, WorkAssignment, WorkKind,
     },
-    ArchiveMode, ArchiveOptions, ArchiveStatusRequirement, ContributorSigner,
-    ContributorStateStore, CoordinatorSigner, FindingKind, FindingSeverity,
-    scan_state_integrity_with_audit_orphans, ScanOptions, SESSION_SCHEMA_VERSION,
+    ContributorSigner, ContributorStateStore, CoordinatorSigner,
+    SESSION_SCHEMA_VERSION,
+};
+use omni_ops::{
+    archive_session, scan_state_integrity, ArchiveMode, ArchiveOptions,
+    ArchiveStatusRequirement, FindingKind, FindingSeverity,
+    scan_state_integrity_with_audit_orphans, ScanOptions,
     STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
 };
 
@@ -780,7 +783,7 @@ fn json_roundtrip_preserves_report() {
 
     let report = scan_state_integrity(&store, &default_opts(NOW_UTC)).unwrap();
     let json = serde_json::to_string(&report).unwrap();
-    let round: omni_contributor::StateIntegrityReport =
+    let round: omni_ops::StateIntegrityReport =
         serde_json::from_str(&json).unwrap();
     assert_eq!(round.schema_version, report.schema_version);
     assert_eq!(round.sessions_scanned, report.sessions_scanned);

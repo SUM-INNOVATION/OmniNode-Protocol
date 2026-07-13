@@ -1,0 +1,25 @@
+[package]
+name                   = "omni-ops"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+# O5 (issue #103) — operator observability report-generators extracted
+# from `omni-contributor`: session status, repair/reassign planning,
+# restart/resume audit, state-integrity scan/diff, archive/restore, and
+# cleanup/quarantine. Local-disk only; NO chain / proof / network / RPC
+# dependency. Depends on `omni-contributor`'s RETAINED persistence
+# (`ContributorStateStore`), session, and verification substrate.
+# Dependency direction: omni-node → omni-ops → omni-contributor.
+
+[dependencies]
+omni-contributor = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+blake3           = { workspace = true }
+thiserror        = { workspace = true }
+
+[dev-dependencies]
+tempfile         = { workspace = true }
