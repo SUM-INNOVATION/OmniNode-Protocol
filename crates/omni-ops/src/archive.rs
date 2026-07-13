@@ -43,8 +43,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ArchiveError;
 use crate::resume::{compute_audit_health, AuditCoherence};
-use crate::session::ExecutionSession;
-use crate::state::{ContributorStateStore, StateObjectKind};
+use omni_contributor::session::ExecutionSession;
+use omni_contributor::state::{ContributorStateStore, StateObjectKind};
 use crate::status::{
     build_session_status_report, SessionOverallStatus, SessionStatusReport,
 };
@@ -228,7 +228,7 @@ pub fn archive_session(
         schema_version: ARCHIVE_MANIFEST_SCHEMA_VERSION,
         session_id: opts.session_id.to_string(),
         generated_at_utc: opts.now_utc.to_string(),
-        source_state_version: crate::state::STATE_VERSION,
+        source_state_version: omni_contributor::state::STATE_VERSION,
         omni_contributor_version: env!("CARGO_PKG_VERSION").to_string(),
         session_overall_status: format!("{:?}", status.overall_status),
         audit_coherence: format_audit_coherence(&audit.coherence),

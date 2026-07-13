@@ -1820,7 +1820,7 @@ struct SessionStatusArgs {
 
 // ── Stage 12.10 args ─────────────────────────────────────────────────────
 
-/// CLI mirror of `omni_contributor::repair::RepairStrategy`. Stage
+/// CLI mirror of `omni_ops::repair::RepairStrategy`. Stage
 /// 12.11 added `ReassignMissing` once the `WorkAssignmentSupersession`
 /// envelope shipped.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -1829,14 +1829,14 @@ enum CliRepairStrategy {
     ReassignMissing,
 }
 
-impl From<CliRepairStrategy> for omni_contributor::RepairStrategy {
+impl From<CliRepairStrategy> for omni_ops::RepairStrategy {
     fn from(v: CliRepairStrategy) -> Self {
         match v {
             CliRepairStrategy::ReannounceMissing => {
-                omni_contributor::RepairStrategy::ReannounceMissing
+                omni_ops::RepairStrategy::ReannounceMissing
             }
             CliRepairStrategy::ReassignMissing => {
-                omni_contributor::RepairStrategy::ReassignMissing
+                omni_ops::RepairStrategy::ReassignMissing
             }
         }
     }
@@ -2092,7 +2092,7 @@ struct ApplySessionReassignArgs {
 // ── Stage 12.14 — archive-session ─────────────────────────────────────────
 
 /// Stage 12.14 — closed status-policy enum mirrored from
-/// `omni_contributor::ArchiveStatusRequirement`. clap-friendly.
+/// `omni_ops::ArchiveStatusRequirement`. clap-friendly.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum CliArchiveStatusRequirement {
     Any,
@@ -2103,24 +2103,24 @@ enum CliArchiveStatusRequirement {
 }
 
 impl From<CliArchiveStatusRequirement>
-    for omni_contributor::ArchiveStatusRequirement
+    for omni_ops::ArchiveStatusRequirement
 {
     fn from(v: CliArchiveStatusRequirement) -> Self {
         match v {
             CliArchiveStatusRequirement::Any => {
-                omni_contributor::ArchiveStatusRequirement::Any
+                omni_ops::ArchiveStatusRequirement::Any
             }
             CliArchiveStatusRequirement::Complete => {
-                omni_contributor::ArchiveStatusRequirement::Complete
+                omni_ops::ArchiveStatusRequirement::Complete
             }
             CliArchiveStatusRequirement::Aggregated => {
-                omni_contributor::ArchiveStatusRequirement::Aggregated
+                omni_ops::ArchiveStatusRequirement::Aggregated
             }
             CliArchiveStatusRequirement::CompletePartials => {
-                omni_contributor::ArchiveStatusRequirement::CompletePartials
+                omni_ops::ArchiveStatusRequirement::CompletePartials
             }
             CliArchiveStatusRequirement::ExpiredIncomplete => {
-                omni_contributor::ArchiveStatusRequirement::ExpiredIncomplete
+                omni_ops::ArchiveStatusRequirement::ExpiredIncomplete
             }
         }
     }
@@ -5858,9 +5858,9 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
         // watcher only needs them to validate other artifacts;
         // joined-pubkey checks inside handlers always re-read.
         if let Some(ref store) = state_store {
-            match omni_contributor::load_verified_restart_snapshot(store) {
+            match omni_ops::load_verified_restart_snapshot(store) {
                 Ok((snapshot, report)) => {
-                    let omni_contributor::RestartSnapshot {
+                    let omni_ops::RestartSnapshot {
                         sessions: s,
                         joins_by_session: _,
                         assignments_by_session: a,
@@ -10258,9 +10258,8 @@ mod tests {
 // ── Stage 12.9 — session-status ──────────────────────────────────────────
 
 fn run_session_status(args: SessionStatusArgs) -> Result<()> {
-    use omni_contributor::{
-        build_session_status_report, ContributorStateStore, SessionOverallStatus,
-    };
+    use omni_contributor::ContributorStateStore;
+    use omni_ops::{build_session_status_report, SessionOverallStatus};
 
     let now_utc =
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -10352,7 +10351,7 @@ fn run_session_status(args: SessionStatusArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_status_events(report: &omni_contributor::SessionStatusReport) {
+fn render_status_events(report: &omni_ops::SessionStatusReport) {
     // Stage 12.11 — top line gains active/superseded/supersession
     // counts. `assignments=` remains the *all-verified* count so
     // existing tooling does not silently break; `active=` is the
@@ -10415,14 +10414,14 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
     // Mirrors the JSON `invalid_artifacts` field.
     for entry in &report.invalid_artifacts {
         match entry {
-            omni_contributor::InvalidArtifactStatus::InvalidSession { reason_tag } => {
+            omni_ops::InvalidArtifactStatus::InvalidSession { reason_tag } => {
                 println!(
                     "event=invalid_artifact session_id={} kind=invalid_session \
                      reason_tag={reason_tag}",
                     report.session_id,
                 );
             }
-            omni_contributor::InvalidArtifactStatus::InvalidJoin {
+            omni_ops::InvalidArtifactStatus::InvalidJoin {
                 contributor_pubkey_hex,
                 reason_tag,
             } => {
@@ -10433,7 +10432,7 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
                     report.session_id,
                 );
             }
-            omni_contributor::InvalidArtifactStatus::InvalidAssignment {
+            omni_ops::InvalidArtifactStatus::InvalidAssignment {
                 assignment_id,
                 reason_tag,
             } => {
@@ -10443,7 +10442,7 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
                     report.session_id,
                 );
             }
-            omni_contributor::InvalidArtifactStatus::InvalidPartial {
+            omni_ops::InvalidArtifactStatus::InvalidPartial {
                 assignment_id,
                 reason_tag,
             } => {
@@ -10453,7 +10452,7 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
                     report.session_id,
                 );
             }
-            omni_contributor::InvalidArtifactStatus::InvalidSupersession {
+            omni_ops::InvalidArtifactStatus::InvalidSupersession {
                 supersession_id,
                 reason_tag,
             } => {
@@ -10463,7 +10462,7 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
                     report.session_id,
                 );
             }
-            omni_contributor::InvalidArtifactStatus::InvalidAggregate {
+            omni_ops::InvalidArtifactStatus::InvalidAggregate {
                 reason_tag,
             } => {
                 println!(
@@ -10507,27 +10506,27 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
     // deterministically. JSON renderer is unchanged (the v3 JSON
     // schema is frozen at Stage 12.12); audit is an ergonomics
     // extension on top of `events` + `pretty`.
-    let audit = omni_contributor::compute_audit_health(report);
+    let audit = omni_ops::compute_audit_health(report);
     let coherence_tag = match &audit.coherence {
-        omni_contributor::AuditCoherence::Coherent => "coherent".to_string(),
-        omni_contributor::AuditCoherence::PartialApplySupersession {
+        omni_ops::AuditCoherence::Coherent => "coherent".to_string(),
+        omni_ops::AuditCoherence::PartialApplySupersession {
             supersession_id,
             unresolved_count,
         } => format!(
             "partial_apply_supersession supersession_id={supersession_id} \
              unresolved_count={unresolved_count}"
         ),
-        omni_contributor::AuditCoherence::OrphanReplacementAssignments {
+        omni_ops::AuditCoherence::OrphanReplacementAssignments {
             assignment_ids,
         } => format!(
             "orphan_replacement_assignments count={} ids={}",
             assignment_ids.len(),
             assignment_ids.join(",")
         ),
-        omni_contributor::AuditCoherence::NotReassignTriagable => {
+        omni_ops::AuditCoherence::NotReassignTriagable => {
             "not_reassign_triagable".to_string()
         }
-        omni_contributor::AuditCoherence::ReassignTriagable => {
+        omni_ops::AuditCoherence::ReassignTriagable => {
             "reassign_triagable".to_string()
         }
     };
@@ -10541,14 +10540,14 @@ fn render_status_events(report: &omni_contributor::SessionStatusReport) {
 }
 
 fn render_status_json(
-    report: &omni_contributor::SessionStatusReport,
+    report: &omni_ops::SessionStatusReport,
 ) -> Result<()> {
     let json = serde_json::to_string_pretty(report)?;
     println!("{json}");
     Ok(())
 }
 
-fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
+fn render_status_pretty(report: &omni_ops::SessionStatusReport) {
     println!("Session   {}", report.session_id);
     println!("Status    {:?}", report.overall_status);
     // Stage 12.11 — surface active / superseded / supersession
@@ -10616,12 +10615,12 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
         );
         for entry in &report.invalid_artifacts {
             let (kind, id, reason_tag) = match entry {
-                omni_contributor::InvalidArtifactStatus::InvalidSession { reason_tag } => (
+                omni_ops::InvalidArtifactStatus::InvalidSession { reason_tag } => (
                     "invalid_session",
                     String::from("-"),
                     reason_tag.as_str(),
                 ),
-                omni_contributor::InvalidArtifactStatus::InvalidJoin {
+                omni_ops::InvalidArtifactStatus::InvalidJoin {
                     contributor_pubkey_hex,
                     reason_tag,
                 } => (
@@ -10629,7 +10628,7 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
                     contributor_pubkey_hex.chars().take(12).collect::<String>(),
                     reason_tag.as_str(),
                 ),
-                omni_contributor::InvalidArtifactStatus::InvalidAssignment {
+                omni_ops::InvalidArtifactStatus::InvalidAssignment {
                     assignment_id,
                     reason_tag,
                 } => (
@@ -10637,7 +10636,7 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
                     assignment_id.chars().take(12).collect::<String>(),
                     reason_tag.as_str(),
                 ),
-                omni_contributor::InvalidArtifactStatus::InvalidPartial {
+                omni_ops::InvalidArtifactStatus::InvalidPartial {
                     assignment_id,
                     reason_tag,
                 } => (
@@ -10645,7 +10644,7 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
                     assignment_id.chars().take(12).collect::<String>(),
                     reason_tag.as_str(),
                 ),
-                omni_contributor::InvalidArtifactStatus::InvalidSupersession {
+                omni_ops::InvalidArtifactStatus::InvalidSupersession {
                     supersession_id,
                     reason_tag,
                 } => (
@@ -10653,7 +10652,7 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
                     supersession_id.chars().take(12).collect::<String>(),
                     reason_tag.as_str(),
                 ),
-                omni_contributor::InvalidArtifactStatus::InvalidAggregate {
+                omni_ops::InvalidArtifactStatus::InvalidAggregate {
                     reason_tag,
                 } => (
                     "invalid_aggregate",
@@ -10683,13 +10682,13 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
     // recommended-action so the pretty output stays operator-
     // friendly without leaking implementation detail. JSON
     // renderer is unchanged (v3 JSON schema frozen at 12.12).
-    let audit = omni_contributor::compute_audit_health(report);
+    let audit = omni_ops::compute_audit_health(report);
     println!("Audit health:");
     match &audit.coherence {
-        omni_contributor::AuditCoherence::Coherent => {
+        omni_ops::AuditCoherence::Coherent => {
             println!("  coherence       coherent");
         }
-        omni_contributor::AuditCoherence::PartialApplySupersession {
+        omni_ops::AuditCoherence::PartialApplySupersession {
             supersession_id,
             unresolved_count,
         } => {
@@ -10700,7 +10699,7 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
                  unresolved={unresolved_count})"
             );
         }
-        omni_contributor::AuditCoherence::OrphanReplacementAssignments {
+        omni_ops::AuditCoherence::OrphanReplacementAssignments {
             assignment_ids,
         } => {
             println!(
@@ -10713,10 +10712,10 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
                 println!("    - {short}");
             }
         }
-        omni_contributor::AuditCoherence::NotReassignTriagable => {
+        omni_ops::AuditCoherence::NotReassignTriagable => {
             println!("  coherence       not_reassign_triagable");
         }
-        omni_contributor::AuditCoherence::ReassignTriagable => {
+        omni_ops::AuditCoherence::ReassignTriagable => {
             println!("  coherence       reassign_triagable");
         }
     }
@@ -10730,8 +10729,9 @@ fn render_status_pretty(report: &omni_contributor::SessionStatusReport) {
 // ── Stage 12.10 — plan-session-repair ───────────────────────────────────
 
 fn run_plan_session_repair(args: PlanSessionRepairArgs) -> Result<()> {
-    use omni_contributor::{
-        build_session_repair_plan, build_session_status_report, ContributorStateStore,
+    use omni_contributor::ContributorStateStore;
+    use omni_ops::{
+        build_session_repair_plan, build_session_status_report,
         SessionStatusReport,
     };
 
@@ -10816,10 +10816,13 @@ fn run_plan_session_repair(args: PlanSessionRepairArgs) -> Result<()> {
 async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
     use omni_contributor::canonical::{hex_lower, net_assign_signing_input};
     use omni_contributor::{
-        build_session_status_report, repair_plan_hash_hex, source_status_hash_hex,
         ContributorRelay, ContributorStateStore, CoordinatorSigner,
-        NetworkWorkAssignedAnnouncement, OmniNetRelay, RepairAction, SessionRepairPlan,
-        WorkAssignment, NET_SCHEMA_VERSION,
+        NetworkWorkAssignedAnnouncement, OmniNetRelay, WorkAssignment,
+        NET_SCHEMA_VERSION,
+    };
+    use omni_ops::{
+        build_session_status_report, repair_plan_hash_hex,
+        source_status_hash_hex, RepairAction, SessionRepairPlan,
     };
 
     // ── 1. Read + integrity-check the plan ─────────────────────
@@ -10827,16 +10830,16 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
         .with_context(|| format!("read repair-plan: {}", args.repair_plan.display()))?;
     let plan: SessionRepairPlan = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse repair-plan: {}", args.repair_plan.display()))?;
-    if plan.schema_version != omni_contributor::REPAIR_PLAN_SCHEMA_VERSION {
+    if plan.schema_version != omni_ops::REPAIR_PLAN_SCHEMA_VERSION {
         return Err(anyhow!(
             "repair_plan.schema_version {} not supported (expected {})",
             plan.schema_version,
-            omni_contributor::REPAIR_PLAN_SCHEMA_VERSION
+            omni_ops::REPAIR_PLAN_SCHEMA_VERSION
         ));
     }
     let recomputed_plan_hash = repair_plan_hash_hex(&plan);
     if recomputed_plan_hash != plan.repair_plan_hash {
-        return Err(anyhow!(omni_contributor::RepairError::PlanHashDrift {
+        return Err(anyhow!(omni_ops::RepairError::PlanHashDrift {
             stored: plan.repair_plan_hash.clone(),
             recomputed: recomputed_plan_hash,
         }));
@@ -10872,7 +10875,7 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
     .map_err(|e| anyhow!("rebuild status report for drift check: {e}"))?;
     let current_projection = source_status_hash_hex(&current_status);
     if current_projection != plan.source_status_hash {
-        return Err(anyhow!(omni_contributor::RepairError::SourceStatusDrift));
+        return Err(anyhow!(omni_ops::RepairError::SourceStatusDrift));
     }
     // `source_status_hash` is a projection over only
     // `(session_id, [(assignment_id, partial_present)])`. Status
@@ -10883,7 +10886,7 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
     // check. Re-check eligibility against the same matrix the
     // planner uses, returning identical typed errors so a CI gate
     // sees a consistent surface.
-    omni_contributor::check_repair_eligible(&current_status)
+    omni_ops::check_repair_eligible(&current_status)
         .map_err(|e| anyhow!("apply rejected by current status: {e}"))?;
 
     // ── 3. Fetch + verify session, check coordinator seed ──────
@@ -10954,7 +10957,7 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
             Some(a) => a,
             None => {
                 return Err(anyhow!(
-                    omni_contributor::RepairError::AssignmentNotPresent {
+                    omni_ops::RepairError::AssignmentNotPresent {
                         session_id: plan.session_id.clone(),
                         assignment_id: assignment_id.clone(),
                     }
@@ -11102,9 +11105,10 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
 // ── Stage 12.11 — plan-session-reassign ──────────────────────────────────
 
 fn run_plan_session_reassign(args: PlanSessionReassignArgs) -> Result<()> {
-    use omni_contributor::{
+    use omni_contributor::ContributorStateStore;
+    use omni_ops::{
         build_session_repair_plan_with_reason, build_session_status_report,
-        ContributorStateStore, SessionStatusReport,
+        SessionStatusReport,
     };
 
     if args.status_report.is_some() == args.build_status {
@@ -11156,7 +11160,7 @@ fn run_plan_session_reassign(args: PlanSessionReassignArgs) -> Result<()> {
 
     let plan = build_session_repair_plan_with_reason(
         &status,
-        omni_contributor::RepairStrategy::ReassignMissing,
+        omni_ops::RepairStrategy::ReassignMissing,
         omni_contributor::SupersessionReason::from(args.reason),
         &now_utc,
         args.coordinator_pubkey_hex.as_deref(),
@@ -11188,12 +11192,15 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
         work_assignment_signing_input, work_assignment_supersession_signing_input,
     };
     use omni_contributor::{
-        build_session_status_report, repair_plan_hash_hex, source_status_hash_hex,
         ContributorRelay, ContributorStateStore, CoordinatorSigner,
-        NetworkWorkAssignedAnnouncement, NetworkWorkAssignmentSupersessionAnnouncement,
-        OmniNetRelay, RepairAction, SessionRepairPlan, WorkAssignment,
-        WorkAssignmentSupersession, NET_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
-        SUPERSESSION_SCHEMA_VERSION,
+        NetworkWorkAssignedAnnouncement,
+        NetworkWorkAssignmentSupersessionAnnouncement, OmniNetRelay,
+        WorkAssignment, WorkAssignmentSupersession, NET_SCHEMA_VERSION,
+        SESSION_SCHEMA_VERSION, SUPERSESSION_SCHEMA_VERSION,
+    };
+    use omni_ops::{
+        build_session_status_report, repair_plan_hash_hex,
+        source_status_hash_hex, RepairAction, SessionRepairPlan,
     };
 
     // ── 1. Read + integrity-check the plan ─────────────────────
@@ -11204,21 +11211,21 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
     let plan: SessionRepairPlan = serde_json::from_slice(&bytes).with_context(|| {
         format!("parse reassignment-plan: {}", args.reassignment_plan.display())
     })?;
-    if plan.schema_version != omni_contributor::REPAIR_PLAN_SCHEMA_VERSION {
+    if plan.schema_version != omni_ops::REPAIR_PLAN_SCHEMA_VERSION {
         return Err(anyhow!(
             "repair_plan.schema_version {} not supported (expected {})",
             plan.schema_version,
-            omni_contributor::REPAIR_PLAN_SCHEMA_VERSION
+            omni_ops::REPAIR_PLAN_SCHEMA_VERSION
         ));
     }
     let recomputed_plan_hash = repair_plan_hash_hex(&plan);
     if recomputed_plan_hash != plan.repair_plan_hash {
-        return Err(anyhow!(omni_contributor::RepairError::PlanHashDrift {
+        return Err(anyhow!(omni_ops::RepairError::PlanHashDrift {
             stored: plan.repair_plan_hash.clone(),
             recomputed: recomputed_plan_hash,
         }));
     }
-    if plan.strategy != omni_contributor::RepairStrategy::ReassignMissing {
+    if plan.strategy != omni_ops::RepairStrategy::ReassignMissing {
         return Err(anyhow!(
             "apply-session-reassign requires plan.strategy == ReassignMissing; got {:?}",
             plan.strategy
@@ -11298,7 +11305,7 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
     .map_err(|e| anyhow!("rebuild status report for drift check: {e}"))?;
     let current_projection = source_status_hash_hex(&current_status);
     if current_projection != plan.source_status_hash {
-        return Err(anyhow!(omni_contributor::RepairError::SourceStatusDrift));
+        return Err(anyhow!(omni_ops::RepairError::SourceStatusDrift));
     }
     // Stage 12.12 — eligibility dispatch.
     //
@@ -11321,13 +11328,13 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
         plan_reason,
         omni_contributor::SupersessionReason::InvalidPartial
     ) {
-        omni_contributor::check_reassign_eligible_allowing_invalid_partials(
+        omni_ops::check_reassign_eligible_allowing_invalid_partials(
             &current_status,
             &plan,
         )
         .map_err(|e| anyhow!("apply rejected by current status: {e}"))?;
     } else {
-        omni_contributor::check_repair_eligible(&current_status)
+        omni_ops::check_repair_eligible(&current_status)
             .map_err(|e| anyhow!("apply rejected by current status: {e}"))?;
     }
 
@@ -11398,7 +11405,7 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
     // intent. The helper required every `ReassignAssignment` to
     // target an active-missing row whose `stage_index` matches
     // the plan's `original_stage_index`.
-    omni_contributor::check_reassign_targets_active_missing(&plan, &current_status)
+    omni_ops::check_reassign_targets_active_missing(&plan, &current_status)
         .map_err(|e| anyhow!("apply rejected by per-action enforcement: {e}"))?;
 
     for action in &plan.actions {
@@ -11416,7 +11423,7 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
         };
         if !existing_ids.contains(superseded_assignment_id) {
             return Err(anyhow!(
-                omni_contributor::RepairError::AssignmentNotPresent {
+                omni_ops::RepairError::AssignmentNotPresent {
                     session_id: plan.session_id.clone(),
                     assignment_id: superseded_assignment_id.clone(),
                 }
@@ -11835,9 +11842,8 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
 // ── Stage 12.14 — archive-session ─────────────────────────────────────────
 
 fn run_archive_session(args: ArchiveSessionArgs) -> Result<()> {
-    use omni_contributor::{
-        archive_session, ArchiveMode, ArchiveOptions, ContributorStateStore,
-    };
+    use omni_contributor::ContributorStateStore;
+    use omni_ops::{archive_session, ArchiveMode, ArchiveOptions};
 
     // Resolve mode. The clap layer pins `--copy` xor `--move`;
     // `--move` (default false) takes precedence when set.
@@ -11873,7 +11879,7 @@ fn run_archive_session(args: ArchiveSessionArgs) -> Result<()> {
         archive_dir: &args.archive_dir,
         mode,
         require_status:
-            omni_contributor::ArchiveStatusRequirement::from(args.require_status),
+            omni_ops::ArchiveStatusRequirement::from(args.require_status),
         include_results: args.include_results,
         now_utc: &now_utc,
         dry_run: args.dry_run,
@@ -11883,7 +11889,7 @@ fn run_archive_session(args: ArchiveSessionArgs) -> Result<()> {
         "event=archive_started session_id={} mode={mode_tag} \
          require_status={} include_results={} dry_run={}",
         args.session_id,
-        omni_contributor::ArchiveStatusRequirement::from(args.require_status)
+        omni_ops::ArchiveStatusRequirement::from(args.require_status)
             .as_str(),
         args.include_results,
         args.dry_run,
@@ -11939,10 +11945,8 @@ fn run_archive_session(args: ArchiveSessionArgs) -> Result<()> {
 // ── Stage 12.15 — restore-session-archive ─────────────────────────────────
 
 fn run_restore_session_archive(args: RestoreSessionArchiveArgs) -> Result<()> {
-    use omni_contributor::{
-        restore_session_archive, ContributorStateStore, RestoreOptions,
-        RestoreSource,
-    };
+    use omni_contributor::ContributorStateStore;
+    use omni_ops::{restore_session_archive, RestoreOptions, RestoreSource};
 
     // Resolve the archive source. Clap enforces the mutual
     // exclusion + the requires-pair (session_id <-> archive_dir);
@@ -12003,7 +12007,7 @@ fn run_restore_session_archive(args: RestoreSessionArchiveArgs) -> Result<()> {
     // line carries the informational status/coherence fields
     // even before per-file work.
     let manifest =
-        omni_contributor::verify_archive_manifest(&opts.source).map_err(|e| {
+        omni_ops::verify_archive_manifest(&opts.source).map_err(|e| {
             anyhow!("restore-session-archive refused: {e}")
         })?;
 
@@ -12084,9 +12088,8 @@ fn run_restore_session_archive(args: RestoreSessionArchiveArgs) -> Result<()> {
 // ── Stage 12.16 — state-integrity ─────────────────────────────────────────
 
 fn run_state_integrity(args: StateIntegrityArgs) -> Result<()> {
-    use omni_contributor::{
-        scan_state_integrity, ContributorStateStore, ScanOptions,
-    };
+    use omni_contributor::ContributorStateStore;
+    use omni_ops::{scan_state_integrity, ScanOptions};
 
     let now_utc =
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -12200,12 +12203,12 @@ fn run_state_integrity(args: StateIntegrityArgs) -> Result<()> {
 /// `StateIntegrityReport` via `load_baseline_report`.
 fn run_state_integrity_baseline_diff(
     args: &StateIntegrityArgs,
-    current_report: &omni_contributor::StateIntegrityReport,
-    baseline: omni_contributor::StateIntegrityReport,
+    current_report: &omni_ops::StateIntegrityReport,
+    baseline: omni_ops::StateIntegrityReport,
     now_utc: &str,
     log_op: impl Fn(&str),
 ) -> Result<()> {
-    use omni_contributor::{diff_state_integrity_reports, DiffOptions};
+    use omni_ops::{diff_state_integrity_reports, DiffOptions};
 
     let diff_opts = DiffOptions {
         now_utc,
@@ -12254,7 +12257,7 @@ fn run_state_integrity_baseline_diff(
     Ok(())
 }
 
-fn render_state_integrity_events(report: &omni_contributor::StateIntegrityReport) {
+fn render_state_integrity_events(report: &omni_ops::StateIntegrityReport) {
     for s in &report.sessions {
         println!(
             "event=session_integrity_summary session_id={} overall_status={}",
@@ -12287,7 +12290,7 @@ fn render_state_integrity_events(report: &omni_contributor::StateIntegrityReport
 }
 
 fn render_state_integrity_json(
-    report: &omni_contributor::StateIntegrityReport,
+    report: &omni_ops::StateIntegrityReport,
 ) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(report)
         .map_err(|e| anyhow!("serialize state integrity report: {e}"))?;
@@ -12303,8 +12306,8 @@ fn render_state_integrity_json(
     Ok(())
 }
 
-fn render_state_integrity_pretty(report: &omni_contributor::StateIntegrityReport) {
-    use omni_contributor::FindingSeverity;
+fn render_state_integrity_pretty(report: &omni_ops::StateIntegrityReport) {
+    use omni_ops::FindingSeverity;
     println!("State integrity report");
     println!("  generated_at_utc     : {}", report.generated_at_utc);
     println!("  state_dir            : {}", report.state_dir);
@@ -12362,10 +12365,11 @@ fn render_state_integrity_pretty(report: &omni_contributor::StateIntegrityReport
 // ── Stage 12.17 — plan-state-cleanup ──────────────────────────────────────
 
 fn run_plan_state_cleanup(args: PlanStateCleanupArgs) -> Result<()> {
-    use omni_contributor::{
+    use omni_contributor::ContributorStateStore;
+    use omni_ops::{
         plan_state_cleanup, scan_state_integrity_with_audit_orphans,
-        source_integrity_hash_hex, CleanupPlanOptions, ContributorStateStore,
-        ScanOptions, StateIntegrityReport,
+        source_integrity_hash_hex, CleanupPlanOptions, ScanOptions,
+        StateIntegrityReport,
     };
     use std::collections::HashMap;
 
@@ -12471,7 +12475,7 @@ fn run_plan_state_cleanup(args: PlanStateCleanupArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_cleanup_plan_events(plan: &omni_contributor::StateCleanupPlan) {
+fn render_cleanup_plan_events(plan: &omni_ops::StateCleanupPlan) {
     for (i, action) in plan.actions.iter().enumerate() {
         println!(
             "event=cleanup_action_planned index={} kind={} session_id={} path={} \
@@ -12496,7 +12500,7 @@ fn render_cleanup_plan_events(plan: &omni_contributor::StateCleanupPlan) {
     );
 }
 
-fn render_cleanup_plan_json(plan: &omni_contributor::StateCleanupPlan) -> Result<()> {
+fn render_cleanup_plan_json(plan: &omni_ops::StateCleanupPlan) -> Result<()> {
     use std::io::Write;
     let bytes = serde_json::to_vec_pretty(plan)
         .map_err(|e| anyhow!("serialize cleanup plan: {e}"))?;
@@ -12509,7 +12513,7 @@ fn render_cleanup_plan_json(plan: &omni_contributor::StateCleanupPlan) -> Result
     Ok(())
 }
 
-fn render_cleanup_plan_pretty(plan: &omni_contributor::StateCleanupPlan) {
+fn render_cleanup_plan_pretty(plan: &omni_ops::StateCleanupPlan) {
     println!("State cleanup plan");
     println!("  plan_id              : {}", plan.plan_id);
     println!("  schema_version       : {}", plan.schema_version);
@@ -12540,10 +12544,8 @@ fn render_cleanup_plan_pretty(plan: &omni_contributor::StateCleanupPlan) {
 // ── Stage 12.17 — apply-state-cleanup ────────────────────────────────────
 
 fn run_apply_state_cleanup(args: ApplyStateCleanupArgs) -> Result<()> {
-    use omni_contributor::{
-        apply_state_cleanup, CleanupApplyOptions, ContributorStateStore,
-        StateCleanupPlan,
-    };
+    use omni_contributor::ContributorStateStore;
+    use omni_ops::{apply_state_cleanup, CleanupApplyOptions, StateCleanupPlan};
 
     let now_utc =
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -12605,7 +12607,7 @@ fn run_apply_state_cleanup(args: ApplyStateCleanupArgs) -> Result<()> {
     Ok(())
 }
 
-fn render_cleanup_apply_events(report: &omni_contributor::CleanupReport) {
+fn render_cleanup_apply_events(report: &omni_ops::CleanupReport) {
     for outcome in &report.outcomes {
         let event = match outcome.status.as_str() {
             "would_apply" => "event=would_apply_action",
@@ -12634,7 +12636,7 @@ fn render_cleanup_apply_events(report: &omni_contributor::CleanupReport) {
     );
 }
 
-fn render_cleanup_apply_json(report: &omni_contributor::CleanupReport) -> Result<()> {
+fn render_cleanup_apply_json(report: &omni_ops::CleanupReport) -> Result<()> {
     use std::io::Write;
     let bytes = serde_json::to_vec_pretty(report)
         .map_err(|e| anyhow!("serialize cleanup report: {e}"))?;
@@ -12645,7 +12647,7 @@ fn render_cleanup_apply_json(report: &omni_contributor::CleanupReport) -> Result
     Ok(())
 }
 
-fn render_cleanup_apply_pretty(report: &omni_contributor::CleanupReport) {
+fn render_cleanup_apply_pretty(report: &omni_ops::CleanupReport) {
     println!("State cleanup apply report");
     println!("  plan_id        : {}", report.plan_id);
     println!("  mode           : {}", report.mode);
@@ -12677,9 +12679,10 @@ fn render_cleanup_apply_pretty(report: &omni_contributor::CleanupReport) {
 fn run_restore_state_cleanup_quarantine(
     args: RestoreStateCleanupQuarantineArgs,
 ) -> Result<()> {
-    use omni_contributor::{
-        restore_state_cleanup_quarantine, ContributorStateStore,
-        QuarantineRestoreOptions, QuarantineRestoreSource,
+    use omni_contributor::ContributorStateStore;
+    use omni_ops::{
+        restore_state_cleanup_quarantine, QuarantineRestoreOptions,
+        QuarantineRestoreSource,
     };
 
     let now_utc =
@@ -12776,7 +12779,7 @@ fn run_restore_state_cleanup_quarantine(
 }
 
 fn render_restore_quarantine_events(
-    report: &omni_contributor::QuarantineRestoreReport,
+    report: &omni_ops::QuarantineRestoreReport,
 ) {
     for o in &report.outcomes {
         let line = match o.status.as_str() {
@@ -12807,7 +12810,7 @@ fn render_restore_quarantine_events(
 }
 
 fn render_restore_quarantine_json(
-    report: &omni_contributor::QuarantineRestoreReport,
+    report: &omni_ops::QuarantineRestoreReport,
 ) -> Result<()> {
     use std::io::Write;
     let bytes = serde_json::to_vec_pretty(report)
@@ -12824,7 +12827,7 @@ fn render_restore_quarantine_json(
 }
 
 fn render_restore_quarantine_pretty(
-    report: &omni_contributor::QuarantineRestoreReport,
+    report: &omni_ops::QuarantineRestoreReport,
 ) {
     println!("Quarantine restore report");
     println!("  plan_id                : {}", report.plan_id);
@@ -12854,7 +12857,7 @@ fn render_restore_quarantine_pretty(
 // ── Stage 12.19 — state-integrity-diff ───────────────────────────────────
 
 fn run_state_integrity_diff(args: StateIntegrityDiffArgs) -> Result<()> {
-    use omni_contributor::{
+    use omni_ops::{
         diff_state_integrity_reports, DiffOptions, StateIntegrityReport,
     };
 
@@ -12929,8 +12932,8 @@ fn run_state_integrity_diff(args: StateIntegrityDiffArgs) -> Result<()> {
 /// from `path` for the diff flow.
 fn load_baseline_report(
     path: &std::path::Path,
-) -> Result<omni_contributor::StateIntegrityReport> {
-    use omni_contributor::StateIntegrityReport;
+) -> Result<omni_ops::StateIntegrityReport> {
+    use omni_ops::StateIntegrityReport;
 
     let bytes = std::fs::read(path)
         .with_context(|| format!("read baseline json: {}", path.display()))?;
@@ -12940,7 +12943,7 @@ fn load_baseline_report(
 }
 
 fn render_state_integrity_diff_events(
-    diff: &omni_contributor::StateIntegrityDiffReport,
+    diff: &omni_ops::StateIntegrityDiffReport,
     summary_only: bool,
 ) {
     for f in &diff.new_findings {
@@ -12995,7 +12998,7 @@ fn render_state_integrity_diff_events(
 }
 
 fn render_state_integrity_diff_json(
-    diff: &omni_contributor::StateIntegrityDiffReport,
+    diff: &omni_ops::StateIntegrityDiffReport,
     summary_only: bool,
 ) -> Result<()> {
     use std::io::Write;
@@ -13006,7 +13009,7 @@ fn render_state_integrity_diff_json(
     // and clears `unchanged_findings` when summary_only is
     // true (preserving `counts.unchanged` verbatim so scripts
     // still see the elided count) and borrows otherwise.
-    let view = omni_contributor::diff_presentation_view(diff, summary_only);
+    let view = omni_ops::diff_presentation_view(diff, summary_only);
     let bytes = serde_json::to_vec_pretty(view.as_ref())
         .map_err(|e| anyhow!("serialize diff report: {e}"))?;
     let stdout = std::io::stdout();
@@ -13021,7 +13024,7 @@ fn render_state_integrity_diff_json(
 }
 
 fn render_state_integrity_diff_pretty(
-    diff: &omni_contributor::StateIntegrityDiffReport,
+    diff: &omni_ops::StateIntegrityDiffReport,
     summary_only: bool,
 ) {
     println!("State integrity diff");
@@ -13066,7 +13069,7 @@ fn render_state_integrity_diff_pretty(
     );
     println!("  unchanged: {}", diff.counts.unchanged);
 
-    let section = |label: &str, findings: &[omni_contributor::IntegrityFinding]| {
+    let section = |label: &str, findings: &[omni_ops::IntegrityFinding]| {
         if findings.is_empty() {
             return;
         }
@@ -13091,7 +13094,7 @@ fn render_state_integrity_diff_pretty(
 }
 
 fn write_diff_json_mirror(
-    diff: &omni_contributor::StateIntegrityDiffReport,
+    diff: &omni_ops::StateIntegrityDiffReport,
     path: &std::path::Path,
     summary_only: bool,
     log_op: &impl Fn(&str),
@@ -13100,7 +13103,7 @@ fn write_diff_json_mirror(
     // stdout JSON render: `--summary-only` elides
     // `unchanged_findings` from the mirrored artifact too,
     // preserving `counts.unchanged`.
-    let view = omni_contributor::diff_presentation_view(diff, summary_only);
+    let view = omni_ops::diff_presentation_view(diff, summary_only);
     match serde_json::to_vec_pretty(view.as_ref()) {
         Ok(bytes) => {
             if let Err(e) = std::fs::write(path, &bytes) {

@@ -33,16 +33,19 @@ use std::collections::HashMap;
 
 use crate::error::StatusError;
 use crate::repair::check_invalid_partial_plan_eligible;
-use crate::session::{ContributorJoin, ExecutionSession, WorkAssignment};
-use crate::session_verify::{
+use omni_contributor::session::{
+    ContributorJoin, ExecutionSession, WorkAssignment,
+};
+use omni_contributor::session_verify::{
     verify_contributor_join, verify_execution_session, verify_work_assignment,
 };
-use crate::supersession_verify::verify_assignment_supersession;
-use crate::state::ContributorStateStore;
+use omni_contributor::supersession_verify::verify_assignment_supersession;
+use omni_contributor::state::ContributorStateStore;
 use crate::status::{
-    AssignmentStatus, InvalidArtifactStatus, SessionOverallStatus, SessionStatusReport,
+    AssignmentStatus, InvalidArtifactStatus, SessionOverallStatus,
+    SessionStatusReport,
 };
-use crate::supersession::WorkAssignmentSupersession;
+use omni_contributor::supersession::WorkAssignmentSupersession;
 
 // ── RestartSnapshot / RestartReport ─────────────────────────────
 

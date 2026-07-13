@@ -2605,6 +2605,7 @@ dependencies = [
  "clap",
  "omni-contributor",
  "omni-net",
+ "omni-ops",
  "omni-proofs-halo2-production-mlp",
  "omni-proofs-halo2-reference",
  "omni-store",
@@ -2618,6 +2619,18 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omni-ops"
+version = "0.1.1"
+dependencies = [
+ "blake3",
+ "omni-contributor",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

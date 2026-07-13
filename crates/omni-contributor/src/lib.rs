@@ -38,14 +38,11 @@
 //! - [`verify`]    — `verify_result` off-chain verification pipeline.
 //! - [`error`]     — Typed error surface.
 
-pub mod archive;
 pub mod canonical;
-pub mod cleanup;
 pub mod discover;
 pub mod error;
 pub mod handoff;
 pub mod handoff_verify;
-pub mod integrity;
 pub mod job;
 pub mod net;
 pub mod peer_advert;
@@ -53,10 +50,7 @@ pub mod peer_routing;
 pub mod planner;
 pub mod posted;
 pub mod relay;
-pub mod repair;
-pub mod restore;
 pub mod result;
-pub mod resume;
 pub mod run;
 pub mod runner;
 pub mod session;
@@ -64,7 +58,6 @@ pub mod session_verify;
 pub mod signing;
 pub mod snip;
 pub mod state;
-pub mod status;
 pub mod supersession;
 pub mod supersession_verify;
 pub mod tensor_transport;
@@ -73,52 +66,8 @@ pub mod watch;
 
 pub use discover::{DiscoveredEntry, FilesystemSource, JobSource, NetworkSource};
 pub use error::{
-    ArchiveError, CanonicalError, CleanupError, ContributorError, DiscoverError,
-    IntegrityDiffError, IntegrityError, PlannerError, QuarantineRestoreError,
-    RelayError, RepairError, RestoreError, RunnerError, SchemaError,
-    SigningError, SnipError, StatusError, VerifyError,
-};
-pub use repair::{
-    build_session_repair_plan, build_session_repair_plan_with_reason,
-    check_invalid_partial_plan_eligible,
-    check_reassign_eligible_allowing_invalid_partials,
-    check_reassign_targets_active_missing, check_repair_eligible, repair_plan_hash_hex,
-    source_status_hash_hex, RepairAction, RepairStrategy, SessionRepairPlan,
-    REPAIR_PLAN_SCHEMA_VERSION,
-};
-pub use status::{
-    build_session_status_report, AssignmentStatus, InvalidArtifactStatus,
-    SessionOverallStatus, SessionStatusReport, SupersessionStatus,
-    STATUS_SCHEMA_VERSION,
-};
-pub use resume::{
-    compute_audit_health, load_verified_restart_snapshot, AuditCoherence,
-    AuditHealth, RestartReport, RestartSnapshot,
-};
-pub use archive::{
-    archive_session, ArchiveManifest, ArchiveMode, ArchiveOptions,
-    ArchiveStatusRequirement, ArchivedFile, ARCHIVE_MANIFEST_SCHEMA_VERSION,
-};
-pub use restore::{
-    restore_session_archive, verify_archive_manifest, RestoreOptions,
-    RestoreReport, RestoreSource,
-};
-pub use integrity::{
-    diff_presentation_view, diff_state_integrity_reports, scan_state_integrity,
-    scan_state_integrity_with_audit_orphans, DiffCounts, DiffOptions, FindingKind,
-    FindingSeverity, IntegrityFinding, RecommendedAction, ScanOptions,
-    SessionIntegritySummary, StateIntegrityDiffReport, StateIntegrityReport,
-    STATE_INTEGRITY_DIFF_SCHEMA_VERSION, STATE_INTEGRITY_REPORT_SCHEMA_VERSION,
-};
-pub use cleanup::{
-    apply_state_cleanup, cleanup_plan_hash_hex, plan_state_cleanup,
-    restore_state_cleanup_quarantine, source_integrity_hash_hex,
-    verify_quarantine_manifest, ApplyOptions as CleanupApplyOptions, CleanupAction,
-    CleanupActionKind, CleanupActionOutcome, CleanupReport,
-    PlanOptions as CleanupPlanOptions, QuarantineEntry, QuarantineManifest,
-    QuarantineRestoreOptions, QuarantineRestoreOutcome, QuarantineRestoreReport,
-    QuarantineRestoreSource, StateCleanupPlan, CLEANUP_PLAN_SCHEMA_VERSION,
-    QUARANTINE_MANIFEST_SCHEMA_VERSION,
+    CanonicalError, ContributorError, DiscoverError, PlannerError, RelayError,
+    RunnerError, SchemaError, SigningError, SnipError, VerifyError,
 };
 pub use planner::{
     plan_assignments, plan_hash_hex, AssignmentPlan, ModelPlan, ModelPlanStage,

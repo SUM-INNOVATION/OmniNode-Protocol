@@ -18,24 +18,35 @@
 //!      serde round-trips, and the source-status drift signal.
 
 use omni_contributor::{
-    build_session_repair_plan, build_session_status_report,
     canonical::{
         aggregated_result_signing_input, assignment_id_hex,
         canonical_partial_result_bytes, contributor_join_signing_input,
-        execution_session_signing_input, hex_lower, partial_result_signing_input,
-        session_id_hex, work_assignment_signing_input,
+        execution_session_signing_input, hex_lower,
+        partial_result_signing_input, session_id_hex,
+        work_assignment_signing_input,
     },
-    repair_plan_hash_hex,
-    repair::{RepairAction, RepairStrategy, SessionRepairPlan, REPAIR_PLAN_SCHEMA_VERSION},
     result::{MeasuredAccounting, StageContribution, WorkUnitKind},
     session::{
-        AggregatedContributorResult, AggregatedPartialRef, PartialContributorResult,
-        WorkAssignment, WorkKind,
+        AggregatedContributorResult, AggregatedPartialRef,
+        PartialContributorResult, WorkAssignment, WorkKind,
+    },
+    ContributorJoin, ContributorSigner, ContributorStateStore,
+    CoordinatorSigner, ExecutionSession, StateObjectKind,
+    SESSION_SCHEMA_VERSION,
+};
+use omni_ops::{
+    build_session_repair_plan, build_session_status_report,
+    repair_plan_hash_hex,
+    repair::{
+        RepairAction, RepairStrategy, SessionRepairPlan,
+        REPAIR_PLAN_SCHEMA_VERSION,
     },
     source_status_hash_hex,
-    status::{AssignmentStatus, SessionOverallStatus, SessionStatusReport, STATUS_SCHEMA_VERSION},
-    ContributorJoin, ContributorSigner, ContributorStateStore, CoordinatorSigner,
-    ExecutionSession, RepairError, StateObjectKind, SESSION_SCHEMA_VERSION,
+    status::{
+        AssignmentStatus, SessionOverallStatus, SessionStatusReport,
+        STATUS_SCHEMA_VERSION,
+    },
+    RepairError,
 };
 
 const COORD_SEED: [u8; 32] = *b"stage12.10-repair-coord-seed-32!";
@@ -670,7 +681,7 @@ fn source_status_hash_drifts_when_supersession_arrives_after_planning() {
 /// apply CLI calls.
 #[test]
 fn apply_eligibility_check_catches_expired_when_projection_is_unchanged() {
-    use omni_contributor::check_repair_eligible;
+    use omni_ops::check_repair_eligible;
 
     // Build two status reports with the SAME assignments/partial
     // shape — only the `overall_status` differs. The projection
@@ -716,7 +727,7 @@ fn apply_eligibility_check_catches_expired_when_projection_is_unchanged() {
 /// change, but the chain is now invalid. Apply must refuse.
 #[test]
 fn apply_eligibility_check_catches_invalid_state_when_projection_is_unchanged() {
-    use omni_contributor::check_repair_eligible;
+    use omni_ops::check_repair_eligible;
 
     let assignments = vec![assignment_status(
         &"aa".repeat(32),
@@ -762,10 +773,8 @@ fn apply_eligibility_check_catches_invalid_state_when_projection_is_unchanged() 
 /// `already_superseded`, `not_in_status`, `stage_index_mismatch`.
 #[test]
 fn apply_per_action_check_rejects_hand_edited_plan_targeting_completed_assignment() {
-    use omni_contributor::{
-        check_reassign_targets_active_missing, supersession::SupersessionReason,
-        SupersessionStatus,
-    };
+    use omni_contributor::{supersession::SupersessionReason};
+    use omni_ops::{check_reassign_targets_active_missing, SupersessionStatus};
 
     let asn_a_id = "aa".repeat(32);
     let asn_b_id = "bb".repeat(32);
@@ -1164,9 +1173,8 @@ fn aggregate_verifier_rejects_extra_assignment_without_partial() {
 
 #[test]
 fn invalid_partial_plan_targets_only_assignments_with_invalid_partials() {
-    use omni_contributor::{
-        supersession::SupersessionReason, InvalidArtifactStatus,
-    };
+    use omni_contributor::{supersession::SupersessionReason};
+    use omni_ops::InvalidArtifactStatus;
 
     // Build a synthetic InvalidState status: assignment A has an
     // InvalidPartial diagnostic; assignment B is just plain
@@ -1182,7 +1190,7 @@ fn invalid_partial_plan_targets_only_assignments_with_invalid_partials() {
         reason_tag: "ContributorSignatureFailed".into(),
     }];
 
-    let plan = omni_contributor::build_session_repair_plan_with_reason(
+    let plan = omni_ops::build_session_repair_plan_with_reason(
         &status,
         RepairStrategy::ReassignMissing,
         SupersessionReason::InvalidPartial,
@@ -1208,9 +1216,8 @@ fn invalid_partial_plan_targets_only_assignments_with_invalid_partials() {
 
 #[test]
 fn invalid_partial_planner_refuses_when_invalid_partial_targets_superseded_assignment() {
-    use omni_contributor::{
-        supersession::SupersessionReason, InvalidArtifactStatus,
-    };
+    use omni_contributor::{supersession::SupersessionReason};
+    use omni_ops::InvalidArtifactStatus;
 
     // Defensive case: the Stage 12.9 reporter SKIPS superseded
     // partials before running `verify_partial_result`, so an
@@ -1242,7 +1249,7 @@ fn invalid_partial_planner_refuses_when_invalid_partial_targets_superseded_assig
         },
     ];
 
-    let err = omni_contributor::build_session_repair_plan_with_reason(
+    let err = omni_ops::build_session_repair_plan_with_reason(
         &status,
         RepairStrategy::ReassignMissing,
         SupersessionReason::InvalidPartial,
@@ -1261,9 +1268,8 @@ fn invalid_partial_planner_refuses_when_invalid_partial_targets_superseded_assig
 
 #[test]
 fn invalid_partial_planner_refuses_when_invalid_state_also_has_invalid_join() {
-    use omni_contributor::{
-        supersession::SupersessionReason, InvalidArtifactStatus,
-    };
+    use omni_contributor::{supersession::SupersessionReason};
+    use omni_ops::InvalidArtifactStatus;
 
     // Reviewer's requested regression. Status has
     // `InvalidPartial(A)` plus a separate `InvalidJoin(...)`.
@@ -1287,7 +1293,7 @@ fn invalid_partial_planner_refuses_when_invalid_state_also_has_invalid_join() {
             reason_tag: "ContributorSignatureFailed".into(),
         },
     ];
-    let err = omni_contributor::build_session_repair_plan_with_reason(
+    let err = omni_ops::build_session_repair_plan_with_reason(
         &status,
         RepairStrategy::ReassignMissing,
         SupersessionReason::InvalidPartial,
@@ -1306,9 +1312,8 @@ fn invalid_partial_planner_refuses_when_invalid_state_also_has_invalid_join() {
 
 #[test]
 fn invalid_partial_planner_refuses_orphan_unmatched_invalid_partial() {
-    use omni_contributor::{
-        supersession::SupersessionReason, InvalidArtifactStatus,
-    };
+    use omni_contributor::{supersession::SupersessionReason};
+    use omni_ops::InvalidArtifactStatus;
 
     // Orphan partials (`reason_tag == "unmatched"`) have NO
     // parent assignment by construction, so the planner cannot
@@ -1324,7 +1329,7 @@ fn invalid_partial_planner_refuses_orphan_unmatched_invalid_partial() {
         assignment_id: orphan_id.clone(),
         reason_tag: "unmatched".into(),
     }];
-    let err = omni_contributor::build_session_repair_plan_with_reason(
+    let err = omni_ops::build_session_repair_plan_with_reason(
         &status,
         RepairStrategy::ReassignMissing,
         SupersessionReason::InvalidPartial,
@@ -1343,7 +1348,8 @@ fn invalid_partial_planner_refuses_orphan_unmatched_invalid_partial() {
 
 #[test]
 fn missing_partial_strategy_still_refuses_invalid_state() {
-    use omni_contributor::{supersession::SupersessionReason, InvalidArtifactStatus};
+    use omni_contributor::{supersession::SupersessionReason};
+    use omni_ops::InvalidArtifactStatus;
 
     let asn_a_id = "aa".repeat(32);
     let asn_a = assignment_status(&asn_a_id, 0, &"01".repeat(32), false);
@@ -1353,7 +1359,7 @@ fn missing_partial_strategy_still_refuses_invalid_state() {
         assignment_id: asn_a_id.clone(),
         reason_tag: "ContributorSignatureFailed".into(),
     }];
-    let err = omni_contributor::build_session_repair_plan_with_reason(
+    let err = omni_ops::build_session_repair_plan_with_reason(
         &status,
         RepairStrategy::ReassignMissing,
         SupersessionReason::MissingPartial,
@@ -1364,7 +1370,7 @@ fn missing_partial_strategy_still_refuses_invalid_state() {
     assert!(matches!(err, RepairError::InvalidState));
 
     // Same for OperatorRebalance.
-    let err2 = omni_contributor::build_session_repair_plan_with_reason(
+    let err2 = omni_ops::build_session_repair_plan_with_reason(
         &status,
         RepairStrategy::ReassignMissing,
         SupersessionReason::OperatorRebalance,
@@ -1377,7 +1383,8 @@ fn missing_partial_strategy_still_refuses_invalid_state() {
 
 #[test]
 fn reannounce_missing_strategy_still_refuses_invalid_state() {
-    use omni_contributor::{supersession::SupersessionReason, InvalidArtifactStatus};
+    use omni_contributor::{supersession::SupersessionReason};
+    use omni_ops::InvalidArtifactStatus;
 
     // ReannounceMissing carries no reason (the helper ignores it),
     // but to be defensive we pass InvalidPartial — the path is the
@@ -1390,7 +1397,7 @@ fn reannounce_missing_strategy_still_refuses_invalid_state() {
         assignment_id: asn_a_id.clone(),
         reason_tag: "ContributorSignatureFailed".into(),
     }];
-    let err = omni_contributor::build_session_repair_plan_with_reason(
+    let err = omni_ops::build_session_repair_plan_with_reason(
         &status,
         RepairStrategy::ReannounceMissing,
         SupersessionReason::InvalidPartial,

@@ -43,7 +43,9 @@ use crate::integrity::{
     scan_state_integrity_with_audit_orphans, FindingKind, IntegrityFinding,
     ScanOptions, StateIntegrityReport,
 };
-use crate::state::{ContributorStateStore, StateNamespace, STATE_VERSION};
+use omni_contributor::state::{
+    ContributorStateStore, StateNamespace, STATE_VERSION,
+};
 use crate::status::build_session_status_report;
 use crate::resume::{compute_audit_health, AuditCoherence};
 

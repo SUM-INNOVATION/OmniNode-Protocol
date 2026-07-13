@@ -12,14 +12,14 @@
 //! mode, no marketplace, no new gossipsub topic, no SNIP wire
 //! change.
 
-use omni_contributor::{
+use omni_contributor::{supersession::SupersessionReason};
+use omni_ops::{
     check_reassign_eligible_allowing_invalid_partials, repair_plan_hash_hex,
     source_status_hash_hex,
     status::{
         AssignmentStatus, SessionOverallStatus, SessionStatusReport,
         STATUS_SCHEMA_VERSION,
     },
-    supersession::SupersessionReason,
     InvalidArtifactStatus, RepairAction, RepairError, RepairStrategy,
     SessionRepairPlan, REPAIR_PLAN_SCHEMA_VERSION,
 };

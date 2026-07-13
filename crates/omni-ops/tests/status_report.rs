@@ -10,25 +10,27 @@
 use std::fs;
 
 use omni_contributor::{
-    build_session_status_report,
     canonical::{
         aggregated_result_signing_input, assignment_id_hex,
         canonical_partial_result_bytes, contributor_join_signing_input,
-        execution_session_signing_input, hex_lower, partial_result_signing_input,
-        peer_advertisement_signing_input, session_id_hex, work_assignment_signing_input,
+        execution_session_signing_input, hex_lower,
+        partial_result_signing_input, peer_advertisement_signing_input,
+        session_id_hex, work_assignment_signing_input,
     },
     handoff::TensorDtype,
     result::{MeasuredAccounting, StageContribution, WorkUnitKind},
     session::{
-        AggregatedContributorResult, AggregatedPartialRef, PartialContributorResult,
-        WorkAssignment, WorkKind,
+        AggregatedContributorResult, AggregatedPartialRef,
+        PartialContributorResult, WorkAssignment, WorkKind,
     },
     ContributorJoin, ContributorPeerAdvertisement, ContributorSigner,
     ContributorStateStore, CoordinatorSigner, ExecutionSession,
-    InvalidArtifactStatus, PeerCapabilities, SessionOverallStatus,
-    SessionStatusReport, StateNamespace, StateObjectKind,
+    PeerCapabilities, StateNamespace, StateObjectKind,
     PEER_ADVERTISEMENT_SCHEMA_VERSION, SESSION_SCHEMA_VERSION,
-    STATUS_SCHEMA_VERSION,
+};
+use omni_ops::{
+    build_session_status_report, InvalidArtifactStatus, SessionOverallStatus,
+    SessionStatusReport, STATUS_SCHEMA_VERSION,
 };
 
 const COORD_SEED: [u8; 32] = *b"stage12.9-status-coord-seed-32b!";

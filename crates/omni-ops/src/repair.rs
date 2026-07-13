@@ -24,7 +24,7 @@
 //!
 //! ### Why no `ReassignMissing` in v1
 //!
-//! [`crate::session_verify::verify_aggregated_result`] requires
+//! [`omni_contributor::session_verify::verify_aggregated_result`] requires
 //! every assignment in the supplied slice to be referenced exactly
 //! once in the aggregate's `partial_refs`. Adding a replacement
 //! assignment for a missing partial would leave the old assignment
@@ -129,12 +129,13 @@ pub enum RepairAction {
         /// original — the planner enforces compatibility).
         replacement_stage_index: u32,
         /// `WorkKind` for the replacement assignment.
-        replacement_work_kind: crate::session::WorkKind,
+        replacement_work_kind: omni_contributor::session::WorkKind,
         replacement_expected_work_units: u64,
-        replacement_expected_work_unit_kind: crate::result::WorkUnitKind,
+        replacement_expected_work_unit_kind:
+            omni_contributor::result::WorkUnitKind,
         /// `SupersessionReason` that will be embedded in the
         /// signed `WorkAssignmentSupersession`.
-        reason: crate::supersession::SupersessionReason,
+        reason: omni_contributor::supersession::SupersessionReason,
     },
 }
 
@@ -645,7 +646,7 @@ pub fn build_session_repair_plan(
     build_session_repair_plan_with_reason(
         status,
         strategy,
-        crate::supersession::SupersessionReason::MissingPartial,
+        omni_contributor::supersession::SupersessionReason::MissingPartial,
         now_utc,
         coordinator_pubkey_hex,
     )
@@ -659,12 +660,12 @@ pub fn build_session_repair_plan(
 pub fn build_session_repair_plan_with_reason(
     status: &SessionStatusReport,
     strategy: RepairStrategy,
-    reassign_reason: crate::supersession::SupersessionReason,
+    reassign_reason: omni_contributor::supersession::SupersessionReason,
     now_utc: &str,
     coordinator_pubkey_hex: Option<&str>,
 ) -> Result<SessionRepairPlan, RepairError> {
     use crate::status::InvalidArtifactStatus;
-    use crate::supersession::SupersessionReason;
+    use omni_contributor::supersession::SupersessionReason;
 
     if status.schema_version != crate::status::STATUS_SCHEMA_VERSION {
         return Err(RepairError::UnsupportedSchemaVersion {
