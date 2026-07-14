@@ -400,8 +400,118 @@ fn submit_attestation_uses_min_fee_unconditionally() {
     let signed = SignedTransaction::from_hex(&hex).expect("hex must decode");
     match signed.inner {
         TxInner::V2(tx) => {
-            assert_eq!(tx.fee, 7, "tx.fee must equal params.min_fee (widened u64 → u128)");
+            assert_eq!(tx.fee, 7, "tx.fee must equal params.min_fee (Balance = u128)");
         }
         TxInner::Legacy(_) => panic!("expected V2 inner, got Legacy"),
     }
+}
+
+/// Issue #97 — provenance-backed fee=1 outer-signing-hash regression,
+/// exercised through the **real production submission path**
+/// (`chain_getChainParams` → `ChainParamsInfo` (u128 `min_fee`) →
+/// `submit_attestation` → `TransactionV2` → captured
+/// `sum_sendRawTransaction` hex → `SignedTransaction` decode), **not** a
+/// direct `TransactionV2` build.
+///
+/// The `u64` → `u128` DTO widening must leave the outer signing bytes
+/// byte-stable for any fee `<= u64::MAX` (`TransactionV2.fee` was already
+/// `u128`). This pins the fee=1 vector.
+///
+/// Provenance of [`PRE_ISSUE_97_FEE_ONE_SIGNING_HASH_HEX`]:
+/// - Reproduced from the pre-Issue-97 base commit **`bc9f365`** (the DTO
+///   was still `u64` there; for a fee `<= u64::MAX` the encoded outer
+///   bytes are identical pre/post-change).
+/// - Chain primitives: **`sumchain-primitives` 0.2.0** (crates.io).
+/// - Construction: **`hash = BLAKE3(bincode_1_3(TransactionV2))`** via
+///   `TransactionV2::signing_hash()`.
+/// - Independently matched by a hand-built canonical `TransactionV2`
+///   carrying the identical fixture (two independent routes agreed).
+/// - Exact production fixture: `attestation_for(&seed_address())` — the
+///   `sess-stage7b` payload (session_id `"sess-stage7b"`,
+///   model_hash `[0x00; 32]`, manifest_root `[0x11; 32]`,
+///   response_hash `[0x11; 32]`, proof_root `[0x22; 32]`) inner-signed
+///   under `SEED`; outer tx `chain_id = 31337`, `fee = 1`, `nonce = 0`,
+///   `from = Address::from_public_key(pubkey(SEED))`.
+///
+/// Recorded as a readable lowercase-hex string (no opaque decimal byte
+/// array) and compared via the chain `Hash` API's own hex parse; the
+/// test target has no `hex` dependency and none is added for cosmetics.
+const PRE_ISSUE_97_FEE_ONE_SIGNING_HASH_HEX: &str =
+    "124f6f6c258133729195824153a8f8c5190b54eccdb14d5ea061a0bac5320033";
+
+#[test]
+fn submit_attestation_fee_one_matches_provenance_signing_hash() {
+    use sumchain_primitives::{Hash, SignedTransaction, TxInner};
+
+    // Real production path. `happy_fake()` returns `min_fee = 1`.
+    let fake = happy_fake();
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    client.submit_attestation(&attestation_for(&seed_address())).unwrap();
+
+    let send_call = fake
+        .calls()
+        .into_iter()
+        .find(|(m, _)| m == "sum_sendRawTransaction")
+        .expect("sum_sendRawTransaction must be called");
+    let hex = send_call.1.as_array().unwrap()[0].as_str().unwrap().to_string();
+    let signed = SignedTransaction::from_hex(&hex).expect("submitted hex must decode");
+    let TxInner::V2(tx) = signed.inner else {
+        panic!("expected V2 inner, got Legacy")
+    };
+
+    assert_eq!(tx.fee, 1, "fee must be the min_fee=1 from chain_getChainParams");
+
+    let expected = Hash::from_hex(PRE_ISSUE_97_FEE_ONE_SIGNING_HASH_HEX)
+        .expect("provenance hash constant must be valid hex");
+    assert_eq!(
+        tx.signing_hash(),
+        expected,
+        "fee=1 production signing hash drifted from the bc9f365 provenance \
+         vector — the u64 → u128 DTO change must not alter practical-fee \
+         tx bytes through the real client path"
+    );
+}
+
+/// Issue #97 — a `min_fee` just above `u64::MAX`, driven through the
+/// **real production submission path** (not a direct `TransactionV2`
+/// build). Proves the widened DTO + the transport's arbitrary-precision
+/// JSON handling carry the exact value all the way to the signed
+/// on-wire transaction with no truncation, float rounding, or wrap.
+#[test]
+fn submit_attestation_fee_above_u64_max_survives_production_path() {
+    use sumchain_primitives::{SignedTransaction, TxInner};
+
+    // Build the `chain_getChainParams` response by parsing a RAW JSON
+    // string so the exact `min_fee` integer token (`u64::MAX + 1`) is
+    // preserved through the intermediate `serde_json::Value` — this is
+    // what the on-wire transport does, and it depends on the crate's
+    // `arbitrary_precision` feature. Splicing a Rust `u128` literal via
+    // `json!` would not reproduce the wire path.
+    let fake = happy_fake();
+    let params_value: serde_json::Value = serde_json::from_str(
+        r#"{"finality_depth":10,"min_fee":18446744073709551616,"chain_id":31337,"omninode_enabled_from_height":0,"v2_enabled_from_height":0}"#,
+    )
+    .expect("raw params JSON must parse");
+    fake.set_response("chain_getChainParams", Ok(params_value));
+
+    let client = SumChainClient::with_transport(SEED, fake.clone());
+    client.submit_attestation(&attestation_for(&seed_address())).unwrap();
+
+    let send_call = fake
+        .calls()
+        .into_iter()
+        .find(|(m, _)| m == "sum_sendRawTransaction")
+        .expect("sum_sendRawTransaction must be called");
+    let hex = send_call.1.as_array().unwrap()[0].as_str().unwrap().to_string();
+    let signed = SignedTransaction::from_hex(&hex).expect("submitted raw tx must decode");
+    let TxInner::V2(tx) = signed.inner else {
+        panic!("expected V2 inner, got Legacy")
+    };
+
+    let expected = u64::MAX as u128 + 1;
+    assert_eq!(
+        tx.fee, expected,
+        "a min_fee just above u64::MAX must survive DTO → TransactionV2 → \
+         raw-tx round-trip intact (no truncation/float/wrap)"
+    );
 }

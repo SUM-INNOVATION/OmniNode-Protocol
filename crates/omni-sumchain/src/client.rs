@@ -4,7 +4,7 @@
 //! Chain's JSON-RPC surface. Both the read/query surface (Stage 7a)
 //! and the real `submit_attestation` flow (Stage 7b) are live; the
 //! submit path delegates to [`crate::tx::build_and_submit_signed_transaction`]
-//! against vendored chain primitives at rev `d83e45a4`.
+//! against the `sumchain-primitives` v0.2.0 chain primitives (crates.io).
 //!
 //! `SumChainClient` is generic over a [`JsonRpcTransport`] so default
 //! `cargo test` runs fully hermetically against

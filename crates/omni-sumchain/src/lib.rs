@@ -2,9 +2,9 @@
 //!
 //! Implements the [`omni_zkml::ChainClient`] trait against SUM Chain's
 //! JSON-RPC surface. Stage 7a shipped the read/query surface; Stage 7b
-//! ships the real `submit_attestation` flow against vendored chain
-//! primitives at rev `d83e45a4` (`sumchain-primitives` +
-//! `sumchain-crypto`). The full chain-confirmed construction sequence
+//! ships the real `submit_attestation` flow against the
+//! `sumchain-primitives` + `sumchain-crypto` v0.2.0 crates (crates.io).
+//! The full chain-confirmed construction sequence
 //! lives in [`tx::build_and_submit_signed_transaction`].
 //!
 //! ## Design points
@@ -53,7 +53,7 @@
 pub mod client;
 pub mod dto;
 // Stage 9a + 9c: outer_sign + tx depend on the public chain
-// primitives (`sumchain-primitives` / `sumchain-crypto` v0.1.0,
+// primitives (`sumchain-primitives` / `sumchain-crypto` v0.2.0,
 // crates.io, MIT OR Apache-2.0). Gated behind `submit` so default
 // builds resolve without ever touching the chain crates.
 #[cfg(feature = "submit")]
