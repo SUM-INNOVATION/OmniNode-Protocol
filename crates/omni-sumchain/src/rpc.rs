@@ -153,6 +153,12 @@ impl JsonRpcTransport for UreqTransport {
             ChainClientError::Other(format!("{TRANSPORT_BODY_READ}{e}"))
         })?;
 
+        // Issue #97: the crate enables `serde_json`'s `arbitrary_precision`
+        // feature, so this intermediate `Value` preserves the exact integer
+        // token of every JSON number (e.g. a `chain_getChainParams.min_fee`
+        // above `u64::MAX`) instead of coercing it to `f64`. The exact token
+        // survives the `.get("result").cloned()` below and the later typed
+        // `from_value::<ChainParamsInfo>` (`min_fee: u128`) deserialize.
         let envelope: serde_json::Value = serde_json::from_str(&resp_str).map_err(|e| {
             ChainClientError::Other(format!("{NON_JSON_RESPONSE}{e}"))
         })?;

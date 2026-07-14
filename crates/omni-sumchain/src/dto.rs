@@ -108,24 +108,36 @@ impl BlockFinality {
 /// `#[serde(default)]` to keep the parser forward-compat with mirrors
 /// that don't yet expose them.
 ///
-/// Chain rev `d83e45a4`'s local mirror config emits both at value `0`,
-/// meaning activation from genesis.
+/// The local-mirror config emits both at value `0`, meaning
+/// activation from genesis.
 ///
 /// Note on `min_fee` width: the chain's on-tx fee field is `Balance`
-/// (= `u128`); this DTO exposes it as `u64` because the JSON-RPC
-/// emission fits in 64 bits for any practical local-mirror fee. Stage 7b
-/// widens to `u128` via `as` cast at the `TransactionV2` construction
-/// site.
+/// (= `u128`); this DTO exposes it as `u128` to match, so the parsed
+/// value flows straight into `TransactionV2.fee` (also `u128`) with no
+/// cast. Fees that fit in 64 bits (every practical local-mirror fee)
+/// parse and encode byte-for-byte identically to the earlier `u64`
+/// representation.
+///
+/// Issue #97 caveat: widening this field to `u128` is necessary but not
+/// sufficient. The production transport parses the raw HTTP body into a
+/// `serde_json::Value` *before* this typed struct is deserialized (see
+/// [`crate::rpc::UreqTransport::call`] → [`crate::client::SumChainClient::get_chain_params`]).
+/// Without `serde_json`'s `arbitrary_precision` feature a JSON integer
+/// above `u64::MAX` is already coerced to `f64` at that `Value` stage and
+/// can never reach this `u128` field intact. The crate therefore enables
+/// `arbitrary_precision` (see `Cargo.toml`), which preserves the exact
+/// integer token through `Value` so a `> u64::MAX` `min_fee` survives to
+/// this field with no truncation, wrap, or float rounding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainParamsInfo {
     pub finality_depth: u64,
-    pub min_fee: u64,
+    pub min_fee: u128,
     pub chain_id: u64,
 
     #[serde(default)]
     pub omninode_enabled_from_height: Option<u64>,
 
-    /// Stage 7b addition. Chain rev `d83e45a4` exposes this alongside
+    /// Stage 7b addition. The local mirror exposes this alongside
     /// `omninode_enabled_from_height`. `submit_attestation` requires
     /// **both** activation flags to be `Some(h)` with `head >= h` before
     /// transmitting.

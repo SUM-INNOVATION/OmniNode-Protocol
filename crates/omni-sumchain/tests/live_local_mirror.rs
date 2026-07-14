@@ -17,6 +17,8 @@
 
 use omni_sumchain::{BlockFinality, SumChainClient};
 
+mod common;
+
 /// Resolve the live-mirror RPC URL from the env var, or print a clear
 /// skip message and return `None` so the test exits 0 instead of
 /// failing.
@@ -65,8 +67,9 @@ fn live_get_chain_params() {
     // operators on a non-default port can override the URL but a
     // wrong chain entirely fails loud.
     assert_eq!(
-        params.chain_id, 31337,
-        "live mirror chain_id should be the documented local-mirror default 31337"
+        params.chain_id, common::DEVNET_CHAIN_ID,
+        "live mirror chain_id should be the shared devnet default {}",
+        common::DEVNET_CHAIN_ID
     );
 }
 
@@ -194,10 +197,10 @@ fn live_submit_roundtrip() {
     // mirror's documented chain_id.
     let params = client.get_chain_params().expect("chain_getChainParams must succeed");
     assert_eq!(
-        params.chain_id, 31337,
-        "expected local-mirror chain_id 31337; got {}. Refusing to submit \
-         against a non-local-mirror endpoint",
-        params.chain_id
+        params.chain_id, common::DEVNET_CHAIN_ID,
+        "expected shared devnet chain_id {}; got {}. Refusing to submit \
+         against a non-devnet endpoint",
+        common::DEVNET_CHAIN_ID, params.chain_id
     );
 
     // Both activation gates must be live.

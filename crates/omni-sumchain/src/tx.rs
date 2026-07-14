@@ -1,7 +1,7 @@
 //! Phase 5 Stage 7b — outer `SignedTransaction` construction & submission.
 //!
-//! Implements the chain-confirmed submit flow against the vendored
-//! `sumchain-primitives` types at chain rev `d83e45a4`. Called by
+//! Implements the chain-confirmed submit flow against the
+//! `sumchain-primitives` v0.2.0 types (crates.io). Called by
 //! [`crate::SumChainClient::submit_attestation`].
 //!
 //! # Flow
@@ -39,8 +39,9 @@
 //! 9. Build `TransactionV2 { chain_id, from, fee, nonce, payload }`.
 //!    `chain_id` and `min_fee` come from `chain_getChainParams`
 //!    (already read for the gates above; reused without a second RPC
-//!    call). `fee` widens `params.min_fee: u64 as u128` to fit the
-//!    chain's `Balance` type. `from = Address::from_public_key(pubkey)`.
+//!    call). `fee = params.min_fee` — the DTO already carries the
+//!    chain's `Balance` width (`u128`), so no cast is needed.
+//!    `from = Address::from_public_key(pubkey)`.
 //! 10. Outer sign via [`crate::outer_sign::outer_sign_transaction_v2`]:
 //!     `outer_hash = TransactionV2::signing_hash()` (BLAKE3 of bincode
 //!     1.3 of the tx); `outer_sig = Ed25519_sign(outer_hash.as_bytes())`;
@@ -178,7 +179,7 @@ pub(crate) fn build_and_submit_signed_transaction<T: JsonRpcTransport>(
     let tx = TransactionV2 {
         chain_id: params.chain_id,
         from,
-        fee: params.min_fee as u128, // widen u64 → Balance (= u128)
+        fee: params.min_fee, // DTO already carries Balance (= u128); no cast
         nonce,
         payload: TxPayload::InferenceAttestation(tx_data),
     };

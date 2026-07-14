@@ -9,8 +9,8 @@ Phase 5 Stage 7a + 7b — SUM Chain adapter for `omni-zkml::ChainClient`.
 
 **Stage 7b (submit):** `submit_attestation` is fully implemented using
 the public chain primitives (`sumchain-primitives` + `sumchain-crypto`
-v0.1.0, crates.io, dual-licensed MIT OR Apache-2.0, byte-equivalent to
-chain rev `d83e45a4` for the InferenceAttestation surface). Flow:
+v0.2.0, crates.io, dual-licensed MIT OR Apache-2.0) covering the
+InferenceAttestation surface. Flow:
 four pre-flight gates → Stage 6 inner pipeline → local-to-chain type
 conversion (parity-tested under bincode 1.3) → outer-tx assembly →
 outer `BLAKE3+Ed25519` sign via `sumchain-crypto` → bare-hex
@@ -44,9 +44,9 @@ outer `BLAKE3+Ed25519` sign via `sumchain-crypto` → bare-hex
   public `sumchain_primitives` types, then outer-tx assembly + sign,
   then bare-hex `sum_sendRawTransaction`. Submission flow detailed in
   [`src/tx.rs`](src/tx.rs).
-- **Public chain primitives** from crates.io (v0.1.0, MIT OR Apache-2.0,
-  byte-equivalent to chain rev `d83e45a4` for the InferenceAttestation
-  surface): `sumchain-primitives` (TransactionV2, TxPayload,
+- **Public chain primitives** from crates.io (v0.2.0, MIT OR Apache-2.0)
+  for the InferenceAttestation surface: `sumchain-primitives`
+  (TransactionV2, TxPayload,
   SignedTransaction, Address) and `sumchain-crypto` (Ed25519
   sign/verify, key derivation).
 - **Parity-verified** local-to-chain byte equivalence under bincode
@@ -82,7 +82,7 @@ only by `#[ignore]`'d live tests gated on env vars.
 ```bash
 # Hermetic (default) — runs in CI; no network, no GitHub credentials.
 # The chain primitives are public crates.io deps (sumchain-primitives
-# / sumchain-crypto v0.1.0) and resolve against the crates.io index.
+# / sumchain-crypto v0.2.0) and resolve against the crates.io index.
 cargo test -p omni-sumchain
 
 # Submit path tests (workspace + crates.io resolution; no live RPC).
@@ -105,16 +105,15 @@ unset, so `cargo test -- --ignored` without them still exits 0.
 ## Auth setup (chain deps)
 
 As of Stage 9c, the chain primitives ship from crates.io
-(`sumchain-primitives` / `sumchain-crypto` v0.1.0, dual-licensed
+(`sumchain-primitives` / `sumchain-crypto` v0.2.0, dual-licensed
 MIT OR Apache-2.0). No GitHub credential, deploy key, or PAT is
 required on any code path — `cargo fetch` / `cargo build` /
 `cargo test` for both default and `--features submit` builds resolve
-entirely from the public crates.io index. The chain crates are
-byte-equivalent to chain rev `d83e45a4` for the InferenceAttestation
-surface; the `tests/parity_vendored_primitives.rs` parity suite and
-the Stage 9c.1 `tests/chain_produced_fixture.rs` chain-produced-bytes
-gate together pin
-that equivalence under bincode 1.3 + BLAKE3 signing.
+entirely from the public crates.io index. The
+`tests/parity_vendored_primitives.rs` parity suite and the Stage 9c.1
+`tests/chain_produced_fixture.rs` chain-produced-bytes gate together
+pin the local Stage 6 → chain-type byte-equivalence under bincode 1.3
++ BLAKE3 signing.
 
 ## Operational setup for live tests
 
@@ -137,10 +136,10 @@ The local mirror's documented defaults are:
 | | Value |
 |---|---|
 | RPC URL | `http://localhost:8545` |
-| `chain_id` | `31337` |
+| `chain_id` | `1337` |
 | `min_fee` | `1` |
 
-Live tests assert `chain_id == 31337` to fail loud when pointed at the
+Live tests assert `chain_id == 1337` to fail loud when pointed at the
 wrong endpoint.
 
 ## Stage 7b — submission flow (shipped)
@@ -168,10 +167,10 @@ The full chain-confirmed construction sequence is implemented in
    `sumchain_primitives::InferenceAttestationDigest`; parity-proven
    byte-equivalent under bincode 1.3.
 8. **`sum_getNonce(verifier_address)`** — fetched only after gates pass.
-9. **`TransactionV2 { chain_id, from, fee: min_fee as u128, nonce,
+9. **`TransactionV2 { chain_id, from, fee: min_fee, nonce,
    payload }`** — `chain_id` from params, `from =
-   Address::from_public_key(pubkey)`, fee widened from the DTO's `u64`
-   to the chain's `Balance` (= `u128`), payload =
+   Address::from_public_key(pubkey)`, `fee = min_fee` (the DTO already
+   carries the chain's `Balance` width `u128`, so no cast), payload =
    `TxPayload::InferenceAttestation(tx_data)`.
 10. **Outer signing** via `sumchain-crypto`:
     `outer_hash = TransactionV2::signing_hash()` (BLAKE3 of bincode 1.3

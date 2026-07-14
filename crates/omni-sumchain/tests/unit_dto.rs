@@ -94,10 +94,10 @@ fn chain_params_info_parses_pre_patch_response() {
 
 #[test]
 fn chain_params_info_local_mirror_defaults() {
-    // Pin the documented local-mirror defaults: chain_id 31337, min_fee 1.
-    let json = r#"{"finality_depth":12,"min_fee":1,"chain_id":31337,"omninode_enabled_from_height":0}"#;
+    // Pin the documented shared-devnet defaults: chain_id 1337, min_fee 1.
+    let json = r#"{"finality_depth":12,"min_fee":1,"chain_id":1337,"omninode_enabled_from_height":0}"#;
     let parsed: ChainParamsInfo = serde_json::from_str(json).unwrap();
-    assert_eq!(parsed.chain_id, 31337);
+    assert_eq!(parsed.chain_id, 1337);
     assert_eq!(parsed.min_fee, 1);
 }
 
@@ -135,6 +135,63 @@ fn chain_params_info_parses_asymmetric_activation() {
     let parsed: ChainParamsInfo = serde_json::from_str(json).unwrap();
     assert_eq!(parsed.omninode_enabled_from_height, Some(0));
     assert_eq!(parsed.v2_enabled_from_height, None);
+}
+
+// ── ChainParamsInfo.min_fee width (Issue #97: u64 → u128) ───────────
+//
+// `min_fee` mirrors the chain's `Balance` (= `u128`). Splice the raw
+// fee token into the JSON verbatim so boundary / overflow values are
+// exercised without Rust integer-literal coercion masking the parse.
+
+fn chain_params_json_with_min_fee(min_fee_token: &str) -> String {
+    format!(r#"{{"finality_depth":10,"min_fee":{min_fee_token},"chain_id":1}}"#)
+}
+
+#[test]
+fn chain_params_min_fee_one_parses() {
+    let parsed: ChainParamsInfo =
+        serde_json::from_str(&chain_params_json_with_min_fee("1")).unwrap();
+    assert_eq!(parsed.min_fee, 1u128);
+}
+
+#[test]
+fn chain_params_min_fee_u64_max_parses() {
+    let parsed: ChainParamsInfo =
+        serde_json::from_str(&chain_params_json_with_min_fee("18446744073709551615")).unwrap();
+    assert_eq!(parsed.min_fee, u64::MAX as u128);
+}
+
+/// Acceptance case for Issue #97: a fee just above `u64::MAX` must now
+/// parse. This errored while `min_fee` was typed `u64`.
+#[test]
+fn chain_params_min_fee_above_u64_max_parses() {
+    let parsed: ChainParamsInfo =
+        serde_json::from_str(&chain_params_json_with_min_fee("18446744073709551616")).unwrap();
+    assert_eq!(parsed.min_fee, u64::MAX as u128 + 1);
+}
+
+#[test]
+fn chain_params_min_fee_u128_max_parses() {
+    let parsed: ChainParamsInfo = serde_json::from_str(
+        &chain_params_json_with_min_fee("340282366920938463463374607431768211455"),
+    )
+    .unwrap();
+    assert_eq!(parsed.min_fee, u128::MAX);
+}
+
+#[test]
+fn chain_params_min_fee_negative_is_rejected() {
+    let res = serde_json::from_str::<ChainParamsInfo>(&chain_params_json_with_min_fee("-1"));
+    assert!(res.is_err(), "negative min_fee must not parse into u128");
+}
+
+#[test]
+fn chain_params_min_fee_above_u128_max_is_rejected() {
+    // u128::MAX + 1.
+    let res = serde_json::from_str::<ChainParamsInfo>(
+        &chain_params_json_with_min_fee("340282366920938463463374607431768211456"),
+    );
+    assert!(res.is_err(), "a value above u128::MAX must not parse");
 }
 
 // ── InferenceAttestationInfo ────────────────────────────────────────────────

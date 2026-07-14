@@ -1263,7 +1263,7 @@ where
 struct WatchSnapshot {
     chain_id: u64,
     finality_depth: u64,
-    min_fee: u64,
+    min_fee: u128,
     v2_from: Option<u64>,
     omninode_from: Option<u64>,
     head: u64,
