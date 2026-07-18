@@ -1,0 +1,52 @@
+[package]
+name        = "r0-zkvm-bench"
+version     = "0.0.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+# MSRV is local to this EXCLUDED crate (uses `u*::is_multiple_of`, stable since
+# 1.87). It intentionally does NOT touch the OmniNode workspace `rust-version`
+# (1.85), which this crate is excluded from.
+rust-version = "1.87"
+description  = "OmniNode #101 R0 host-side research crate that ADOPTS the frozen sumchain-wire 0.2.1 B0 wire types (NON-SELECTION; NOT a zkVM harness; performs no proving/measurement; NOT a workspace member; no production crate depends on it)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone research crate. It ADOPTS the published, frozen B0 candidate-neutral
+# wire types from `sumchain-wire 0.2.1` (namespace `sumchain_wire::b0`) — object
+# commitments, SNIP Merkle rules, input/output manifests, the 996-byte statement,
+# the candidate-neutral partial-compute proof, the candidate-specific production
+# proof envelope, the guest-program allowlist, and the verifier-material manifest
+# — and exercises the host-side, crypto-free groundwork around them (Merkle
+# witness/proof generation, allowlist/identity/journal binding LOGIC, the integer
+# reference workload, and a benchmark artifact schema). It does NOT prove
+# anything and integrates no zkVM SDK / toolchain / container / build-script.
+#
+# NON-SELECTION is structurally forced: the statement is only ever a zero-spec-
+# hash TEMPLATE, no code path materializes a final statement or writes a proof /
+# allowlist / measurement / protocol-hash artifact, and every emitted artifact is
+# stamped `NON_SELECTION / INVALID_FOR_B0`.
+#
+# Intentionally NOT a member of the OmniNode workspace: the root Cargo.toml sets
+# `exclude = ["tools"]`, so the operator binary's build graph can never reach
+# this crate. No production crate may depend on it. See README.md and
+# tests/dependency_isolation.rs for the enforced boundary.
+#
+# Dependencies are the crates.io `sumchain-wire` (exact-pinned `=0.2.1`, no
+# path/git source) plus blake3 / serde / serde_json, so `cargo build`/`cargo
+# test` resolve fully offline with plain stable Rust. No zkVM SDK/toolchain is
+# declared or integrated, there are NO `sp1`/`risc0` feature gates, and NO guest
+# scaffolding — nothing here pretends to be a working prover.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[dependencies]
+# Issue #101 — adopt the published, frozen B0 wire types from the SUM Chain
+# team's crates.io release. Exact-pinned; no path/git source. This crate uses
+# ONLY the `b0` module (object commitments, Merkle rules, manifests, statement,
+# proof/envelope, allowlist, verifier-material, enums, workload byte helpers).
+sumchain-wire = "=0.2.1"
+blake3        = "1.5"
+serde         = { version = "1.0", features = ["derive"] }
+serde_json    = "1.0"
+
+[profile.release]
+opt-level = 3
