@@ -1,0 +1,100 @@
+# Dedicated CI for the workspace-EXCLUDED research tool `tools/r0-zkvm-bench`.
+#
+# The main workspace CI (`ci.yml`) never builds or tests these files: the root
+# `Cargo.toml` sets `exclude = ["tools"]`, so the tool is invisible to every
+# workspace job. This job builds, tests, formats, lints, and gates the tool on
+# its own — using the tool's declared `rust-version` (1.87) — and asserts the
+# non-selection / isolation invariants that keep it a pure host-side research
+# crate: no production dependency, no SP1/RISC Zero, an exact `sumchain-wire`
+# `=0.2.1` registry pin, and no proof/guest/measurement/finalization artifact.
+name: r0-zkvm-bench (excluded research tool)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/r0-zkvm-bench/**'
+      - '.github/workflows/r0-zkvm-bench.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/r0-zkvm-bench/**'
+      - '.github/workflows/r0-zkvm-bench.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  r0-zkvm-bench:
+    name: r0-zkvm-bench — build / test / gate (excluded tool)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the tool's declared Rust version (rust-version = 1.87)
+        run: |
+          rustup toolchain install 1.87.0 --profile minimal --component rustfmt --component clippy
+          rustup run 1.87.0 rustc --version
+
+      - name: Cache cargo registry / git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-r0zkvmbench-${{ hashFiles('tools/r0-zkvm-bench/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-r0zkvmbench-
+
+      - name: fmt --check
+        run: cargo +1.87.0 fmt --manifest-path tools/r0-zkvm-bench/Cargo.toml -- --check
+
+      - name: clippy -D warnings (locked)
+        run: cargo +1.87.0 clippy --locked --manifest-path tools/r0-zkvm-bench/Cargo.toml --all-targets -- -D warnings
+
+      - name: test (locked)
+        run: cargo +1.87.0 test --locked --manifest-path tools/r0-zkvm-bench/Cargo.toml
+
+      - name: doctests (locked)
+        run: cargo +1.87.0 test --locked --manifest-path tools/r0-zkvm-bench/Cargo.toml --doc
+
+      - name: production-dependency isolation
+        run: tools/r0-zkvm-bench/scripts/check_no_prod_dep.sh
+
+      - name: Assert root workspace metadata contains ZERO r0-zkvm-bench packages
+        run: |
+          n=$(cargo metadata --format-version 1 --no-deps \
+              | python3 -c 'import sys,json; print(sum(1 for p in json.load(sys.stdin)["packages"] if p["name"]=="r0-zkvm-bench"))')
+          echo "r0-zkvm-bench packages in root metadata: $n"
+          test "$n" -eq 0
+
+      - name: Assert exact registry sumchain-wire 0.2.1 pin + lock
+        run: |
+          grep -q 'sumchain-wire = "=0.2.1"' tools/r0-zkvm-bench/Cargo.toml
+          awk '/name = "sumchain-wire"/{f=1} f' tools/r0-zkvm-bench/Cargo.lock | grep -q 'version = "0.2.1"'
+          awk '/name = "sumchain-wire"/{f=1} f' tools/r0-zkvm-bench/Cargo.lock | grep -q 'source = "registry+'
+
+      - name: Assert NO SP1 / RISC Zero / zkVM in the resolved dependency graph
+        run: |
+          if cargo +1.87.0 tree --locked --manifest-path tools/r0-zkvm-bench/Cargo.toml \
+               | grep -v 'r0-zkvm-bench v' | grep -iE 'sp1|risc0|zkvm'; then
+            echo "ERROR: SP1/RISC Zero/zkVM dependency in the resolved graph"; exit 1
+          fi
+          echo "OK: no SP1/RISC Zero/zkVM dependency"
+
+      - name: Assert NO proof / guest / measurement / finalization artifact present
+        run: |
+          hits=$(find tools/r0-zkvm-bench -type d -name target -prune -o \
+                   -type f \( -name '*.elf' -o -name '*.proof' -o -name '*.bin' \
+                              -o -name '*.log' -o -name '*.receipt' \) -print)
+          if [ -n "$hits" ]; then echo "ERROR: generated artifact(s):"; echo "$hits"; exit 1; fi
+          if [ -d tools/r0-zkvm-bench/riscv-guest ] || find tools/r0-zkvm-bench -type d -name 'riscv-guest' | grep -q .; then
+            echo "ERROR: guest tree present"; exit 1
+          fi
+          echo "OK: no proof/guest/measurement/finalization artifact"
+
+      - name: Assert the checkout is CLEAN after building/testing
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain)"

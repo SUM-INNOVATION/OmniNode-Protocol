@@ -1,0 +1,25 @@
+# Build outputs — never commit. This crate is workspace-excluded and builds
+# into its own target/, which must stay out of version control.
+/target/
+
+# Cargo package dry-run output (.crate tarballs, extracted verify dirs).
+**/*.crate
+
+# Toolchain / compiler scratch artifacts.
+.rustc_info.json
+**/*.rlib
+**/*.rmeta
+**/*.rs.bk
+
+# zkVM guest / proof outputs (would only exist under an authorized toolchain,
+# which is ABSENT here): guest ELF/image binaries, receipts/proofs, image-id
+# caches, and any guest scaffolding directory.
+**/*.elf
+**/*.bin
+**/riscv-guest/
+**/*.receipt
+**/*.proof
+
+# Run logs / scratch output.
+**/*.log
+**/*.tmp
