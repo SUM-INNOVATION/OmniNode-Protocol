@@ -48,10 +48,15 @@ pub mod wire;
 
 pub use error::SettlementSubmitError;
 pub use tx::{
-    decode_unsigned_tx, sign_and_submit, verify_builder_envelope,
-    verify_decoded_transaction, ClaimSubmitReceipt,
+    decode_unsigned_tx, sign_and_submit, sign_and_submit_tx,
+    verify_builder_envelope, verify_decoded_transaction,
+    verify_register_verifier_transaction, ClaimSubmitReceipt,
+    SettlementSubmitReceipt, SubmitStatus,
 };
-pub use wire::{BuildClaimRewardRaw, BuildClaimRewardRequest};
+pub use wire::{
+    BuildClaimRewardRaw, BuildClaimRewardRequest, BuildRegisterVerifierRequest,
+    SettlementBuilderEnvelope,
+};
 
 // Re-export the chain-primitives types downstream consumers
 // (`omni-node`'s `run_claim` handler + its tests) need to inspect and
@@ -60,6 +65,8 @@ pub use wire::{BuildClaimRewardRaw, BuildClaimRewardRequest};
 // public-API chain surfaces — nothing test-only in this list.
 pub use sumchain_primitives::inference_settlement::{
     ClaimInferenceRewardRequest, InferenceSettlementOperation,
-    InferenceSettlementTxData,
+    InferenceSettlementTxData, RegisterVerifierRequest,
 };
-pub use sumchain_primitives::{Address, SignedTransaction, TransactionV2, TxPayload};
+pub use sumchain_primitives::{
+    Address, SignedTransaction, TransactionV2, TxInner, TxPayload,
+};
