@@ -258,6 +258,16 @@ pub enum SettlementCmd {
     #[cfg(feature = "settlement-submit")]
     Claim(Box<ClaimArgs>),
 
+    /// Issue #100 — operator verifier on-chain registration. Builds
+    /// the chain's no-key `omninode_buildRegisterVerifier` tx, signs
+    /// the returned hash with the `OMNINODE_VERIFIER_SEED_HEX` key,
+    /// and submits via `sum_sendRawTransaction`. Boxed for enum-size
+    /// parity with `Claim`. Feature-gated on `settlement-submit` —
+    /// reuses the same builder-envelope / signer / submit helpers as
+    /// the claim path.
+    #[cfg(feature = "settlement-submit")]
+    RegisterVerifier(Box<RegisterVerifierArgs>),
+
     /// Issue #81 — dispute open + resolve write path. Boxed for
     /// enum-size parity with `Claim`. Feature-gated on
     /// `settlement-dispute`; `settlement-read` / `settlement-submit`
@@ -316,6 +326,43 @@ pub struct ClaimArgs {
     /// verification and STOP. Never loads the signing seed. Never
     /// invokes `sum_sendRawTransaction`. Used for operator dry-runs
     /// and CI checks.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Issue #100 — argument surface for
+/// `operator settlement register-verifier`.
+#[cfg(feature = "settlement-submit")]
+#[derive(Args, Debug, Clone)]
+pub struct RegisterVerifierArgs {
+    /// Chain-id guardrail. The command REFUSES before building the tx
+    /// unless `chain_getChainParams.chain_id` equals this value —
+    /// preventing an accidental registration against the wrong chain.
+    #[arg(long)]
+    pub expect_chain_id: u64,
+
+    /// Bond amount (native Koppa) to lock at registration. REQUIRED —
+    /// clap rejects the command when `--bond` is omitted. Passed
+    /// straight to the chain builder. The chain executor requires a
+    /// positive bond (`Failed(365)` on zero), so the handler ALSO
+    /// rejects `--bond 0` locally — before any preflight RPC or seed
+    /// access — rather than building a guaranteed-doomed, fee-paying
+    /// transaction.
+    #[arg(long)]
+    pub bond: u128,
+
+    /// Optional fee override. When absent, the chain-side builder
+    /// applies its default. When present, it is passed to the builder
+    /// request and asserted-equal on the returned envelope.
+    #[arg(long)]
+    pub fee: Option<u128>,
+
+    /// Run preflight + builder RPC + envelope + decoded-tx
+    /// verification and STOP. Dry-run DERIVES the operator address from
+    /// `OMNINODE_VERIFIER_SEED_HEX` (needed for the builder request and
+    /// the envelope's `from` assertion) but never retains the secret,
+    /// never signs, and never invokes `sum_sendRawTransaction`. Used
+    /// for operator dry-runs and CI checks.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -435,6 +482,13 @@ pub(crate) fn dispatch_core<T: JsonRpcTransport>(
         SettlementCmd::Claim(a) => {
             run_claim(client, &a, out, crate::operator::SeedSource::Env)
         }
+        #[cfg(feature = "settlement-submit")]
+        SettlementCmd::RegisterVerifier(a) => run_register_verifier(
+            client,
+            &a,
+            out,
+            crate::operator::SeedSource::Env,
+        ),
         #[cfg(feature = "settlement-dispute")]
         SettlementCmd::Dispute(a) => match a.cmd {
             DisputeCmd::Open(inner) => {
@@ -1389,6 +1443,378 @@ fn run_claim<T: JsonRpcTransport>(
     );
     writeln!(out, "tx_hash={}", receipt.tx_hash)?;
     writeln!(out, "submitted=true")?;
+    Ok(())
+}
+
+// ── Issue #100 — verifier registration markers + run (settlement-submit) ──
+
+#[cfg(feature = "settlement-submit")]
+pub(crate) mod register_verifier_markers {
+    /// Emitted once preflight (chain-id + settlement gate + bonding
+    /// gate) and builder-envelope / decoded-tx verification all pass,
+    /// immediately before the signing seed is loaded.
+    pub(crate) const REGISTER_READY: &str = "settlement_register_verifier_ready";
+
+    /// Emitted when `--bond` is zero. The chain executor rejects a zero
+    /// bond (`Failed(365)`), so the handler refuses locally at the very
+    /// top — before any preflight RPC or seed/identity access — rather
+    /// than building a guaranteed-doomed, fee-paying transaction.
+    pub(crate) const REGISTER_REFUSED_BOND_ZERO: &str =
+        "settlement_register_verifier_refused_bond_zero";
+
+    /// Emitted when the chain reports a `chain_id` different from the
+    /// operator's `--expect-chain-id` guardrail.
+    pub(crate) const REGISTER_REFUSED_CHAIN_ID: &str =
+        "settlement_register_verifier_refused_chain_id";
+
+    /// Emitted when the settlement base gate OR the verifier-bonding
+    /// gate is dormant/scheduled at head. Carries the offending
+    /// `gate` name.
+    pub(crate) const REGISTER_REFUSED_DORMANCY: &str =
+        "settlement_register_verifier_refused_dormancy";
+
+    /// Emitted on a successful `sum_sendRawTransaction`.
+    pub(crate) const REGISTER_SUBMITTED: &str =
+        "settlement_register_verifier_submitted";
+
+    /// Emitted on any RPC / envelope / wire / signer failure.
+    pub(crate) const REGISTER_FAILED: &str = "settlement_register_verifier_failed";
+}
+
+/// Issue #100 — build + sign + submit an on-chain verifier registration.
+///
+/// Reuses the claim path's building blocks end-to-end: the
+/// `ClaimSignerIdentity` / `ClaimSigner` seed helpers (#80/#87), the
+/// generic `verify_builder_envelope` + `decode_unsigned_tx` +
+/// `sign_and_submit` helpers, and the chain's no-key
+/// `omninode_buildRegisterVerifier` builder. This handler adds ONLY
+/// the register-verifier preflight (chain-id + the two activation
+/// gates) and the register-verifier decoded-tx assertion — no new
+/// crypto and no chain-side change.
+#[cfg(feature = "settlement-submit")]
+fn run_register_verifier<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
+    args: &RegisterVerifierArgs,
+    out: &mut dyn Write,
+    seed_source: crate::operator::SeedSource,
+) -> Result<()> {
+    use omni_sumchain::dto::BlockFinality;
+    use omni_sumchain::settlement_submit::{
+        decode_unsigned_tx, sign_and_submit_tx, verify_builder_envelope,
+        verify_register_verifier_transaction, BuildRegisterVerifierRequest,
+    };
+
+    use register_verifier_markers as rvm;
+
+    tracing::info!(
+        event = "settlement_query",
+        subcommand = "register-verifier",
+        "settlement register-verifier start"
+    );
+
+    // ── Step 1: local bond validation (zero network, zero secrets) ───
+    // The chain executor rejects a zero bond (`Failed(365)`), so a
+    // `--bond 0` would build a guaranteed-doomed, fee-paying tx. Refuse
+    // at the very TOP — before any preflight RPC and before any seed /
+    // identity access. `--bond` is a REQUIRED clap arg, so an omitted
+    // flag is rejected by clap before this handler is ever reached; the
+    // only local case left to enforce is an explicit zero.
+    if args.bond == 0 {
+        tracing::warn!(
+            event = rvm::REGISTER_REFUSED_BOND_ZERO,
+            subcommand = "register-verifier",
+            bond = args.bond.to_string(),
+            "register-verifier refused: --bond must be positive"
+        );
+        return Err(anyhow::anyhow!(
+            "--bond must be a positive amount: the chain executor rejects a \
+             zero bond (Failed(365)); refusing to register verifier before \
+             any RPC or seed access"
+        ));
+    }
+
+    // ── Step 2: preflight RPC — params + head, chain-id, both gates ──
+    // The entire preflight precedes signer-identity resolution: the
+    // configured seed is never read for a command that a chain-id or
+    // dormant-gate refusal would reject anyway.
+    let params = client.get_chain_params().map_err(|e| {
+        let err = anyhow::anyhow!("chain_getChainParams: {e}");
+        tracing::error!(
+            event = rvm::REGISTER_FAILED,
+            subcommand = "register-verifier",
+            category = "chain_rpc",
+            error = %err,
+            "chain_getChainParams failed during register-verifier preflight"
+        );
+        err
+    })?;
+    let head = client
+        .get_block_height(BlockFinality::Latest)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("chain_getBlockHeight: {e}");
+            tracing::error!(
+                event = rvm::REGISTER_FAILED,
+                subcommand = "register-verifier",
+                category = "chain_rpc",
+                error = %err,
+                "chain_getBlockHeight failed during register-verifier preflight"
+            );
+            err
+        })?
+        .height;
+
+    // chain-id guardrail.
+    if params.chain_id != args.expect_chain_id {
+        let msg = format!(
+            "chain-id mismatch: --expect-chain-id={}, chain reports {}; \
+             refusing to register verifier",
+            args.expect_chain_id, params.chain_id
+        );
+        tracing::warn!(
+            event = rvm::REGISTER_REFUSED_CHAIN_ID,
+            subcommand = "register-verifier",
+            expected = args.expect_chain_id,
+            actual = params.chain_id,
+            "register-verifier refused: chain-id mismatch"
+        );
+        return Err(anyhow::anyhow!(msg));
+    }
+
+    // settlement base gate.
+    let settlement_observed = params.inference_settlement_enabled_from_height;
+    if !settlement_observed.is_some_and(|n| head >= n) {
+        let observed_display = match settlement_observed {
+            None => "None".to_string(),
+            Some(n) => format!("Some({n})"),
+        };
+        tracing::warn!(
+            event = rvm::REGISTER_REFUSED_DORMANCY,
+            subcommand = "register-verifier",
+            gate = "inference_settlement_enabled_from_height",
+            observed = %observed_display,
+            head = head,
+            "register-verifier refused: settlement subsystem inactive"
+        );
+        return Err(anyhow::anyhow!(
+            "settlement subsystem inactive: gate \
+             'inference_settlement_enabled_from_height' observed={observed_display}, \
+             head={head}; refusing to register verifier"
+        ));
+    }
+
+    // verifier-bonding gate. RegisterVerifier is a bonding operation;
+    // the chain gates it on `inference_verifier_bonding_enabled_from_height`
+    // (executor `Failed(364)` when closed) in addition to the outer
+    // settlement gate above. Refuse locally to avoid a fee-paying
+    // doomed tx.
+    let bonding_observed = params.inference_verifier_bonding_enabled_from_height;
+    if !bonding_observed.is_some_and(|n| head >= n) {
+        let observed_display = match bonding_observed {
+            None => "None".to_string(),
+            Some(n) => format!("Some({n})"),
+        };
+        tracing::warn!(
+            event = rvm::REGISTER_REFUSED_DORMANCY,
+            subcommand = "register-verifier",
+            gate = "inference_verifier_bonding_enabled_from_height",
+            observed = %observed_display,
+            head = head,
+            "register-verifier refused: verifier bonding inactive"
+        );
+        return Err(anyhow::anyhow!(
+            "verifier bonding inactive: gate \
+             'inference_verifier_bonding_enabled_from_height' observed={observed_display}, \
+             head={head}; refusing to register verifier"
+        ));
+    }
+
+    // ── Step 3: resolve signer identity (reads seed, derives address) ─
+    // Only now — after local bond validation and every preflight
+    // refusal — is the configured `OMNINODE_VERIFIER_SEED_HEX` seed
+    // read. `ClaimSignerIdentity::resolve` derives the base58 address
+    // and drops the secret; it is NOT retained. Dry-run needs this
+    // address for the builder request and the envelope `from`
+    // assertion, but never signs and never submits.
+    let identity = match crate::settlement_signer::ClaimSignerIdentity::resolve(
+        seed_source.clone(),
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            let err = anyhow::anyhow!("register-verifier signer identity resolve: {e}");
+            tracing::error!(
+                event = rvm::REGISTER_FAILED,
+                subcommand = "register-verifier",
+                category = "seed_missing_or_malformed",
+                error = %err,
+                "signer identity resolve failed"
+            );
+            return Err(err);
+        }
+    };
+    let derived = identity.address().to_string();
+
+    // ── Step 4: builder RPC ──────────────────────────────────────────
+    let build_response = client
+        .omninode_build_register_verifier(&BuildRegisterVerifierRequest {
+            from: derived.clone(),
+            bond: args.bond,
+            fee: args.fee,
+        })
+        .map_err(|e| {
+            let err = anyhow::anyhow!("{e}");
+            tracing::error!(
+                event = rvm::REGISTER_FAILED,
+                subcommand = "register-verifier",
+                verifier = %derived,
+                category = "chain_rpc",
+                error = %err,
+                "omninode_buildRegisterVerifier failed"
+            );
+            err
+        })?;
+
+    // ── Step 5: verify envelope (before hex decode) ──────────────────
+    if let Err(e) = verify_builder_envelope(
+        &build_response,
+        &derived,
+        params.chain_id,
+        args.fee,
+    ) {
+        let msg = e.to_string();
+        tracing::error!(
+            event = rvm::REGISTER_FAILED,
+            subcommand = "register-verifier",
+            verifier = %derived,
+            category = "builder_mismatch",
+            error = %msg,
+            "builder envelope mismatch"
+        );
+        return Err(anyhow::anyhow!(e));
+    }
+
+    // ── Step 6: decode + verify decoded TransactionV2 ────────────────
+    let tx = decode_unsigned_tx(&build_response).map_err(|e| {
+        let msg = e.to_string();
+        tracing::error!(
+            event = rvm::REGISTER_FAILED,
+            subcommand = "register-verifier",
+            verifier = %derived,
+            category = "wire_decode",
+            error = %msg,
+            "unsigned_tx decode failed"
+        );
+        anyhow::anyhow!(e)
+    })?;
+    if let Err(e) = verify_register_verifier_transaction(
+        &tx,
+        &build_response,
+        &derived,
+        args.bond,
+    ) {
+        let msg = e.to_string();
+        tracing::error!(
+            event = rvm::REGISTER_FAILED,
+            subcommand = "register-verifier",
+            verifier = %derived,
+            category = "builder_mismatch",
+            error = %msg,
+            "decoded transaction mismatch"
+        );
+        return Err(anyhow::anyhow!(e));
+    }
+
+    // ── READY marker: all preflight + verify passed ──────────────────
+    tracing::info!(
+        event = rvm::REGISTER_READY,
+        subcommand = "register-verifier",
+        verifier = %derived,
+        chain_id = params.chain_id,
+        nonce = build_response.nonce,
+        fee = build_response.fee.to_string(),
+        bond = args.bond.to_string(),
+        head = head,
+        "register-verifier ready for submission"
+    );
+
+    writeln!(out, "verifier={derived}")?;
+    writeln!(out, "chain_id={}", params.chain_id)?;
+    writeln!(out, "nonce={}", build_response.nonce)?;
+    writeln!(out, "fee={}", build_response.fee)?;
+    writeln!(out, "bond={}", args.bond)?;
+    writeln!(out, "head={head}")?;
+
+    if args.dry_run {
+        writeln!(out, "dry_run=true submitted=false")?;
+        return Ok(());
+    }
+
+    // ── Step 7: load signer, re-derivation guard, sign + submit ──────
+    let signer = crate::settlement_signer::ClaimSigner::resolve(seed_source)
+        .map_err(|e| {
+            let err = anyhow::anyhow!("register-verifier signer resolve: {e}");
+            tracing::error!(
+                event = rvm::REGISTER_FAILED,
+                subcommand = "register-verifier",
+                verifier = %derived,
+                category = "seed_missing_or_malformed",
+                error = %err,
+                "signer resolve failed"
+            );
+            err
+        })?;
+    if signer.address() != derived.as_str() {
+        let msg = format!(
+            "signer re-derivation mismatch: preflight used {derived}, \
+             signer would sign as {}",
+            signer.address()
+        );
+        tracing::error!(
+            event = rvm::REGISTER_FAILED,
+            subcommand = "register-verifier",
+            verifier = %derived,
+            category = "seed_mismatch_between_stages",
+            error = %msg,
+            "signer re-derivation disagrees with preflight-time derivation"
+        );
+        return Err(anyhow::anyhow!(msg));
+    }
+
+    // Uses the generic `sign_and_submit_tx` core, which returns the
+    // generic `SettlementSubmitReceipt` (tx hash + submit status). A
+    // verifier registration has no session / verifier-reward fields to
+    // report, so it does NOT reuse the claim path's `ClaimSubmitReceipt`
+    // (which would force a fabricated empty `session_id`). The envelope
+    // values (`chain_id` / `nonce` / `fee`), already asserted equal to
+    // the signed tx during verification above, are reported directly.
+    let receipt = sign_and_submit_tx(client, &tx, signer.seed_for_signing())
+        .map_err(|e| {
+            let err = anyhow::anyhow!("sign_and_submit: {e}");
+            tracing::error!(
+                event = rvm::REGISTER_FAILED,
+                subcommand = "register-verifier",
+                verifier = %derived,
+                category = "chain_rpc",
+                error = %err,
+                "sign_and_submit failed"
+            );
+            err
+        })?;
+
+    let submitted = receipt.status.is_submitted();
+    tracing::info!(
+        event = rvm::REGISTER_SUBMITTED,
+        subcommand = "register-verifier",
+        verifier = derived.as_str(),
+        tx_hash = receipt.tx_hash.as_str(),
+        chain_id = params.chain_id,
+        nonce = build_response.nonce,
+        fee = build_response.fee.to_string().as_str(),
+        bond = args.bond.to_string().as_str(),
+        submitted = submitted,
+        "register-verifier submitted"
+    );
+    writeln!(out, "tx_hash={}", receipt.tx_hash)?;
+    writeln!(out, "submitted={submitted}")?;
     Ok(())
 }
 
@@ -3914,6 +4340,7 @@ mod tests {
                     SettlementCmd::Claimable(_) => "claimable",
                     SettlementCmd::Verifier(_) => "verifier",
                     SettlementCmd::Claim(_) => "claim",
+                    SettlementCmd::RegisterVerifier(_) => "register-verifier",
                     #[cfg(feature = "settlement-dispute")]
                     SettlementCmd::Dispute(_) => "dispute",
                 }
@@ -3921,6 +4348,924 @@ mod tests {
             let _ = variant_check;
             // Runtime grep against the module source is done at code-
             // review time; no runtime source-string check needed here.
+        }
+    }
+
+    // ── Issue #100 — settlement register-verifier tests ────────────────
+
+    #[cfg(feature = "settlement-submit")]
+    mod register_verifier {
+        use super::*;
+        use crate::operator::SeedSource;
+        use omni_sumchain::settlement_submit::{
+            verify_register_verifier_transaction, Address,
+            ClaimInferenceRewardRequest, InferenceSettlementOperation,
+            InferenceSettlementTxData, RegisterVerifierRequest,
+            SettlementBuilderEnvelope, SignedTransaction, TransactionV2, TxInner,
+            TxPayload,
+        };
+
+        const TEST_SEED: [u8; 32] = [7u8; 32];
+        const TEST_CHAIN_ID: u64 = 1_800_100;
+        const TEST_NONCE: u64 = 7;
+        const TEST_FEE: u128 = 1000;
+        const TEST_BOND: u128 = 5_000_000;
+
+        struct TestRegisterTx {
+            unsigned_hex: String,
+            signing_hash_hex: String,
+            from_b58: String,
+            tx: TransactionV2,
+        }
+
+        fn encode_hex_local(bytes: &[u8]) -> String {
+            use std::fmt::Write;
+            let mut s = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                let _ = write!(&mut s, "{b:02x}");
+            }
+            s
+        }
+
+        fn build_test_register_tx(
+            seed: &[u8; 32],
+            bond: u128,
+            chain_id: u64,
+            nonce: u64,
+            fee: u128,
+        ) -> TestRegisterTx {
+            let pubkey =
+                omni_zkml::signer_pubkey_bytes(seed).expect("signer_pubkey_bytes");
+            let from = Address::from_public_key(&pubkey);
+            let from_b58 = from.to_base58();
+            let tx = TransactionV2 {
+                chain_id: chain_id.into(),
+                from,
+                fee: fee.into(),
+                nonce: nonce.into(),
+                payload: TxPayload::InferenceSettlement(InferenceSettlementTxData {
+                    operation: InferenceSettlementOperation::RegisterVerifier(
+                        RegisterVerifierRequest { bond },
+                    ),
+                }),
+            };
+            let unsigned_hex = format!("0x{}", encode_hex_local(&tx.to_bytes()));
+            let signing_hash = tx.signing_hash();
+            let signing_hash_hex =
+                format!("0x{}", encode_hex_local(signing_hash.as_bytes()));
+            TestRegisterTx {
+                unsigned_hex,
+                signing_hash_hex,
+                from_b58,
+                tx,
+            }
+        }
+
+        /// Chain params with BOTH the settlement base gate and the
+        /// verifier-bonding gate active from height 0.
+        fn params_all_active() -> serde_json::Value {
+            json!({
+                "finality_depth": 12,
+                "min_fee": 100,
+                "chain_id": TEST_CHAIN_ID,
+                "inference_settlement_enabled_from_height": 0,
+                "inference_verifier_bonding_enabled_from_height": 0,
+            })
+        }
+
+        fn args_register(
+            bond: u128,
+            expect_chain_id: u64,
+            dry_run: bool,
+        ) -> Box<RegisterVerifierArgs> {
+            Box::new(RegisterVerifierArgs {
+                expect_chain_id,
+                bond,
+                fee: None,
+                dry_run,
+            })
+        }
+
+        /// Seed a full happy-path builder + submit fixture. Returns the
+        /// fixture so tests can assert against the exact tx.
+        fn seed_full_happy_path(fake: &FakeJsonRpcTransport) -> TestRegisterTx {
+            let fixture = build_test_register_tx(
+                &TEST_SEED,
+                TEST_BOND,
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            seed_params(fake, params_all_active());
+            seed_head(fake, 500_000);
+            fake.set_response(
+                "omninode_buildRegisterVerifier",
+                Ok(json!({
+                    "unsigned_tx": fixture.unsigned_hex,
+                    "signing_hash": fixture.signing_hash_hex,
+                    "from": fixture.from_b58,
+                    "nonce": TEST_NONCE,
+                    "fee": TEST_FEE,
+                    "chain_id": TEST_CHAIN_ID,
+                })),
+            );
+            fake.set_response(
+                "sum_sendRawTransaction",
+                Ok(json!({ "tx_hash": "0xregister-happy" })),
+            );
+            fixture
+        }
+
+        fn run_with_capture_register(
+            args: SettlementArgs,
+            client: &SumChainClient<FakeJsonRpcTransport>,
+            seed_source: SeedSource,
+        ) -> (String, Vec<u8>, Result<()>) {
+            let logs = CapturedLogs::new();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            let mut stdout_buf = Vec::new();
+            let result = tracing::subscriber::with_default(subscriber, || {
+                let SettlementArgs { cmd, .. } = args;
+                match cmd {
+                    SettlementCmd::RegisterVerifier(a) => super::super::run_register_verifier(
+                        client,
+                        &a,
+                        &mut stdout_buf,
+                        seed_source,
+                    ),
+                    _ => panic!(
+                        "run_with_capture_register called with non-RegisterVerifier variant"
+                    ),
+                }
+            });
+            (logs.as_string(), stdout_buf, result)
+        }
+
+        fn call_methods(fake: &FakeJsonRpcTransport) -> Vec<String> {
+            fake.calls().into_iter().map(|(m, _)| m).collect()
+        }
+
+        // ── Test 1 — build + sign + submit round-trip ──────────────
+        //
+        // Drives the full handler, then decodes the exact bytes sent to
+        // `sum_sendRawTransaction` and asserts they parse to a
+        // `RegisterVerifier(bond)` operation carrying the expected
+        // fields.
+        #[test]
+        fn register_verifier_build_sign_submit_round_trip() {
+            let (client, fake) = make_client();
+            let fixture = seed_full_happy_path(&fake);
+
+            let (logs, stdout, result) = run_with_capture_register(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::RegisterVerifier(args_register(
+                        TEST_BOND,
+                        TEST_CHAIN_ID,
+                        false,
+                    )),
+                },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect("happy path must succeed");
+
+            assert!(
+                logs.contains("event=\"settlement_register_verifier_ready\""),
+                "READY marker missing; logs=\n{logs}"
+            );
+            assert!(
+                logs.contains("event=\"settlement_register_verifier_submitted\""),
+                "SUBMITTED marker missing; logs=\n{logs}"
+            );
+            let stdout_str = String::from_utf8(stdout).unwrap();
+            assert!(stdout_str.contains("submitted=true"), "{stdout_str}");
+            assert!(
+                stdout_str.contains("tx_hash=0xregister-happy"),
+                "{stdout_str}"
+            );
+            assert!(stdout_str.contains("bond=5000000"), "{stdout_str}");
+
+            // Builder + submit each called exactly once.
+            let methods = call_methods(&fake);
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|m| m.as_str() == "omninode_buildRegisterVerifier")
+                    .count(),
+                1,
+                "builder called once; methods={methods:?}"
+            );
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|m| m.as_str() == "sum_sendRawTransaction")
+                    .count(),
+                1,
+                "submit called once; methods={methods:?}"
+            );
+
+            // Decode the exact submitted wire and prove it is a
+            // RegisterVerifier op with the expected fields.
+            let calls = fake.calls();
+            let (_m, params) = calls
+                .iter()
+                .find(|(m, _)| m == "sum_sendRawTransaction")
+                .expect("submit RPC must have been called");
+            let hex_param = params
+                .as_array()
+                .expect("params array")
+                .first()
+                .expect("params[0]")
+                .as_str()
+                .expect("hex string")
+                .to_string();
+
+            let decoded = SignedTransaction::from_hex(&hex_param)
+                .expect("submitted hex must round-trip via SignedTransaction::from_hex");
+            // Signing hash agrees with the fixture (proves fields intact).
+            assert_eq!(decoded.signing_hash(), fixture.tx.signing_hash());
+
+            let inner_tx = match decoded.inner() {
+                TxInner::V2(v2) => v2,
+                other => panic!("expected TxInner::V2, got {other:?}"),
+            };
+            assert_eq!(u64::from(inner_tx.chain_id), TEST_CHAIN_ID);
+            assert_eq!(u64::from(inner_tx.nonce), TEST_NONCE);
+            assert_eq!(u128::from(inner_tx.fee), TEST_FEE);
+            assert_eq!(inner_tx.from.to_base58(), fixture.from_b58);
+            match &inner_tx.payload {
+                TxPayload::InferenceSettlement(InferenceSettlementTxData {
+                    operation:
+                        InferenceSettlementOperation::RegisterVerifier(
+                            RegisterVerifierRequest { bond },
+                        ),
+                }) => assert_eq!(*bond, TEST_BOND, "bond field must round-trip"),
+                other => panic!("expected RegisterVerifier op, got {other:?}"),
+            }
+        }
+
+        // ── Test 2 — dry-run stops before signing/submitting ───────
+        #[test]
+        fn register_verifier_dry_run_never_submits() {
+            let (client, fake) = make_client();
+            let _fixture = seed_full_happy_path(&fake);
+
+            let (logs, stdout, result) = run_with_capture_register(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::RegisterVerifier(args_register(
+                        TEST_BOND,
+                        TEST_CHAIN_ID,
+                        true,
+                    )),
+                },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect("dry-run must succeed through preflight + verify");
+
+            let stdout_str = String::from_utf8(stdout).unwrap();
+            assert!(
+                stdout_str.contains("dry_run=true submitted=false"),
+                "{stdout_str}"
+            );
+            assert!(
+                logs.contains("event=\"settlement_register_verifier_ready\""),
+                "READY marker missing; logs=\n{logs}"
+            );
+            let methods = call_methods(&fake);
+            assert!(
+                !methods.iter().any(|m| m == "sum_sendRawTransaction"),
+                "dry-run must not submit; methods={methods:?}"
+            );
+        }
+
+        // ── Test 3 — chain-id mismatch refusal (preflight) ─────────
+        #[test]
+        fn register_verifier_refuses_on_chain_id_mismatch() {
+            let (client, fake) = make_client();
+            let _fixture = seed_full_happy_path(&fake);
+
+            let (logs, _stdout, result) = run_with_capture_register(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::RegisterVerifier(args_register(
+                        TEST_BOND,
+                        // Guardrail disagrees with the chain's chain_id.
+                        TEST_CHAIN_ID + 1,
+                        false,
+                    )),
+                },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            let err = result.expect_err("chain-id mismatch must refuse");
+            assert!(
+                err.to_string().contains("chain-id mismatch"),
+                "error must name chain-id mismatch: {err}"
+            );
+            assert!(
+                logs.contains("event=\"settlement_register_verifier_refused_chain_id\""),
+                "chain-id refusal marker missing; logs=\n{logs}"
+            );
+            // Refused BEFORE the builder or submit RPCs.
+            let methods = call_methods(&fake);
+            assert!(
+                !methods.iter().any(|m| m == "omninode_buildRegisterVerifier"),
+                "must not call builder on chain-id mismatch; methods={methods:?}"
+            );
+            assert!(
+                !methods.iter().any(|m| m == "sum_sendRawTransaction"),
+                "must not submit on chain-id mismatch; methods={methods:?}"
+            );
+        }
+
+        // ── Test 4 — settlement-inactive refusal (preflight) ───────
+        #[test]
+        fn register_verifier_refuses_when_settlement_dormant() {
+            let (client, fake) = make_client();
+            // Settlement base gate ABSENT (dormant); chain-id matches.
+            seed_params(
+                &fake,
+                json!({
+                    "finality_depth": 12,
+                    "min_fee": 100,
+                    "chain_id": TEST_CHAIN_ID,
+                }),
+            );
+            seed_head(&fake, 500_000);
+
+            let (logs, _stdout, result) = run_with_capture_register(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::RegisterVerifier(args_register(
+                        TEST_BOND,
+                        TEST_CHAIN_ID,
+                        false,
+                    )),
+                },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            let err = result.expect_err("settlement-inactive must refuse");
+            assert!(
+                err.to_string().contains("settlement subsystem inactive"),
+                "error must name settlement inactivity: {err}"
+            );
+            assert!(
+                logs.contains("event=\"settlement_register_verifier_refused_dormancy\""),
+                "dormancy refusal marker missing; logs=\n{logs}"
+            );
+            assert!(
+                logs.contains("gate=\"inference_settlement_enabled_from_height\""),
+                "must name the settlement gate; logs=\n{logs}"
+            );
+            let methods = call_methods(&fake);
+            assert!(
+                !methods.iter().any(|m| m == "omninode_buildRegisterVerifier"),
+                "must not call builder when settlement dormant; methods={methods:?}"
+            );
+        }
+
+        // ── Test 5 — bonding-inactive refusal (preflight) ──────────
+        #[test]
+        fn register_verifier_refuses_when_bonding_dormant() {
+            let (client, fake) = make_client();
+            // Settlement base gate ACTIVE, but verifier-bonding ABSENT.
+            seed_params(
+                &fake,
+                json!({
+                    "finality_depth": 12,
+                    "min_fee": 100,
+                    "chain_id": TEST_CHAIN_ID,
+                    "inference_settlement_enabled_from_height": 0,
+                }),
+            );
+            seed_head(&fake, 500_000);
+
+            let (logs, _stdout, result) = run_with_capture_register(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::RegisterVerifier(args_register(
+                        TEST_BOND,
+                        TEST_CHAIN_ID,
+                        false,
+                    )),
+                },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            let err = result.expect_err("bonding-inactive must refuse");
+            assert!(
+                err.to_string().contains("verifier bonding inactive"),
+                "error must name bonding inactivity: {err}"
+            );
+            assert!(
+                logs.contains("gate=\"inference_verifier_bonding_enabled_from_height\""),
+                "must name the bonding gate; logs=\n{logs}"
+            );
+            let methods = call_methods(&fake);
+            assert!(
+                !methods.iter().any(|m| m == "omninode_buildRegisterVerifier"),
+                "must not call builder when bonding dormant; methods={methods:?}"
+            );
+        }
+
+        // ── Test 6 — marker constant names pinned ──────────────────
+        #[test]
+        fn register_verifier_marker_constant_names_are_pinned() {
+            use super::super::register_verifier_markers as rvm;
+            assert_eq!(rvm::REGISTER_READY, "settlement_register_verifier_ready");
+            assert_eq!(
+                rvm::REGISTER_REFUSED_BOND_ZERO,
+                "settlement_register_verifier_refused_bond_zero"
+            );
+            assert_eq!(
+                rvm::REGISTER_REFUSED_CHAIN_ID,
+                "settlement_register_verifier_refused_chain_id"
+            );
+            assert_eq!(
+                rvm::REGISTER_REFUSED_DORMANCY,
+                "settlement_register_verifier_refused_dormancy"
+            );
+            assert_eq!(
+                rvm::REGISTER_SUBMITTED,
+                "settlement_register_verifier_submitted"
+            );
+            assert_eq!(rvm::REGISTER_FAILED, "settlement_register_verifier_failed");
+        }
+
+        // ── Test 7 — missing --bond is a clap required-arg error ───
+        //
+        // `--bond` is a REQUIRED clap arg (no default). Omitting it must
+        // fail at parse time, before `run_register_verifier` is ever
+        // entered — so no client / transport / seed is even constructed.
+        #[test]
+        fn register_verifier_missing_bond_is_clap_required_error() {
+            #[derive(Debug, clap::Parser)]
+            struct Probe {
+                #[command(subcommand)]
+                #[allow(dead_code)]
+                cmd: SettlementCmd,
+            }
+            use clap::Parser as _;
+
+            // Supply --expect-chain-id (also required) but omit --bond.
+            let parsed = Probe::try_parse_from([
+                "op",
+                "register-verifier",
+                "--expect-chain-id",
+                "1800100",
+            ]);
+            let err = parsed.expect_err("missing --bond must be a clap error");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("--bond"),
+                "clap error must name the missing --bond arg: {rendered}"
+            );
+        }
+
+        // ── Test 8 — --bond 0 refused locally, before any RPC ──────
+        #[test]
+        fn register_verifier_bond_zero_refused_locally() {
+            let (client, fake) = make_client();
+            // Seed a full happy path; NONE of it must be reached.
+            let _fixture = seed_full_happy_path(&fake);
+
+            let (logs, _stdout, result) = run_with_capture_register(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::RegisterVerifier(args_register(
+                        0,
+                        TEST_CHAIN_ID,
+                        false,
+                    )),
+                },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            let err = result.expect_err("bond 0 must be refused");
+            assert!(
+                err.to_string().contains("--bond must be a positive amount"),
+                "error must name the zero-bond refusal: {err}"
+            );
+            assert!(
+                logs.contains(
+                    "event=\"settlement_register_verifier_refused_bond_zero\""
+                ),
+                "bond-zero marker missing; logs=\n{logs}"
+            );
+            // Refused before ANY RPC: the recorder is empty.
+            let methods = call_methods(&fake);
+            assert!(
+                methods.is_empty(),
+                "bond-0 must issue ZERO RPC; methods={methods:?}"
+            );
+        }
+
+        // ── Test 9 — bond failures precede builder, signer, submit ──
+        //
+        // Proves BOTH bond-failure paths short-circuit before the
+        // builder RPC, before any seed/identity resolution, and before
+        // any submission. Zero seed access is proven by supplying
+        // `SeedSource::AbsentForTest`: had the handler reached identity
+        // resolution, it would have returned a seed-missing error rather
+        // than the bond-zero error.
+        #[test]
+        fn register_verifier_bond_failures_precede_builder_signer_and_submit() {
+            // (a) missing --bond: clap rejects before the handler is
+            //     entered, so no transport/seed is ever touched.
+            #[derive(Debug, clap::Parser)]
+            struct Probe {
+                #[command(subcommand)]
+                #[allow(dead_code)]
+                cmd: SettlementCmd,
+            }
+            use clap::Parser as _;
+            let missing = Probe::try_parse_from([
+                "op",
+                "register-verifier",
+                "--expect-chain-id",
+                "1800100",
+            ]);
+            assert!(
+                missing.is_err(),
+                "missing --bond must fail at clap parse, before the handler"
+            );
+
+            // (b) --bond 0 with an ABSENT seed: refuses for bond-zero,
+            //     NOT for a missing seed — proving no seed/identity
+            //     resolution occurred.
+            let (client, fake) = make_client();
+            let _fixture = seed_full_happy_path(&fake);
+            let (logs, _stdout, result) = run_with_capture_register(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::RegisterVerifier(args_register(
+                        0,
+                        TEST_CHAIN_ID,
+                        false,
+                    )),
+                },
+                &client,
+                SeedSource::AbsentForTest,
+            );
+            let err = result.expect_err("bond 0 must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--bond must be a positive amount"),
+                "must refuse for bond-zero: {msg}"
+            );
+            // NOT the seed-missing / identity-resolve error path.
+            assert!(
+                !msg.contains("identity resolve") && !msg.contains("unavailable"),
+                "bond-zero must fire BEFORE any seed/identity resolution \
+                 (AbsentForTest would surface a seed error if reached): {msg}"
+            );
+            assert!(
+                logs.contains(
+                    "event=\"settlement_register_verifier_refused_bond_zero\""
+                ),
+                "bond-zero marker missing; logs=\n{logs}"
+            );
+            // ZERO builder RPC + ZERO submission.
+            let methods = call_methods(&fake);
+            assert!(
+                methods.is_empty(),
+                "bond-0 must issue ZERO RPC (no builder, no submit); \
+                 methods={methods:?}"
+            );
+            assert!(
+                !methods.iter().any(|m| m == "omninode_buildRegisterVerifier"),
+                "bond-0 must not call the builder; methods={methods:?}"
+            );
+            assert!(
+                !methods.iter().any(|m| m == "sum_sendRawTransaction"),
+                "bond-0 must not submit; methods={methods:?}"
+            );
+        }
+
+        // ── Test 10 — dry-run derives the address but never signs ──
+        //
+        // Pins the FINAL documented dry-run contract word-for-word in
+        // intent: dry-run DERIVES the operator address from
+        // `OMNINODE_VERIFIER_SEED_HEX` (for the builder request + the
+        // envelope `from` assertion) but never retains the secret, never
+        // signs, and never invokes `sum_sendRawTransaction`.
+        #[test]
+        fn register_verifier_dry_run_derives_address_but_never_signs_or_submits() {
+            let (client, fake) = make_client();
+            let fixture = seed_full_happy_path(&fake);
+
+            let (logs, stdout, result) = run_with_capture_register(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::RegisterVerifier(args_register(
+                        TEST_BOND,
+                        TEST_CHAIN_ID,
+                        true,
+                    )),
+                },
+                &client,
+                SeedSource::Explicit(TEST_SEED),
+            );
+            result.expect("dry-run must succeed through preflight + verify");
+            let stdout_str = String::from_utf8(stdout).unwrap();
+
+            // (1) The seed's address WAS derived and surfaced.
+            assert!(
+                stdout_str.contains(&format!("verifier={}", fixture.from_b58)),
+                "dry-run must derive + report the seed's address; \
+                 stdout=\n{stdout_str}"
+            );
+            // (2) Build + verify happened (READY), then STOP.
+            assert!(
+                logs.contains("event=\"settlement_register_verifier_ready\""),
+                "READY marker missing; logs=\n{logs}"
+            );
+            assert!(
+                stdout_str.contains("dry_run=true submitted=false"),
+                "{stdout_str}"
+            );
+            // (3) ZERO signing / ZERO submission.
+            assert!(
+                !logs.contains(
+                    "event=\"settlement_register_verifier_submitted\""
+                ),
+                "dry-run must not emit SUBMITTED; logs=\n{logs}"
+            );
+            let methods = call_methods(&fake);
+            assert!(
+                !methods.iter().any(|m| m == "sum_sendRawTransaction"),
+                "dry-run must not sign/submit; methods={methods:?}"
+            );
+            // The builder RPC IS part of a dry-run (build + verify).
+            assert!(
+                methods.iter().any(|m| m == "omninode_buildRegisterVerifier"),
+                "dry-run must still run the builder RPC; methods={methods:?}"
+            );
+
+            // Contract corollary: dry-run REQUIRES the seed. With no
+            // seed, the identity resolution dry-run depends on fails —
+            // proving dry-run reads the seed rather than fabricating an
+            // address.
+            let (client2, fake2) = make_client();
+            let _f2 = seed_full_happy_path(&fake2);
+            let (_logs2, _stdout2, result2) = run_with_capture_register(
+                SettlementArgs {
+                    rpc_url: None,
+                    cmd: SettlementCmd::RegisterVerifier(args_register(
+                        TEST_BOND,
+                        TEST_CHAIN_ID,
+                        true,
+                    )),
+                },
+                &client2,
+                SeedSource::AbsentForTest,
+            );
+            let err2 = result2
+                .expect_err("dry-run without a seed must fail at identity resolve");
+            assert!(
+                err2.to_string().contains("identity resolve"),
+                "dry-run must fail resolving the seed's address when absent: \
+                 {err2}"
+            );
+        }
+
+        // ── Tests 11-18 — tampered builder responses each rejected ──
+        //
+        // Each mutates exactly one aspect of the builder envelope / tx /
+        // caller expectation and asserts `verify_register_verifier_transaction`
+        // returns a DISTINCT, clearly-labeled error. A non-Ok verify
+        // return is exactly what makes the driver refuse before Step 7
+        // (sign + submit) — these never reach a submission.
+
+        /// Canonical (untampered) envelope matching `fixture.tx`.
+        fn canonical_envelope(
+            fixture: &TestRegisterTx,
+            chain_id: u64,
+            nonce: u64,
+            fee: u128,
+        ) -> SettlementBuilderEnvelope {
+            SettlementBuilderEnvelope {
+                unsigned_tx: fixture.unsigned_hex.clone(),
+                signing_hash: fixture.signing_hash_hex.clone(),
+                from: fixture.from_b58.clone(),
+                nonce,
+                fee,
+                chain_id,
+            }
+        }
+
+        #[test]
+        fn verify_register_rejects_wrong_chain_id() {
+            let f = build_test_register_tx(
+                &TEST_SEED,
+                TEST_BOND,
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            // Envelope claims a different chain id than the tx.
+            let env =
+                canonical_envelope(&f, TEST_CHAIN_ID + 1, TEST_NONCE, TEST_FEE);
+            let err = verify_register_verifier_transaction(
+                &f.tx,
+                &env,
+                &f.from_b58,
+                TEST_BOND,
+            )
+            .expect_err("wrong chain_id must be rejected");
+            assert!(
+                err.to_string().contains("field 'tx.chain_id'"),
+                "distinct chain_id error expected: {err}"
+            );
+        }
+
+        #[test]
+        fn verify_register_rejects_wrong_from() {
+            let f = build_test_register_tx(
+                &TEST_SEED,
+                TEST_BOND,
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            let mut env =
+                canonical_envelope(&f, TEST_CHAIN_ID, TEST_NONCE, TEST_FEE);
+            env.from = "WRONG_FROM_ADDRESS".to_string();
+            let err = verify_register_verifier_transaction(
+                &f.tx,
+                &env,
+                &f.from_b58,
+                TEST_BOND,
+            )
+            .expect_err("wrong from must be rejected");
+            assert!(
+                err.to_string().contains("field 'tx.from vs envelope.from'"),
+                "distinct from error expected: {err}"
+            );
+        }
+
+        #[test]
+        fn verify_register_rejects_wrong_nonce() {
+            let f = build_test_register_tx(
+                &TEST_SEED,
+                TEST_BOND,
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            let env =
+                canonical_envelope(&f, TEST_CHAIN_ID, TEST_NONCE + 1, TEST_FEE);
+            let err = verify_register_verifier_transaction(
+                &f.tx,
+                &env,
+                &f.from_b58,
+                TEST_BOND,
+            )
+            .expect_err("wrong nonce must be rejected");
+            assert!(
+                err.to_string().contains("field 'tx.nonce'"),
+                "distinct nonce error expected: {err}"
+            );
+        }
+
+        #[test]
+        fn verify_register_rejects_wrong_fee() {
+            let f = build_test_register_tx(
+                &TEST_SEED,
+                TEST_BOND,
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            let env =
+                canonical_envelope(&f, TEST_CHAIN_ID, TEST_NONCE, TEST_FEE + 1);
+            let err = verify_register_verifier_transaction(
+                &f.tx,
+                &env,
+                &f.from_b58,
+                TEST_BOND,
+            )
+            .expect_err("wrong fee must be rejected");
+            assert!(
+                err.to_string().contains("field 'tx.fee'"),
+                "distinct fee error expected: {err}"
+            );
+        }
+
+        #[test]
+        fn verify_register_rejects_wrong_operation() {
+            // A non-RegisterVerifier op (ClaimReward) with otherwise
+            // valid envelope metadata must be rejected at the operation
+            // variant check.
+            let pubkey =
+                omni_zkml::signer_pubkey_bytes(&TEST_SEED).expect("pubkey");
+            let from = Address::from_public_key(&pubkey);
+            let from_b58 = from.to_base58();
+            let claim_tx = TransactionV2 {
+                chain_id: TEST_CHAIN_ID.into(),
+                from,
+                fee: TEST_FEE.into(),
+                nonce: TEST_NONCE.into(),
+                payload: TxPayload::InferenceSettlement(
+                    InferenceSettlementTxData {
+                        operation: InferenceSettlementOperation::ClaimReward(
+                            ClaimInferenceRewardRequest {
+                                session_id: "s-not-register".to_string(),
+                            },
+                        ),
+                    },
+                ),
+            };
+            let signing_hash = claim_tx.signing_hash();
+            let env = SettlementBuilderEnvelope {
+                unsigned_tx: format!(
+                    "0x{}",
+                    encode_hex_local(&claim_tx.to_bytes())
+                ),
+                signing_hash: format!(
+                    "0x{}",
+                    encode_hex_local(signing_hash.as_bytes())
+                ),
+                from: from_b58.clone(),
+                nonce: TEST_NONCE,
+                fee: TEST_FEE,
+                chain_id: TEST_CHAIN_ID,
+            };
+            let err = verify_register_verifier_transaction(
+                &claim_tx,
+                &env,
+                &from_b58,
+                TEST_BOND,
+            )
+            .expect_err("non-RegisterVerifier op must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("field 'tx.payload.operation variant'"),
+                "distinct operation-variant error expected: {err}"
+            );
+        }
+
+        #[test]
+        fn verify_register_rejects_wrong_bond() {
+            let f = build_test_register_tx(
+                &TEST_SEED,
+                TEST_BOND,
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            let env =
+                canonical_envelope(&f, TEST_CHAIN_ID, TEST_NONCE, TEST_FEE);
+            // Caller expected a different bond than the tx carries.
+            let err = verify_register_verifier_transaction(
+                &f.tx,
+                &env,
+                &f.from_b58,
+                TEST_BOND + 1,
+            )
+            .expect_err("wrong bond must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("field 'tx.payload.operation.bond'"),
+                "distinct bond error expected: {err}"
+            );
+        }
+
+        #[test]
+        fn verify_register_rejects_wrong_signing_hash() {
+            let f = build_test_register_tx(
+                &TEST_SEED,
+                TEST_BOND,
+                TEST_CHAIN_ID,
+                TEST_NONCE,
+                TEST_FEE,
+            );
+            let mut env =
+                canonical_envelope(&f, TEST_CHAIN_ID, TEST_NONCE, TEST_FEE);
+            // A different (but well-formed) 32-byte signing hash.
+            env.signing_hash = format!("0x{}", "11".repeat(32));
+            let err = verify_register_verifier_transaction(
+                &f.tx,
+                &env,
+                &f.from_b58,
+                TEST_BOND,
+            )
+            .expect_err("wrong signing_hash must be rejected");
+            assert!(
+                err.to_string().contains(
+                    "field 'tx.signing_hash() vs envelope.signing_hash'"
+                ),
+                "distinct signing-hash error expected: {err}"
+            );
         }
     }
 

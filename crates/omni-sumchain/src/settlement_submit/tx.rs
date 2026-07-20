@@ -20,7 +20,7 @@ use crate::rpc::JsonRpcTransport;
 use crate::tx::parse_send_raw_transaction_result;
 
 use super::error::SettlementSubmitError;
-use super::wire::BuildClaimRewardRaw;
+use super::wire::{BuildClaimRewardRaw, SettlementBuilderEnvelope};
 
 // ── Small hex helpers ────────────────────────────────────────────────────────
 //
@@ -56,7 +56,47 @@ pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Successful submission receipt.
+/// Issue #100 — status of a settlement write submission.
+///
+/// A successful `sum_sendRawTransaction` returns a tx hash, which the
+/// chain treats as accepted into the mempool ([`SubmitStatus::Submitted`]).
+/// The [`SubmitStatus::Pending`] variant is reserved for a future
+/// builder/RPC that acknowledges a hash without confirming mempool
+/// acceptance; the current path only ever produces `Submitted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitStatus {
+    /// `sum_sendRawTransaction` accepted the raw tx and returned a hash.
+    Submitted,
+    /// The tx hash is known but not yet acknowledged as accepted.
+    Pending,
+}
+
+impl SubmitStatus {
+    /// `true` when the chain accepted the raw tx into the mempool.
+    pub fn is_submitted(self) -> bool {
+        matches!(self, SubmitStatus::Submitted)
+    }
+}
+
+/// Issue #100 — generic settlement submission receipt.
+///
+/// Carries only what any settlement write submission yields: the
+/// chain-returned tx hash and the [`SubmitStatus`]. Operation-specific
+/// receipts (e.g. the claim path's [`ClaimSubmitReceipt`]) wrap this
+/// and add their own fields; paths with no extra fields to report (the
+/// register-verifier path) use this directly rather than fabricating
+/// claim-only fields such as `session_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementSubmitReceipt {
+    /// The `0x`-prefixed chain-returned tx hash.
+    pub tx_hash: String,
+    /// Submission status reported by `sum_sendRawTransaction`.
+    pub status: SubmitStatus,
+}
+
+/// Successful claim submission receipt. Superset of the generic
+/// [`SettlementSubmitReceipt`] — adds the claim-only session /
+/// verifier / envelope fields the claim CLI reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimSubmitReceipt {
     /// The `0x`-prefixed chain-returned tx hash.
@@ -270,27 +310,143 @@ pub fn verify_decoded_transaction(
     Ok(())
 }
 
+/// Issue #100 — verify a decoded `TransactionV2` is the expected
+/// `RegisterVerifier(bond)` transaction. Runs BEFORE any signing seed
+/// is loaded, mirroring [`verify_decoded_transaction`] for the claim
+/// path but asserting the register-verifier operation shape instead.
+///
+/// Checks (in order):
+/// 1. `tx.chain_id` == `envelope.chain_id`.
+/// 2. `tx.from.to_base58()` == `envelope.from` == `expected_from`.
+/// 3. `tx.nonce` == `envelope.nonce`.
+/// 4. `tx.fee` == `envelope.fee`.
+/// 5. `tx.payload` is `TxPayload::InferenceSettlement(_)`.
+/// 6. Inner operation is `InferenceSettlementOperation::RegisterVerifier(_)`.
+/// 7. `request.bond` == `expected_bond` (the operator's `--bond`).
+/// 8. Locally-computed `tx.signing_hash()` matches `envelope.signing_hash`.
+pub fn verify_register_verifier_transaction(
+    tx: &TransactionV2,
+    envelope: &SettlementBuilderEnvelope,
+    expected_from: &str,
+    expected_bond: u128,
+) -> Result<(), SettlementSubmitError> {
+    // 1. chain_id.
+    if u64::from(tx.chain_id) != envelope.chain_id {
+        return Err(SettlementSubmitError::DecodedTransactionMismatch {
+            field: "tx.chain_id",
+            expected: envelope.chain_id.to_string(),
+            got: u64::from(tx.chain_id).to_string(),
+        });
+    }
+
+    // 2. from.
+    let tx_from_b58 = tx.from.to_base58();
+    if tx_from_b58 != envelope.from {
+        return Err(SettlementSubmitError::DecodedTransactionMismatch {
+            field: "tx.from vs envelope.from",
+            expected: envelope.from.clone(),
+            got: tx_from_b58.clone(),
+        });
+    }
+    if tx_from_b58 != expected_from {
+        return Err(SettlementSubmitError::DecodedTransactionMismatch {
+            field: "tx.from vs derived verifier",
+            expected: expected_from.to_string(),
+            got: tx_from_b58,
+        });
+    }
+
+    // 3. nonce.
+    if u64::from(tx.nonce) != envelope.nonce {
+        return Err(SettlementSubmitError::DecodedTransactionMismatch {
+            field: "tx.nonce",
+            expected: envelope.nonce.to_string(),
+            got: u64::from(tx.nonce).to_string(),
+        });
+    }
+
+    // 4. fee.
+    if u128::from(tx.fee) != envelope.fee {
+        return Err(SettlementSubmitError::DecodedTransactionMismatch {
+            field: "tx.fee",
+            expected: envelope.fee.to_string(),
+            got: u128::from(tx.fee).to_string(),
+        });
+    }
+
+    // 5. payload variant.
+    let settlement = match &tx.payload {
+        TxPayload::InferenceSettlement(inner) => inner,
+        other => {
+            return Err(SettlementSubmitError::DecodedTransactionMismatch {
+                field: "tx.payload variant",
+                expected: "TxPayload::InferenceSettlement".to_string(),
+                got: format!("{other:?}"),
+            })
+        }
+    };
+
+    // 6. inner operation variant.
+    let register_request = match &settlement.operation {
+        InferenceSettlementOperation::RegisterVerifier(req) => req,
+        other => {
+            return Err(SettlementSubmitError::DecodedTransactionMismatch {
+                field: "tx.payload.operation variant",
+                expected: "InferenceSettlementOperation::RegisterVerifier".to_string(),
+                got: format!("{other:?}"),
+            })
+        }
+    };
+
+    // 7. bond.
+    if register_request.bond != expected_bond {
+        return Err(SettlementSubmitError::DecodedTransactionMismatch {
+            field: "tx.payload.operation.bond",
+            expected: expected_bond.to_string(),
+            got: register_request.bond.to_string(),
+        });
+    }
+
+    // 8. Cross-verify signing_hash — defense-in-depth against a builder
+    //    that returns a signing_hash mismatched with the tx bytes.
+    let local_hash = tx.signing_hash();
+    let local_hex = format!("0x{}", encode_hex(local_hash.as_bytes()));
+    if local_hex != envelope.signing_hash {
+        return Err(SettlementSubmitError::DecodedTransactionMismatch {
+            field: "tx.signing_hash() vs envelope.signing_hash",
+            expected: envelope.signing_hash.clone(),
+            got: local_hex,
+        });
+    }
+
+    Ok(())
+}
+
 // ── Sign + submit ────────────────────────────────────────────────────────────
 
-/// Sign the decoded `TransactionV2` with the verifier seed and submit
-/// via `sum_sendRawTransaction`. Reuses
-/// [`crate::outer_sign::outer_sign_transaction_v2`] — which internally
-/// re-computes `tx.signing_hash()`, signs with Ed25519, and returns a
-/// `SignedTransaction::new_v2(tx, sig_bytes, pubkey_bytes)`. The wire
-/// bytes are produced by `SignedTransaction::to_hex()` — **no raw
-/// concat anywhere in this module**.
+/// Issue #100 — generic sign + submit for ANY settlement
+/// `TransactionV2`. Signs the decoded tx with the verifier seed and
+/// submits via `sum_sendRawTransaction`, returning only the generic
+/// [`SettlementSubmitReceipt`] (tx hash + [`SubmitStatus`]). This is
+/// the shared core the claim path's [`sign_and_submit`] wraps; the
+/// register-verifier path calls it directly since it has no
+/// session/verifier fields to report.
 ///
-/// This function is the ONLY caller in the settlement claim path that
-/// touches seed bytes. All prechecks (dormancy, attestation,
-/// authority, maturity, bond, envelope, decoded-tx) must fire BEFORE
-/// this function is invoked.
-pub fn sign_and_submit<T: JsonRpcTransport>(
+/// Reuses [`crate::outer_sign::outer_sign_transaction_v2`] — which
+/// internally re-computes `tx.signing_hash()`, signs with Ed25519, and
+/// returns a `SignedTransaction::new_v2(tx, sig_bytes, pubkey_bytes)`.
+/// The wire bytes are produced by `SignedTransaction::to_hex()` —
+/// **no raw concat anywhere in this module**.
+///
+/// This function is the ONLY place in the settlement submit paths that
+/// touches seed bytes. All prechecks (dormancy / gates / envelope /
+/// decoded-tx, plus the claim-only attestation/authority/maturity/bond
+/// gates) must fire BEFORE this function is invoked.
+pub fn sign_and_submit_tx<T: JsonRpcTransport>(
     client: &SumChainClient<T>,
     tx: &TransactionV2,
     seed: &[u8; 32],
-    session_id: &str,
-    verifier: &str,
-) -> Result<ClaimSubmitReceipt, SettlementSubmitError> {
+) -> Result<SettlementSubmitReceipt, SettlementSubmitError> {
     let signed = outer_sign_transaction_v2(seed, tx).map_err(|e| {
         // outer_sign returns ChainClientError; map to a submit-side
         // variant so the CLI's dispatcher classifies it correctly.
@@ -323,8 +479,32 @@ pub fn sign_and_submit<T: JsonRpcTransport>(
             }
         })?;
 
-    Ok(ClaimSubmitReceipt {
+    Ok(SettlementSubmitReceipt {
         tx_hash,
+        status: SubmitStatus::Submitted,
+    })
+}
+
+/// Sign the decoded claim `TransactionV2` with the verifier seed and
+/// submit via `sum_sendRawTransaction`, returning the claim-specific
+/// [`ClaimSubmitReceipt`]. Thin wrapper over the generic
+/// [`sign_and_submit_tx`] that adds the claim-only session / verifier /
+/// envelope fields.
+///
+/// This function is the ONLY caller in the settlement claim path that
+/// touches seed bytes. All prechecks (dormancy, attestation,
+/// authority, maturity, bond, envelope, decoded-tx) must fire BEFORE
+/// this function is invoked.
+pub fn sign_and_submit<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
+    tx: &TransactionV2,
+    seed: &[u8; 32],
+    session_id: &str,
+    verifier: &str,
+) -> Result<ClaimSubmitReceipt, SettlementSubmitError> {
+    let receipt = sign_and_submit_tx(client, tx, seed)?;
+    Ok(ClaimSubmitReceipt {
+        tx_hash: receipt.tx_hash,
         session_id: session_id.to_string(),
         verifier: verifier.to_string(),
         chain_id: u64::from(tx.chain_id),

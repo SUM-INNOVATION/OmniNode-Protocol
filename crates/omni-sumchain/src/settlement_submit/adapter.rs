@@ -9,7 +9,10 @@ use crate::client::SumChainClient;
 use crate::rpc::JsonRpcTransport;
 
 use super::error::SettlementSubmitError;
-use super::wire::{BuildClaimRewardRaw, BuildClaimRewardRequest};
+use super::wire::{
+    BuildClaimRewardRaw, BuildClaimRewardRequest, BuildRegisterVerifierRequest,
+    SettlementBuilderEnvelope,
+};
 
 impl<T: JsonRpcTransport> SumChainClient<T> {
     /// Issue #87 — call `omninode_buildClaimInferenceReward`.
@@ -42,6 +45,40 @@ impl<T: JsonRpcTransport> SumChainClient<T> {
         serde_json::from_value(result).map_err(|e| {
             SettlementSubmitError::WireDecode(format!(
                 "failed to parse omninode_buildClaimInferenceReward response: {e}"
+            ))
+        })
+    }
+
+    /// Issue #100 — call `omninode_buildRegisterVerifier`.
+    ///
+    /// Chain-side write-preparation RPC (no state mutation). The chain
+    /// returns the canonical unsigned `RegisterVerifier(bond)` tx plus
+    /// the signing hash and envelope; the caller signs and submits via
+    /// the normal `sum_sendRawTransaction` path.
+    ///
+    /// The response envelope is the generic settlement build response
+    /// (`OmniSettlementBuildResponse`), modeled here by the generic
+    /// [`SettlementBuilderEnvelope`] — the same envelope the claim
+    /// builder returns — so the shared
+    /// [`super::tx::verify_builder_envelope`] / [`super::tx::decode_unsigned_tx`]
+    /// helpers apply. Local prechecks (chain-id, dormancy) live in the
+    /// CLI driver and fire BEFORE this method is called.
+    pub fn omninode_build_register_verifier(
+        &self,
+        request: &BuildRegisterVerifierRequest,
+    ) -> Result<SettlementBuilderEnvelope, SettlementSubmitError> {
+        let params = serde_json::to_value(request).map_err(|e| {
+            SettlementSubmitError::WireDecode(format!(
+                "failed to serialize BuildRegisterVerifierRequest: {e}"
+            ))
+        })?;
+        let result = self
+            .transport()
+            .call("omninode_buildRegisterVerifier", serde_json::json!([params]))
+            .map_err(SettlementSubmitError::BuilderRpc)?;
+        serde_json::from_value(result).map_err(|e| {
+            SettlementSubmitError::WireDecode(format!(
+                "failed to parse omninode_buildRegisterVerifier response: {e}"
             ))
         })
     }
