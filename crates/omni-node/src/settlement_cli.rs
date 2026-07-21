@@ -770,12 +770,11 @@ fn render_per_verifier_human(
     match &v.bond_summary {
         Some(b) => writeln!(
             out,
-            "    bond: amount={} state={} unbonding_since={} withdrawable_at={} slashes={}",
+            "    bond: amount={} state={} unbonding_since={} withdrawable_at={}",
             b.bond_amount,
             render_bond_state(&b.bond_state),
             opt_u64(b.unbonding_since_height),
             opt_u64(b.withdrawable_at_height),
-            b.slash_history_len,
         )?,
         None => writeln!(out, "    bond=none")?,
     }
@@ -911,7 +910,6 @@ fn per_verifier_to_json(v: &PerVerifierView) -> serde_json::Value {
             "bond_state": render_bond_state(&b.bond_state),
             "unbonding_since_height": b.unbonding_since_height,
             "withdrawable_at_height": b.withdrawable_at_height,
-            "slash_history_len": b.slash_history_len,
         })),
     })
 }
@@ -969,16 +967,16 @@ fn run_verifier<T: JsonRpcTransport>(
             writeln!(out, "address={} found=false", address)?;
         }
         Some(v) => {
-            writeln!(out, "address={}", v.address)?;
-            writeln!(out, "bond_amount={}", v.bond_amount)?;
-            writeln!(out, "bond_state={}", v.bond_state)?;
-            if let Some(h) = v.unbonding_since_height {
-                writeln!(out, "unbonding_since_height={h}")?;
+            writeln!(out, "verifier={}", v.verifier)?;
+            writeln!(out, "bond={}", v.bond)?;
+            writeln!(out, "status={}", v.status)?;
+            writeln!(out, "registered_at_height={}", v.registered_at_height)?;
+            if let Some(h) = v.unbonding_started_height {
+                writeln!(out, "unbonding_started_height={h}")?;
             }
-            if let Some(h) = v.withdrawable_at_height {
-                writeln!(out, "withdrawable_at_height={h}")?;
+            if let Some(h) = v.unlock_height {
+                writeln!(out, "unlock_height={h}")?;
             }
-            writeln!(out, "slash_history_len={}", v.slash_history.len())?;
         }
     }
 
@@ -3008,10 +3006,10 @@ mod tests {
         fake.set_response(
             "omninode_getVerifier",
             Ok(json!({
-                "address": "v-A",
-                "bond_amount": "10000",
-                "bond_state": "bonded",
-                "slash_history": []
+                "verifier": "v-A",
+                "bond": 10_000,
+                "status": "Active",
+                "registered_at_height": 100
             })),
         );
         // FakeJsonRpcTransport returns the same seeded response for
@@ -3656,10 +3654,10 @@ mod tests {
         fake.set_response(
             "omninode_getVerifier",
             Ok(json!({
-                "address": "v-1",
-                "bond_amount": "10000",
-                "bond_state": "bonded",
-                "slash_history": []
+                "verifier": "v-1",
+                "bond": 10_000,
+                "status": "Active",
+                "registered_at_height": 100
             })),
         );
 
@@ -3682,6 +3680,49 @@ mod tests {
             logs.contains("address=\"v-1\""),
             "must record address field; logs=\n{logs}"
         );
+    }
+
+    // ── Verifier renders the canonical record; null → found=false ──────
+
+    #[test]
+    fn verifier_canonical_record_renders_and_null_is_found_false() {
+        let (client, fake) = make_client();
+        seed_params(&fake, params_all_gates_active(0));
+        seed_head(&fake, 500_000);
+        fake.set_response(
+            "omninode_getVerifier",
+            Ok(json!({
+                "verifier": "v-1",
+                "bond": 10_000,
+                "status": "Active",
+                "registered_at_height": 777,
+                "unbonding_started_height": 800,
+                "unlock_height": 900
+            })),
+        );
+        let (_logs, stdout, result) = run_with_capture(args_verifier("v-1"), &client);
+        result.expect("canonical verifier record must render");
+        let out = String::from_utf8(stdout).expect("utf8 stdout");
+        assert!(out.contains("verifier=v-1"), "{out}");
+        assert!(out.contains("bond=10000"), "{out}");
+        assert!(out.contains("status=Active"), "{out}");
+        assert!(out.contains("registered_at_height=777"), "{out}");
+        assert!(out.contains("unbonding_started_height=800"), "{out}");
+        assert!(out.contains("unlock_height=900"), "{out}");
+        // No leftover legacy field names in operator-facing output.
+        assert!(!out.contains("bond_amount="), "{out}");
+        assert!(!out.contains("bond_state="), "{out}");
+        assert!(!out.contains("slash_history"), "{out}");
+
+        // A null record renders `found=false`, not a parse failure.
+        let (client2, fake2) = make_client();
+        seed_params(&fake2, params_all_gates_active(0));
+        seed_head(&fake2, 500_000);
+        fake2.set_response("omninode_getVerifier", Ok(serde_json::Value::Null));
+        let (_logs2, stdout2, result2) = run_with_capture(args_verifier("ghost"), &client2);
+        result2.expect("null verifier must succeed as found=false");
+        let out2 = String::from_utf8(stdout2).expect("utf8 stdout");
+        assert!(out2.contains("address=ghost found=false"), "{out2}");
     }
 
     // ── Issue #87 — settlement claim tests ─────────────────────────────
@@ -4113,10 +4154,10 @@ mod tests {
             fake.set_response(
                 "omninode_getVerifier",
                 Ok(json!({
-                    "address": fixture.from_b58,
-                    "bond_amount": "0",
-                    "bond_state": "withdrawn",       // <-- not Bonded
-                    "slash_history": []
+                    "verifier": fixture.from_b58,
+                    "bond": 0,
+                    "status": "Withdrawn",           // <-- not Active/Bonded
+                    "registered_at_height": 100
                 })),
             );
 

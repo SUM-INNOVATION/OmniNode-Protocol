@@ -13,9 +13,10 @@
 //! 3. Params sent on the gated RPC when active — exact JSON.
 //!
 //! Terminology guard: reward denial is never referred to as "slashing"
-//! anywhere in this test file. Slashing appears only in
-//! [`crate::settlement::wire::SlashRecordRaw`], which is the chain's
-//! validator-quorum-denied bond removal — a strictly different event.
+//! anywhere in this test file. The verifier registry record
+//! (`omninode_getVerifier` / [`VerifierRegistryRaw`]) carries no slash
+//! history — slashing is a strictly different, validator-quorum-denied
+//! bond-removal event the chain does not expose through this RPC.
 
 #![cfg(feature = "settlement-read")]
 
@@ -527,20 +528,20 @@ fn scenario_6d_bond_required_view_composes_bond_summary_from_registry() {
     // Registry covers both verifiers with distinct bond states.
     let registry = vec![
         VerifierRegistryRaw {
-            address: "v-bonded".into(),
-            bond_amount: "10000".into(),
-            bond_state: "bonded".into(),
-            unbonding_since_height: None,
-            withdrawable_at_height: None,
-            slash_history: vec![],
+            verifier: "v-bonded".into(),
+            bond: 10_000,
+            status: "Active".into(),
+            registered_at_height: 400_000,
+            unbonding_started_height: None,
+            unlock_height: None,
         },
         VerifierRegistryRaw {
-            address: "v-unbonding".into(),
-            bond_amount: "5000".into(),
-            bond_state: "unbonding".into(),
-            unbonding_since_height: Some(490_000),
-            withdrawable_at_height: Some(500_050),
-            slash_history: vec![],
+            verifier: "v-unbonding".into(),
+            bond: 5_000,
+            status: "Unbonding".into(),
+            registered_at_height: 400_000,
+            unbonding_started_height: Some(490_000),
+            unlock_height: Some(500_050),
         },
     ];
 
@@ -563,7 +564,6 @@ fn scenario_6d_bond_required_view_composes_bond_summary_from_registry() {
     let bs_bonded = v_bonded.bond_summary.as_ref().expect("bonded verifier must have bond_summary");
     assert_eq!(bs_bonded.bond_amount, 10_000u128);
     assert_eq!(bs_bonded.bond_state, BondState::Bonded);
-    assert_eq!(bs_bonded.slash_history_len, 0);
 
     let bs_unb = v_unbonding.bond_summary.as_ref().expect("unbonding verifier must have bond_summary");
     assert_eq!(bs_unb.bond_amount, 5_000u128);
@@ -640,10 +640,10 @@ fn scenario_7_verifier_registry_records_round_trip() {
     fake.set_response(
         "omninode_getVerifier",
         Ok(json!({
-            "address": "verifier-1",
-            "bond_amount": "10000",
-            "bond_state": "bonded",
-            "slash_history": []
+            "verifier": "verifier-1",
+            "bond": 10_000,
+            "status": "Active",
+            "registered_at_height": 12_345
         })),
     );
 
@@ -651,39 +651,42 @@ fn scenario_7_verifier_registry_records_round_trip() {
         .omninode_get_verifier("verifier-1")
         .expect("bonded read should succeed")
         .expect("verifier should not be absent");
-    assert_eq!(v.address, "verifier-1");
-    assert_eq!(v.bond_amount, "10000");
-    assert_eq!(v.bond_state, "bonded");
-    assert!(v.slash_history.is_empty());
+    assert_eq!(v.verifier, "verifier-1");
+    assert_eq!(v.bond, 10_000);
+    assert_eq!(v.status, "Active");
+    assert_eq!(v.registered_at_height, 12_345);
+    assert_eq!(v.unbonding_started_height, None);
+    assert_eq!(v.unlock_height, None);
 
     // Also test unbonding + withdrawn.
     fake.set_response(
         "omninode_getVerifier",
         Ok(json!({
-            "address": "verifier-2",
-            "bond_amount": "5000",
-            "bond_state": "unbonding",
-            "unbonding_since_height": 490_000,
-            "withdrawable_at_height": 500_050,
-            "slash_history": []
+            "verifier": "verifier-2",
+            "bond": 5_000,
+            "status": "Unbonding",
+            "registered_at_height": 10_000,
+            "unbonding_started_height": 490_000,
+            "unlock_height": 500_050
         })),
     );
     let v2 = client.omninode_get_verifier("verifier-2").unwrap().unwrap();
-    assert_eq!(v2.bond_state, "unbonding");
-    assert_eq!(v2.unbonding_since_height, Some(490_000));
+    assert_eq!(v2.status, "Unbonding");
+    assert_eq!(v2.unbonding_started_height, Some(490_000));
+    assert_eq!(v2.unlock_height, Some(500_050));
 
     fake.set_response(
         "omninode_getVerifier",
         Ok(json!({
-            "address": "verifier-3",
-            "bond_amount": "0",
-            "bond_state": "withdrawn",
-            "slash_history": []
+            "verifier": "verifier-3",
+            "bond": 0,
+            "status": "Withdrawn",
+            "registered_at_height": 9_000
         })),
     );
     let v3 = client.omninode_get_verifier("verifier-3").unwrap().unwrap();
-    assert_eq!(v3.bond_state, "withdrawn");
-    assert_eq!(v3.bond_amount, "0");
+    assert_eq!(v3.status, "Withdrawn");
+    assert_eq!(v3.bond, 0);
 
     // Ensure each call carried the right address param.
     let calls = fake.calls();
@@ -695,6 +698,214 @@ fn scenario_7_verifier_registry_records_round_trip() {
     assert_eq!(verifier_calls[0].1, json!(["verifier-1"]));
     assert_eq!(verifier_calls[1].1, json!(["verifier-2"]));
     assert_eq!(verifier_calls[2].1, json!(["verifier-3"]));
+}
+
+// ── Scenario 7a — getVerifier decode: negatives, boundaries, forward-compat ─
+
+// `null` is a successful "not registered", never a parse error.
+#[test]
+fn scenario_7a_null_maps_to_not_registered() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    fake.set_response("omninode_getVerifier", Ok(serde_json::Value::Null));
+    assert!(
+        client
+            .omninode_get_verifier("nobody")
+            .expect("null must be a successful not-registered, not a parse error")
+            .is_none()
+    );
+}
+
+// A legacy / mis-named envelope (no canonical `verifier`) is rejected —
+// never silently decoded. Proves the stale client shape can't sneak through.
+#[test]
+fn scenario_7a_legacy_shape_is_rejected() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    fake.set_response(
+        "omninode_getVerifier",
+        Ok(json!({
+            "address": "legacy-v",
+            "bond_amount": "10000",
+            "bond_state": "bonded"
+        })),
+    );
+    match client
+        .omninode_get_verifier("legacy-v")
+        .expect_err("a legacy-named response must be rejected, not decoded")
+    {
+        SettlementReadError::WireParse(msg) => {
+            assert!(msg.contains("omninode_getVerifier"), "got {msg:?}");
+        }
+        other => panic!("expected WireParse, got {other:?}"),
+    }
+}
+
+// A missing required field (`verifier`) is rejected.
+#[test]
+fn scenario_7a_missing_verifier_field_is_rejected() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    fake.set_response(
+        "omninode_getVerifier",
+        Ok(json!({
+            "bond": 10_000,
+            "status": "Active",
+            "registered_at_height": 1
+        })),
+    );
+    assert!(matches!(
+        client
+            .omninode_get_verifier("v")
+            .expect_err("missing `verifier` must reject"),
+        SettlementReadError::WireParse(_)
+    ));
+}
+
+// The canonical wire is a JSON number; a string bond is rejected.
+#[test]
+fn scenario_7a_string_bond_is_rejected() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    fake.set_response(
+        "omninode_getVerifier",
+        Ok(json!({
+            "verifier": "v",
+            "bond": "10000",
+            "status": "Active",
+            "registered_at_height": 1
+        })),
+    );
+    assert!(matches!(
+        client
+            .omninode_get_verifier("v")
+            .expect_err("string bond must reject on the canonical numeric wire"),
+        SettlementReadError::WireParse(_)
+    ));
+}
+
+// Boundary: `u64::MAX` decodes exactly (the largest value serde_json's
+// `Value` holds as a native integer even without arbitrary_precision).
+#[test]
+fn scenario_7a_bond_u64_max_is_accepted() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    fake.set_response(
+        "omninode_getVerifier",
+        Ok(json!({
+            "verifier": "v",
+            "bond": u64::MAX,
+            "status": "Active",
+            "registered_at_height": 1
+        })),
+    );
+    let v = client.omninode_get_verifier("v").unwrap().unwrap();
+    assert_eq!(v.bond, u64::MAX as u128);
+}
+
+// Boundary: values ABOVE `u64::MAX` decode exactly. `arbitrary_precision`
+// (issue #97) preserves the exact integer token through the `Value` stage,
+// so there is no u64 ceiling — `u64::MAX + 1` and `u128::MAX` both decode
+// byte-for-byte. Tokens are written as raw JSON so no Rust-side coercion
+// occurs before the typed decode.
+#[test]
+fn scenario_7a_bond_above_u64_max_and_u128_max_decode_exactly() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    let cases: [(&str, u128); 2] = [
+        ("18446744073709551616", (u64::MAX as u128) + 1),
+        ("340282366920938463463374607431768211455", u128::MAX),
+    ];
+    for (token, expected) in cases {
+        let raw = format!(
+            r#"{{"verifier":"v","bond":{token},"status":"Active","registered_at_height":1}}"#
+        );
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("raw json parses to Value");
+        fake.set_response("omninode_getVerifier", Ok(value));
+        let v = client.omninode_get_verifier("v").unwrap().unwrap();
+        assert_eq!(v.bond, expected, "bond token {token} must decode exactly");
+    }
+}
+
+// Boundary: `u128::MAX + 1` overflows `u128` and is rejected. The token is
+// written directly as raw JSON — it cannot be represented in a Rust `u128`,
+// so nothing truncates it before the typed decode sees the overflow.
+#[test]
+fn scenario_7a_bond_above_u128_max_is_rejected() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    let raw = r#"{"verifier":"v","bond":340282366920938463463374607431768211456,"status":"Active","registered_at_height":1}"#;
+    let value: serde_json::Value = serde_json::from_str(raw).expect("raw json parses to Value");
+    fake.set_response("omninode_getVerifier", Ok(value));
+    assert!(matches!(
+        client
+            .omninode_get_verifier("v")
+            .expect_err("bond above u128::MAX must reject as overflow"),
+        SettlementReadError::WireParse(_)
+    ));
+}
+
+// Invalid numeric forms are rejected under the canonical numeric contract.
+#[test]
+fn scenario_7a_bond_negative_is_rejected() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    fake.set_response(
+        "omninode_getVerifier",
+        Ok(json!({"verifier": "v", "bond": -1, "status": "Active", "registered_at_height": 1})),
+    );
+    assert!(matches!(
+        client
+            .omninode_get_verifier("v")
+            .expect_err("negative bond must reject"),
+        SettlementReadError::WireParse(_)
+    ));
+}
+
+#[test]
+fn scenario_7a_bond_fractional_is_rejected() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    fake.set_response(
+        "omninode_getVerifier",
+        Ok(json!({"verifier": "v", "bond": 1.5, "status": "Active", "registered_at_height": 1})),
+    );
+    assert!(matches!(
+        client
+            .omninode_get_verifier("v")
+            .expect_err("fractional bond must reject"),
+        SettlementReadError::WireParse(_)
+    ));
+}
+
+// Forward-compat: an unrecognized `status` decodes at the wire level
+// (never hard-fails the read); the view layer normalizes it to
+// `BondState::UnknownWire` (see the signer's precheck_bond_unknown_wire_state).
+#[test]
+fn scenario_7a_unknown_status_decodes_verbatim() {
+    let (client, fake) = make_client();
+    seed_params(&fake, params_all_gates_active(0));
+    seed_head(&fake, 500_000);
+    fake.set_response(
+        "omninode_getVerifier",
+        Ok(json!({
+            "verifier": "v",
+            "bond": 42,
+            "status": "Frobnicated",
+            "registered_at_height": 7
+        })),
+    );
+    let v = client.omninode_get_verifier("v").unwrap().unwrap();
+    assert_eq!(v.status, "Frobnicated");
 }
 
 // ── Scenario 8 — claimable reward: mature-and-claimable vs. immature ────────

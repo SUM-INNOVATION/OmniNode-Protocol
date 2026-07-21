@@ -12,10 +12,13 @@
 //!   (32-byte values → 66 chars incl. prefix; 20-byte addresses may
 //!   use a chain-native encoding — Stage 6 uses base58 chain
 //!   addresses in `verifier_address`).
-//! - `Balance` fields (`escrow_total`, `reward_amount`, `bond_amount`,
-//!   slash amounts) are emitted as decimal strings on the wire
-//!   because a `u128` exceeds JSON's safe integer range. The view
-//!   layer parses them into `u128`.
+//! - `Balance` fields (`escrow_total`, `reward_amount`) are emitted as
+//!   decimal strings on the wire because a `u128` exceeds JSON's safe
+//!   integer range. The view layer parses them into `u128`. The
+//!   verifier registry `bond` is the lone exception — the chain emits
+//!   it as a JSON number, decoded across the full `u128` range via
+//!   `serde_json/arbitrary_precision` (see [`VerifierRegistryRaw`] and
+//!   the crate manifest's issue-#97 note).
 //! - Optional fields carry `#[serde(default)]` so partial responses
 //!   (older chain patches, empty-state variants) parse cleanly.
 //!
@@ -281,42 +284,47 @@ pub struct DigestTupleRaw {
 
 // ── Verifier registry ────────────────────────────────────────────────────────
 
-/// Response shape for `omninode_getVerifier(address)`. Returns `null`
-/// when the address has no verifier registry record. Requires the
-/// bonding gate to be RPC-level active.
+/// Response shape for `omninode_getVerifier(address)`. Mirrors the
+/// chain's `InferenceVerifierInfo` verbatim (sum-chain
+/// `crates/rpc/src/inference_settlement_types.rs`, issue #78). Returns
+/// `null` when the address has no verifier registry record. Requires
+/// the bonding gate to be RPC-level active.
+///
+/// Unlike the other balance DTOs in this module, `bond` is a JSON
+/// **number**, not a decimal string — the chain serializes the verifier
+/// bond numerically. This crate enables `serde_json`'s
+/// `arbitrary_precision` feature (issue #97, see the crate manifest), so
+/// the exact integer token survives the intermediate `serde_json::Value`
+/// stage and the **full `u128` range decodes faithfully** — there is no
+/// `u64` ceiling. Values exceeding `u128::MAX`, negatives, non-integers,
+/// and strings are rejected at the wire boundary.
+///
+/// (Numeric `u128` on the wire is safe for this Rust client but is a
+/// cross-ecosystem interop hazard — e.g. JavaScript `JSON.parse` loses
+/// precision above 2⁵³. That is a chain-side concern, not this adapter's.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifierRegistryRaw {
-    pub address: String,
+    /// Verifier chain address (base58). Chain field: `verifier`.
+    pub verifier: String,
 
-    /// Currently bonded amount. Decimal `u128` string.
-    pub bond_amount: String,
+    /// Currently bonded amount, as a JSON number. Chain field: `bond`.
+    pub bond: u128,
 
-    /// `"bonded"` | `"unbonding"` | `"withdrawn"`. Anything else
-    /// maps to `BondState::UnknownWire(...)` in the view layer.
-    pub bond_state: String,
+    /// `"Active"` | `"Unbonding"` | `"Withdrawn"`. Anything else maps
+    /// to `BondState::UnknownWire(...)` in the view layer. Chain field:
+    /// `status`.
+    pub status: String,
 
+    /// Height at which the verifier's bond was first registered.
+    pub registered_at_height: u64,
+
+    /// Height at which unbonding began; `null`/absent while actively
+    /// bonded. Chain field: `unbonding_started_height`.
     #[serde(default)]
-    pub unbonding_since_height: Option<u64>,
+    pub unbonding_started_height: Option<u64>,
 
+    /// Height at which an unbonding bond becomes withdrawable;
+    /// `null`/absent until unbonding starts. Chain field: `unlock_height`.
     #[serde(default)]
-    pub withdrawable_at_height: Option<u64>,
-
-    /// Slash history is chain-append-only. **Reward denial is NOT
-    /// recorded here** — this vec only carries actual slashing events
-    /// against bond-required sessions where validator-quorum-denied
-    /// dispute triggered chain-side stake removal.
-    #[serde(default)]
-    pub slash_history: Vec<SlashRecordRaw>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlashRecordRaw {
-    pub slashed_at_height: u64,
-    /// Decimal `u128` string.
-    pub amount: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// Session that triggered the slash, if the chain records it.
-    #[serde(default)]
-    pub session_id: Option<String>,
+    pub unlock_height: Option<u64>,
 }

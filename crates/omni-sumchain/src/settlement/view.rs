@@ -151,8 +151,10 @@ pub enum DisputeState {
     UnknownWire(String),
 }
 
-/// Bond state — mirror of the wire `bond_state` string. `UnknownWire`
-/// preserves the raw value if the chain adds a state.
+/// Bond state — normalized from the wire `status` string
+/// (`"Active"` → [`BondState::Bonded`], `"Unbonding"`, `"Withdrawn"`).
+/// `UnknownWire` preserves the raw value if the chain adds a state, so
+/// a read-only client never hard-fails on an unrecognized status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BondState {
     Bonded,
@@ -172,13 +174,6 @@ pub struct BondSummary {
     pub bond_state: BondState,
     pub unbonding_since_height: Option<u64>,
     pub withdrawable_at_height: Option<u64>,
-    /// Count of chain-recorded slash events against this verifier.
-    /// The full records live on the raw
-    /// [`super::wire::VerifierRegistryRaw::slash_history`] the caller
-    /// already fetched — this is just a summary counter so a view
-    /// consumer can render "N previous slashes" without re-inspecting
-    /// the raw DTO.
-    pub slash_history_len: usize,
 }
 
 /// Per-verifier view for one session — always populated inside
@@ -363,7 +358,7 @@ impl SettlementSessionView {
         // matching entry.
         let registry_by_address: BTreeMap<String, &VerifierRegistryRaw> = match &verifier_registry
         {
-            Some(entries) => entries.iter().map(|e| (e.address.clone(), e)).collect(),
+            Some(entries) => entries.iter().map(|e| (e.verifier.clone(), e)).collect(),
             None => BTreeMap::new(),
         };
 
@@ -410,10 +405,7 @@ impl SettlementSessionView {
                 .map(classify_dispute)
                 .unwrap_or(DisputeState::None);
 
-            let bond_summary = registry_by_address
-                .get(&addr)
-                .map(|r| parse_bond_summary(r))
-                .transpose()?;
+            let bond_summary = registry_by_address.get(&addr).map(|r| parse_bond_summary(r));
 
             verifiers.push(PerVerifierView {
                 verifier_address: addr,
@@ -474,21 +466,19 @@ fn classify_claim(c: &InferenceClaimRaw) -> Result<ClaimState, SettlementReadErr
     })
 }
 
-fn parse_bond_summary(raw: &VerifierRegistryRaw) -> Result<BondSummary, SettlementReadError> {
-    let bond_amount = parse_u128_decimal(&raw.bond_amount, "bond_amount")?;
-    let bond_state = match raw.bond_state.as_str() {
-        "bonded" => BondState::Bonded,
-        "unbonding" => BondState::Unbonding,
-        "withdrawn" => BondState::Withdrawn,
+fn parse_bond_summary(raw: &VerifierRegistryRaw) -> BondSummary {
+    let bond_state = match raw.status.as_str() {
+        "Active" => BondState::Bonded,
+        "Unbonding" => BondState::Unbonding,
+        "Withdrawn" => BondState::Withdrawn,
         other => BondState::UnknownWire(other.to_string()),
     };
-    Ok(BondSummary {
-        bond_amount,
+    BondSummary {
+        bond_amount: raw.bond,
         bond_state,
-        unbonding_since_height: raw.unbonding_since_height,
-        withdrawable_at_height: raw.withdrawable_at_height,
-        slash_history_len: raw.slash_history.len(),
-    })
+        unbonding_since_height: raw.unbonding_started_height,
+        withdrawable_at_height: raw.unlock_height,
+    }
 }
 
 fn classify_dispute(d: &InferenceDisputeRaw) -> DisputeState {
