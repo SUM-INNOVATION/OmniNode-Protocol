@@ -203,20 +203,17 @@ impl ClaimSignerIdentity {
             Some(e) => e,
         };
 
-        let bond_amount = entry.bond_amount.parse::<u128>().map_err(|e| {
-            ClaimSignerError::RegistryFetchFailed(format!(
-                "failed to parse bond_amount '{}' as u128: {e}",
-                entry.bond_amount
-            ))
-        })?;
+        // `bond` arrives as a JSON number decoded straight into `u128` at
+        // the wire boundary — no string parse needed.
+        let bond_amount = entry.bond;
 
-        Ok(match entry.bond_state.as_str() {
-            "bonded" => BondPrecheckOutcome::Bonded { bond_amount },
-            "unbonding" => BondPrecheckOutcome::Unbonding {
+        Ok(match entry.status.as_str() {
+            "Active" => BondPrecheckOutcome::Bonded { bond_amount },
+            "Unbonding" => BondPrecheckOutcome::Unbonding {
                 bond_amount,
-                withdrawable_at_height: entry.withdrawable_at_height,
+                withdrawable_at_height: entry.unlock_height,
             },
-            "withdrawn" => BondPrecheckOutcome::Withdrawn,
+            "Withdrawn" => BondPrecheckOutcome::Withdrawn,
             other => BondPrecheckOutcome::UnknownWireState {
                 raw: other.to_string(),
                 bond_amount,
@@ -532,10 +529,10 @@ mod tests {
         fake.set_response(
             "omninode_getVerifier",
             Ok(json!({
-                "address": expected_addr_for_seed_7(),
-                "bond_amount": "10000",
-                "bond_state": "bonded",
-                "slash_history": []
+                "verifier": expected_addr_for_seed_7(),
+                "bond": 10_000,
+                "status": "Active",
+                "registered_at_height": 100
             })),
         );
 
@@ -571,10 +568,10 @@ mod tests {
         fake.set_response(
             "omninode_getVerifier",
             Ok(json!({
-                "address": expected_addr_for_seed_7(),
-                "bond_amount": "10000",
-                "bond_state": "bonded",
-                "slash_history": []
+                "verifier": expected_addr_for_seed_7(),
+                "bond": 10_000,
+                "status": "Active",
+                "registered_at_height": 100
             })),
         );
         let identity = ClaimSignerIdentity::resolve(SeedSource::Explicit(seed_7()))
@@ -619,12 +616,12 @@ mod tests {
         fake.set_response(
             "omninode_getVerifier",
             Ok(json!({
-                "address": expected_addr_for_seed_7(),
-                "bond_amount": "5000",
-                "bond_state": "unbonding",
-                "unbonding_since_height": 490_000,
-                "withdrawable_at_height": 500_050,
-                "slash_history": []
+                "verifier": expected_addr_for_seed_7(),
+                "bond": 5_000,
+                "status": "Unbonding",
+                "registered_at_height": 100,
+                "unbonding_started_height": 490_000,
+                "unlock_height": 500_050
             })),
         );
         let identity = ClaimSignerIdentity::resolve(SeedSource::Explicit(seed_7()))
@@ -650,10 +647,10 @@ mod tests {
         fake.set_response(
             "omninode_getVerifier",
             Ok(json!({
-                "address": expected_addr_for_seed_7(),
-                "bond_amount": "0",
-                "bond_state": "withdrawn",
-                "slash_history": []
+                "verifier": expected_addr_for_seed_7(),
+                "bond": 0,
+                "status": "Withdrawn",
+                "registered_at_height": 100
             })),
         );
         let identity = ClaimSignerIdentity::resolve(SeedSource::Explicit(seed_7()))
@@ -664,7 +661,7 @@ mod tests {
         assert_eq!(outcome, BondPrecheckOutcome::Withdrawn);
     }
 
-    // ── Test 12 — unknown wire bond_state reported verbatim ────────────
+    // ── Test 12 — unknown wire status reported verbatim ────────────────
 
     #[test]
     fn precheck_bond_unknown_wire_state() {
@@ -673,10 +670,10 @@ mod tests {
         fake.set_response(
             "omninode_getVerifier",
             Ok(json!({
-                "address": expected_addr_for_seed_7(),
-                "bond_amount": "7777",
-                "bond_state": "some-future-state",
-                "slash_history": []
+                "verifier": expected_addr_for_seed_7(),
+                "bond": 7_777,
+                "status": "some-future-state",
+                "registered_at_height": 100
             })),
         );
         let identity = ClaimSignerIdentity::resolve(SeedSource::Explicit(seed_7()))
