@@ -1,0 +1,82 @@
+{
+  "kind": "r0-closure-record/v1",
+  "non_production": true,
+  "no_production_or_integration_claim": true,
+  "authority": {
+    "measurement_head_sum_chain": "9cccaa5ee6e038fb9dcb45af44ecb3cbdc2f48c6",
+    "b0_pre_spec_hash": "e933e7325c2639a48d8e25f20746d0f8abc822dee9fcfa87c2e6cdec226cf2a2",
+    "official_seal_blake3": "60ace32cc2775fd38c3a4b9ea81f49686121cdd25a38db7a5ca5a0f4580bd600",
+    "package_id_blake3": "80ab5ecfbe7a24d96d02dad78db2e4aee712ea0b29a071c19893b0d83dd0f11b",
+    "r0_guest_set_hash": "11d059c7dbc37b3d80f0a0c1fcaee96ad5e0ba1916ba08bdb0f37e1a7d76401a",
+    "mia": "fe90a56c52857478ffb245531aaf623ccf71727918b232458faa39bf290b6ad8",
+    "eligibility": "2a2804b0b6057cdae47b0aaed733f1b94ef7d2894888a73bc3cbcc3949363fe1",
+    "canonical_sp1_guest": "d72d98b5d453c28ee270506af92ee6adc41ffde608cea9a5798a8ebdf61103b2",
+    "fragment_sp1_x86_64_blake3": "113958582eb54355e976c0bdfed3a6c70067822ad3b3ae2d868dd683fd573a65",
+    "fragment_risc0_x86_64_blake3": "b6090b05af95cbfca6cbbfeeba2513d5e6f855da5d2da7070a1e3f6845b18900"
+  },
+  "identities": {
+    "sp1_x86_64": {
+      "program_id": "001c9c55aa73323951c6d6a83f06a318305876a044ca1a1a9fe1d556e9ebfad6",
+      "toolchain_identity": "4367170fa04c2ab4e00ae4371c0a61c07581a2d6ee35309e1f84f3410d675f5c"
+    },
+    "sp1_aarch64_identity_only": {
+      "program_id": "001c9c55aa73323951c6d6a83f06a318305876a044ca1a1a9fe1d556e9ebfad6"
+    },
+    "risc0_x86_64": {
+      "program_id": "f09c454a2eb7d5e7905196c17815efa07380c7ead00477433ed623519550b6cb",
+      "guest_image_hash": "9945fcb45c2a88b991a0a78136d84a9f81c003a66d7003243be03605083382b3"
+    }
+  },
+  "eligibility_matrix": {
+    "measurement_cells_x86_64": ["Sp1", "Risc0"],
+    "sp1_aarch64": "identity_only_reconciliation",
+    "sp1_aarch64_terminal_groth16": "ratified_unsupported_no_first_party_linux_arm64_gnark",
+    "risc0_aarch64": "unsupported_refused",
+    "arm_performance_measured": false,
+    "arm_identity_reconciliation_required": true,
+    "arm_identity_reconciliation_satisfied": true
+  },
+  "acceptance_confirmation": {
+    "both_eligible_x86_cells_completed": true,
+    "bounded_transformer_layer_group_unit_proven_and_verified": true,
+    "select_token_unit_proven_and_verified": true,
+    "statement_program_lock_toolchain_bindings": "bound (records-authoritative; per-candidate)",
+    "golden_roots": {
+      "types_corrected_from": ["StateObjectV1", "UnitOutputManifestV1"],
+      "ratified_types": ["ObjectCommitmentV1", "OutputManifestV1", "InputManifestV1"],
+      "cases": ["empty_object", "single_chunk_object", "two_slot_output_manifest", "three_slot_input_manifest", "three_chunk_boundary_root"],
+      "encoding_golden_vectors_sha256": "26a6338e3572384adfc4e0aa379f4501cb1c350a4195ce85f8056b2f378875c1",
+      "encoding_golden_vectors_source": "sum-chain docs/b0-pre/fixtures/encoding-golden/vectors.json",
+      "snip_cross_validation": "Storage-Node-Interface-Protocol/crates/sum-store/tests/object_manifest_golden.rs",
+      "present": true
+    },
+    "malformed_and_wrong_statement_proofs_deterministically_refused": true,
+    "adversarial_evidence": "tools/r0-zkvm-bench/tests/adversarial_binding.rs + verifier_matrix.rs",
+    "determinism_evidence": "tools/r0-zkvm-bench/tests/guest_output_equivalence.rs",
+    "raw_metrics_and_reproducibility_retrievable_and_hash_bound": true
+  },
+  "corrections": {
+    "architecture": "supersedes 'both candidate guests prove on both architectures': ratified two-cell model is x86_64-only terminal measurement + SP1/aarch64 identity-only reconciliation; SP1/aarch64 terminal Groth16 and RISC0/aarch64 ratified-unsupported. ARM performance never measured or implied.",
+    "golden_fixture_type_names": "supersedes 'StateObjectV1 / UnitOutputManifestV1': ratified types are ObjectCommitmentV1 / OutputManifestV1 / InputManifestV1; the five golden cases exist and are committed + SNIP-cross-validated."
+  },
+  "durable_evidence": {
+    "release_tag": "b0-final-evidence-60ace32c",
+    "release_tag_commit": "9cccaa5ee6e038fb9dcb45af44ecb3cbdc2f48c6",
+    "release_repo": "SUM-INNOVATION/sum-chain",
+    "release_url": "https://github.com/SUM-INNOVATION/sum-chain/releases/tag/b0-final-evidence-60ace32c",
+    "release_id": 380755330,
+    "assets": [
+      {"name": "b0-final-official-evidence.tar", "id": "RA_kwDOQp_rU84gL9G7", "size": 3123200,
+       "sha256": "fe18544a9b9ded74e58a267bd2f6d1577b7f677567d620f69aa94e012c04a8b7",
+       "blake3": "a904316e65a2e7286ed3911d0f5d692e64e445477040cb0e7381249c2c7ec07f"},
+      {"name": "b0-final-official-evidence-manifest.v1.json", "id": "RA_kwDOQp_rU84gL9G5", "size": 7795,
+       "sha256": "bf159c5cf5c487ba2103b2a00ebe71a9f1671c28e5595463c1ee0fe0fc09cd03",
+       "blake3": "e01a9f3f22f9c3322179ae08164f5bdcf0f85270109c577f16b2d69303a12570"},
+      {"name": "CHECKSUMS.txt", "id": "RA_kwDOQp_rU84gL9G6", "size": 5010,
+       "sha256": "d162e1090a31d3ad65ed9db062792684d393abedfba3549c1aa6855fe1eca1b3",
+       "blake3": "7ff11b18ad55082d39f968e8c6120ea17c9bcae53b3812e0cd89a357ee275ab8"}
+    ]
+  },
+  "sub_issue": "SUM-INNOVATION/OmniNode-Protocol#113",
+  "sibling_issue": "SUM-INNOVATION/sum-chain#194"
+}
