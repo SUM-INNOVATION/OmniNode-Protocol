@@ -107,11 +107,18 @@ ureq       = "2.10"
 # re-run under `--features submit` after the bump and must remain
 # byte-identical.
 #
+# Converged to `=0.3.0` (BR1 beacon + #117 consolidation; sum-chain
+# `main` d5218500). Pinned EXACT and bumped as a PAIR: `sumchain-crypto`
+# 0.3.0 requires `sumchain-primitives ^0.3.0`, and the submit-feature
+# parity goldens construct a claim using types from BOTH, so they must
+# move together. 0.3.0 preserves the append-only ordinals, so the
+# parity test + `chain_attestation_vectors.json` remain byte-identical.
+#
 # Used by `omni-sumchain` only, and only behind the `submit` /
 # `settlement-submit` features. Default builds resolve entirely from
 # the crates.io index without pulling either crate.
-sumchain-primitives = "0.2.0"
-sumchain-crypto     = "0.2.0"
+sumchain-primitives = "=0.3.0"
+sumchain-crypto     = "=0.3.0"
 
 # ─── Phase 3: FFI ────────────────────────────────────────────────────────────
 
