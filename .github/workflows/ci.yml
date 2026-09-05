@@ -14,7 +14,7 @@
 #
 # Jobs:
 #   1. default-build-test     — public; builds + tests the workspace
-#                               minus the PyO3 `omni-bridge` crate
+#                               including the PyO3 `omni-bridge` crate
 #                               under default features.
 #   2. default-tree-check     — HARD GATE: `cargo tree -p omni-node`
 #                               must NOT contain `sumchain-(crypto|
@@ -57,6 +57,20 @@ jobs:
       - name: Show toolchain (honours rust-toolchain.toml)
         run: rustup show active-toolchain || rustup show
 
+      # `omni-bridge` is a PyO3 crate: linking it needs a Python whose
+      # development library is present. Without this the link fails with
+      # undefined symbols (_PyBaseObject_Type, _PyBytes_AsString, ...), which is
+      # why the crate used to be excluded from CI entirely -- meaning it was
+      # tested NOWHERE. Setting Python up here is what lets it be gated.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show Python (PyO3 link prerequisite)
+        run: |
+          python3 --version
+          python3 -c "import sysconfig; print('LIBDIR =', sysconfig.get_config_var('LIBDIR'))"
+
       - name: Cache cargo registry / git / target
         uses: actions/cache@v4
         with:
@@ -71,7 +85,15 @@ jobs:
       - name: cargo build -p omni-node (default features)
         run: cargo build -p omni-node
 
-      - name: cargo test (workspace minus omni-bridge / PyO3)
+      # omni-bridge is now INCLUDED. It was previously excluded for the PyO3
+      # link prerequisite above, which left it untested in CI as well as locally.
+      #
+      # The halo2 prover crates stay out deliberately and are NOT an oversight:
+      # `default-tree-check` below asserts omni-proofs-halo2-production-mlp is
+      # absent from the default omni-node tree (Stage 11d.2 isolation), and
+      # omni-proofs-halo2-reference is opt-in. A blanket `--workspace` here would
+      # contradict those guards, so the crate list stays explicit.
+      - name: cargo test (default surface, including omni-bridge)
         run: |
           cargo test \
             -p omni-net \
@@ -82,7 +104,8 @@ jobs:
             -p omni-sumchain \
             -p omni-contributor \
             -p omni-ops \
-            -p omni-node
+            -p omni-node \
+            -p omni-bridge
 
   # ── (2) Default dep-tree: HARD GATE — feature gating keeps submit out ──────
   default-tree-check:
