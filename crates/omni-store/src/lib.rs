@@ -1,3 +1,4 @@
+mod publication;
 pub mod announce;
 pub mod chunker;
 pub mod content_id;
@@ -66,10 +67,6 @@ impl OmniStore {
         // Write each shard to disk.
         let file_len = mapped.len() as u64;
         for (plan, desc) in plans.iter().zip(man.shards.iter()) {
-            if self.local.has(&desc.cid) {
-                info!(cid = %desc.cid, "shard already exists — skipping");
-                continue;
-            }
             let (abs_start, abs_end) = chunker::shard_data_range(&gguf, plan, file_len);
             let shard_bytes = &mapped[abs_start as usize..abs_end as usize];
             self.local.put(&desc.cid, shard_bytes)?;

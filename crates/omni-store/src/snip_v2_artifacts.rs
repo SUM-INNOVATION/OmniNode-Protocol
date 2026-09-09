@@ -20,10 +20,8 @@ use omni_types::phase5::{SnipV2ObjectId, SnipV2ObjectRef};
 
 use crate::error::{Result, StoreError};
 use crate::manifest;
-use crate::mmap;
 use crate::snip_v2::SnipV2Adapter;
 use crate::store::ShardStore;
-use crate::verify;
 
 // ── Reports ───────────────────────────────────────────────────────────────────
 
@@ -89,8 +87,11 @@ pub fn publish_to_snip<A: SnipV2Adapter>(
             continue;
         }
 
-        let shard_path = store.shard_path(&manifest.shards[i].cid);
-        if !shard_path.is_file() {
+        let shard_path = store.shard_path(&manifest.shards[i].cid)?;
+        if !store.verify_existing(
+            &manifest.shards[i].cid,
+            Some(&manifest.shards[i].blake3_hash),
+        )? {
             return Err(StoreError::ShardFileMissing {
                 cid: manifest.shards[i].cid.clone(),
                 path: shard_path,
@@ -170,13 +171,11 @@ pub fn restore_manifest_from_snip<A: SnipV2Adapter>(
 /// `store`, using each shard's `snip_v2.merkle_root` as the SNIP V2
 /// identifier.
 ///
-/// For each missing shard the download lands at `<store>/<cid>.shard.partial`
-/// and is then verified against the manifest's authoritative BLAKE3 hash and
-/// CID via the existing [`crate::verify`] primitives. Only after both
-/// checks pass is the file atomically renamed to `<store>/<cid>.shard`. On
-/// any verification failure the partial is removed and
-/// [`StoreError::IntegrityMismatch`] is returned; the cache state is
-/// otherwise unchanged.
+/// Each download gets an attempt-owned staging directory. Streaming BLAKE3
+/// and CID verification precedes no-clobber publication and synchronization.
+/// Existing cache entries are verified and synchronized before being skipped.
+/// Ordinary errors clean up only the current attempt. A failed durability
+/// confirmation may leave a complete published file for a verified retry.
 ///
 /// If any shard in `manifest` lacks a `snip_v2` ref, [`StoreError::ShardLacksSnipRef`]
 /// is returned for that shard.
@@ -188,7 +187,7 @@ pub fn restore_from_snip<A: SnipV2Adapter>(
     let mut report = RestoreReport::default();
 
     for shard in &manifest.shards {
-        if store.has(&shard.cid) {
+        if store.verify_existing(&shard.cid, Some(&shard.blake3_hash))? {
             report.shards_skipped_already_cached += 1;
             continue;
         }
@@ -200,25 +199,10 @@ pub fn restore_from_snip<A: SnipV2Adapter>(
                 cid: shard.cid.clone(),
             })?;
 
-        let tmp = store.temp_path_for(&shard.cid);
-        adapter.download_public(&snip_ref.merkle_root, &tmp)?;
-
-        // Verify against authoritative CID + BLAKE3 from the manifest. The
-        // mmap is dropped at the end of the closure so the atomic rename
-        // below can proceed without holding a mapping.
-        let verify_outcome: Result<()> = (|| -> Result<()> {
-            let mapped = mmap::mmap_file(&tmp)?;
-            verify::verify_blake3(&mapped, &shard.blake3_hash)?;
-            verify::verify_cid(&mapped, &shard.cid)?;
+        store.publish_download(&shard.cid, &shard.blake3_hash, |path| {
+            adapter.download_public(&snip_ref.merkle_root, path)?;
             Ok(())
-        })();
-
-        if let Err(e) = verify_outcome {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-
-        std::fs::rename(&tmp, store.shard_path(&shard.cid))?;
+        })?;
         tracing::info!(
             cid = %shard.cid,
             merkle = %snip_ref.merkle_root,
@@ -348,6 +332,89 @@ mod tests {
         }
     }
 
+    fn assert_no_staging(store: &ShardStore) {
+        assert!(std::fs::read_dir(store.root()).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".publish-")
+        }));
+    }
+
+    #[test]
+    fn publication_restore_child() {
+        let Some(root) = std::env::var_os("S3P_RESTORE_ROOT") else {
+            return;
+        };
+        let store = ShardStore::new(root.into()).unwrap();
+        let bytes = vec![0x59; 128 * 1024];
+        let (_, mut shard) = real_shard(0, &bytes, (0, 3));
+        if std::env::var("S3P_RESTORE_MODE").as_deref() == Ok("put") {
+            store.put(&shard.cid, &bytes).unwrap();
+        } else {
+            let root = SnipV2ObjectId::from_bytes([0x58; 32]);
+            shard.snip_v2 = Some(SnipV2ObjectRef {
+                merkle_root: root,
+                lifecycle: SnipV2Lifecycle::Active,
+                plaintext_size_bytes: Some(bytes.len() as u64),
+            });
+            let fake = FakeSnipV2Adapter::new();
+            fake.set_download_override(root, bytes.clone());
+            restore_from_snip(&fake, &store, &empty_manifest(vec![shard])).unwrap();
+        }
+        assert_eq!(
+            store.get(&content_id::cid_from_data(&bytes)).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn independent_process_restore_and_put_do_not_share_download_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut children: Vec<_> = (0..8)
+            .map(|index| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "snip_v2_artifacts::tests::publication_restore_child",
+                        "--nocapture",
+                    ])
+                    .env("S3P_RESTORE_ROOT", dir.path())
+                    .env(
+                        "S3P_RESTORE_MODE",
+                        if index % 2 == 0 { "restore" } else { "put" },
+                    )
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+        let store = ShardStore::new(dir.path().to_owned()).unwrap();
+        let bytes = vec![0x59; 128 * 1024];
+        assert_eq!(
+            store.get(&content_id::cid_from_data(&bytes)).unwrap(),
+            bytes
+        );
+        assert_no_staging(&store);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn restore_refuses_corrupt_cached_file_without_download_or_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ShardStore::new(dir.path().to_owned()).unwrap();
+        let (_, shard) = real_shard(0, b"expected", (0, 3));
+        let path = store.shard_path(&shard.cid).unwrap();
+        std::fs::write(&path, b"corrupt cached bytes").unwrap();
+        let fake = FakeSnipV2Adapter::new();
+        assert!(matches!(
+            restore_from_snip(&fake, &store, &empty_manifest(vec![shard])),
+            Err(StoreError::IntegrityMismatch { .. })
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), b"corrupt cached bytes");
+        assert!(fake.download_calls().is_empty());
+        assert_no_staging(&store);
+    }
+
     // ── Test helpers ─────────────────────────────────────────────────────
 
     /// Build a real shard byte stream and the matching `ShardDescriptor`.
@@ -464,10 +531,10 @@ mod tests {
         assert_eq!(report.shards_skipped_already_populated, 1);
 
         // FakeAdapter must NOT have been called with shard 0's path.
-        let shard0_path = store.shard_path(&manifest.shards[0].cid);
+        let shard0_path = store.shard_path(&manifest.shards[0].cid).unwrap();
         assert!(!fake.ingest_calls().contains(&shard0_path));
         // It must have been called with shard 1's path.
-        let shard1_path = store.shard_path(&manifest.shards[1].cid);
+        let shard1_path = store.shard_path(&manifest.shards[1].cid).unwrap();
         assert!(fake.ingest_calls().contains(&shard1_path));
     }
 
@@ -503,7 +570,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ShardStore::new(dir.path().join("shards")).unwrap();
         // Build a shard descriptor whose CID has no file on disk.
-        let bogus_cid = "bafknonexistent".to_string();
+        let bogus_cid = content_id::cid_from_data(b"absent shard bytes");
         let manifest = empty_manifest(vec![ShardDescriptor {
             shard_index: 0,
             cid: bogus_cid.clone(),
@@ -534,8 +601,8 @@ mod tests {
             (b"first", (0, 3)),
             (b"second", (4, 7)),
         ]);
-        let shard0_path = store.shard_path(&manifest.shards[0].cid);
-        let shard1_path = store.shard_path(&manifest.shards[1].cid);
+        let shard0_path = store.shard_path(&manifest.shards[0].cid).unwrap();
+        let shard1_path = store.shard_path(&manifest.shards[1].cid).unwrap();
 
         let fake = FakeSnipV2Adapter::new();
         fake.fail_on_ingest(shard1_path.clone());
@@ -595,7 +662,7 @@ mod tests {
         for shard in &manifest.shards {
             assert!(store_b.has(&shard.cid));
             // No stray .partial files left behind.
-            assert!(!store_b.temp_path_for(&shard.cid).exists());
+            assert_no_staging(&store_b);
         }
     }
 
@@ -645,7 +712,7 @@ mod tests {
         let err = restore_from_snip(&fake, &store_b, &manifest).unwrap_err();
         assert!(matches!(err, StoreError::IntegrityMismatch { .. }));
         assert!(!store_b.has(&manifest.shards[0].cid));
-        assert!(!store_b.temp_path_for(&manifest.shards[0].cid).exists());
+        assert_no_staging(&store_b);
     }
 
     // ── 9. restore rejects mismatched CID (BLAKE3 passes, CID does not) ─
@@ -658,7 +725,7 @@ mod tests {
 
         // Construct a shard whose blake3_hash is correct but whose CID is
         // mismatched. BLAKE3 verification will pass; CID will fail.
-        let fake_cid = "bafkrlies".to_string();
+        let fake_cid = content_id::cid_from_data(b"other valid content");
         let mut bytes = [0u8; 32];
         bytes.fill(0x77);
         let shard = ShardDescriptor {
@@ -694,7 +761,7 @@ mod tests {
         let err = restore_from_snip(&fake, &store, &manifest).unwrap_err();
         assert!(matches!(err, StoreError::IntegrityMismatch { .. }));
         assert!(!store.has(&fake_cid));
-        assert!(!store.temp_path_for(&fake_cid).exists());
+        assert_no_staging(&store);
     }
 
     // ── 10. restore errors when shard lacks snip_v2 ref ─────────────────
@@ -835,7 +902,7 @@ mod tests {
         let expected: Vec<PathBuf> = manifest
             .shards
             .iter()
-            .map(|s| store.shard_path(&s.cid))
+            .map(|s| store.shard_path(&s.cid).unwrap())
             .chain(std::iter::once(manifest_path.clone()))
             .collect();
 
