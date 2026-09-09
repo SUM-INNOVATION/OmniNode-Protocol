@@ -20,6 +20,10 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 ciborium   = { workspace = true }
 bincode    = { workspace = true }
+async-trait = { workspace = true }
+anyhow     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio    = { workspace = true }
+futures  = { workspace = true }
