@@ -1,0 +1,130 @@
+# Bounded parallel-execution soak for the settlement CLI test suite (issue #115).
+#
+# NOT part of PR CI. This workflow measures a failure RATE for an intermittent
+# defect, so it runs many fresh processes and counts outcomes rather than
+# stopping at the first failure. The merge gate is zero.
+name: settlement-cli soak
+
+# BRANCH AND TRIGGER MECHANICS — read before assuming this can be dispatched.
+#
+# `workflow_dispatch` only works for a workflow present on the DEFAULT branch.
+# Until this file is on `main`, the only way to run it is the `push` trigger on
+# the soak branch below.
+#
+# Branch layout is deliberate:
+#   * `fix/115-settlement-cli-test-isolation` — the PRODUCT branch. It contains
+#     the approved fix commit ALONE. This workflow is NOT on it, so the
+#     diagnostic soak can never be pulled into the product PR by accident.
+#   * `soak/115-capture` — the DIAGNOSTIC branch. Same approved fix commit as
+#     its base, plus one workflow-only commit adding this file. Pushing this
+#     branch is what triggers the soak.
+on:
+  push:
+    branches: ['soak/115-*']
+  workflow_dispatch:
+    inputs:
+      session_runs:
+        description: 'fresh-process runs of session_ per profile'
+        default: '1000'
+      group_runs:
+        description: 'fresh-process runs of the full group per profile'
+        default: '200'
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: soak (${{ matrix.arch.label }}, ${{ matrix.profile }})
+    runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          # Both labels are already in production use in this repository's
+          # release.yml (x86_64 at line 149, aarch64 at line 150).
+          - { label: x86_64,  runner: ubuntu-24.04 }
+          - { label: aarch64, runner: ubuntu-24.04-arm }
+        profile: [debug, release]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Rust toolchain (repo-pinned)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Build test binary
+        id: build
+        run: |
+          set -euo pipefail
+          FLAGS=""
+          [ "${{ matrix.profile }}" = "release" ] && FLAGS="--release"
+          BIN=$(cargo test --locked $FLAGS -p omni-node --features settlement-dispute \
+                  --bin omni-node --no-run --message-format=json \
+                | jq -r 'select(.profile.test == true and .target.name == "omni-node") | .executable' \
+                | tail -1)
+          # Discovery must not silently yield nothing: an empty or
+          # non-executable path would make every later assertion vacuous.
+          if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
+            echo "::error::test executable not found or not executable: '$BIN'"
+            exit 1
+          fi
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Soak
+        id: soak
+        env:
+          BIN: ${{ steps.build.outputs.bin }}
+          SESSION_RUNS: ${{ github.event.inputs.session_runs || '1000' }}
+          GROUP_RUNS: ${{ github.event.inputs.group_runs || '200' }}
+        run: |
+          set -uo pipefail
+          mkdir -p soak-logs
+          fails=0; total=0; kept=0
+          run_many() {
+            local filter="$1" threads="$2" count="$3" tag="$4"
+            for i in $(seq 1 "$count"); do
+              total=$((total+1))
+              # Per-iteration timeout so one wedged process cannot consume the job.
+              if ! timeout 120s "$BIN" "$filter" --test-threads="$threads" > "soak-logs/$tag-$i.log" 2>&1; then
+                fails=$((fails+1))
+                # Artifact cap is BOTH a count and a byte bound: at most 50
+                # retained logs, each truncated to 1 MiB, so the uploaded
+                # payload can never exceed a hard 50 MiB.
+                if [ "$kept" -lt 50 ]; then
+                  truncate -s '<1M' "soak-logs/$tag-$i.log" 2>/dev/null || true
+                  kept=$((kept+1))
+                else
+                  rm -f "soak-logs/$tag-$i.log"
+                fi
+              else
+                rm -f "soak-logs/$tag-$i.log"
+              fi
+            done
+          }
+          run_many settlement_cli::tests::session_ 16 "$SESSION_RUNS" session
+          run_many settlement_cli::tests          32 "$GROUP_RUNS"   group
+          echo "total=$total fails=$fails"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "fails=$fails" >> "$GITHUB_OUTPUT"
+          # MERGE GATE: zero. Any lost required marker means the harness is
+          # still flaky. The counts above preserve the measured rate.
+          if [ "$fails" -ne 0 ]; then
+            echo "::error::soak failed $fails of $total iterations (gate is zero)"
+            exit 1
+          fi
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: soak-logs-${{ matrix.arch.label }}-${{ matrix.profile }}
+          path: soak-logs/
+          retention-days: 7
+          if-no-files-found: ignore
