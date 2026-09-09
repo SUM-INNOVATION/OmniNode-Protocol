@@ -77,6 +77,43 @@ jobs:
           fi
           echo "bin=$BIN" >> "$GITHUB_OUTPUT"
 
+      # PRE-FLIGHT: a soak over an empty or shrunken filter would pass
+      # vacuously and prove nothing — libtest exits 0 when a filter matches no
+      # test. Enumerate both filters from the built executable and require the
+      # exact expected sets BEFORE any iteration runs. The enumeration is
+      # printed in full, so the job log itself is the evidence that non-empty
+      # test sets executed.
+      - name: Enumerate test filters
+        env:
+          BIN: ${{ steps.build.outputs.bin }}
+          EXPECT_SESSION: '8'
+          EXPECT_GROUP: '76'
+        run: |
+          set -euo pipefail
+          fail=0
+          enumerate() {
+            local filter="$1" expect="$2" tag="$3" actual
+            echo "----- --list for filter '$filter' (expect $expect tests) -----"
+            # `--list` emits one "<name>: test" line per test plus a trailing
+            # summary line. Count only the ": test" entries, anchored at
+            # end-of-line: the summary line would otherwise be miscounted, and
+            # ": benchmark" entries are not tests.
+            "$BIN" "$filter" --list | tee "enumeration-$tag.txt"
+            actual=$(grep -c ': test$' "enumeration-$tag.txt" || true)
+            echo "----- filter='$filter' expected=$expect actual=$actual -----"
+            if [ "$actual" -ne "$expect" ]; then
+              echo "::error::filter '$filter' enumerated $actual tests, expected exactly $expect"
+              fail=1
+            fi
+          }
+          enumerate settlement_cli::tests::session_ "$EXPECT_SESSION" session
+          enumerate settlement_cli::tests          "$EXPECT_GROUP"   group
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::test-set enumeration mismatch; the soak would be vacuous or under-scoped"
+            exit 1
+          fi
+          echo "enumeration OK: session_=$EXPECT_SESSION group=$EXPECT_GROUP"
+
       - name: Soak
         id: soak
         env:
