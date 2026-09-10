@@ -226,6 +226,8 @@ async fn run_fetch(cid: String) -> Result<()> {
     let timeout = Duration::from_secs(60);
     let deadline = tokio::time::Instant::now() + timeout;
     let mut target_peer = None;
+    // Size from the announcement that led us to this peer, when one was seen.
+    let mut announced_size: Option<u64> = None;
 
     // Phase 1: discover a peer advertising this CID.
     loop {
@@ -235,8 +237,9 @@ async fn run_fetch(cid: String) -> Result<()> {
                     OmniNetEvent::MessageReceived { topic, data, from } if topic == TOPIC_SHARD => {
                         if let Some(ann) = decode_announcement(data) {
                             if ann.cid == cid {
-                                info!(from = %from, "found peer with shard");
+                                info!(from = %from, size_bytes = ann.size_bytes, "found peer with shard");
                                 target_peer = Some(*from);
+                                announced_size = Some(ann.size_bytes);
                                 break;
                             }
                         }
@@ -259,7 +262,7 @@ async fn run_fetch(cid: String) -> Result<()> {
     }
 
     let peer = target_peer.unwrap();
-    store.fetcher.start_fetch(&net, peer, cid.clone())
+    store.fetcher.start_fetch_announced(&net, peer, cid.clone(), announced_size)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
