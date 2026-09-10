@@ -4,6 +4,17 @@ use std::path::PathBuf;
 
 // ── Phase 1: Networking ───────────────────────────────────────────────────────
 
+/// Default ceiling on the total bytes accepted for one shard fetch.
+///
+/// 1 GiB — a conservative compatibility limit, not a measured one. It clears
+/// the ~510 MB shard this repository documents by a wide margin while refusing
+/// the multi-gigabyte reservation a hostile peer would otherwise obtain.
+/// Operators may lower it.
+pub const DEFAULT_MAX_SHARD_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Default per-message ceiling for a shard range request.
+pub const DEFAULT_MAX_SHARD_MSG_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct NetConfig {
     /// UDP port for QUIC listener. 0 = OS-assigned.
@@ -100,6 +111,60 @@ pub struct StoreConfig {
     /// Shards larger than this are fetched in multiple round-trips.
     /// Default: 64 MiB.
     pub max_shard_msg_bytes: usize,
+
+    /// Hard ceiling on the TOTAL bytes accepted for one shard fetch,
+    /// regardless of what a serving peer claims.
+    ///
+    /// Distinct from `max_shard_msg_bytes`, which bounds a single
+    /// request-response message: a shard is fetched in several messages, so
+    /// the per-message bound does not constrain the accumulated total.
+    ///
+    /// **This does not prevent memory exhaustion.** It bounds *one* fetch.
+    /// Shard downloads still buffer the whole shard in memory rather than
+    /// streaming into a staged file, and nothing bounds how many fetches run
+    /// concurrently, so a node's total exposure is this value multiplied by
+    /// the number of simultaneous fetches. Removing whole-shard buffering and
+    /// bounding concurrency are separate pieces of work; until both land,
+    /// treat this as a per-fetch sanity limit, not a memory bound.
+    ///
+    /// Unlike SNIP — where a chunk is protocol-fixed at 1 MiB and the bound
+    /// follows from the format — an Omni shard is a model slice whose size
+    /// depends on the GGUF tensor layout and `layers_per_shard`, so no
+    /// format-derived ceiling exists. Operators may lower this.
+    pub max_shard_total_bytes: u64,
+}
+
+/// The single validation entry point for [`StoreConfig`].
+///
+/// Both the Rust constructors and the Python `StoreConfig` binding call this,
+/// so the two cannot drift apart and a Python caller that changes only one
+/// field still gets the whole configuration checked.
+///
+/// Deliberately **not** requiring `max_shard_total_bytes >= max_shard_msg_bytes`:
+/// the message limit sizes the window a fetcher *asks* for, and a small shard
+/// may legitimately be shorter than that window. A total below the message
+/// size is unusual, not invalid.
+impl StoreConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_shard_limits(self.max_shard_msg_bytes, self.max_shard_total_bytes)
+    }
+}
+
+/// The limit rules themselves, callable without a whole [`StoreConfig`].
+///
+/// `FetchManager` validates through this, so a fetcher constructed directly
+/// cannot hold limits a `StoreConfig` would have rejected.
+pub fn validate_shard_limits(
+    max_shard_msg_bytes: usize,
+    max_shard_total_bytes: u64,
+) -> Result<(), String> {
+    if max_shard_msg_bytes == 0 {
+        return Err("max_shard_msg_bytes must be greater than zero".to_string());
+    }
+    if max_shard_total_bytes == 0 {
+        return Err("max_shard_total_bytes must be greater than zero".to_string());
+    }
+    Ok(())
 }
 
 impl Default for StoreConfig {
@@ -113,7 +178,8 @@ impl Default for StoreConfig {
         Self {
             store_dir,
             layers_per_shard: 4,
-            max_shard_msg_bytes: 64 * 1024 * 1024,
+            max_shard_msg_bytes: DEFAULT_MAX_SHARD_MSG_BYTES,
+            max_shard_total_bytes: DEFAULT_MAX_SHARD_TOTAL_BYTES,
         }
     }
 }

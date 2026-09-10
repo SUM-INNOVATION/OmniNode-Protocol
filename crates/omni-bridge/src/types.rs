@@ -48,12 +48,13 @@ pub struct PyStoreConfig {
 #[pymethods]
 impl PyStoreConfig {
     #[new]
-    #[pyo3(signature = (store_dir=None, layers_per_shard=None, max_shard_msg_bytes=None))]
+    #[pyo3(signature = (store_dir=None, layers_per_shard=None, max_shard_msg_bytes=None, max_shard_total_bytes=None))]
     fn new(
         store_dir: Option<String>,
         layers_per_shard: Option<u32>,
         max_shard_msg_bytes: Option<usize>,
-    ) -> Self {
+        max_shard_total_bytes: Option<u64>,
+    ) -> PyResult<Self> {
         let mut cfg = StoreConfig::default();
         if let Some(d) = store_dir {
             cfg.store_dir = PathBuf::from(d);
@@ -64,7 +65,17 @@ impl PyStoreConfig {
         if let Some(m) = max_shard_msg_bytes {
             cfg.max_shard_msg_bytes = m;
         }
-        Self { inner: cfg }
+        if let Some(t) = max_shard_total_bytes {
+            cfg.max_shard_total_bytes = t;
+        }
+
+        // One validation entry point, shared with the Rust constructors, so a
+        // caller that changes only `max_shard_msg_bytes` still gets the whole
+        // configuration checked rather than just the field it touched.
+        cfg.validate()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+        Ok(Self { inner: cfg })
     }
 
     #[getter]
@@ -82,12 +93,18 @@ impl PyStoreConfig {
         self.inner.max_shard_msg_bytes
     }
 
+    #[getter]
+    fn max_shard_total_bytes(&self) -> u64 {
+        self.inner.max_shard_total_bytes
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "StoreConfig(store_dir='{}', layers_per_shard={}, max_shard_msg_bytes={})",
+            "StoreConfig(store_dir='{}', layers_per_shard={}, max_shard_msg_bytes={}, max_shard_total_bytes={})",
             self.inner.store_dir.display(),
             self.inner.layers_per_shard,
             self.inner.max_shard_msg_bytes,
+            self.inner.max_shard_total_bytes,
         )
     }
 }

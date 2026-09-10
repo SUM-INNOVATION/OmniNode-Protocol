@@ -42,8 +42,13 @@ pub struct OmniStore {
 impl OmniStore {
     /// Open (or create) the shard store from the given config.
     pub fn new(config: StoreConfig) -> Result<Self> {
+        // Validate BEFORE touching the filesystem: an invalid configuration
+        // must not leave a created store directory behind.
+        config.validate().map_err(StoreError::Other)?;
+
         let local = ShardStore::new(config.store_dir.clone())?;
-        let fetcher = FetchManager::new(config.max_shard_msg_bytes);
+        let fetcher =
+            FetchManager::with_limits(config.max_shard_msg_bytes, config.max_shard_total_bytes)?;
         Ok(Self { config, local, fetcher })
     }
 
