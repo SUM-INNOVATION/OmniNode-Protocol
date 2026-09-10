@@ -9,6 +9,7 @@ mod framing;
 pub mod gossip;
 pub mod identity;    // Stage 12.6 — persistent libp2p mesh identity
 pub mod nat;
+pub mod request;
 pub mod swarm;
 pub mod tensor_codec;
 #[cfg(test)]
@@ -32,12 +33,13 @@ pub use identity::{
 pub use codec::{ShardCodec, ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL};
 pub use tensor_codec::{TensorCodec, TensorRequest, TensorResponse, TENSOR_XFER_PROTOCOL};
 pub use nat::NatStatus;
+pub use request::{Pending, RequestError};
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
 use anyhow::Result;
-use libp2p::PeerId;
-use tokio::sync::mpsc;
+use libp2p::{Multiaddr, PeerId};
+use tokio::sync::{mpsc, oneshot};
 
 use omni_types::config::NetConfig;
 
@@ -180,6 +182,7 @@ impl OmniNet {
             .send(SwarmCommand::RequestShard {
                 peer_id,
                 request: ShardRequest { cid, offset, max_bytes },
+                completion: None,
             })
             .await
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot request shard"))
@@ -213,7 +216,7 @@ impl OmniNet {
         request: TensorRequest,
     ) -> Result<()> {
         self.cmd_tx
-            .send(SwarmCommand::RequestTensor { peer_id, request })
+            .send(SwarmCommand::RequestTensor { peer_id, request, completion: None })
             .await
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot send tensor"))
     }
@@ -232,7 +235,81 @@ impl OmniNet {
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot respond tensor"))
     }
 
+    // ── Solicited requests: private completion ──────────────────────────
+
+    /// Request a shard chunk and get a handle to *this* request's response.
+    ///
+    /// Unlike [`OmniNet::request_shard_chunk`], the response never appears on
+    /// the shared event stream: it is delivered to the returned [`Pending`]
+    /// and to nobody else. Two concurrent requests to the same peer therefore
+    /// complete independently, and their responses may arrive in any order.
+    ///
+    /// The returned handle always resolves. Dropping it cancels the caller's
+    /// interest and lets the swarm release the request's retained state.
+    pub async fn fetch_shard_chunk(
+        &self,
+        peer_id: PeerId,
+        cid: String,
+        offset: Option<u64>,
+        max_bytes: Option<u64>,
+    ) -> Pending<ShardResponse> {
+        let (completion, rx) = oneshot::channel();
+        let sent = self
+            .cmd_tx
+            .send(SwarmCommand::RequestShard {
+                peer_id,
+                request: ShardRequest {
+                    cid,
+                    offset,
+                    max_bytes,
+                },
+                completion: Some(completion),
+            })
+            .await;
+        match sent {
+            Ok(()) => Pending::new(rx),
+            // The swarm loop is gone, so the command — and with it the
+            // completion channel we just handed over — was dropped. Answer
+            // the caller now rather than let them await a closed channel.
+            Err(_) => Pending::failed(RequestError::NotSent),
+        }
+    }
+
+    /// Send a tensor and get a handle to *this* request's acknowledgment.
+    ///
+    /// Same delivery guarantee as [`OmniNet::fetch_shard_chunk`].
+    pub async fn send_tensor(
+        &self,
+        peer_id: PeerId,
+        request: TensorRequest,
+    ) -> Pending<TensorResponse> {
+        let (completion, rx) = oneshot::channel();
+        let sent = self
+            .cmd_tx
+            .send(SwarmCommand::RequestTensor {
+                peer_id,
+                request,
+                completion: Some(completion),
+            })
+            .await;
+        match sent {
+            Ok(()) => Pending::new(rx),
+            Err(_) => Pending::failed(RequestError::NotSent),
+        }
+    }
+
     // ── Lifecycle ───────────────────────────────────────────────────────
+
+    /// Dial a peer at an explicit multiaddr, bypassing mDNS and the DHT.
+    ///
+    /// Returns once the command reaches the swarm loop; the connection
+    /// itself surfaces later as [`OmniNetEvent::PeerConnected`].
+    pub async fn dial(&self, addr: Multiaddr) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::Dial { addr })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot dial"))
+    }
 
     /// Receive the next event from the mesh.
     /// Returns `None` when the swarm task has stopped and the buffer is drained.

@@ -20,5 +20,9 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio              = { workspace = true }
+# Integration tests dial an explicit loopback multiaddr, so they need the
+# libp2p address/peer types directly rather than through omni-net's surface.
+libp2p             = { workspace = true }
+omni-types         = { workspace = true }
 tracing-subscriber = { workspace = true }
 tempfile           = { workspace = true }

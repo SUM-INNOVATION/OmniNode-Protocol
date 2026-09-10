@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
     dcutr, gossipsub, identify, mdns,
-    request_response::{self, InboundRequestId, ProtocolSupport, ResponseChannel},
+    request_response::{
+        self, InboundRequestId, OutboundRequestId, ProtocolSupport, ResponseChannel,
+    },
     swarm::SwarmEvent,
     Multiaddr, PeerId, SwarmBuilder,
 };
@@ -22,6 +24,7 @@ use crate::{
     events::OmniNetEvent,
     gossip::GossipManager,
     nat::{self, NatStatus},
+    request::{Completion, PendingRequests, RequestError},
 };
 
 // ── SwarmCommand ──────────────────────────────────────────────────────────────
@@ -32,14 +35,35 @@ pub enum SwarmCommand {
     /// Publish bytes to a named Gossipsub topic.
     Publish { topic: String, data: Vec<u8> },
 
+    /// Dial a peer at an explicit multiaddr, bypassing discovery.
+    Dial { addr: Multiaddr },
+
     /// Send a shard request to a remote peer.
-    RequestShard { peer_id: PeerId, request: ShardRequest },
+    ///
+    /// `completion` is this request's private delivery channel. When it is
+    /// `Some`, the response — or the failure — is handed to that one caller
+    /// and is NOT published on the shared event stream, so two concurrent
+    /// requests to the same peer cannot be confused for one another. `None`
+    /// keeps the pre-correlation behaviour: the result is broadcast as
+    /// [`OmniNetEvent::ShardReceived`] / [`OmniNetEvent::ShardRequestFailed`].
+    RequestShard {
+        peer_id: PeerId,
+        request: ShardRequest,
+        completion: Option<Completion<ShardResponse>>,
+    },
 
     /// Send a shard response on a stored response channel.
     SendShardResponse { channel_id: u64, response: ShardResponse },
 
     /// Send a tensor (hidden-state activation) to a remote pipeline stage.
-    RequestTensor { peer_id: PeerId, request: TensorRequest },
+    ///
+    /// `completion` carries the same meaning as on
+    /// [`SwarmCommand::RequestShard`].
+    RequestTensor {
+        peer_id: PeerId,
+        request: TensorRequest,
+        completion: Option<Completion<TensorResponse>>,
+    },
 
     /// Send a tensor acknowledgment on a stored response channel.
     SendTensorResponse { channel_id: u64, response: TensorResponse },
@@ -78,6 +102,17 @@ pub struct OmniSwarm {
 
     /// Monotonic counter shared across shard and tensor channel IDs.
     next_channel_id: u64,
+
+    // ── Outbound correlation ─────────────────────────────────────────────
+    //
+    // Keyed by the `OutboundRequestId` that `send_request` returns — the only
+    // identifier that distinguishes two concurrent requests to one peer. Both
+    // tables are emptied on every exit from `run`, so a caller is never left
+    // waiting on a response the loop can no longer deliver.
+    /// Callers waiting on a solicited shard response.
+    pending_shard_requests: PendingRequests<OutboundRequestId, ShardResponse>,
+    /// Callers waiting on a solicited tensor acknowledgment.
+    pending_tensor_requests: PendingRequests<OutboundRequestId, TensorResponse>,
 
     // ── WAN state ────────────────────────────────────────────────────────
 
@@ -222,6 +257,8 @@ impl OmniSwarm {
             pending_tensor_channels: HashMap::new(),
             pending_tensor_by_req: HashMap::new(),
             next_channel_id: 0,
+            pending_shard_requests: PendingRequests::new(),
+            pending_tensor_requests: PendingRequests::new(),
             relay_peers: Vec::new(),
             nat_status: NatStatus::Unknown,
             active_relay_reservation: None,
@@ -253,6 +290,15 @@ impl OmniSwarm {
     ///
     /// Runs until a [`SwarmCommand::Shutdown`] is received or `cmd_rx` is
     /// dropped. Forwards all meaningful events to `event_tx`.
+    ///
+    /// The loop never awaits a consumer. Unsolicited events go out through
+    /// `event_tx.try_send`, and solicited results go out through a `oneshot`,
+    /// which also never blocks. Awaiting either here would deadlock the node:
+    /// consumers issue requests from inside their event handling, and those
+    /// commands are serviced only by this loop.
+    ///
+    /// On every exit — clean shutdown or a dropped command channel — every
+    /// retained request is completed with [`RequestError::RouterGone`].
     pub async fn run(
         mut self,
         event_tx:   mpsc::Sender<OmniNetEvent>,
@@ -273,9 +319,25 @@ impl OmniSwarm {
                                 warn!(%e, %topic, "gossipsub publish failed");
                             }
                         }
-                        Some(SwarmCommand::RequestShard { peer_id, request }) => {
-                            self.inner.behaviour_mut().shard_xfer
+                        Some(SwarmCommand::Dial { addr }) => {
+                            if let Err(e) = self.inner.dial(addr.clone()) {
+                                warn!(%e, %addr, "dial failed");
+                            }
+                        }
+                        Some(SwarmCommand::RequestShard { peer_id, request, completion }) => {
+                            // Capture the id the moment the request exists.
+                            // This is the only point at which the caller's
+                            // completion channel can be tied to the wire.
+                            let request_id = self.inner.behaviour_mut().shard_xfer
                                 .send_request(&peer_id, request);
+                            if let Some(completion) = completion {
+                                self.pending_shard_requests.insert(request_id, completion);
+                                debug!(
+                                    %request_id,
+                                    inflight = self.pending_shard_requests.len(),
+                                    "shard request correlated"
+                                );
+                            }
                         }
                         Some(SwarmCommand::SendShardResponse { channel_id, response }) => {
                             if let Some(pending) = self.pending_shard_channels.remove(&channel_id) {
@@ -289,9 +351,17 @@ impl OmniSwarm {
                                 warn!(channel_id, "no pending channel for shard response");
                             }
                         }
-                        Some(SwarmCommand::RequestTensor { peer_id, request }) => {
-                            self.inner.behaviour_mut().tensor_xfer
+                        Some(SwarmCommand::RequestTensor { peer_id, request, completion }) => {
+                            let request_id = self.inner.behaviour_mut().tensor_xfer
                                 .send_request(&peer_id, request);
+                            if let Some(completion) = completion {
+                                self.pending_tensor_requests.insert(request_id, completion);
+                                debug!(
+                                    %request_id,
+                                    inflight = self.pending_tensor_requests.len(),
+                                    "tensor request correlated"
+                                );
+                            }
                         }
                         Some(SwarmCommand::SendTensorResponse { channel_id, response }) => {
                             if let Some(pending) = self.pending_tensor_channels.remove(&channel_id) {
@@ -309,13 +379,33 @@ impl OmniSwarm {
                             }
                         }
                         Some(SwarmCommand::Shutdown) | None => {
-                            info!("swarm event loop shutting down");
+                            let released = self.release_pending_requests();
+                            info!(released, "swarm event loop shutting down");
                             return Ok(());
                         }
                     }
                 }
             }
         }
+    }
+
+    // ── Private: outbound correlation teardown ───────────────────────────────
+
+    /// Complete every retained outbound request with
+    /// [`RequestError::RouterGone`] and empty both tables.
+    ///
+    /// Returns how many callers were released. Dropping the tables instead
+    /// would also wake the callers — a dropped `oneshot::Sender` closes the
+    /// channel — but doing it explicitly makes the reason legible to the
+    /// caller and keeps the count observable.
+    fn release_pending_requests(&mut self) -> usize {
+        let shard = self
+            .pending_shard_requests
+            .fail_all(RequestError::RouterGone);
+        let tensor = self
+            .pending_tensor_requests
+            .fail_all(RequestError::RouterGone);
+        shard + tensor
     }
 
     // ── Private: inbound channel cleanup ─────────────────────────────────────
@@ -501,14 +591,27 @@ impl OmniSwarm {
                             }
                         }
                     }
-                    request_response::Message::Response { response, .. } => {
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    } => {
                         info!(
                             %peer,
+                            %request_id,
                             cid = %response.cid,
                             offset = response.offset,
                             bytes = response.data.len(),
                             "shard chunk received"
                         );
+                        // A solicited response belongs to exactly one caller.
+                        // Delivering it on the shared event stream instead
+                        // would make it indistinguishable from the response
+                        // to any other request to the same peer.
+                        if self.pending_shard_requests.contains(&request_id) {
+                            self.pending_shard_requests
+                                .complete(&request_id, Ok(response));
+                            return;
+                        }
                         if let Err(e) = event_tx.try_send(OmniNetEvent::ShardReceived {
                             peer_id: peer,
                             response,
@@ -520,9 +623,27 @@ impl OmniSwarm {
             }
 
             SwarmEvent::Behaviour(OmniNodeBehaviourEvent::ShardXfer(
-                request_response::Event::OutboundFailure { peer, error, .. }
+                request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
             )) => {
-                warn!(%peer, %error, "shard request outbound failure");
+                warn!(%peer, %request_id, %error, "shard request outbound failure");
+                // Includes libp2p's own request timeout, so a caller whose
+                // peer simply went silent is still completed rather than
+                // left waiting.
+                if self.pending_shard_requests.contains(&request_id) {
+                    self.pending_shard_requests.complete(
+                        &request_id,
+                        Err(RequestError::Outbound {
+                            peer: peer.to_string(),
+                            error: error.to_string(),
+                        }),
+                    );
+                    return;
+                }
                 if let Err(e) = event_tx.try_send(OmniNetEvent::ShardRequestFailed {
                     peer_id: peer,
                     error: error.to_string(),
@@ -584,15 +705,24 @@ impl OmniSwarm {
                             }
                         }
                     }
-                    request_response::Message::Response { response, .. } => {
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    } => {
                         info!(
                             %peer,
+                            %request_id,
                             session = %response.session_id,
                             micro_batch = response.micro_batch_index,
                             stage = response.stage_index,
                             accepted = response.accepted,
                             "tensor response received"
                         );
+                        if self.pending_tensor_requests.contains(&request_id) {
+                            self.pending_tensor_requests
+                                .complete(&request_id, Ok(response));
+                            return;
+                        }
                         if let Err(e) = event_tx.try_send(OmniNetEvent::TensorResponseReceived {
                             peer_id: peer,
                             response,
@@ -604,9 +734,24 @@ impl OmniSwarm {
             }
 
             SwarmEvent::Behaviour(OmniNodeBehaviourEvent::TensorXfer(
-                request_response::Event::OutboundFailure { peer, error, .. }
+                request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
             )) => {
-                warn!(%peer, %error, "tensor request outbound failure");
+                warn!(%peer, %request_id, %error, "tensor request outbound failure");
+                if self.pending_tensor_requests.contains(&request_id) {
+                    self.pending_tensor_requests.complete(
+                        &request_id,
+                        Err(RequestError::Outbound {
+                            peer: peer.to_string(),
+                            error: error.to_string(),
+                        }),
+                    );
+                    return;
+                }
                 if let Err(e) = event_tx.try_send(OmniNetEvent::TensorRequestFailed {
                     peer_id: peer,
                     error: error.to_string(),
@@ -663,5 +808,89 @@ impl OmniSwarm {
 
             _ => {}
         }
+    }
+}
+
+// ── Never-await invariant ─────────────────────────────────────────────────────
+//
+// There is a real deadlock cycle behind this: a consumer issues a request from
+// inside its handling of an event (omni-store's `FetchManager::process` calls
+// `request_chunk`, which blocks on `cmd_tx.send`), and that command is
+// serviced only by this loop. If the loop ever awaited a congested consumer —
+// an awaiting send on the event lane instead of `try_send` — the loop would be
+// waiting on the consumer while the consumer waits on the loop, and the node
+// stops.
+//
+// A test that *triggers* the deadlock cannot exist: it either hangs the suite
+// or passes without proving anything. So the property is pinned structurally
+// instead — once by the compiler, once by reading the source.
+
+#[cfg(test)]
+mod never_await_invariant {
+    use super::*;
+
+    /// Reading swarm.rs from disk would make the test pass vacuously if the
+    /// file moved; `include_str!` is resolved by the compiler against this
+    /// very file.
+    const SWARM_SRC: &str = include_str!("swarm.rs");
+
+    /// Needles are assembled at runtime so this test module's own text can
+    /// never satisfy the scan it performs.
+    fn needle(head: &str, tail: &str) -> String {
+        format!("{head}{tail}")
+    }
+
+    #[test]
+    fn handle_swarm_event_is_not_async() {
+        // An `async fn` returns an opaque future, which cannot coerce to a
+        // function pointer with a `()` return type. This line therefore stops
+        // compiling the moment someone makes the dispatcher awaitable — which
+        // is the only way an `.await` could be introduced inside it.
+        let _: fn(&mut OmniSwarm, SwarmEvent<OmniNodeBehaviourEvent>, &mpsc::Sender<OmniNetEvent>) =
+            OmniSwarm::handle_swarm_event;
+    }
+
+    /// What the swarm hands to a waiting caller.
+    type ShardOutcome = Result<ShardResponse, RequestError>;
+    /// The exact shape of a non-blocking, non-awaitable delivery call.
+    type SyncDelivery = fn(Completion<ShardResponse>, ShardOutcome) -> Result<(), ShardOutcome>;
+
+    #[test]
+    fn completion_delivery_is_synchronous() {
+        // The solicited path must be non-blocking too. `oneshot::Sender::send`
+        // consumes self and returns a plain `Result`, so it can neither await
+        // nor block; pin that in the type system.
+        let _: SyncDelivery = Completion::<ShardResponse>::send;
+    }
+
+    #[test]
+    fn the_swarm_loop_never_blocks_on_the_event_lane() {
+        for (head, tail) in [
+            // An awaiting send on the event lane — waits on a congested
+            // consumer, which is the deadlock.
+            ("event_tx.se", "nd("),
+            // A blocking send — stalls the whole runtime worker instead.
+            ("blocking_se", "nd("),
+            // A cloned sender is the same hazard wearing a different name.
+            ("event_tx.clone().se", "nd("),
+        ] {
+            let forbidden = needle(head, tail);
+            assert!(
+                !SWARM_SRC.contains(&forbidden),
+                "swarm.rs contains `{forbidden}`: the swarm loop would then \
+                 wait on a consumer that is itself waiting on the swarm loop"
+            );
+        }
+    }
+
+    #[test]
+    fn unsolicited_events_are_delivered_with_try_send() {
+        // The positive half of the invariant: delivery happens, and it happens
+        // through the non-blocking call.
+        let try_send = needle("event_tx.try_", "send(");
+        assert!(
+            SWARM_SRC.matches(&try_send).count() >= 8,
+            "expected every unsolicited event to be delivered via `{try_send}`"
+        );
     }
 }
