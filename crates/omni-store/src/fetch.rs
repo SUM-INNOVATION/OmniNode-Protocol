@@ -364,8 +364,44 @@ pub(crate) fn validate_response_metadata(
     let data_len = u64::try_from(response.data.len())
         .map_err(|_| "ShardResponse.data.len() is not representable as u64".to_string())?;
 
-    // (1) Zero is not a valid total. Peers signal "nothing" through `error`,
-    //     never through `total_bytes = 0`.
+    // (0) The one canonical empty completion.
+    //
+    //     An empty shard is publishable (`publication.rs` round-trips b"")
+    //     and servable (`serve.rs` answers total_bytes = 0, error = None), so
+    //     refusing every zero total made a legitimately empty shard
+    //     unfetchable — the fetcher rejected an honest response.
+    //
+    //     Exactly one shape is accepted, and every clause is load-bearing:
+    //     the fetch must not have started (`next_offset == 0`, so no prior
+    //     non-empty response), the peer must place it at the beginning
+    //     (`offset == 0`), it must carry no bytes, the total must be zero,
+    //     **no total may have been declared yet** (`declared_total.is_none()`),
+    //     and an announced size must be absent or zero. Anything else falls
+    //     through to the ordinary rules below.
+    //
+    //     `declared_total.is_none()` is the strict initial-state condition and
+    //     is deliberately narrower than "declared zero". A `Some(0)` means a
+    //     total was already accepted for this fetch — but the contract is one
+    //     initial response followed by immediate removal, so a fetch that has
+    //     accepted a zero total cannot still be active. Admitting `Some(0)`
+    //     would keep alive a duplicate/replayed completion state that
+    //     production should never retain.
+    //
+    //     `Ok(0)` makes the handler complete immediately: `next_offset` stays
+    //     0, `0 < 0` is false, so no follow-up piece is requested and the
+    //     empty buffer goes straight to CID verification.
+    if total == 0
+        && data_len == 0
+        && response.offset == 0
+        && next_offset == 0
+        && declared_total.is_none()
+        && expected_size.map(|s| s == 0).unwrap_or(true)
+    {
+        return Ok(0);
+    }
+
+    // (1) Otherwise zero is not a valid total. Peers signal "nothing"
+    //     through `error`, never through `total_bytes = 0`.
     if total == 0 {
         return Err("ShardResponse.total_bytes is zero".into());
     }
@@ -430,10 +466,11 @@ pub(crate) fn validate_response_metadata(
     //     advance, so the fetcher re-requests the same offset forever. At
     //     completion it is unreachable: a fetch that reaches
     //     `next_offset == total` is removed immediately, so no active fetch
-    //     can be sitting at the end waiting for more. Carving out an
-    //     exception would preserve a state that cannot occur and complicate
-    //     the contract for nothing. Peers report "nothing to send" through
-    //     `error`, never through an empty successful piece.
+    //     can be sitting at the end waiting for more. Peers report "nothing
+    //     to send" through `error`, never through an empty successful piece.
+    //
+    //     The sole exception is the canonical empty completion handled in
+    //     (0), which returns before reaching here.
     if data_len == 0 {
         return Err(format!(
             "zero-length piece at offset {next_offset} with {total} total bytes makes no progress"
@@ -630,8 +667,26 @@ mod tests {
     }
 
     #[test]
-    fn zero_total_is_rejected() {
-        assert!(validate_response_metadata(&r(0, 0, 0), 0, None, None, MAX).is_err());
+    fn zero_total_is_rejected_except_for_the_canonical_empty_shard() {
+        // This test previously asserted that EVERY zero total is invalid.
+        // That made a legitimately empty shard unfetchable, which rule (0)
+        // now fixes, so the assertion is retargeted rather than dropped: the
+        // canonical shape is accepted and every other zero total is still
+        // refused.
+        assert!(
+            validate_response_metadata(&r(0, 0, 0), 0, None, None, MAX).is_ok(),
+            "the canonical empty response is now the one accepted zero total"
+        );
+        // Zero total carrying data.
+        assert!(validate_response_metadata(&r(0, 0, 8), 0, None, None, MAX).is_err());
+        // Zero total at a non-zero offset.
+        assert!(validate_response_metadata(&r(0, 8, 0), 0, None, None, MAX).is_err());
+        // Zero total after the fetch advanced.
+        assert!(validate_response_metadata(&r(0, 0, 0), 8, Some(0), None, MAX).is_err());
+        // Zero total already declared — a replayed completion.
+        assert!(validate_response_metadata(&r(0, 0, 0), 0, Some(0), None, MAX).is_err());
+        // Zero total against a non-zero announced size.
+        assert!(validate_response_metadata(&r(0, 0, 0), 0, None, Some(64), MAX).is_err());
     }
 
     #[test]
@@ -728,6 +783,143 @@ mod tests {
             _ => panic!("expected Failed"),
         }
         assert!(!m.is_active("cid-a"));
+    }
+
+    // ── the canonical empty completion (rule 0) ─────────────────────────
+
+    #[test]
+    fn the_canonical_empty_response_is_accepted() {
+        // total 0, offset 0, no data, nothing declared, nothing announced.
+        let empty = resp("cid", 0, 0, Vec::new());
+        assert_eq!(
+            validate_response_metadata(&empty, 0, None, None, MAX).unwrap(),
+            0,
+            "next position must stay 0 so the handler completes immediately"
+        );
+        // An announced size of exactly zero is equally canonical.
+        assert_eq!(
+            validate_response_metadata(&empty, 0, None, Some(0), MAX).unwrap(),
+            0
+        );
+        // But a previously declared total is NOT canonical, even if zero: the
+        // contract is one initial response then immediate removal, so an
+        // active fetch cannot already have accepted a total.
+        assert!(
+            validate_response_metadata(&empty, 0, Some(0), Some(0), MAX).is_err(),
+            "declared_total must be None for the canonical empty completion"
+        );
+    }
+
+    #[test]
+    fn every_non_canonical_empty_response_is_still_rejected() {
+        // Each case flips exactly one clause of rule (0).
+        /// (label, response, next_offset, declared_total, expected_size)
+        type Case = (&'static str, ShardResponse, u64, Option<u64>, Option<u64>);
+        let cases: Vec<Case> = vec![
+            // A replayed empty response AFTER the fetch advanced. Response
+            // offset is 0, so only the `next_offset == 0` clause of rule (0)
+            // rejects it — this case isolates that clause specifically.
+            (
+                "replayed after progress",
+                resp("cid", 0, 0, Vec::new()),
+                8,
+                Some(0),
+                None,
+            ),
+            // zero total but the fetch already advanced, at a later offset
+            ("mid-fetch", resp("cid", 0, 8, Vec::new()), 8, Some(0), None),
+            // zero total at a non-zero response offset
+            (
+                "nonzero offset",
+                resp("cid", 0, 8, Vec::new()),
+                0,
+                None,
+                None,
+            ),
+            // zero-length piece against a non-zero total
+            (
+                "nonzero total",
+                resp("cid", 1024, 0, Vec::new()),
+                0,
+                None,
+                None,
+            ),
+            // announced size disagrees
+            (
+                "announced nonzero",
+                resp("cid", 0, 0, Vec::new()),
+                0,
+                None,
+                Some(1024),
+            ),
+            // the peer previously declared a different total
+            (
+                "total changed",
+                resp("cid", 0, 0, Vec::new()),
+                0,
+                Some(1024),
+                None,
+            ),
+        ];
+        for (label, r, next_offset, declared, expected) in cases {
+            assert!(
+                validate_response_metadata(&r, next_offset, declared, expected, MAX).is_err(),
+                "case '{label}' must remain invalid"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_completes_an_empty_fetch_without_requesting_more() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = manager();
+
+        let cid = cid_from_data(b"");
+        seeded(&mut m, &req, &cid, Some(0)).await;
+        let issued_by_begin = req.count();
+
+        let empty = resp(&cid, 0, 0, Vec::new());
+        match m.process(&req, &st, &empty).await {
+            FetchOutcome::Complete { cid: c, size } => {
+                assert_eq!(c, cid);
+                assert_eq!(size, 0);
+            }
+            other => panic!(
+                "expected Complete, got failed={}",
+                matches!(other, FetchOutcome::Failed { .. })
+            ),
+        }
+        assert!(st.has(&cid), "the empty shard must be published");
+        assert!(!m.is_active(&cid));
+        assert_eq!(
+            req.count(),
+            issued_by_begin,
+            "no follow-up piece may be requested for an empty shard"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_rejects_an_empty_response_whose_cid_is_wrong() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = manager();
+
+        // A CID that is NOT the CID of empty content.
+        let wrong = cid_from_data(b"not empty");
+        seeded(&mut m, &req, &wrong, Some(0)).await;
+
+        let empty = resp(&wrong, 0, 0, Vec::new());
+        match m.process(&req, &st, &empty).await {
+            FetchOutcome::Failed { error, .. } => {
+                assert!(error.contains("integrity"), "{error}")
+            }
+            _ => panic!("an empty body must still be CID-verified before publication"),
+        }
+        assert!(
+            !st.has(&wrong),
+            "nothing may be published on a failed verification"
+        );
     }
 
     #[tokio::test]
