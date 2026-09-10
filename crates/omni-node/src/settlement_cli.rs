@@ -3287,61 +3287,215 @@ mod tests {
 
     // ── Issue #85 — observability marker tests ─────────────────────────
 
-    /// Shared-buffer `MakeWriter` for capturing tracing output inside a
-    /// test scope. Each test constructs one, sets it as the current
-    /// tracing subscriber via `tracing::subscriber::with_default`, runs
-    /// `dispatch_core`, and then greps the captured bytes for marker
-    /// strings.
-    #[derive(Clone)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl CapturedLogs {
-        fn new() -> Self {
-            Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
-        }
-        fn as_string(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    struct CapturedLogsWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for CapturedLogsWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogsWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            CapturedLogsWriter(self.0.clone())
-        }
-    }
-
-    /// Run `dispatch_core` inside a scoped tracing subscriber that
-    /// captures every event into a `CapturedLogs`. Returns the
-    /// captured tracing bytes as a `String` PLUS the `dispatch_core`
+    /// Run `dispatch_core` with this thread's tracing output captured by the
+    /// process-wide test subscriber (see [`crate::settlement_cli::capture`]).
+    /// Returns the captured bytes as a `String` PLUS the `dispatch_core`
     /// result, so the same test can inspect both.
     fn run_with_capture(
         args: SettlementArgs,
         client: &SumChainClient<FakeJsonRpcTransport>,
     ) -> (String, Vec<u8>, Result<(), anyhow::Error>) {
-        let logs = CapturedLogs::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .without_time()
-            .finish();
+        let (logs, _capture) = crate::settlement_cli::capture::begin();
         let mut stdout_buf = Vec::new();
-        let result = tracing::subscriber::with_default(subscriber, || {
-            dispatch_core(args, client, &mut stdout_buf)
+        let result = dispatch_core(args, client, &mut stdout_buf);
+        (
+            crate::settlement_cli::capture::take(&logs),
+            stdout_buf,
+            result,
+        )
+    }
+
+    // ── Capture-harness contract tests (issue #115) ────────────────────
+    //
+    // These pin the harness itself. They must keep passing under parallel
+    // execution, because that is the condition the harness exists to survive.
+
+    use crate::settlement_cli::capture;
+
+    /// Two threads capturing at the same time must each see only their own
+    /// output, and a third thread emitting WITHOUT a capture must leak into
+    /// neither.
+    #[test]
+    fn concurrent_captures_are_isolated_and_uncaptured_threads_do_not_leak() {
+        capture::init();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let mut handles = Vec::new();
+        for sentinel in ["alpha_sentinel_115", "beta_sentinel_115"] {
+            let tx = tx.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let (buf, _guard) = capture::begin();
+                barrier.wait();
+                tracing::warn!(event = sentinel, "isolated capture");
+                // Give the uncaptured thread room to emit concurrently.
+                std::thread::yield_now();
+                tx.send((sentinel, capture::take(&buf))).unwrap();
+            }));
+        }
+        // Uncaptured emitter: has the global subscriber, but no target.
+        {
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                assert!(!capture::has_target(), "this thread must have no target");
+                for _ in 0..50 {
+                    tracing::warn!(event = "leaked_sentinel_115", "uncaptured");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        drop(tx);
+
+        let mut seen = 0;
+        for (sentinel, logs) in rx.iter() {
+            seen += 1;
+            assert!(
+                logs.contains(sentinel),
+                "{sentinel} missing from its own buffer"
+            );
+            let other = if sentinel.starts_with("alpha") {
+                "beta_sentinel_115"
+            } else {
+                "alpha_sentinel_115"
+            };
+            assert!(!logs.contains(other), "{sentinel} buffer leaked {other}");
+            assert!(
+                !logs.contains("leaked_sentinel_115"),
+                "{sentinel} buffer leaked an UNCAPTURED thread's event:\n{logs}"
+            );
+        }
+        assert_eq!(seen, 2);
+    }
+
+    /// A thread with no active target discards output. That is NOT the same as
+    /// having no subscriber: the global subscriber is installed either way.
+    #[test]
+    fn no_active_target_discards_but_subscriber_is_installed() {
+        capture::init();
+        assert!(!capture::has_target());
+        // Emitting here must not panic and must not accumulate anywhere.
+        tracing::warn!(event = "discarded_sentinel_115", "no target");
+
+        // Proof the subscriber IS installed: a capture on this same thread
+        // immediately afterwards records normally.
+        let (buf, guard) = capture::begin();
+        tracing::warn!(event = "present_sentinel_115", "with target");
+        let logs = capture::take(&buf);
+        drop(guard);
+        assert!(logs.contains("present_sentinel_115"));
+        assert!(
+            !logs.contains("discarded_sentinel_115"),
+            "an event emitted before the capture began must not appear"
+        );
+        assert!(
+            !capture::has_target(),
+            "guard must restore the empty target"
+        );
+    }
+
+    /// Nesting contract: the inner capture gets its own buffer and the OUTER
+    /// target is restored when the inner guard drops.
+    #[test]
+    fn nested_capture_restores_the_outer_target() {
+        let (outer, _outer_guard) = capture::begin();
+        tracing::warn!(event = "outer_before_115", "outer");
+        {
+            let (inner, _inner_guard) = capture::begin();
+            tracing::warn!(event = "inner_only_115", "inner");
+            let inner_logs = capture::take(&inner);
+            assert!(inner_logs.contains("inner_only_115"));
+            assert!(
+                !inner_logs.contains("outer_before_115"),
+                "inner capture must not inherit outer content"
+            );
+        }
+        tracing::warn!(event = "outer_after_115", "outer again");
+        let outer_logs = capture::take(&outer);
+        assert!(outer_logs.contains("outer_before_115"));
+        assert!(
+            outer_logs.contains("outer_after_115"),
+            "outer target must be restored after the inner guard drops:\n{outer_logs}"
+        );
+        assert!(
+            !outer_logs.contains("inner_only_115"),
+            "events during the inner capture must not reach the outer buffer"
+        );
+    }
+
+    /// Unwinding out of a capture must restore the previous target, and the
+    /// same thread must be able to capture again afterwards.
+    #[test]
+    fn unwind_restores_target_and_capture_works_again() {
+        assert!(!capture::has_target());
+        let panicked = std::panic::catch_unwind(|| {
+            let (_buf, _guard) = capture::begin();
+            tracing::warn!(event = "before_panic_115", "about to unwind");
+            panic!("deliberate unwind inside a capture");
         });
-        (logs.as_string(), stdout_buf, result)
+        assert!(panicked.is_err(), "the closure must have panicked");
+        assert!(
+            !capture::has_target(),
+            "the guard must restore the prior target while unwinding"
+        );
+
+        let (buf, _guard) = capture::begin();
+        tracing::warn!(event = "after_unwind_115", "capture still works");
+        let logs = capture::take(&buf);
+        assert!(logs.contains("after_unwind_115"));
+        assert!(
+            !logs.contains("before_panic_115"),
+            "the abandoned buffer must not bleed into the new one"
+        );
+    }
+
+    /// Concurrent FIRST initialization, with sibling threads emitting on
+    /// callsites before any capture exists. Meaningful in a fresh process;
+    /// harmless afterwards.
+    #[test]
+    fn concurrent_first_init_with_uncaptured_first_touch_events() {
+        let start = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let mut handles = Vec::new();
+        // Four threads touch callsites while uncaptured, possibly before init.
+        for _ in 0..4 {
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..100 {
+                    tracing::warn!(event = "first_touch_115", "uncaptured first touch");
+                }
+                None
+            }));
+        }
+        // Four threads race to initialize and capture.
+        for i in 0..4 {
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let (buf, _guard) = capture::begin();
+                tracing::warn!(event = "raced_sentinel_115", idx = i, "captured");
+                Some(capture::take(&buf))
+            }));
+        }
+        start.wait();
+        let mut captured = 0;
+        for h in handles {
+            if let Some(logs) = h.join().unwrap() {
+                captured += 1;
+                assert!(
+                    logs.contains("raced_sentinel_115"),
+                    "a capture that raced initialization lost its own event:\n{logs}"
+                );
+                assert!(
+                    !logs.contains("first_touch_115"),
+                    "uncaptured sibling events leaked into a racing capture"
+                );
+            }
+        }
+        assert_eq!(captured, 4);
     }
 
     // ── Marker constant pin ────────────────────────────────────────────
@@ -3908,15 +4062,9 @@ mod tests {
             client: &SumChainClient<FakeJsonRpcTransport>,
             seed_source: SeedSource,
         ) -> (String, Vec<u8>, Result<()>) {
-            let logs = CapturedLogs::new();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .without_time()
-                .finish();
+            let (logs, _capture) = crate::settlement_cli::capture::begin();
             let mut stdout_buf = Vec::new();
-            let result = tracing::subscriber::with_default(subscriber, || {
+            let result = {
                 let SettlementArgs { cmd, .. } = args;
                 match cmd {
                     SettlementCmd::Claim(a) => {
@@ -3924,8 +4072,12 @@ mod tests {
                     }
                     _ => panic!("run_with_capture_claim called with non-Claim variant"),
                 }
-            });
-            (logs.as_string(), stdout_buf, result)
+            };
+            (
+                crate::settlement_cli::capture::take(&logs),
+                stdout_buf,
+                result,
+            )
         }
 
         fn call_methods(fake: &FakeJsonRpcTransport) -> Vec<String> {
@@ -4522,15 +4674,9 @@ mod tests {
             client: &SumChainClient<FakeJsonRpcTransport>,
             seed_source: SeedSource,
         ) -> (String, Vec<u8>, Result<()>) {
-            let logs = CapturedLogs::new();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .without_time()
-                .finish();
+            let (logs, _capture) = crate::settlement_cli::capture::begin();
             let mut stdout_buf = Vec::new();
-            let result = tracing::subscriber::with_default(subscriber, || {
+            let result = {
                 let SettlementArgs { cmd, .. } = args;
                 match cmd {
                     SettlementCmd::RegisterVerifier(a) => super::super::run_register_verifier(
@@ -4543,8 +4689,12 @@ mod tests {
                         "run_with_capture_register called with non-RegisterVerifier variant"
                     ),
                 }
-            });
-            (logs.as_string(), stdout_buf, result)
+            };
+            (
+                crate::settlement_cli::capture::take(&logs),
+                stdout_buf,
+                result,
+            )
         }
 
         fn call_methods(fake: &FakeJsonRpcTransport) -> Vec<String> {
@@ -5559,18 +5709,15 @@ mod tests {
             client: &SumChainClient<FakeJsonRpcTransport>,
             seed_source: SeedSource,
         ) -> (String, Vec<u8>, Result<()>) {
-            let logs = CapturedLogs::new();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .without_time()
-                .finish();
+            let (logs, _capture) = crate::settlement_cli::capture::begin();
             let mut stdout_buf = Vec::new();
-            let result = tracing::subscriber::with_default(subscriber, || {
-                super::super::run_dispute_open(client, &args, &mut stdout_buf, seed_source)
-            });
-            (logs.as_string(), stdout_buf, result)
+            let result =
+                super::super::run_dispute_open(client, &args, &mut stdout_buf, seed_source);
+            (
+                crate::settlement_cli::capture::take(&logs),
+                stdout_buf,
+                result,
+            )
         }
 
         fn run_resolve_with_capture(
@@ -5578,23 +5725,15 @@ mod tests {
             client: &SumChainClient<FakeJsonRpcTransport>,
             seed_source: SeedSource,
         ) -> (String, Vec<u8>, Result<()>) {
-            let logs = CapturedLogs::new();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .without_time()
-                .finish();
+            let (logs, _capture) = crate::settlement_cli::capture::begin();
             let mut stdout_buf = Vec::new();
-            let result = tracing::subscriber::with_default(subscriber, || {
-                super::super::run_dispute_resolve(
-                    client,
-                    &args,
-                    &mut stdout_buf,
-                    seed_source,
-                )
-            });
-            (logs.as_string(), stdout_buf, result)
+            let result =
+                super::super::run_dispute_resolve(client, &args, &mut stdout_buf, seed_source);
+            (
+                crate::settlement_cli::capture::take(&logs),
+                stdout_buf,
+                result,
+            )
         }
 
         fn call_methods_dispute(fake: &FakeJsonRpcTransport) -> Vec<String> {
@@ -5980,7 +6119,36 @@ mod tests {
 
         // ── RESOLVE tests ───────────────────────────────────────────
 
-        fn write_approvals_json(approvals: &[ValidatorApproval]) -> std::path::PathBuf {
+        /// A uniquely-owned approvals fixture.
+        ///
+        /// The previous helpers derived their filename from the process id
+        /// alone, so every test in one process wrote and read the SAME file.
+        /// Under parallel execution one test could truncate the file another
+        /// was about to read — observed as a parse failure on empty JSON.
+        ///
+        /// Each fixture now owns a private `TempDir`. Callers keep the value
+        /// alive for the whole dispatch/read, so the guard cannot drop early
+        /// and no two tests can collide, whatever the thread count.
+        struct ApprovalsFixture {
+            _dir: tempfile::TempDir,
+            path: std::path::PathBuf,
+        }
+
+        impl ApprovalsFixture {
+            fn path(&self) -> std::path::PathBuf {
+                self.path.clone()
+            }
+        }
+
+        /// Write `body` to a uniquely-owned file named `name`.
+        fn write_approvals_file(name: &str, body: &str) -> ApprovalsFixture {
+            let dir = tempfile::tempdir().expect("approvals fixture temp dir");
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).expect("write approvals fixture");
+            ApprovalsFixture { _dir: dir, path }
+        }
+
+        fn write_approvals_json(approvals: &[ValidatorApproval]) -> ApprovalsFixture {
             let items: Vec<_> = approvals
                 .iter()
                 .map(|a| {
@@ -5991,13 +6159,42 @@ mod tests {
                 })
                 .collect();
             let body = serde_json::to_string(&items).unwrap();
-            let mut path = std::env::temp_dir();
-            path.push(format!(
-                "omninode-test-approvals-{}.json",
-                std::process::id()
-            ));
-            std::fs::write(&path, body).unwrap();
-            path
+            write_approvals_file("approvals.json", &body)
+        }
+
+        /// Simultaneous distinct fixtures must not share a path or content.
+        ///
+        /// This is the property the PID-derived filename lacked: with the old
+        /// helper both fixtures resolved to one file, so whichever was written
+        /// last defined what BOTH tests read.
+        #[test]
+        fn simultaneous_fixtures_are_independent() {
+            let a = write_approvals_file("approvals.json", r#"[{"a":1}]"#);
+            let b = write_approvals_file("approvals.json", r#"[{"b":2}]"#);
+            let c = write_approvals_json(&make_test_approvals());
+
+            // Distinct paths, even though two share a file NAME.
+            assert_ne!(a.path(), b.path());
+            assert_ne!(a.path(), c.path());
+            assert_ne!(b.path(), c.path());
+
+            // Each still holds its own bytes while the others are alive.
+            assert_eq!(std::fs::read_to_string(a.path()).unwrap(), r#"[{"a":1}]"#);
+            assert_eq!(std::fs::read_to_string(b.path()).unwrap(), r#"[{"b":2}]"#);
+            let c_body = std::fs::read_to_string(c.path()).unwrap();
+            assert!(
+                c_body.contains("pubkey"),
+                "unexpected fixture body: {c_body}"
+            );
+
+            // The guard removes the file only when the fixture is dropped.
+            let path_a = a.path();
+            drop(a);
+            assert!(!path_a.exists(), "fixture must clean up when dropped");
+            assert!(
+                b.path().exists(),
+                "dropping one fixture must not affect another"
+            );
         }
 
         fn make_test_approvals() -> Vec<ValidatorApproval> {
@@ -6075,7 +6272,8 @@ mod tests {
         fn resolve_dormant_refuses_and_never_calls_builder_or_submit() {
             let (client, fake) = make_client();
             let approvals = make_test_approvals();
-            let path = write_approvals_json(&approvals);
+            let approvals_fixture = write_approvals_json(&approvals);
+            let path = approvals_fixture.path();
             seed_params(&fake, params_all_dormant());
             seed_head(&fake, 100_000);
             let (logs, _s, r) = run_resolve_with_capture(
@@ -6094,7 +6292,8 @@ mod tests {
         fn resolve_dispute_not_open_refuses_and_never_calls_builder_or_submit() {
             let (client, fake) = make_client();
             let approvals = make_test_approvals();
-            let path = write_approvals_json(&approvals);
+            let approvals_fixture = write_approvals_json(&approvals);
+            let path = approvals_fixture.path();
             seed_params(&fake, params_settlement_active());
             seed_head(&fake, 500_000);
             fake.set_response(
@@ -6138,16 +6337,11 @@ mod tests {
                 })),
             );
             // Write bad JSON — non-hex chars in pubkey.
-            let mut path = std::env::temp_dir();
-            path.push(format!(
-                "omninode-test-bad-approvals-{}.json",
-                std::process::id()
-            ));
-            std::fs::write(
-                &path,
+            let approvals_fixture = write_approvals_file(
+                "bad-approvals.json",
                 r#"[{"pubkey": "0xNOT_HEX", "signature": "0x00"}]"#,
-            )
-            .unwrap();
+            );
+            let path = approvals_fixture.path();
 
             let (logs, _s, r) = run_resolve_with_capture(
                 args_resolve(path, true),
@@ -6184,12 +6378,8 @@ mod tests {
                 })),
             );
             // Well-formed but empty approvals list.
-            let mut path = std::env::temp_dir();
-            path.push(format!(
-                "omninode-test-empty-approvals-{}.json",
-                std::process::id()
-            ));
-            std::fs::write(&path, "[]").unwrap();
+            let approvals_fixture = write_approvals_file("empty-approvals.json", "[]");
+            let path = approvals_fixture.path();
 
             let (logs, _s, r) = run_resolve_with_capture(
                 args_resolve(path, true),
@@ -6246,7 +6436,8 @@ mod tests {
             let (client, fake) = make_client();
             let approvals = make_test_approvals();
             let _fixture = seed_resolve_happy_path(&fake, &approvals);
-            let path = write_approvals_json(&approvals);
+            let approvals_fixture = write_approvals_json(&approvals);
+            let path = approvals_fixture.path();
             let (logs, stdout, r) = run_resolve_with_capture(
                 args_resolve_dry(path),
                 &client,
@@ -6267,7 +6458,8 @@ mod tests {
             let (client, fake) = make_client();
             let approvals = make_test_approvals();
             let fixture = seed_resolve_happy_path(&fake, &approvals);
-            let path = write_approvals_json(&approvals);
+            let approvals_fixture = write_approvals_json(&approvals);
+            let path = approvals_fixture.path();
             let (logs, _stdout, r) = run_resolve_with_capture(
                 args_resolve(path, true),
                 &client,
@@ -6331,5 +6523,156 @@ mod tests {
                 dry_run: false,
             };
         }
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST-ONLY tracing capture harness (issue #115)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The previous helpers each built a fresh `fmt` subscriber and installed it
+// with `tracing::subscriber::with_default`. Under 16–32 parallel test threads
+// that produced intermittent capture failures: an event whose emitting arm
+// provably ran (`entered=1`) was not delivered to the buffer. The exact
+// filtering step inside `tracing` was never isolated, so this harness removes
+// the per-capture subscriber construction rather than trying to out-race it.
+//
+// Design: ONE subscriber for the whole test binary, installed once, whose
+// writer routes to a THREAD-LOCAL buffer. Capture then costs a thread-local
+// swap and never touches global subscriber state.
+//
+// NOTE ON TWO DISTINCT STATES — do not conflate them:
+//   * "no active capture target on this thread" -> output is DISCARDED.
+//   * "no subscriber installed"                 -> cannot happen after `init`.
+// A thread with no target still has the global subscriber; its events are
+// formatted and thrown away.
+//
+// LIMITATION: capture is per-thread and is NOT propagated into threads spawned
+// by the code under test. Every current caller dispatches synchronously on the
+// calling thread, so this is sufficient here; a future caller that spawns work
+// would silently lose those events, and must not rely on this harness.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub(crate) type Buf = Arc<Mutex<Vec<u8>>>;
+
+    thread_local! {
+        /// The buffer this thread's events are written to, if any.
+        static TARGET: RefCell<Option<Buf>> = const { RefCell::new(None) };
+    }
+
+    /// Writer handed to the `fmt` subscriber. Resolves the target at write
+    /// time so a single installed subscriber serves every thread.
+    pub(crate) struct ThreadWriter;
+
+    impl std::io::Write for ThreadWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // Clone the handle OUT of the thread-local first, then drop the
+            // borrow before locking. Holding a TLS borrow across the lock
+            // would deadlock if anything on that path logged.
+            let target = TARGET.with(|t| t.borrow().clone());
+            if let Some(buf) = target {
+                // Poisoning: a panicking test may leave the mutex poisoned.
+                // Recover the bytes rather than cascade a second panic out of
+                // a writer, which would mask the original failure.
+                match buf.lock() {
+                    Ok(mut g) => g.extend_from_slice(bytes),
+                    Err(poisoned) => poisoned.into_inner().extend_from_slice(bytes),
+                }
+            }
+            // No active target: discard. Never log from inside the writer.
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub(crate) struct MakeThreadWriter;
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeThreadWriter {
+        type Writer = ThreadWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            ThreadWriter
+        }
+    }
+
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+
+    /// Install the process-wide test subscriber exactly once.
+    ///
+    /// `OnceLock::get_or_init` blocks every concurrent first caller until the
+    /// initializer returns, so a capture can never begin before installation
+    /// has completed.
+    ///
+    /// Installing the global default also repairs callsites that sibling
+    /// threads already touched while uncaptured: `Dispatch::new` calls
+    /// `callsite::register_dispatch`, which rebuilds interest for every
+    /// registered callsite (tracing-core 0.1.36, `callsite.rs`). No per-event
+    /// rebuild and no marker prewarming is used.
+    pub(crate) fn init() {
+        INSTALLED.get_or_init(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(MakeThreadWriter)
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            // Do NOT swallow this. Only one installation can succeed per
+            // process; if another site won the race, captures would silently
+            // read an unknown subscriber's output.
+            if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+                panic!(
+                    "settlement CLI tests must own the global tracing subscriber, \
+                     but one was already installed: {e}"
+                );
+            }
+        });
+    }
+
+    /// Restores the previous capture target when dropped — on normal return
+    /// and on unwind alike.
+    pub(crate) struct CaptureGuard {
+        prev: Option<Buf>,
+    }
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            let prev = self.prev.take();
+            TARGET.with(|t| *t.borrow_mut() = prev);
+        }
+    }
+
+    /// Begin capturing on this thread.
+    ///
+    /// NESTING CONTRACT: nesting is allowed. An inner capture receives its own
+    /// buffer and, when its guard drops, the OUTER target is restored — an
+    /// inner capture never permanently replaces it. Events emitted while the
+    /// inner capture is active go only to the inner buffer.
+    ///
+    /// The thread-local borrow is released before this returns, so the caller's
+    /// closure runs with no borrow and no lock held by the harness.
+    pub(crate) fn begin() -> (Buf, CaptureGuard) {
+        init();
+        let buf: Buf = Arc::new(Mutex::new(Vec::new()));
+        let prev = TARGET.with(|t| t.borrow_mut().replace(buf.clone()));
+        (buf, CaptureGuard { prev })
+    }
+
+    /// Read the captured bytes as a string.
+    pub(crate) fn take(buf: &Buf) -> String {
+        match buf.lock() {
+            Ok(g) => String::from_utf8_lossy(&g).into_owned(),
+            Err(poisoned) => String::from_utf8_lossy(&poisoned.into_inner()).into_owned(),
+        }
+    }
+
+    /// Whether this thread currently has a capture target. Test-support only.
+    pub(crate) fn has_target() -> bool {
+        TARGET.with(|t| t.borrow().is_some())
     }
 }
