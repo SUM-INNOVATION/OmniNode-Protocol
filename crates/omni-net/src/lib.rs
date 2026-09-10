@@ -1,6 +1,7 @@
 // ── Module declarations ───────────────────────────────────────────────────────
 
 pub mod behaviour;
+pub mod budget;
 pub mod capability;  // deferred — WAN capability advertisement protocol
 pub mod codec;
 pub mod discovery;
@@ -38,6 +39,10 @@ pub use request::{Pending, RequestError};
 pub use router::{
     classify, EventClass, EventRouter, Interests, RouterCounts, RouterHandle,
     RouterStopped, Subscription, SUBSCRIBER_CAPACITY,
+};
+pub use budget::{
+    weight as event_weight, ByteCounts, ByteLedger, Charge, EVENT_FLOOR_BYTES,
+    SHADOW_GLOBAL_BYTES, SHADOW_PEER_BYTES,
 };
 
 // ── Imports ───────────────────────────────────────────────────────────────────
@@ -103,6 +108,13 @@ impl NetHandle {
     /// subscribed to, and deliveries that failed a subscriber who did.
     pub fn router_counts(&self) -> RouterCounts {
         self.router.counts()
+    }
+
+    /// The shadow byte accounting — what every event weighed, and what a
+    /// budget at the shadow ceilings *would* have refused. Nothing was
+    /// refused; see [`crate::budget`].
+    pub fn byte_counts(&self) -> ByteCounts {
+        self.router.byte_counts()
     }
 
     /// The router behind this handle.
@@ -372,6 +384,11 @@ impl OmniNet {
     /// The router's counters. See [`NetHandle::router_counts`].
     pub fn router_counts(&self) -> RouterCounts {
         self.handle.router_counts()
+    }
+
+    /// The shadow byte accounting. See [`NetHandle::byte_counts`].
+    pub fn byte_counts(&self) -> ByteCounts {
+        self.handle.byte_counts()
     }
 
     /// Stage 12.5-pre — local libp2p [`PeerId`] for this node.

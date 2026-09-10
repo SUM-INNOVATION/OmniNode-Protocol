@@ -51,6 +51,43 @@
 //! says a wired-up consumer is falling behind or has vanished. The counters
 //! are fixed struct fields, never a map keyed by topic or peer — a key chosen
 //! by a remote peer is unbounded growth wearing a metrics label.
+//!
+//! ## Bytes, observed and never enforced
+//!
+//! Counting events cannot distinguish a flood of empty keep-alives from one
+//! peer streaming activation tensors, and it is bytes a future admission
+//! budget would have to spend. So every event the router sees is also weighed
+//! by [`crate::budget`], in shadow mode: the ledger records what a budget
+//! *would* have refused and the router then routes the event anyway. Nothing
+//! in this file consults the ledger to decide anything. Read
+//! [`RouterHandle::byte_counts`] to see what a budget would have said before
+//! giving anything the power to say it.
+//!
+//! ### What "in flight" means here
+//!
+//! Bytes in flight are bytes *this node is still holding*, and what holds
+//! them is a subscriber's queue. The router itself holds an event for the
+//! length of one synchronous fan-out and then hands it on; the copies are
+//! what sit in memory afterwards, one bounded queue at a time, until a
+//! consumer reads them.
+//!
+//! So the charge travels with the copy. Every event admitted to a
+//! subscriber's channel goes in wrapped in a [`Delivery`] — the event plus
+//! its own [`budget::Charge`] — and the charge is released when that envelope
+//! dies: on dequeue in [`Subscription::recv`], when `try_send` bounces it off
+//! a full channel, when the subscriber has departed, when the subscription is
+//! dropped with a backlog still in it, or when the router stops and the
+//! queues go with it. The envelope is internal; `recv` yields the plain
+//! [`OmniNetEvent`] the caller has always received.
+//!
+//! Two consequences follow, and both are the point. N interested subscribers
+//! means N charges, because N copies exist, each with its own payload
+//! allocation. An event nobody wants means no charge at all, because after
+//! the counters are bumped nothing keeps it.
+//!
+//! The rejected alternative — charge on entry, release when fan-out returns —
+//! is what makes a 32 MiB ceiling meaningless: it can only ever be crossed by
+//! a single event larger than 32 MiB, whatever the backlog behind it.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,6 +97,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::debug;
 
+use crate::budget::{ByteCounts, ByteLedger, Charge};
 use crate::events::OmniNetEvent;
 
 /// Per-subscriber channel depth.
@@ -301,11 +339,34 @@ pub struct RouterStopped;
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 
+/// One event, and the byte charge its place in a queue is paying for.
+///
+/// Internal to the router. It exists so that a charge can outlive the fan-out
+/// that created it and expire with the copy it accounts for: whichever way the
+/// copy dies — dequeued, bounced off a full channel, dropped with a departed
+/// subscriber, dropped with the subscription, dropped when the router stops —
+/// this struct dies with it, and `Drop for Charge` releases the bytes.
+///
+/// It never reaches a caller. [`Subscription::recv`] unwraps it and returns
+/// the unchanged public [`OmniNetEvent`].
+pub(crate) struct Delivery {
+    event: OmniNetEvent,
+    /// Released on drop. Never read; holding it *is* the accounting.
+    _charge: Charge,
+}
+
+impl Delivery {
+    /// Take the event out, releasing the charge that its queue slot held.
+    fn into_event(self) -> OmniNetEvent {
+        self.event
+    }
+}
+
 /// One registered consumer.
 struct Subscriber {
     id: u64,
     interests: Interests,
-    tx: mpsc::Sender<OmniNetEvent>,
+    tx: mpsc::Sender<Delivery>,
 }
 
 /// The shared table of subscribers, plus the counters.
@@ -319,6 +380,13 @@ pub(crate) struct Registry {
     next_id: AtomicU64,
     running: AtomicBool,
     counts: Counters,
+    /// Shadow byte accounting. Observed on every event, consulted for no
+    /// decision — see the module docs and [`crate::budget`].
+    ///
+    /// Held behind an `Arc` because a charge outlives the fan-out that issued
+    /// it: it travels into a subscriber's queue inside a [`Delivery`] and may
+    /// be released from a consumer's task, long after `route` returned.
+    ledger: Arc<ByteLedger>,
 }
 
 impl Registry {
@@ -328,6 +396,7 @@ impl Registry {
             next_id: AtomicU64::new(1),
             running: AtomicBool::new(true),
             counts: Counters::default(),
+            ledger: Arc::new(ByteLedger::new()),
         }
     }
 
@@ -344,10 +413,7 @@ impl Registry {
     }
 
     /// Register `interests` and return that consumer's own channel.
-    fn register(
-        self: &Arc<Self>,
-        interests: Interests,
-    ) -> Result<Subscription, RouterStopped> {
+    fn register(self: &Arc<Self>, interests: Interests) -> Result<Subscription, RouterStopped> {
         if !self.running.load(Ordering::Acquire) {
             return Err(RouterStopped);
         }
@@ -361,11 +427,7 @@ impl Registry {
             if !self.running.load(Ordering::Acquire) {
                 return Err(RouterStopped);
             }
-            subs.push(Subscriber {
-                id,
-                interests,
-                tx,
-            });
+            subs.push(Subscriber { id, interests, tx });
         }
         self.counts
             .subscriptions_opened
@@ -401,6 +463,21 @@ impl Registry {
     fn route(&self, event: OmniNetEvent) {
         self.counts.events.fetch_add(1, Ordering::Relaxed);
 
+        // Shadow accounting, wired here because here is where production
+        // events actually pass — the ledger therefore weighs exactly what the
+        // router routes, not a sampled or reconstructed shadow of it.
+        //
+        // Weighing is *seeing*: it happens once, before it is known whether
+        // anyone wants this, so the cumulative totals cover the unwanted event
+        // below as well. Retention is charged separately, per copy, at the
+        // moment a copy is actually put somewhere that will hold it.
+        //
+        // Nothing below reads a verdict. There is deliberately no branch on
+        // `Charge::would_be_refused` anywhere in this file — see
+        // `observation_only_invariant` — so an event's fate is identical to
+        // what it was before the ledger existed.
+        self.ledger.weigh(&event);
+
         let mut subs = self.subscribers();
 
         // The interested set is resolved into indices while the event is
@@ -420,6 +497,10 @@ impl Registry {
                 // Nobody asked for this. Counted, never silently discarded —
                 // and counted apart from the delivery failures below, because
                 // this is a missing consumer, not a failing one.
+                //
+                // No in-flight charge was ever taken: the event was weighed,
+                // and it is about to be dropped rather than held, so there are
+                // no retained bytes to account for.
                 self.counter_for(class).fetch_add(1, Ordering::Relaxed);
                 debug!(?class, "event had no interested subscriber");
                 return;
@@ -444,18 +525,26 @@ impl Registry {
                     .expect("carrier holds the event before the last delivery")
                     .clone()
             };
-            match subs[index].tx.try_send(copy) {
+            // Charge this copy, then hand copy and receipt over together. If
+            // the send fails the envelope comes straight back in the error and
+            // is dropped at the end of the arm, which releases the charge: a
+            // copy that was never taken is a copy nobody is holding.
+            match subs[index].tx.try_send(self.envelope(copy)) {
                 Ok(()) => {
+                    // The charge is now in that subscriber's queue and stays
+                    // open until the copy leaves it.
                     self.counts.delivered.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(TrySendError::Full(_)) => {
+                Err(TrySendError::Full(bounced)) => {
                     // Someone asked and we failed them: this consumer is not
                     // keeping up. Deliberately not the "nobody asked" counter.
+                    drop(bounced);
                     self.counts
                         .dropped_backlogged
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                Err(TrySendError::Closed(_)) => {
+                Err(TrySendError::Closed(bounced)) => {
+                    drop(bounced);
                     self.counts.dropped_departed.fetch_add(1, Ordering::Relaxed);
                     saw_departed = true;
                 }
@@ -474,6 +563,19 @@ impl Registry {
                     .subscriptions_closed
                     .fetch_add(closed as u64, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Wrap one copy in its own charge, ready to be handed to a queue.
+    ///
+    /// The charge is taken here and released only when the returned
+    /// [`Delivery`] dies, so the accounting follows the copy wherever it goes
+    /// — including straight back out of a `try_send` that failed.
+    fn envelope(&self, event: OmniNetEvent) -> Delivery {
+        let charge = self.ledger.charge(&event);
+        Delivery {
+            event,
+            _charge: charge,
         }
     }
 
@@ -516,13 +618,17 @@ impl Registry {
 /// consumer — the router stops copying events into a channel nobody reads.
 pub struct Subscription {
     id: u64,
-    rx: mpsc::Receiver<OmniNetEvent>,
+    /// Carries `Delivery`, not the bare event: each queued item holds the
+    /// charge for the bytes its own queue slot retains. Dequeuing releases it.
+    rx: mpsc::Receiver<Delivery>,
     registry: Arc<Registry>,
 }
 
 impl std::fmt::Debug for Subscription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Subscription").field("id", &self.id).finish()
+        f.debug_struct("Subscription")
+            .field("id", &self.id)
+            .finish()
     }
 }
 
@@ -536,8 +642,13 @@ impl Subscription {
     ///
     /// Returns `None` once the router has stopped and the buffer is drained —
     /// the signal that no further event can arrive.
+    ///
+    /// The public type is unchanged: the delivery envelope is unwrapped here
+    /// and its charge released, so a caller never sees the accounting. Holding
+    /// the event past this point costs nothing, because the bytes are no longer
+    /// sitting in a queue.
     pub async fn recv(&mut self) -> Option<OmniNetEvent> {
-        self.rx.recv().await
+        self.rx.recv().await.map(Delivery::into_event)
     }
 
     /// Take the next matching event if one is already buffered.
@@ -546,7 +657,7 @@ impl Subscription {
     /// router has stopped"; a caller that needs to tell those apart should
     /// await [`Subscription::recv`] instead.
     pub fn try_recv(&mut self) -> Option<OmniNetEvent> {
-        self.rx.try_recv().ok()
+        self.rx.try_recv().ok().map(Delivery::into_event)
     }
 }
 
@@ -588,6 +699,24 @@ impl RouterHandle {
         self.registry.counts.snapshot()
     }
 
+    /// Read the shadow byte accounting.
+    ///
+    /// Observation only: [`ByteCounts::would_refuse_global`] and
+    /// [`ByteCounts::would_refuse_peer`] report what a budget at the shadow
+    /// ceilings would have turned away. Nothing was turned away.
+    pub fn byte_counts(&self) -> ByteCounts {
+        self.registry.ledger.snapshot()
+    }
+
+    /// How many peers currently hold a byte charge.
+    ///
+    /// Test-only: this is the live size of the ledger's one keyed map, which
+    /// production reads only in aggregate through [`RouterHandle::byte_counts`].
+    #[cfg(test)]
+    pub(crate) fn peers_in_flight_for_test(&self) -> usize {
+        self.registry.ledger.peers_in_flight()
+    }
+
     /// Whether the router is still draining the swarm lane.
     pub fn is_running(&self) -> bool {
         self.registry.running.load(Ordering::Acquire)
@@ -617,14 +746,12 @@ impl RouterHandle {
     pub(crate) fn orphan_subscriber_for_test(
         &self,
         interests: Interests,
-    ) -> mpsc::Receiver<OmniNetEvent> {
+    ) -> mpsc::Receiver<Delivery> {
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CAPACITY);
         let id = self.registry.next_id.fetch_add(1, Ordering::Relaxed);
-        self.registry.subscribers().push(Subscriber {
-            id,
-            interests,
-            tx,
-        });
+        self.registry
+            .subscribers()
+            .push(Subscriber { id, interests, tx });
         self.registry
             .counts
             .subscriptions_opened
@@ -753,6 +880,8 @@ mod never_await_invariant {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use libp2p::PeerId;
 
@@ -839,6 +968,45 @@ mod tests {
         (tx, handle)
     }
 
+    /// Deadline on every await in this suite.
+    ///
+    /// A routing regression must *fail* these tests, not hang them. Every
+    /// assertion below waits on a `recv()` that a broken router simply never
+    /// satisfies — drop the interest filter, or the fan-out, and the awaiting
+    /// task parks forever. Without a deadline the test never returns and CI
+    /// reports a stalled job, or a killed one, instead of a named failing
+    /// test; a regression that hangs the suite is a regression nobody reads.
+    ///
+    /// This is a failure detector, not an expected duration: the router hands
+    /// events over synchronously and a passing run never comes near it.
+    const TEST_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Await the next event, failing by name if none arrives in time.
+    async fn recv_within(sub: &mut Subscription, expected: &str) -> OmniNetEvent {
+        match tokio::time::timeout(TEST_DEADLINE, sub.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => panic!("the stream ended before {expected} arrived"),
+            Err(_) => {
+                panic!("timed out after {TEST_DEADLINE:?} waiting for {expected}")
+            }
+        }
+    }
+
+    /// Await the *end* of a stream, failing by name if it neither ends nor
+    /// yields. The shutdown counterpart of [`recv_within`].
+    async fn end_within(sub: &mut Subscription, expected: &str) {
+        match tokio::time::timeout(TEST_DEADLINE, sub.recv()).await {
+            Ok(None) => {}
+            Ok(Some(event)) => {
+                panic!("expected {expected} to have ended, got {event:?}")
+            }
+            Err(_) => panic!(
+                "timed out after {TEST_DEADLINE:?} waiting for {expected} to end — \
+                 a consumer must learn the stream stopped, not wait forever"
+            ),
+        }
+    }
+
     fn topic_of(event: &OmniNetEvent) -> String {
         match event {
             OmniNetEvent::MessageReceived { topic, .. } => topic.clone(),
@@ -900,16 +1068,25 @@ mod tests {
             .subscribe(Interests::none().tensor())
             .expect("transport subscribes");
 
-        lane.send(gossip(TOPIC_A, "job-announcement")).await.unwrap();
+        lane.send(gossip(TOPIC_A, "job-announcement"))
+            .await
+            .unwrap();
         lane.send(tensor("session-1")).await.unwrap();
 
         // The tensor consumer drains everything it can see...
-        let drained = transport.recv().await.expect("tensor consumer gets its event");
+        let drained = recv_within(&mut transport, "the tensor consumer's own event").await;
         assert!(matches!(drained, OmniNetEvent::TensorReceived { .. }));
-        assert!(transport.try_recv().is_none(), "and nothing that isn't its own");
+        assert!(
+            transport.try_recv().is_none(),
+            "and nothing that isn't its own"
+        );
 
         // ...and the gossip event is still there for the relay.
-        let survived = relay.recv().await.expect("gossip survived the tensor drain");
+        let survived = recv_within(
+            &mut relay,
+            "the gossip event the tensor drain must not have taken",
+        )
+        .await;
         assert_eq!(body_of(&survived), "job-announcement");
     }
 
@@ -926,16 +1103,19 @@ mod tests {
             .expect("transport subscribes");
 
         lane.send(tensor("session-2")).await.unwrap();
-        lane.send(gossip(TOPIC_B, "result-announcement")).await.unwrap();
+        lane.send(gossip(TOPIC_B, "result-announcement"))
+            .await
+            .unwrap();
 
-        let drained = relay.recv().await.expect("gossip consumer gets its event");
+        let drained = recv_within(&mut relay, "the gossip consumer's own event").await;
         assert_eq!(topic_of(&drained), TOPIC_B);
         assert!(relay.try_recv().is_none());
 
-        let survived = transport
-            .recv()
-            .await
-            .expect("the tensor survived the gossip drain");
+        let survived = recv_within(
+            &mut transport,
+            "the tensor the gossip drain must not have taken",
+        )
+        .await;
         match survived {
             OmniNetEvent::TensorReceived { request, .. } => {
                 assert_eq!(request.session_id, "session-2");
@@ -958,8 +1138,10 @@ mod tests {
 
         lane.send(gossip(TOPIC_A, "broadcast")).await.unwrap();
 
-        assert_eq!(body_of(&first.recv().await.expect("first")), "broadcast");
-        assert_eq!(body_of(&second.recv().await.expect("second")), "broadcast");
+        let to_first = recv_within(&mut first, "the first subscriber's copy").await;
+        let to_second = recv_within(&mut second, "the second subscriber's copy").await;
+        assert_eq!(body_of(&to_first), "broadcast");
+        assert_eq!(body_of(&to_second), "broadcast");
     }
 
     #[tokio::test]
@@ -981,36 +1163,44 @@ mod tests {
             .expect("peer watcher subscribes");
 
         for round in 0..4 {
-            lane.send(shard_request(&format!("cid-{round}"))).await.unwrap();
-            lane.send(gossip(TOPIC_A, &format!("job-{round}"))).await.unwrap();
-            lane.send(tensor(&format!("session-{round}"))).await.unwrap();
-            lane.send(gossip(TOPIC_B, &format!("result-{round}"))).await.unwrap();
+            lane.send(shard_request(&format!("cid-{round}")))
+                .await
+                .unwrap();
+            lane.send(gossip(TOPIC_A, &format!("job-{round}")))
+                .await
+                .unwrap();
+            lane.send(tensor(&format!("session-{round}")))
+                .await
+                .unwrap();
+            lane.send(gossip(TOPIC_B, &format!("result-{round}")))
+                .await
+                .unwrap();
             lane.send(control()).await.unwrap();
         }
 
         for round in 0..4 {
-            match store.recv().await.expect("shard") {
+            match recv_within(&mut store, &format!("shard request cid-{round}")).await {
                 OmniNetEvent::ShardRequested { request, .. } => {
                     assert_eq!(request.cid, format!("cid-{round}"));
                 }
                 other => panic!("store received {other:?}"),
             }
             assert_eq!(
-                body_of(&relay.recv().await.expect("job")),
+                body_of(&recv_within(&mut relay, &format!("gossip job-{round}")).await),
                 format!("job-{round}")
             );
-            match transport.recv().await.expect("tensor") {
+            match recv_within(&mut transport, &format!("tensor session-{round}")).await {
                 OmniNetEvent::TensorReceived { request, .. } => {
                     assert_eq!(request.session_id, format!("session-{round}"));
                 }
                 other => panic!("transport received {other:?}"),
             }
             assert_eq!(
-                body_of(&relay.recv().await.expect("result")),
+                body_of(&recv_within(&mut relay, &format!("gossip result-{round}")).await),
                 format!("result-{round}")
             );
             assert!(matches!(
-                watcher.recv().await.expect("control"),
+                recv_within(&mut watcher, &format!("control event {round}")).await,
                 OmniNetEvent::PeerConnected { .. }
             ));
         }
@@ -1041,7 +1231,7 @@ mod tests {
         lane.send(control()).await.unwrap();
 
         assert!(matches!(
-            watcher.recv().await.expect("peer event"),
+            recv_within(&mut watcher, "the peer event the watcher is waiting on").await,
             OmniNetEvent::PeerConnected { .. }
         ));
         assert!(
@@ -1049,7 +1239,7 @@ mod tests {
             "the peer watcher must never be handed gossip it would discard"
         );
         assert_eq!(
-            body_of(&relay.recv().await.expect("gossip survived the peer wait")),
+            body_of(&recv_within(&mut relay, "the gossip published during the peer wait").await),
             "published-during-peer-wait"
         );
     }
@@ -1073,7 +1263,10 @@ mod tests {
 
         // The survivor is unaffected.
         lane.send(gossip(TOPIC_A, "after-drop")).await.unwrap();
-        assert_eq!(body_of(&keeper.recv().await.unwrap()), "after-drop");
+        assert_eq!(
+            body_of(&recv_within(&mut keeper, "the survivor's event after the drop").await),
+            "after-drop"
+        );
         // And the router never counts a departed-subscriber delivery for it.
         assert_eq!(handle.counts().dropped_departed, 0);
     }
@@ -1108,11 +1301,8 @@ mod tests {
         // Closing the swarm lane is what a stopped swarm task looks like.
         drop(lane);
 
-        assert!(
-            relay.recv().await.is_none(),
-            "a consumer must learn the stream ended rather than wait forever"
-        );
-        assert!(transport.recv().await.is_none());
+        end_within(&mut relay, "the relay's stream").await;
+        end_within(&mut transport, "the tensor consumer's stream").await;
         assert!(!handle.is_running());
         assert_eq!(
             handle.subscribe(Interests::everything()).unwrap_err(),
@@ -1215,6 +1405,323 @@ mod tests {
             handle.subscriber_count(),
             0,
             "a departed subscriber must be swept out of the table"
+        );
+    }
+
+    // ── Shadow byte accounting ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn the_router_weighs_exactly_the_events_it_routes() {
+        // The ledger is wired into `route`, so it sees production traffic
+        // rather than a reconstruction of it. Both paths through `route` are
+        // exercised: an event with a taker and an event with none.
+        //
+        // The property that changed: a charge is held for as long as the copy
+        // sits in a subscriber's queue, not for the duration of the fan-out.
+        // Releasing at the end of `route` would measure one routing call and
+        // call it "in flight", which is what an earlier version of this did.
+        let (_lane, handle) = router();
+        let mut consumer = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+
+        let wanted = gossip(TOPIC_A, "short");
+        let unwanted = gossip(TOPIC_B, &"x".repeat(4_096));
+        let wanted_weight = crate::budget::weight(&wanted);
+        let expected = wanted_weight + crate::budget::weight(&unwanted);
+
+        handle.route_for_test(wanted);
+        handle.route_for_test(unwanted);
+
+        let bytes = handle.byte_counts();
+        assert_eq!(bytes.events, 2, "both events were weighed");
+        assert_eq!(bytes.bytes, expected, "including the one nobody wanted");
+        assert_eq!(bytes.bytes_saturated, 0);
+
+        // The delivered copy is still sitting in the consumer's queue, so its
+        // bytes are still retained. The unwanted one was never enqueued and so
+        // never took a charge — the whole 4 KiB of it.
+        assert_eq!(
+            bytes.bytes_in_flight, wanted_weight,
+            "only the queued copy is in flight; the undelivered event took no charge"
+        );
+
+        // Dequeuing releases it, and nothing else.
+        let _ = recv_within(&mut consumer, "the queued gossip event").await;
+        assert_eq!(
+            handle.byte_counts().bytes_in_flight,
+            0,
+            "dequeuing releases exactly the charge its queue slot held"
+        );
+    }
+
+    #[tokio::test]
+    async fn accounting_observes_but_does_not_refuse() {
+        // The load-bearing property of a shadow increment. This traffic would
+        // exhaust any plausible budget — every event on its own is larger than
+        // the shadow per-peer ceiling — and the ledger says so. Not one event's
+        // fate differs: all of them are delivered, in order, intact, and the
+        // router's own counters read exactly as they would with no ledger at
+        // all. The day accounting starts refusing, this test fails.
+        let (_lane, handle) = router();
+        let mut consumer = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+
+        let peer = PeerId::random();
+        let over_ceiling = usize::try_from(crate::budget::SHADOW_PEER_BYTES)
+            .expect("the shadow ceiling fits a usize")
+            + 1;
+        const FLOOD: u64 = 4;
+
+        for marker in 1..=FLOOD {
+            handle.route_for_test(OmniNetEvent::MessageReceived {
+                from: peer,
+                topic: TOPIC_A.to_string(),
+                // A distinct first byte per event, so a reordering or a
+                // swallowed event shows up as a wrong marker rather than a
+                // right count.
+                data: {
+                    let mut data = vec![0u8; over_ceiling];
+                    data[0] = u8::try_from(marker).expect("marker fits a byte");
+                    data
+                },
+            });
+        }
+
+        let bytes = handle.byte_counts();
+        assert_eq!(
+            bytes.would_refuse_peer, FLOOD,
+            "a budget at the shadow ceiling would have refused every one: {bytes:?}"
+        );
+        assert!(bytes.would_refuse_any());
+
+        // And yet.
+        for marker in 1..=FLOOD {
+            let event =
+                recv_within(&mut consumer, &format!("the flood event marked {marker}")).await;
+            match event {
+                OmniNetEvent::MessageReceived { data, .. } => {
+                    assert_eq!(
+                        u64::from(data[0]),
+                        marker,
+                        "the flood was delivered out of order or short"
+                    );
+                    assert_eq!(data.len(), over_ceiling, "payload arrived truncated");
+                }
+                other => panic!("the consumer received {other:?}"),
+            }
+        }
+
+        let counts = handle.counts();
+        assert_eq!(counts.events, FLOOD);
+        assert_eq!(
+            counts.delivered, FLOOD,
+            "shadow accounting must not cost a single delivery"
+        );
+        assert_eq!(counts.dropped_backlogged, 0);
+        assert_eq!(counts.dropped_departed, 0);
+        assert_eq!(counts.unwanted_gossip, 0);
+        assert_eq!(
+            handle.byte_counts().bytes_in_flight,
+            0,
+            "and the ledger is back to zero, holding nothing"
+        );
+    }
+
+    /// The load-bearing case for queue retention: a backlog of several events
+    /// sitting in one subscriber's queue holds several charges at once.
+    ///
+    /// Releasing at the end of each fan-out — the behaviour this amends —
+    /// leaves `bytes_in_flight` at zero here no matter how deep the backlog
+    /// gets, which is exactly why the old accounting could only ever answer
+    /// "does one event exceed the ceiling".
+    #[tokio::test]
+    async fn a_backlog_of_events_retains_every_charge_until_drained() {
+        let (_lane, handle) = router();
+        let mut consumer = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+
+        let bodies = ["one", "two", "three", "four", "five"];
+        let mut expected = 0u64;
+        for body in bodies {
+            let event = gossip(TOPIC_A, body);
+            expected += crate::budget::weight(&event);
+            handle.route_for_test(event);
+        }
+
+        assert_eq!(
+            handle.byte_counts().bytes_in_flight,
+            expected,
+            "every queued event's charge is held at once, not just the last"
+        );
+
+        // Draining releases them one at a time, monotonically.
+        let mut last = expected;
+        for body in bodies {
+            let _ = recv_within(&mut consumer, body).await;
+            let now = handle.byte_counts().bytes_in_flight;
+            assert!(now < last, "each dequeue must release its own charge");
+            last = now;
+        }
+        assert_eq!(last, 0, "a fully drained queue retains nothing");
+    }
+
+    /// One event, several interested subscribers: each queue keeps its own
+    /// copy, so each copy is charged.
+    #[tokio::test]
+    async fn each_delivered_clone_is_charged_separately() {
+        let (_lane, handle) = router();
+        let mut a = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+        let mut b = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+        let mut c = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+
+        let event = gossip(TOPIC_A, "shared");
+        let one = crate::budget::weight(&event);
+        handle.route_for_test(event);
+
+        assert_eq!(
+            handle.byte_counts().bytes_in_flight,
+            one * 3,
+            "three queues retain three payloads, so three charges are open"
+        );
+
+        for (sub, name) in [(&mut a, "a"), (&mut b, "b"), (&mut c, "c")] {
+            let _ = recv_within(sub, name).await;
+        }
+        assert_eq!(handle.byte_counts().bytes_in_flight, 0);
+    }
+
+    /// A copy that never reaches a queue is never charged for one. The
+    /// envelope comes back out of the failed `try_send` and dies there.
+    #[tokio::test]
+    async fn a_full_subscriber_queue_releases_the_bounced_charge() {
+        let (_lane, handle) = router();
+        let _consumer = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+
+        // Fill the queue exactly, then overflow it.
+        for i in 0..SUBSCRIBER_CAPACITY {
+            handle.route_for_test(gossip(TOPIC_A, &format!("fill-{i}")));
+        }
+        let full = handle.byte_counts().bytes_in_flight;
+        assert!(full > 0, "the queue is holding its backlog");
+
+        let overflow = gossip(TOPIC_A, "bounced");
+        handle.route_for_test(overflow);
+
+        assert_eq!(
+            handle.byte_counts().bytes_in_flight,
+            full,
+            "a bounced copy adds no retained bytes"
+        );
+        assert_eq!(
+            handle.counts().dropped_backlogged,
+            1,
+            "and it is counted as a delivery failure, not as unwanted"
+        );
+    }
+
+    /// A subscriber that goes away still releases whatever its queue held.
+    #[tokio::test]
+    async fn dropping_a_subscription_releases_its_whole_backlog() {
+        let (_lane, handle) = router();
+        let consumer = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+
+        for i in 0..8 {
+            handle.route_for_test(gossip(TOPIC_A, &format!("queued-{i}")));
+        }
+        assert!(handle.byte_counts().bytes_in_flight > 0);
+
+        drop(consumer);
+        assert_eq!(
+            handle.byte_counts().bytes_in_flight,
+            0,
+            "dropping the subscription drops its queue, which releases its charges"
+        );
+    }
+
+    /// No charge outlives the router that opened it.
+    ///
+    /// Shutdown closes the sender side; a closed channel still hands over what
+    /// it already buffered, so the queued copies — and their charges — survive
+    /// until the consumer drains or drops. Both routes are asserted here,
+    /// because "shutdown zeroes the ledger instantly" would be a nice claim and
+    /// a false one.
+    #[tokio::test]
+    async fn shutdown_releases_every_retained_charge() {
+        let (lane, handle) = router();
+        let mut a = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+        let b = handle.subscribe(Interests::none().topic(TOPIC_A)).unwrap();
+        for i in 0..4 {
+            handle.route_for_test(gossip(TOPIC_A, &format!("q-{i}")));
+        }
+        assert!(handle.byte_counts().bytes_in_flight > 0);
+
+        // A stopped swarm task is the lane closing.
+        drop(lane);
+        assert!(
+            handle.byte_counts().bytes_in_flight > 0,
+            "shutdown does not reach into a queue that already has copies in it"
+        );
+
+        // Route one: the consumer drains. Each dequeue releases its own charge,
+        // and the stream then ends rather than hanging.
+        for _ in 0..4 {
+            let _ = recv_within(&mut a, "a buffered event after shutdown").await;
+        }
+        end_within(&mut a, "the drained subscriber's stream").await;
+
+        // Route two: the consumer never drains and simply goes away.
+        drop(b);
+        assert_eq!(
+            handle.byte_counts().bytes_in_flight,
+            0,
+            "between draining and dropping, no charge outlives the router"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_for_many_peers_leaves_no_per_peer_state_behind() {
+        // The ledger's one keyed map, seen through the router: a thousand
+        // distinct remote identities — one keypair each, which is free to
+        // mint — leave nothing behind. A map keyed by "peers ever seen" would
+        // be a thousand entries here and unbounded in production.
+        let (_lane, handle) = router();
+
+        // First the early-return path: nobody has subscribed, so every event
+        // is counted as unwanted and `route` returns before any charge.
+        for _ in 0..1_000 {
+            handle.route_for_test(control());
+        }
+        assert_eq!(
+            handle.peers_in_flight_for_test(),
+            0,
+            "an event with no interested subscriber must take no charge at all"
+        );
+
+        // Then the delivery path. Each copy is charged on enqueue and released
+        // on dequeue, so the map is bounded by what is *queued*, never by how
+        // many distinct peers have ever been seen.
+        let mut watcher = handle.subscribe(Interests::none().control()).unwrap();
+        for _ in 0..100 {
+            handle.route_for_test(control());
+        }
+        assert!(
+            handle.peers_in_flight_for_test() > 0,
+            "queued copies are still retained"
+        );
+
+        for _ in 0..100 {
+            let _ = recv_within(&mut watcher, "a queued control event").await;
+        }
+
+        assert_eq!(
+            handle.peers_in_flight_for_test(),
+            0,
+            "draining the queue returns the map to empty"
+        );
+        let bytes = handle.byte_counts();
+        assert_eq!(bytes.events, 1_100);
+        assert_eq!(bytes.bytes_in_flight, 0);
+        assert_eq!(bytes.peers_in_flight, 0);
+        assert!(
+            bytes.peak_peers_in_flight <= 100,
+            "the map is bounded by queued copies, not by peers ever seen: {bytes:?}"
         );
     }
 
