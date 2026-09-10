@@ -323,16 +323,44 @@ fn read_gguf_string(data: &[u8], cursor: &mut usize) -> Result<String> {
     Ok(owned)
 }
 
+/// Maximum permitted metadata array nesting.
+///
+/// Depth counts *enclosing arrays*: a scalar or string is depth 0, an array of
+/// scalars is depth 1, an array of arrays of scalars is depth 2. Depth 64 is
+/// accepted; 65 is rejected before the deeper node is constructed.
+///
+/// The limit is local, not a format rule. The pinned upstream specification
+/// (ggml-org/ggml `6af560d55df03ad92116e3c0a697779584477e85`, `docs/gguf.md`)
+/// explicitly permits nested arrays and states no bound, but documents no
+/// metadata key deeper than a single array level -- so 64 leaves 63 levels of
+/// headroom above every standardised key while keeping both parse recursion
+/// and the recursive drop of the resulting tree bounded.
+///
+/// SCOPE: this bounds values *this parser produces*. `MetadataValue` is a
+/// public enum with public variants, so a caller outside this crate can still
+/// construct a deeper value by hand; dropping such a value recurses as deeply
+/// as it was built and is outside this guarantee.
+pub const MAX_METADATA_DEPTH: u32 = 64;
+
 /// Read one metadata key-value pair.
 fn read_metadata_kv(data: &[u8], cursor: &mut usize) -> Result<MetadataKv> {
     let key = read_gguf_string(data, cursor)?;
     let value_type = read_u32_le(data, cursor)?;
-    let value = read_metadata_value(data, cursor, value_type)?;
+    // Top-level value of a key: zero enclosing arrays so far.
+    let value = read_metadata_value(data, cursor, value_type, 0)?;
     Ok(MetadataKv { key, value })
 }
 
 /// Read a typed metadata value.
-fn read_metadata_value(data: &[u8], cursor: &mut usize, value_type: u32) -> Result<MetadataValue> {
+///
+/// `enclosing_arrays` is how many arrays already enclose this value, so the
+/// array arm below rejects at [`MAX_METADATA_DEPTH`] before recursing.
+fn read_metadata_value(
+    data: &[u8],
+    cursor: &mut usize,
+    value_type: u32,
+    enclosing_arrays: u32,
+) -> Result<MetadataValue> {
     match value_type {
         0 => Ok(MetadataValue::Uint8(read_u8(data, cursor)?)),
         1 => Ok(MetadataValue::Int8(read_i8(data, cursor)?)),
@@ -344,6 +372,15 @@ fn read_metadata_value(data: &[u8], cursor: &mut usize, value_type: u32) -> Resu
         7 => Ok(MetadataValue::Bool(read_u8(data, cursor)? != 0)),
         8 => Ok(MetadataValue::String(read_gguf_string(data, cursor)?)),
         9 => {
+            // Reject BEFORE reading the body or constructing anything, so an
+            // over-deep file never allocates and never recurses further.
+            let depth = enclosing_arrays + 1;
+            if depth > MAX_METADATA_DEPTH {
+                return Err(StoreError::GgufParse(format!(
+                    "metadata array nesting depth {depth} exceeds the limit of \
+                     {MAX_METADATA_DEPTH}"
+                )));
+            }
             // Array: [u32 element_type][u64 count][elements...]
             let elem_type = read_u32_le(data, cursor)?;
             let count = read_u64_le(data, cursor)?;
@@ -365,7 +402,7 @@ fn read_metadata_value(data: &[u8], cursor: &mut usize, value_type: u32) -> Resu
             let count = checked_count(data, *cursor, count, min_size)?;
             let mut elems = Vec::new();
             for _ in 0..count {
-                let value = read_metadata_value(data, cursor, elem_type)?;
+                let value = read_metadata_value(data, cursor, elem_type, depth)?;
                 push_fallible(&mut elems, value)?;
             }
             Ok(MetadataValue::Array(elems))
@@ -555,6 +592,132 @@ mod tests {
         raw.extend_from_slice(&count.to_le_bytes());
         raw.extend_from_slice(body);
         raw
+    }
+
+    /// Build a GGUF file whose single metadata value is an array nested
+    /// `depth` levels deep, innermost being an empty array of `u8`.
+    ///
+    /// depth 1 = ARRAY(u8, 0); depth 2 = ARRAY(ARRAY, 1, [ARRAY(u8, 0)]); ...
+    fn nested_array_file(depth: u32) -> Vec<u8> {
+        assert!(depth >= 1);
+        let mut body = array_body(0, 0, &[]); // innermost: ARRAY(u8, count 0)
+        for _ in 1..depth {
+            body = array_body(9, 1, &body); // wrap: ARRAY(ARRAY, count 1, [inner])
+        }
+        one_value(9, &body)
+    }
+
+    /// Depth of a parsed value, counting enclosing arrays.
+    fn value_depth(v: &MetadataValue) -> u32 {
+        match v {
+            MetadataValue::Array(items) => {
+                1 + items.iter().map(value_depth).max().unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn depth_at_the_limit_is_accepted() {
+        let parsed = parse_gguf(&nested_array_file(MAX_METADATA_DEPTH))
+            .expect("depth 64 must parse");
+        assert_eq!(value_depth(&parsed.metadata[0].value), MAX_METADATA_DEPTH);
+    }
+
+    #[test]
+    fn depth_one_past_the_limit_is_rejected() {
+        assert_parse_error(parse_gguf(&nested_array_file(MAX_METADATA_DEPTH + 1)));
+    }
+
+    #[test]
+    fn shallow_depths_are_unaffected() {
+        // Depth 0 (scalar), 1 and 2 must be unchanged by the bound.
+        let scalar = parse_gguf(&one_value(4, &7u32.to_le_bytes())).unwrap();
+        assert_eq!(value_depth(&scalar.metadata[0].value), 0);
+        for depth in [1, 2, 3] {
+            let parsed = parse_gguf(&nested_array_file(depth)).unwrap();
+            assert_eq!(value_depth(&parsed.metadata[0].value), depth);
+        }
+    }
+
+    /// The rejection must happen BEFORE the deeper node is built, so an
+    /// over-deep declaration cannot make the parser allocate its way down.
+    #[test]
+    fn over_deep_rejection_does_not_consume_the_declared_body() {
+        // 200 levels: far past the limit. If the parser recursed first and
+        // checked later it would still have descended 200 frames.
+        assert_parse_error(parse_gguf(&nested_array_file(200)));
+    }
+
+    // ── child-process destruction tests ──────────────────────────────────
+    //
+    // A stack overflow ABORTS and is not catchable, so these cannot run in the
+    // harness process: a regression would take the whole suite down instead of
+    // failing one test. Each re-invokes this binary for the single test and
+    // asserts the child's exit status.
+
+    fn run_in_child(test_path: &str) -> std::process::Output {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_path, "--nocapture", "--test-threads=1"])
+            .env("S2B_CHILD", "1")
+            .output()
+            .expect("spawn child test process");
+        // libtest exits 0 when a filter matches NOTHING, so a stale test path
+        // would make every assertion on `status` vacuous. Require that the
+        // child actually ran exactly one test.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("1 passed") || stdout.contains("1 failed"),
+            "child did not run exactly one test for {test_path}; stdout={stdout}"
+        );
+        out
+    }
+
+    /// Normal destruction of a maximum-depth value.
+    #[test]
+    fn max_depth_value_drops_normally_in_child() {
+        if std::env::var_os("S2B_CHILD").is_some() {
+            let parsed = parse_gguf(&nested_array_file(MAX_METADATA_DEPTH)).unwrap();
+            drop(parsed); // must not overflow the stack
+            return;
+        }
+        let out = run_in_child("gguf::tests::max_depth_value_drops_normally_in_child");
+        assert!(
+            out.status.success(),
+            "child failed dropping a max-depth value: status={:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Destruction on the ERROR path: a file whose value is a maximum-depth
+    /// subtree followed by a truncated sibling. The partially built tree is
+    /// dropped while the error propagates.
+    #[test]
+    fn max_depth_subtree_drops_on_error_path_in_child() {
+        if std::env::var_os("S2B_CHILD").is_some() {
+            // Outer array of two elements; the first is a max-depth-1 subtree,
+            // the second is truncated, so the parse fails after building it.
+            let mut inner = array_body(0, 0, &[]);
+            for _ in 1..(MAX_METADATA_DEPTH - 1) {
+                inner = array_body(9, 1, &inner);
+            }
+            let mut body = 9u32.to_le_bytes().to_vec();
+            body.extend_from_slice(&2u64.to_le_bytes()); // count = 2
+            body.extend_from_slice(&inner); // element 1: deep, well formed
+            body.extend_from_slice(&9u32.to_le_bytes()); // element 2: truncated
+            let raw = one_value(9, &body);
+            assert_parse_error(parse_gguf(&raw)); // drop happens here
+            return;
+        }
+        let out = run_in_child("gguf::tests::max_depth_subtree_drops_on_error_path_in_child");
+        assert!(
+            out.status.success(),
+            "child failed dropping a max-depth subtree on the error path: \
+             status={:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn assert_parse_error<T: std::fmt::Debug>(result: Result<T>) {
