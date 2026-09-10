@@ -4,6 +4,24 @@ use std::path::PathBuf;
 /// Crate-local error type for `omni-store` operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    /// Native Windows (and any other non-Unix target) is fail-closed for store
+    /// publication: the confined-open, no-clobber link and directory-durability
+    /// guarantees have no validated equivalent there. Tracked in Omni #119.
+    #[error(
+        "store publication is not supported on this platform: native Windows is \
+         unsupported; run under WSL2 or another Unix target"
+    )]
+    UnsupportedPlatform,
+
+    #[error("invalid store key: {0}")]
+    InvalidKey(String),
+
+    #[error("publication requires canonical CIDv1/raw/BLAKE3-256: {0}")]
+    InvalidCid(String),
+
+    #[error("publication may exist for {cid}, but durability is unconfirmed: {detail}")]
+    DurabilityUnconfirmed { cid: String, detail: String },
+
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 

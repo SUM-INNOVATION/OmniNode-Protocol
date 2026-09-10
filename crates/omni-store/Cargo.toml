@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+tempfile = { workspace = true }
 omni-types = { workspace = true }
 omni-net   = { workspace = true }
 libp2p     = { workspace = true }
@@ -24,6 +25,10 @@ async-trait = { workspace = true }
 anyhow     = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+# S1's capture-seam tests need an executor and futures::io; `tempfile` is now a
+# regular dependency (publication staging) so it is not repeated here.
 tokio    = { workspace = true }
 futures  = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", features = ["fs"] }
