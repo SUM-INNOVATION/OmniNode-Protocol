@@ -11,6 +11,8 @@ use std::io;
 
 use async_trait::async_trait;
 use futures::prelude::*;
+
+use crate::framing::{read_length_prefixed, write_length_prefixed};
 use serde::{Deserialize, Serialize};
 
 /// Protocol identifier negotiated via ALPN during substream opening.
@@ -137,42 +139,6 @@ impl libp2p::request_response::Codec for ShardCodec {
 
 // ── Wire Helpers ──────────────────────────────────────────────────────────────
 
-/// Read a `[u32 BE length][payload]` frame.
-async fn read_length_prefixed<T>(io: &mut T, max_bytes: usize) -> io::Result<Vec<u8>>
-where
-    T: AsyncRead + Unpin + Send,
-{
-    let mut len_buf = [0u8; 4];
-    io.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("message too large: {len} bytes (max {max_bytes})"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    io.read_exact(&mut buf).await?;
-    Ok(buf)
-}
-
-/// Write a `[u32 BE length][payload]` frame.
-async fn write_length_prefixed<T>(io: &mut T, data: &[u8]) -> io::Result<()>
-where
-    T: AsyncWrite + Unpin + Send,
-{
-    let len = u32::try_from(data.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("payload exceeds u32::MAX: {} bytes", data.len()),
-        )
-    })?;
-    io.write_all(&len.to_be_bytes()).await?;
-    io.write_all(data).await?;
-    io.flush().await?;
-    Ok(())
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -280,5 +246,49 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("message too large"));
+    }
+}
+
+/// Proves this codec reads through the shared framing module rather than a
+/// private copy. The duplication is what let the eager-allocation defect exist
+/// twice; these tests fail if a local reader is reintroduced.
+#[cfg(test)]
+mod shared_framing_routing_tests {
+    use super::*;
+    use futures::io::Cursor;
+
+    fn header_only(len: u32) -> Vec<u8> {
+        len.to_be_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn oversized_prefix_is_refused_with_the_shared_reader_message() {
+        // The shared reader owns this exact wording. A private copy would have
+        // to reproduce it, and any drift shows up here.
+        let over = (MAX_MSG_BYTES as u64 + 1) as u32;
+        let mut io = Cursor::new(header_only(over));
+        let err = crate::framing::read_length_prefixed(&mut io, MAX_MSG_BYTES)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("message too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_declared_length_far_beyond_delivery_fails_on_data_not_memory() {
+        // The scratch is capped at READ_STEP and the destination follows
+        // delivered bytes, so neither approaches the declaration — observed
+        // through this codec's own ceiling rather than the shared module's
+        // test constant.
+        let declared = (MAX_MSG_BYTES / 2) as u32;
+        let mut body = declared.to_be_bytes().to_vec();
+        body.extend_from_slice(&[5u8; 64]);
+        let err = {
+            let _guard = crate::test_alloc::ArmGuard::new(1024 * 1024);
+            crate::framing::read_length_prefixed(&mut Cursor::new(body), MAX_MSG_BYTES)
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

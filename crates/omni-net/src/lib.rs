@@ -5,11 +5,14 @@ pub mod capability;  // deferred — WAN capability advertisement protocol
 pub mod codec;
 pub mod discovery;
 pub mod events;
+mod framing;
 pub mod gossip;
 pub mod identity;    // Stage 12.6 — persistent libp2p mesh identity
 pub mod nat;
 pub mod swarm;
 pub mod tensor_codec;
+#[cfg(test)]
+pub(crate) mod test_alloc;
 pub mod transport;   // deferred — TCP/Noise fallback transport
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
@@ -463,3 +466,7 @@ mod local_peer_id_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: test_alloc::Failing = test_alloc::Failing;
