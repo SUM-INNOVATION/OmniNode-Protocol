@@ -2681,10 +2681,13 @@ dependencies = [
 name = "omni-store"
 version = "0.1.1"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "bincode 2.0.1",
  "blake3",
  "ciborium",
  "cid",
+ "futures",
  "libp2p",
  "memmap2",
  "multihash",
@@ -2694,6 +2697,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
