@@ -7,11 +7,11 @@
 //!   - [`InMemoryRelay`] — vec-backed in-process queues for tests.
 //!     Fully synchronous; no tokio runtime required.
 //!
-//!   - [`OmniNetRelay`] — production adapter wrapping
-//!     `omni_net::OmniNet`. Uses Stage 12.2-pre's
-//!     `try_next_event` for non-blocking event drain and
-//!     `block_in_place + Handle::block_on` to bridge the
-//!     async `OmniNet::publish` from the sync watch loop.
+//!   - [`OmniNetRelay`] — production adapter over an
+//!     `omni_net::NetHandle`. Drains its own router subscription —
+//!     registered for the contributor gossip topics and nothing else —
+//!     and uses `block_in_place + Handle::block_on` to bridge the async
+//!     `NetHandle::publish` from the sync watch loop.
 //!
 //! Dedup-by-`posted_id` lives in the watch loop (mirrors 12.1's
 //! filesystem dedup); the relay returns whatever the transport has
@@ -327,39 +327,63 @@ mod omni_net_relay {
     use std::sync::{Arc, Mutex as StdMutex};
 
     use omni_net::{
-        OmniNet, OmniNetEvent, TOPIC_CONTRIBUTOR_JOB, TOPIC_CONTRIBUTOR_RESULT,
+        Interests, NetHandle, OmniNetEvent, Subscription, TOPIC_CONTRIBUTOR_JOB,
+        TOPIC_CONTRIBUTOR_RESULT,
         TOPIC_CONTRIBUTOR_SESSION_AGGREGATED, TOPIC_CONTRIBUTOR_SESSION_ASSIGN,
         TOPIC_CONTRIBUTOR_SESSION_ASSIGNMENT_SUPERSESSION,
         TOPIC_CONTRIBUTOR_SESSION_JOIN, TOPIC_CONTRIBUTOR_SESSION_OPEN,
         TOPIC_CONTRIBUTOR_SESSION_PARTIAL, TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT,
     };
     use tokio::runtime::Handle;
-    use tokio::sync::Mutex as AsyncMutex;
 
-    /// Production relay over `omni_net::OmniNet`. Holds an
-    /// `Arc<tokio::sync::Mutex<OmniNet>>` (so multiple consumers —
-    /// e.g. a watch loop's `NetworkSource` AND a result broadcaster
-    /// running off the same loop's events — can share the
-    /// underlying mesh connection, and `OmniNet::shutdown().await`
-    /// can be held across an await from the async CLI handlers) and
-    /// a `tokio::runtime::Handle` to bridge the async
-    /// `OmniNet::publish` from sync callers.
+    /// The gossip topics this relay carries. Registered as the
+    /// subscription's interest, so the router never hands this consumer an
+    /// event it would only discard — and, more to the point, never lets it
+    /// take one another consumer needed.
+    const RELAY_TOPICS: [&str; 8] = [
+        TOPIC_CONTRIBUTOR_JOB,
+        TOPIC_CONTRIBUTOR_RESULT,
+        TOPIC_CONTRIBUTOR_SESSION_OPEN,
+        TOPIC_CONTRIBUTOR_SESSION_JOIN,
+        TOPIC_CONTRIBUTOR_SESSION_ASSIGN,
+        TOPIC_CONTRIBUTOR_SESSION_PARTIAL,
+        TOPIC_CONTRIBUTOR_SESSION_AGGREGATED,
+        TOPIC_CONTRIBUTOR_SESSION_PEER_ADVERT,
+    ];
+
+    /// Production relay over an `omni_net::NetHandle`, plus a
+    /// `tokio::runtime::Handle` to bridge the async `publish` from sync
+    /// callers.
     ///
-    /// `OmniNetRelay` is `Clone`-able; clones share `pending_jobs` /
-    /// `pending_results` queues (via `Arc<std::sync::Mutex<_>>`) so
-    /// the caller can drain events through one clone while
-    /// publishing through another without dropping messages.
+    /// This used to hold `Arc<tokio::sync::Mutex<OmniNet>>` and drain the
+    /// node's single shared event receiver. That was the bug: the tensor
+    /// transport held the same `OmniNet` and drained the same receiver, so
+    /// whichever woke first consumed the other's events and dropped them —
+    /// this relay discarded every `TensorReceived`, and the transport
+    /// discarded every gossip message. Both now register their own interest
+    /// with the router and read a channel of their own.
     ///
-    /// Event-drain strategy: the OmniNet event stream is shared
-    /// across all gossipsub topics (and other event kinds like
-    /// PeerConnected etc.). On every `drain_events()` call we pull
-    /// from `try_next_event` and route to the per-topic pending
-    /// queue. `poll_jobs` and `poll_results` each drain first, so
-    /// callers don't lose results-topic messages when polling jobs.
+    /// `OmniNetRelay` is `Clone`-able; clones share the subscription and the
+    /// pending queues (via `Arc<_>`) so the caller can drain events through
+    /// one clone while publishing through another without dropping messages.
+    /// Sharing the *subscription* between clones is safe in a way sharing the
+    /// node's receiver was not: every clone drains into the same per-topic
+    /// queues, so nothing is discarded by whoever loses the race.
+    ///
+    /// Event-drain strategy: `drain_events()` pulls whatever the router has
+    /// delivered and routes each message to its per-topic pending queue.
+    /// `poll_jobs` and `poll_results` each drain first, so callers don't lose
+    /// results-topic messages when polling jobs.
     #[derive(Clone)]
     pub struct OmniNetRelay {
-        net: Arc<AsyncMutex<OmniNet>>,
+        net: NetHandle,
         handle: Handle,
+        /// This relay's own stream, carrying the contributor topics only.
+        ///
+        /// `None` when the router had already stopped at construction time —
+        /// the relay then publishes as usual and polls empty, rather than
+        /// failing a constructor that 19 call sites treat as infallible.
+        events: Arc<StdMutex<Option<Subscription>>>,
         pending_jobs: Arc<StdMutex<VecDeque<NetworkPostedJobAnnouncement>>>,
         pending_results: Arc<StdMutex<VecDeque<NetworkPostedResultAnnouncement>>>,
         // Stage 12.3 session-topic queues.
@@ -387,15 +411,17 @@ mod omni_net_relay {
     }
 
     impl OmniNetRelay {
-        /// Construct from a shared `OmniNet` handle + the current
-        /// tokio runtime handle. The caller (`omni-node` CLI) wraps
-        /// its `OmniNet::new` instance in
-        /// `Arc<tokio::sync::Mutex<_>>` from its async main and
-        /// passes a clone here.
-        pub fn new(net: Arc<AsyncMutex<OmniNet>>, handle: Handle) -> Self {
+        /// Construct from a cloneable `NetHandle` + the current tokio
+        /// runtime handle, registering this relay's own interest in the
+        /// contributor gossip topics.
+        pub fn new(net: NetHandle, handle: Handle) -> Self {
+            let events = net
+                .subscribe(Interests::none().with_topics(RELAY_TOPICS))
+                .ok();
             Self {
                 net,
                 handle,
+                events: Arc::new(StdMutex::new(events)),
                 pending_jobs: Arc::new(StdMutex::new(VecDeque::new())),
                 pending_results: Arc::new(StdMutex::new(VecDeque::new())),
                 pending_sessions_opened: Arc::new(StdMutex::new(VecDeque::new())),
@@ -415,12 +441,13 @@ mod omni_net_relay {
         /// also silently dropped — the higher-level watch loop's
         /// announcer-signature check is the load-bearing filter.
         fn drain_events(&self) {
-            // Acquire the OmniNet lock via block_in_place + block_on
-            // so the sync watch loop can call us without blocking
-            // the runtime.
-            let mut net = tokio::task::block_in_place(|| {
-                self.handle.block_on(self.net.lock())
-            });
+            // No lock on the node, and no runtime bridging: this is our own
+            // channel, and reading it is a plain non-blocking `try_recv`.
+            let mut events = self.events.lock().expect("relay subscription poisoned");
+            let Some(events) = events.as_mut() else {
+                // The router was already gone when this relay was built.
+                return;
+            };
             let mut jobs = self.pending_jobs.lock().expect("pending_jobs poisoned");
             let mut results = self.pending_results.lock().expect("pending_results poisoned");
             let mut s_open = self
@@ -451,7 +478,7 @@ mod omni_net_relay {
                 .pending_assignment_supersessions
                 .lock()
                 .expect("pending_assignment_supersessions poisoned");
-            while let Some(ev) = net.try_next_event() {
+            while let Some(ev) = events.try_recv() {
                 if let OmniNetEvent::MessageReceived { topic, data, .. } = ev {
                     match topic.as_str() {
                         TOPIC_CONTRIBUTOR_JOB => {
@@ -540,14 +567,10 @@ mod omni_net_relay {
             topic: &'static str,
             bytes: Vec<u8>,
         ) -> Result<(), RelayError> {
-            // OmniNet::publish takes `&self`; acquire the async lock
-            // and call publish inside a single block_on so we don't
-            // hold the std-side guards across awaits.
+            // `NetHandle::publish` takes `&self` and needs no lock: the
+            // command sender is `Clone`, so nothing is shared by exclusion.
             let result = tokio::task::block_in_place(|| {
-                self.handle.block_on(async {
-                    let g = self.net.lock().await;
-                    g.publish(topic, bytes).await
-                })
+                self.handle.block_on(self.net.publish(topic, bytes))
             });
             result.map_err(|e| RelayError::Publish(e.to_string()))?;
             Ok(())

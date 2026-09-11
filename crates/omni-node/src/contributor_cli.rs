@@ -2668,14 +2668,24 @@ fn build_snip_adapter(
 /// After the first peer event the function also waits a brief
 /// `mesh_stabilize_ms` so gossipsub has a chance to form a topic
 /// mesh before the caller publishes.
+///
+/// This used to await the node's single shared event stream, which meant it
+/// consumed — and discarded — every gossip message, shard request and tensor
+/// handoff that arrived inside its window, on behalf of consumers that were
+/// built moments later and never saw them. It now takes a subscription to
+/// control events only, so the traffic it is not waiting for is delivered to
+/// whoever actually asked for it.
 async fn wait_for_first_peer(
-    net: &mut omni_net::OmniNet,
+    net: &omni_net::OmniNet,
     timeout_secs: u64,
     mesh_stabilize_ms: u64,
 ) -> Result<()> {
-    use omni_net::OmniNetEvent;
+    use omni_net::{Interests, OmniNetEvent};
+    let mut peers = net
+        .subscribe(Interests::none().control())
+        .map_err(|e| anyhow!("cannot watch for peers: {e}"))?;
     let wait_fut = async {
-        while let Some(event) = net.next_event().await {
+        while let Some(event) = peers.recv().await {
             if matches!(
                 event,
                 OmniNetEvent::PeerDiscovered { .. } | OmniNetEvent::PeerConnected { .. }
@@ -3850,16 +3860,19 @@ async fn run_announce_job(args: AnnounceJobArgs) -> Result<()> {
         identity,
         ..NetConfig::default()
     };
-    let mut net = OmniNet::new(net_config)
+    let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
     // Bounded peer-wait BEFORE publish so the announcement isn't a
     // silent drop on an empty mesh. Mirrors `omni-node send`'s
     // PeerDiscovered-wait pattern at main.rs:309.
     if args.peer_wait_secs > 0 {
-        wait_for_first_peer(&mut net, args.peer_wait_secs, args.mesh_stabilize_ms).await?;
+        wait_for_first_peer(&net, args.peer_wait_secs, args.mesh_stabilize_ms).await?;
     }
-    let net = std::sync::Arc::new(tokio::sync::Mutex::new(net));
+    // One cheap, cloneable handle from here on. Each consumer built below
+    // registers its own router subscription instead of taking turns draining
+    // the node's single event receiver.
+    let net = net.handle();
     let handle = tokio::runtime::Handle::current();
     let mut relay = OmniNetRelay::new(net.clone(), handle);
     relay
@@ -3869,8 +3882,7 @@ async fn run_announce_job(args: AnnounceJobArgs) -> Result<()> {
     // Brief propagation wait.
     tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     {
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
 
     println!("posted_id={}", ann.posted_id);
@@ -3948,7 +3960,10 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
     let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
-    let net = std::sync::Arc::new(tokio::sync::Mutex::new(net));
+    // One cheap, cloneable handle from here on. Each consumer built below
+    // registers its own router subscription instead of taking turns draining
+    // the node's single event receiver.
+    let net = net.handle();
     let handle = tokio::runtime::Handle::current();
 
     // Build a result broadcaster that piggybacks on the same
@@ -4115,16 +4130,19 @@ async fn run_announce_result(args: AnnounceResultArgs) -> Result<()> {
         identity,
         ..NetConfig::default()
     };
-    let mut net = OmniNet::new(net_config)
+    let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
     // Same bounded peer-wait as announce-job: without it, a
     // freshly-opened OmniNet has zero peers and `publish` silently
     // drops the announcement.
     if args.peer_wait_secs > 0 {
-        wait_for_first_peer(&mut net, args.peer_wait_secs, args.mesh_stabilize_ms).await?;
+        wait_for_first_peer(&net, args.peer_wait_secs, args.mesh_stabilize_ms).await?;
     }
-    let net = std::sync::Arc::new(tokio::sync::Mutex::new(net));
+    // One cheap, cloneable handle from here on. Each consumer built below
+    // registers its own router subscription instead of taking turns draining
+    // the node's single event receiver.
+    let net = net.handle();
     let handle = tokio::runtime::Handle::current();
     let mut relay = OmniNetRelay::new(net.clone(), handle);
     relay
@@ -4132,8 +4150,7 @@ async fn run_announce_result(args: AnnounceResultArgs) -> Result<()> {
         .map_err(|e| anyhow!("publish: {e}"))?;
     tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     {
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
 
     println!("posted_id={}", ann.posted_id);
@@ -4163,7 +4180,10 @@ async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> 
     let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
-    let net = std::sync::Arc::new(tokio::sync::Mutex::new(net));
+    // One cheap, cloneable handle from here on. Each consumer built below
+    // registers its own router subscription instead of taking turns draining
+    // the node's single event receiver.
+    let net = net.handle();
     let handle = tokio::runtime::Handle::current();
     std::fs::create_dir_all(&args.result_out_dir)?;
 
@@ -4373,7 +4393,7 @@ async fn open_omninet_with_peer_wait(
     peer_wait_secs: u64,
     mesh_stabilize_ms: u64,
     net_identity_file: Option<&std::path::Path>,
-) -> Result<(std::sync::Arc<tokio::sync::Mutex<omni_net::OmniNet>>, tokio::runtime::Handle)>
+) -> Result<(omni_net::NetHandle, tokio::runtime::Handle)>
 {
     use omni_net::OmniNet;
     use omni_types::config::NetConfig;
@@ -4384,13 +4404,16 @@ async fn open_omninet_with_peer_wait(
         identity,
         ..NetConfig::default()
     };
-    let mut net = OmniNet::new(net_config)
+    let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
     if peer_wait_secs > 0 {
-        wait_for_first_peer(&mut net, peer_wait_secs, mesh_stabilize_ms).await?;
+        wait_for_first_peer(&net, peer_wait_secs, mesh_stabilize_ms).await?;
     }
-    let net = std::sync::Arc::new(tokio::sync::Mutex::new(net));
+    // One cheap, cloneable handle from here on. Each consumer built below
+    // registers its own router subscription instead of taking turns draining
+    // the node's single event receiver.
+    let net = net.handle();
     let handle = tokio::runtime::Handle::current();
     Ok((net, handle))
 }
@@ -4478,8 +4501,7 @@ async fn run_open_session(args: OpenSessionArgs) -> Result<()> {
         .map_err(|e| anyhow!("publish: {e}"))?;
     tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     {
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
 
     println!("session_id={}", session.session_id);
@@ -4579,8 +4601,7 @@ async fn run_join_session(args: JoinSessionArgs) -> Result<()> {
         .map_err(|e| anyhow!("publish: {e}"))?;
     tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     {
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
 
     println!("session_id={}", session.session_id);
@@ -4726,8 +4747,7 @@ async fn run_assign_work(args: AssignWorkArgs) -> Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     {
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
     println!("assigned=true");
     Ok(())
@@ -5361,8 +5381,7 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
     // Settle + shutdown.
     if let Some((net, _handle)) = net_and_handle {
         tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
 
     println!("assignment_id={}", assignment.assignment_id);
@@ -5515,8 +5534,7 @@ async fn run_send_handoff(args: SendHandoffArgs) -> Result<()> {
     }
     tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     {
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
     println!("tensor_hash={tensor_hash}");
     println!("byte_len={byte_len}");
@@ -5788,8 +5806,7 @@ async fn run_aggregate_session(args: AggregateSessionArgs) -> Result<()> {
         .map_err(|e| anyhow!("publish: {e}"))?;
     tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     {
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
 
     println!("session_id={}", session.session_id);
@@ -6792,8 +6809,7 @@ async fn run_advertise_peer(args: AdvertisePeerArgs) -> Result<()> {
     )
     .await?;
     let libp2p_peer_id_b58 = {
-        let g = net.lock().await;
-        g.local_peer_id().to_base58()
+        net.local_peer_id().to_base58()
     };
 
     // Build + sign the advertisement. Capture `now` once so the
@@ -6862,8 +6878,7 @@ async fn run_advertise_peer(args: AdvertisePeerArgs) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     }
     {
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
 
     println!("advertisement_id={}", advert.advertisement_id);
@@ -7462,8 +7477,7 @@ async fn run_assign_session_plan(args: AssignSessionPlanArgs) -> Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms)).await;
     {
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
     println!(
         "event=plan_assigned session_id={} assignments_published={}",
@@ -11027,7 +11041,7 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
     // `should_publish_announcements` predicate.
     let should_publish_announcements = !args.no_publish_announcements;
     let mut mesh: Option<(
-        std::sync::Arc<tokio::sync::Mutex<omni_net::OmniNet>>,
+        omni_net::NetHandle,
         OmniNetRelay,
     )> = if should_publish_announcements {
         let (net, handle) = open_omninet_with_peer_wait(
@@ -11092,8 +11106,7 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
     if let Some((net, _relay)) = mesh {
         tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms))
             .await;
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
     println!(
         "event=repair_applied session_id={} assignments_reannounced={}",
@@ -11553,7 +11566,7 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
     // ── 8. Real publish path. ────────────────────────────────
     let should_publish_announcements = !args.no_publish_announcements;
     let mut mesh: Option<(
-        std::sync::Arc<tokio::sync::Mutex<omni_net::OmniNet>>,
+        omni_net::NetHandle,
         OmniNetRelay,
     )> = if should_publish_announcements {
         let (net, handle) = open_omninet_with_peer_wait(
@@ -11780,8 +11793,7 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
     if let Some((net, _relay)) = mesh {
         tokio::time::sleep(std::time::Duration::from_millis(args.propagation_wait_ms))
             .await;
-        let g = net.lock().await;
-        let _ = g.shutdown().await;
+        let _ = net.shutdown().await;
     }
     println!(
         "event=reassign_applied session_id={} replacements_published={} \

@@ -126,15 +126,23 @@ mod omni_net_tensor_transport {
     use std::sync::{Arc, Mutex as StdMutex};
 
     use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
-    use omni_net::{OmniNet, OmniNetEvent, TensorRequest, TensorResponse};
+    use omni_net::{
+        Interests, NetHandle, OmniNetEvent, Subscription, TensorRequest, TensorResponse,
+    };
     use tokio::runtime::Handle;
-    use tokio::sync::Mutex as AsyncMutex;
 
-    /// Production tensor transport over `omni_net::OmniNet`'s
-    /// request/response tensor codec. Holds an
-    /// `Arc<tokio::sync::Mutex<OmniNet>>` so it can share the mesh
-    /// connection with the Stage 12.2 `OmniNetRelay` that the watch
-    /// loop already opens.
+    /// Production tensor transport over `omni_net`'s request/response tensor
+    /// codec. Holds a cloneable `NetHandle` so it can share the mesh
+    /// connection with the Stage 12.2 `OmniNetRelay` that the watch loop
+    /// already opens.
+    ///
+    /// It used to share that connection by holding
+    /// `Arc<tokio::sync::Mutex<OmniNet>>` and draining the node's single
+    /// event receiver — which meant this transport consumed the relay's
+    /// gossip messages and threw them away, and the relay did the same to the
+    /// `TensorReceived` events meant for here. Each now registers its own
+    /// interest with the router: this one asks for tensor traffic and sees
+    /// nothing else.
     ///
     /// Outer `TensorRequest` fields are populated from the inner
     /// `ActivationHandoff` at send time but are NOT trusted at
@@ -144,16 +152,23 @@ mod omni_net_tensor_transport {
     /// routing; documented as Stage 12.4 transport overlay.
     #[derive(Clone)]
     pub struct OmniNetTensorTransport {
-        net: Arc<AsyncMutex<OmniNet>>,
+        net: NetHandle,
         handle: Handle,
+        /// This transport's own stream, carrying inbound tensor traffic only.
+        ///
+        /// `None` when the router had already stopped at construction time;
+        /// sends still work and `poll_handoffs` simply returns empty.
+        events: Arc<StdMutex<Option<Subscription>>>,
         pending: Arc<StdMutex<VecDeque<ActivationHandoff>>>,
     }
 
     impl OmniNetTensorTransport {
-        pub fn new(net: Arc<AsyncMutex<OmniNet>>, handle: Handle) -> Self {
+        pub fn new(net: NetHandle, handle: Handle) -> Self {
+            let events = net.subscribe(Interests::none().tensor()).ok();
             Self {
                 net,
                 handle,
+                events: Arc::new(StdMutex::new(events)),
                 pending: Arc::new(StdMutex::new(VecDeque::new())),
             }
         }
@@ -180,9 +195,14 @@ mod omni_net_tensor_transport {
         }
 
         fn drain_events(&self) {
-            let mut net = tokio::task::block_in_place(|| {
-                self.handle.block_on(self.net.lock())
-            });
+            let mut events = self
+                .events
+                .lock()
+                .expect("tensor subscription poisoned");
+            let Some(events) = events.as_mut() else {
+                // The router was already gone when this transport was built.
+                return;
+            };
             let mut pending = self.pending.lock().expect("pending poisoned");
             // ACK semantics on `/omni/tensor-xfer/1`:
             //   - `accepted: true`  → we decoded a Stage 12.4
@@ -199,7 +219,7 @@ mod omni_net_tensor_transport {
             // mismatch, etc.) are per-envelope outcomes the caller
             // consumes via `poll_handoffs`; they do NOT generate
             // negative ACKs here.
-            while let Some(ev) = net.try_next_event() {
+            while let Some(ev) = events.try_recv() {
                 if let OmniNetEvent::TensorReceived {
                     request,
                     channel_id,
@@ -231,7 +251,7 @@ mod omni_net_tensor_transport {
                     };
                     let _ = tokio::task::block_in_place(|| {
                         self.handle
-                            .block_on(net.respond_tensor(channel_id, resp))
+                            .block_on(self.net.respond_tensor(channel_id, resp))
                     });
                 }
             }
@@ -286,10 +306,7 @@ mod omni_net_tensor_transport {
                 data,
             };
             let result = tokio::task::block_in_place(|| {
-                self.handle.block_on(async {
-                    let g = self.net.lock().await;
-                    g.request_tensor(peer_id, req).await
-                })
+                self.handle.block_on(self.net.request_tensor(peer_id, req))
             });
             result.map_err(|e| TensorTransportError::Send(e.to_string()))?;
             Ok(())
