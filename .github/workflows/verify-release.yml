@@ -55,7 +55,9 @@ jobs:
           - { arch: x86_64,  runner: ubuntu-latest,    triple: x86_64-unknown-linux-gnu  }
           - { arch: aarch64, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
     env:
-      GH_TOKEN: ${{ github.token }}
+      # GH_TOKEN is deliberately NOT job-wide: it is set only on the
+      # steps that call the GitHub API, so the release binaries under
+      # test (§6.3-§6.7) never see any token in their environment.
       # Release source is pinned to the canonical repo (not github.repository)
       # so a fork run can never verify a look-alike bundle.
       REPO: SUM-INNOVATION/OmniNode-Protocol
@@ -106,6 +108,8 @@ jobs:
       # read-only GITHUB_TOKEN. Raw responses are printed verbatim.
       - name: §7 before — resolve draft release with read-only token
         id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Errors are captured and printed, not fatal, until the
           # visibility decision below.
@@ -128,6 +132,7 @@ jobs:
           gh api graphql \
             -f owner="${REPO%/*}" -f name="${REPO#*/}" -f tag="$TAG" \
             -f query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){databaseId isDraft tagName name url}}}' 2>&1
+          echo
           echo "::endgroup::"
 
           echo "::group::gh release view (runbook §7 command)"
@@ -165,6 +170,8 @@ jobs:
           echo "§7 before: isDraft=true, tagName=$TAG — OK"
 
       - name: §4 download every asset + assert the 11 expected files
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p "$WORKDIR/dl"; cd "$WORKDIR/dl"
@@ -200,6 +207,8 @@ jobs:
 
       - name: §5 cosign verify-blob (production identity regex) + Fulcio SAN
         working-directory: ${{ runner.temp }}/release-verify/dl
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cosign version
@@ -323,6 +332,8 @@ jobs:
 
       - name: §7 after — draft status unchanged
         if: always() && steps.probe.outputs.visible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo "$REPO" --json isDraft,name,tagName,url | tee "$WORKDIR/view-after.json"
