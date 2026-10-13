@@ -1,0 +1,349 @@
+# OmniNode Protocol — read-only, per-architecture verification of a
+# signed release bundle on native GitHub-hosted Linux runners (#73).
+#
+# Executes the #73 runbook's §4 (download + 11-file assert), §5
+# (cosign verify-blob against the production cert identity regex +
+# Fulcio SAN extraction), §6 (sha256sum -c, file -b, native-arch
+# --version / --help and the 6.5 / 6.6 snapshot diffs) and §7 (draft
+# status) on an x86_64 runner and on an aarch64 runner.
+#
+# This workflow NEVER promotes, edits, uploads to or publishes a
+# release. Its GITHUB_TOKEN is read-only (`contents: read`); it uses
+# no secrets and no personal token, so a write is technically
+# impossible. §7 draft status is captured before and after the
+# verification steps and the run fails if anything changed.
+#
+# Draft releases may be invisible to a read-only token. The first API
+# step records the raw responses and stops the job if the draft
+# cannot be resolved; it does not fall back to anything else.
+
+name: Verify release (hosted, read-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify (read-only; nothing is promoted or modified)."
+        required: true
+        default: "v0.1.1"
+        type: string
+  push:
+    branches: [ "ci/73-hosted-release-verification" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    name: Verify ${{ inputs.tag || 'v0.1.1' }} on ${{ matrix.host.arch }} (${{ matrix.host.runner }})
+    runs-on: ${{ matrix.host.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        host:
+          - { arch: x86_64,  runner: ubuntu-latest,    triple: x86_64-unknown-linux-gnu  }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Release source is pinned to the canonical repo (not github.repository)
+      # so a fork run can never verify a look-alike bundle.
+      REPO: SUM-INNOVATION/OmniNode-Protocol
+      TAG: ${{ inputs.tag || 'v0.1.1' }}
+      HOST_ARCH: ${{ matrix.host.arch }}
+      HOST_TRIPLE: ${{ matrix.host.triple }}
+      # Snapshots are captured by release.yml on the x86_64 build only.
+      SNAPSHOT_TRIPLE: x86_64-unknown-linux-gnu
+      OIDC_ISSUER: https://token.actions.githubusercontent.com
+      # §5 regex, byte-for-byte from the #73 runbook and
+      # docs/stage15.2-release-artifact-workflow.md §4.
+      RUNBOOK_REGEX: 'https://github\.com/SUM-INNOVATION/OmniNode-Protocol/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'
+      # PROD_REGEX, byte-for-byte from release.yml `Verify cosign signature`.
+      RELEASE_YML_REGEX: 'https://github\.com/SUM-INNOVATION/OmniNode-Protocol/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9\.-]+)?$'
+    steps:
+      - name: Host facts + tool check
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::tag '$TAG' is not v<semver>"
+            exit 1
+          fi
+          echo "WORKDIR=$RUNNER_TEMP/release-verify" >> "$GITHUB_ENV"
+          echo "uname -m: $(uname -m)"
+          echo "uname -sr: $(uname -sr)"
+          grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release
+          echo "RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-unset} RUNNER_NAME=${RUNNER_NAME:-unset}"
+          echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
+          echo "nproc: $(nproc)"; df -h "$RUNNER_TEMP" | tail -1
+          if [[ "$(uname -m)" != "$HOST_ARCH" ]]; then
+            echo "::error::runner arch $(uname -m) != expected $HOST_ARCH"
+            exit 1
+          fi
+          missing=()
+          for t in file jq openssl perl sha256sum; do command -v "$t" >/dev/null || missing+=("$t"); done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "installing missing tools: ${missing[*]}"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq file jq openssl perl coreutils
+          fi
+          gh --version | head -1
+          sha256sum --version | head -1
+          file --version | head -1
+          openssl version
+          jq --version
+
+      # §7 (before) — also the empirical draft-visibility probe for a
+      # read-only GITHUB_TOKEN. Raw responses are printed verbatim.
+      - name: §7 before — resolve draft release with read-only token
+        id: probe
+        run: |
+          # Errors are captured and printed, not fatal, until the
+          # visibility decision below.
+          set +e -uo pipefail
+          mkdir -p "$WORKDIR"
+          echo "::group::GET /repos/$REPO/releases/tags/$TAG (published-only endpoint)"
+          gh api -i "repos/$REPO/releases/tags/$TAG" 2>&1 | grep -viE '^(set-cookie|x-github-request-id):' | head -40
+          echo "::endgroup::"
+
+          echo "::group::GET /repos/$REPO/releases?per_page=100 (drafts listed only with push access)"
+          gh api -i "repos/$REPO/releases?per_page=100" > "$WORKDIR/list.raw" 2>&1
+          echo "exit=$?"
+          sed -n '1,/^\r\{0,1\}$/p' "$WORKDIR/list.raw" | grep -viE '^(set-cookie|x-github-request-id):'
+          gh api "repos/$REPO/releases?per_page=100" \
+            --jq '[.[] | {id, tag_name, name, draft, prerelease}]' 2>&1
+          echo "::endgroup::"
+
+          echo "::group::GraphQL repository.release(tagName)"
+          # shellcheck disable=SC2016 # GraphQL variables, not shell
+          gh api graphql \
+            -f owner="${REPO%/*}" -f name="${REPO#*/}" -f tag="$TAG" \
+            -f query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){databaseId isDraft tagName name url}}}' 2>&1
+          echo "::endgroup::"
+
+          echo "::group::gh release view (runbook §7 command)"
+          gh release view "$TAG" --repo "$REPO" --json isDraft,name,tagName,url > "$WORKDIR/view-before.json" 2> "$WORKDIR/view-before.err"
+          rc=$?
+          echo "exit=$rc"
+          cat "$WORKDIR/view-before.json" "$WORKDIR/view-before.err"
+          echo "::endgroup::"
+
+          IDS=$(gh api "repos/$REPO/releases?per_page=100" \
+                  --jq "[.[] | select(.tag_name == \"$TAG\") | .id] | join(\" \")" 2>/dev/null)
+          read -r -a IDA <<<"$IDS"
+          if [[ $rc -ne 0 || ${#IDA[@]} -eq 0 ]]; then
+            echo "::error::Draft release '$TAG' is NOT visible to this read-only GITHUB_TOKEN (gh release view exit=$rc, matching list ids='${IDS}'). STOP: permissions are not raised, no secret or personal token is used."
+            echo "visible=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [[ ${#IDA[@]} -ne 1 ]]; then
+            echo "::error::expected exactly one release for '$TAG', found: $IDS"
+            echo "visible=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          ID="${IDA[0]}"
+          set -e
+          echo "visible=true" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_ID=$ID" >> "$GITHUB_ENV"
+
+          jq -e --arg t "$TAG" '.isDraft == true and .tagName == $t and .name == $t' "$WORKDIR/view-before.json" >/dev/null \
+            || { echo "::error::§7 expected isDraft=true, tagName=name=$TAG"; exit 1; }
+          # Full release state minus download counters (which our own
+          # download increments); compared again after verification.
+          gh api "repos/$REPO/releases/$ID" --jq '{id, tag_name, name, draft, prerelease, created_at, published_at, updated_at, target_commitish, html_url, body, assets: [.assets[] | {id, name, size, digest, state, updated_at}] | sort_by(.name)}' > "$WORKDIR/state-before.json"
+          echo "release id: $ID"
+          cat "$WORKDIR/state-before.json"
+          echo "§7 before: isDraft=true, tagName=$TAG — OK"
+
+      - name: §4 download every asset + assert the 11 expected files
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORKDIR/dl"; cd "$WORKDIR/dl"
+          gh release download "$TAG" --repo "$REPO" --pattern '*'
+          ls -la
+          EXPECTED=(
+            "omni-node-$TAG-x86_64-unknown-linux-gnu-default"
+            "omni-node-$TAG-x86_64-unknown-linux-gnu-submit"
+            "omni-node-$TAG-aarch64-unknown-linux-gnu-default"
+            "omni-node-$TAG-aarch64-unknown-linux-gnu-submit"
+            "omni-node-default-version.txt"
+            "omni-node-submit-version.txt"
+            "omni-node-default-help.txt"
+            "omni-node-submit-help.txt"
+            "SHA256SUMS"
+            "SHA256SUMS.sig"
+            "SHA256SUMS.cert"
+          )
+          MISSING=()
+          for f in "${EXPECTED[@]}"; do [[ -f "$f" ]] || MISSING+=("$f"); done
+          if [[ ${#MISSING[@]} -gt 0 ]]; then echo "::error::MISSING: ${MISSING[*]}"; exit 1; fi
+          n=$(find . -maxdepth 1 -type f | wc -l)
+          if [[ "$n" -ne 11 ]]; then echo "::error::expected exactly 11 files, found $n"; exit 1; fi
+          echo "All 11 expected files present (and no others)."
+          # Extra: GitHub's server-side asset digests vs local bytes.
+          gh api "repos/$REPO/releases/$RELEASE_ID" --jq '.assets[] | "\(.digest | sub("^sha256:"; ""))  \(.name)"' > "$WORKDIR/api-digests"
+          sha256sum -c "$WORKDIR/api-digests"
+
+      - name: §5 cosign install (job-local, pinned)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v2.6.5"
+
+      - name: §5 cosign verify-blob (production identity regex) + Fulcio SAN
+        working-directory: ${{ runner.temp }}/release-verify/dl
+        run: |
+          set -euo pipefail
+          cosign version
+          echo "--- runbook §5 regex ---"
+          printf '%s\n' "$RUNBOOK_REGEX"
+          cosign verify-blob \
+            --certificate         SHA256SUMS.cert \
+            --signature           SHA256SUMS.sig \
+            --certificate-identity-regexp "$RUNBOOK_REGEX" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            SHA256SUMS
+          echo "--- release.yml PROD_REGEX ---"
+          printf '%s\n' "$RELEASE_YML_REGEX"
+          cosign verify-blob \
+            --certificate         SHA256SUMS.cert \
+            --signature           SHA256SUMS.sig \
+            --certificate-identity-regexp "$RELEASE_YML_REGEX" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            SHA256SUMS
+          echo "--- extra: bind cert to the commit the tag points at ---"
+          REF=$(gh api "repos/$REPO/git/ref/tags/$TAG")
+          OBJ_TYPE=$(jq -r .object.type <<<"$REF"); OBJ_SHA=$(jq -r .object.sha <<<"$REF")
+          if [[ "$OBJ_TYPE" == "tag" ]]; then
+            COMMIT=$(gh api "repos/$REPO/git/tags/$OBJ_SHA" --jq .object.sha)
+          else
+            COMMIT="$OBJ_SHA"
+          fi
+          echo "tag object: $OBJ_TYPE $OBJ_SHA -> commit $COMMIT"
+          cosign verify-blob \
+            --certificate         SHA256SUMS.cert \
+            --signature           SHA256SUMS.sig \
+            --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$TAG" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            --certificate-github-workflow-repository "$REPO" \
+            --certificate-github-workflow-ref "refs/tags/$TAG" \
+            --certificate-github-workflow-trigger push \
+            --certificate-github-workflow-sha "$COMMIT" \
+            SHA256SUMS
+          echo "--- runbook §5 SAN extraction ---"
+          base64 -d < SHA256SUMS.cert > cert.pem
+          openssl x509 -in cert.pem -noout -ext subjectAltName | tee san.txt
+          openssl x509 -in cert.pem -noout -subject -issuer -startdate -enddate -serial
+          openssl x509 -in cert.pem -noout -text | sed -n '/X509v3 extensions/,/Signature Algorithm/p'
+          WANT="URI:https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$TAG"
+          if ! grep -qxF "    $WANT" san.txt && ! grep -qxF "$WANT" san.txt; then
+            echo "::error::SAN does not equal $WANT"; exit 1
+          fi
+          echo "SAN OK: $WANT"
+
+      - name: §6.1 sha256sum -c SHA256SUMS
+        working-directory: ${{ runner.temp }}/release-verify/dl
+        run: |
+          set -euo pipefail
+          cat SHA256SUMS
+          echo "---"
+          sha256sum -c SHA256SUMS | tee "$WORKDIR/sha256-c.txt"
+          total=$(wc -l < SHA256SUMS)
+          ok=$(grep -c ': OK$' "$WORKDIR/sha256-c.txt" || true)
+          echo "sha256sum -c: $ok of $total OK"
+          if [[ "$ok" -ne "$total" || "$total" -ne 8 ]]; then
+            echo "::error::expected 8 of 8 OK, got $ok of $total"; exit 1
+          fi
+
+      - name: §6.2 file -b on all 4 binaries
+        working-directory: ${{ runner.temp }}/release-verify/dl
+        run: |
+          set -euo pipefail
+          rc=0
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            case "$t" in x86_64*) re="x86-64" ;; aarch64*) re="ARM aarch64" ;; esac
+            for v in default submit; do
+              b="omni-node-$TAG-$t-$v"
+              out=$(file -b "$b")
+              echo "$b: $out"
+              if ! grep -qE "^ELF 64-bit LSB .*$re, .*GNU/Linux" <<<"$out"; then
+                echo "::error::wrong ELF arch for $b (want '$re')"; rc=1
+              fi
+            done
+          done
+          exit $rc
+
+      - name: §6.3/§6.4 native ${{ matrix.host.arch }} --version + §6.5/§6.6 snapshot diffs
+        working-directory: ${{ runner.temp }}/release-verify/dl
+        run: |
+          set -euo pipefail
+          WANT="omni-node ${TAG#v}"
+          for v in default submit; do
+            b="omni-node-$TAG-$HOST_TRIPLE-$v"
+            chmod +x "$b"
+            got=$("./$b" --version)
+            echo "$b --version: $got"
+            [[ "$got" == "$WANT" ]] || { echo "::error::$b printed '$got', want '$WANT'"; exit 1; }
+            echo "diff <(./$b --version) omni-node-$v-version.txt"
+            diff <("./$b" --version) "omni-node-$v-version.txt"
+            echo "  -> empty"
+          done
+
+      - name: §6.7 native ${{ matrix.host.arch }} --help + snapshot diffs
+        working-directory: ${{ runner.temp }}/release-verify/dl
+        run: |
+          set -euo pipefail
+          for v in default submit; do
+            b="omni-node-$TAG-$HOST_TRIPLE-$v"
+            snap="omni-node-$v-help.txt"
+            capname="omni-node-$TAG-$SNAPSHOT_TRIPLE-$v"
+            echo "===== ./$b --help | head -40"
+            "./$b" --help | head -40
+            echo "===== raw: diff <(./$b --help) $snap  (informational)"
+            # clap's Usage line embeds argv[0]'s basename; the snapshot was
+            # captured from the x86_64 binary, so on aarch64 exactly that
+            # token differs. Shown verbatim; asserted by the two checks below.
+            diff <("./$b" --help) "$snap" || true
+            echo "===== check 1: live --help vs snapshot with argv0 basename '$capname' -> '$b'"
+            OLD="$capname" NEW="$b" perl -pe 's/\Q$ENV{OLD}\E/$ENV{NEW}/g' "$snap" > "$WORKDIR/expected-$v-help.txt"
+            diff <("./$b" --help) "$WORKDIR/expected-$v-help.txt"
+            echo "  -> empty"
+            echo "===== check 2: live --help with argv0='$capname' vs unmodified snapshot"
+            diff <(exec -a "$capname" "./$b" --help) "$snap"
+            echo "  -> empty"
+          done
+
+      - name: §7 after — draft status unchanged
+        if: always() && steps.probe.outputs.visible == 'true'
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$REPO" --json isDraft,name,tagName,url | tee "$WORKDIR/view-after.json"
+          gh api "repos/$REPO/releases/$RELEASE_ID" --jq '{id, tag_name, name, draft, prerelease, created_at, published_at, updated_at, target_commitish, html_url, body, assets: [.assets[] | {id, name, size, digest, state, updated_at}] | sort_by(.name)}' > "$WORKDIR/state-after.json"
+          jq -e --arg t "$TAG" '.isDraft == true and .tagName == $t' "$WORKDIR/view-after.json" >/dev/null \
+            || { echo "::error::isDraft is no longer true"; exit 1; }
+          diff "$WORKDIR/view-before.json" "$WORKDIR/view-after.json"
+          diff "$WORKDIR/state-before.json" "$WORKDIR/state-after.json"
+          echo "§7 after: isDraft=true; release metadata and all asset digests identical before/after."
+
+      - name: Evidence summary
+        if: always()
+        run: |
+          {
+            echo "### $HOST_ARCH ($(uname -m), ${ImageOS:-?} ${ImageVersion:-?}, ${RUNNER_NAME:-?})"
+            echo '```'
+            echo "tag=$TAG release_id=${RELEASE_ID:-unresolved}"
+            [[ -f "$WORKDIR/dl/san.txt" ]] && cat "$WORKDIR/dl/san.txt"
+            [[ -f "$WORKDIR/sha256-c.txt" ]] && echo "sha256sum -c: $(grep -c ': OK$' "$WORKDIR/sha256-c.txt") OK"
+            [[ -f "$WORKDIR/view-before.json" ]] && echo "before: $(cat "$WORKDIR/view-before.json")"
+            [[ -f "$WORKDIR/view-before.err" ]] && echo "before stderr: $(cat "$WORKDIR/view-before.err")"
+            [[ -f "$WORKDIR/view-after.json" ]] && echo "after:  $(cat "$WORKDIR/view-after.json")"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
