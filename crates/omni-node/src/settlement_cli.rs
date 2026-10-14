@@ -2687,6 +2687,17 @@ mod tests {
     use omni_sumchain::FakeJsonRpcTransport;
     use serde_json::json;
 
+    /// Runs the enclosing marker-capture test in an isolated child process
+    /// (see `capture::isolated`). In the parent, the test returns once the
+    /// child has run it and passed. Must be the test's first statement.
+    macro_rules! isolated_capture_test {
+        ($name:literal) => {
+            if !crate::settlement_cli::capture::isolated(concat!(module_path!(), "::", $name)) {
+                return;
+            }
+        };
+    }
+
     // ── Fixtures ────────────────────────────────────────────────────────
 
     fn make_client() -> (SumChainClient<FakeJsonRpcTransport>, FakeJsonRpcTransport) {
@@ -3295,7 +3306,7 @@ mod tests {
         args: SettlementArgs,
         client: &SumChainClient<FakeJsonRpcTransport>,
     ) -> (String, Vec<u8>, Result<(), anyhow::Error>) {
-        let (logs, _capture) = crate::settlement_cli::capture::begin();
+        let (logs, _capture) = crate::settlement_cli::capture::begin_isolated();
         let mut stdout_buf = Vec::new();
         let result = dispatch_core(args, client, &mut stdout_buf);
         (
@@ -3541,6 +3552,199 @@ mod tests {
         assert_eq!(captured, 4);
     }
 
+    /// The window `begin` cannot close, shown deterministically: a stale
+    /// `never` stored after a capture's rebuild, as a registration that read
+    /// the no-op dispatcher before installation would store it, drops that
+    /// callsite's events for the rest of the capture. No rebuild inside the
+    /// shared process can prevent it, which is why marker captures run in an
+    /// isolated child where no such registration can exist.
+    #[test]
+    fn a_stale_never_stored_after_begin_drops_events_in_a_shared_process() {
+        use tracing::callsite::{Callsite, DefaultCallsite, Identifier};
+        use tracing::field::FieldSet;
+        use tracing::metadata::Kind;
+        use tracing::subscriber::Interest;
+
+        static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
+        static META: tracing::Metadata<'static> = tracing::Metadata::new(
+            "late_stale_interest_115",
+            module_path!(),
+            tracing::Level::WARN,
+            Some(file!()),
+            Some(line!()),
+            Some(module_path!()),
+            FieldSet::new(&["message"], Identifier(&CALLSITE)),
+            Kind::EVENT,
+        );
+
+        let (buf, _guard) = capture::begin();
+        let _ = CALLSITE.interest(); // registers it under the installed subscriber
+        // The stalled registration's store lands after the rebuild.
+        CALLSITE.set_interest(Interest::never());
+        // Emit as the event macros do: only when the cached interest allows.
+        if !CALLSITE.interest().is_never() {
+            let field = META.fields().field("message").unwrap();
+            let message: &dyn tracing::Value = &"late_stale_sentinel_115";
+            tracing::Event::dispatch(&META, &META.fields().value_set(&[(&field, Some(message))]));
+        }
+        let logs = capture::take(&buf);
+        assert!(!logs.contains("late_stale_sentinel_115"), "{logs}");
+    }
+
+    /// Outside an isolated child, a marker capture is refused, so a marker
+    /// test that omits `isolated_capture_test!` fails instead of capturing in
+    /// this shared process.
+    #[test]
+    fn marker_captures_are_refused_outside_an_isolated_child() {
+        let refused = std::panic::catch_unwind(|| {
+            let _ = capture::begin_isolated();
+        });
+        assert!(refused.is_err());
+        assert!(!capture::has_target(), "a refused capture must leave no target");
+    }
+
+    /// Run only as the child of
+    /// `an_isolated_child_refuses_a_dispatcher_constructed_before_installation`:
+    /// constructs a dispatcher, as a scoped subscriber would, then enters
+    /// isolation.
+    #[test]
+    #[ignore = "a probe run as a child by an_isolated_child_refuses_a_dispatcher_constructed_before_installation"]
+    fn pre_installation_dispatcher_probe() {
+        if !capture::is_isolated_child_process() {
+            return;
+        }
+        let _early = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        isolated_capture_test!("pre_installation_dispatcher_probe");
+        panic!("the isolated child must refuse before running the body");
+    }
+
+    /// The isolated child checks its precondition rather than assuming it: a
+    /// dispatcher constructed before installation raises the max level early,
+    /// which would let registrations read the no-op dispatcher, and fails the
+    /// child with `TRIPWIRE`.
+    #[test]
+    fn an_isolated_child_refuses_a_dispatcher_constructed_before_installation() {
+        let out = capture::run_child(
+            concat!(module_path!(), "::pre_installation_dispatcher_probe"),
+            &["--ignored"],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "the probe child must fail:\n{stdout}");
+        assert!(stdout.contains("test result: FAILED. 0 passed; 1 failed;"), "{stdout}");
+        assert!(stdout.contains(capture::TRIPWIRE), "{stdout}");
+        assert!(
+            !stdout.contains("the isolated child must refuse before running the body"),
+            "{stdout}"
+        );
+    }
+
+    /// Index just past the `}` that closes the `{` at `src[0]`, skipping
+    /// braces inside comments, string and raw-string literals and char
+    /// literals, which test bodies contain.
+    fn rust_block_end(src: &str) -> usize {
+        let b = src.as_bytes();
+        let (mut i, mut depth) = (0usize, 0usize);
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    i = src[i..].find('\n').map_or(b.len(), |n| i + n);
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i = src[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
+                    continue;
+                }
+                b'r' if matches!(b.get(i + 1), Some(b'"' | b'#'))
+                    && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+                {
+                    let hashes = src[i + 1..].bytes().take_while(|&c| c == b'#').count();
+                    if b.get(i + 1 + hashes) == Some(&b'"') {
+                        let close = format!("\"{}", "#".repeat(hashes));
+                        let from = i + 2 + hashes;
+                        i = src[from..].find(&close).map_or(b.len(), |n| from + n + close.len());
+                        continue;
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'\'' => {
+                    // A char literal (`'{'`, `'\n'`); a lifetime has no closing quote.
+                    if b.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        while i < b.len() && b[i] != b'\'' {
+                            i += 1;
+                        }
+                    } else if let Some(c) = src[i + 1..].chars().next() {
+                        if src[i + 1 + c.len_utf8()..].starts_with('\'') {
+                            i += c.len_utf8() + 1;
+                        }
+                    }
+                }
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces in scanned source");
+    }
+
+    /// Every test that captures through a marker helper starts with
+    /// `isolated_capture_test!` naming itself, so it runs in an isolated child
+    /// that installs the subscriber before the test can start a thread.
+    #[test]
+    fn every_marker_capture_test_runs_in_an_isolated_child() {
+        let src = include_str!("settlement_cli.rs");
+        let tests = &src[src.find("#[cfg(test)]\nmod tests").expect("test module")..];
+        let helpers = ["run_with_capture", "run_with_capture_claim", "run_with_capture_register"];
+        let mut checked = Vec::new();
+        for (at, _) in tests.match_indices("#[test]") {
+            // Only an attribute that starts its line.
+            let line_start = tests[..at].rfind('\n').map_or(0, |n| n + 1);
+            if !tests[line_start..at].trim().is_empty() {
+                continue;
+            }
+            let rest = &tests[at..];
+            let fn_at = rest.find("\n").expect("attribute line") + rest[rest.find("\n").unwrap()..]
+                .find("fn ")
+                .expect("test function");
+            let name: String = rest[fn_at + 3..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let open = fn_at + rest[fn_at..].find('{').expect("test body");
+            let body = &rest[open..open + rust_block_end(&rest[open..])];
+            if !helpers.iter().any(|h| body.contains(&format!("{h}("))) {
+                continue;
+            }
+            let first = body[1..].trim_start();
+            assert!(
+                first.starts_with(&format!("isolated_capture_test!(\"{name}\");")),
+                "`{name}` captures through a marker helper, so its first statement must \
+                 be `isolated_capture_test!(\"{name}\");`"
+            );
+            checked.push(name);
+        }
+        assert_eq!(
+            checked.len(),
+            25,
+            "the scan found these marker-capture tests: {checked:?}; update the count \
+             when one is added or removed"
+        );
+    }
+
     // ── Marker constant pin ────────────────────────────────────────────
 
     #[test]
@@ -3561,6 +3765,7 @@ mod tests {
 
     #[test]
     fn status_happy_path_emits_query_and_query_ok_markers() {
+        isolated_capture_test!("status_happy_path_emits_query_and_query_ok_markers");
         let (client, fake) = make_client();
         seed_params(&fake, params_all_gates_active(0));
         seed_head(&fake, 500_000);
@@ -3597,6 +3802,7 @@ mod tests {
 
     #[test]
     fn session_dormant_emits_dormant_marker_with_gate_observed_head() {
+        isolated_capture_test!("session_dormant_emits_dormant_marker_with_gate_observed_head");
         let (client, fake) = make_client();
         seed_params(&fake, params_all_dormant());
         seed_head(&fake, 100_000);
@@ -3764,6 +3970,7 @@ mod tests {
 
     #[test]
     fn session_view_incomplete_emits_view_incomplete_marker() {
+        isolated_capture_test!("session_view_incomplete_emits_view_incomplete_marker");
         // Settlement gate active + consistency gate DORMANT, and the
         // session is consistency-mode. The `omninode_getInferenceConsistency`
         // RPC would be gated at RPC level (dormant), so the CLI's
@@ -3841,6 +4048,7 @@ mod tests {
 
     #[test]
     fn claimable_rpc_error_emits_query_failed_marker() {
+        isolated_capture_test!("claimable_rpc_error_emits_query_failed_marker");
         use omni_zkml::ChainClientError;
         let (client, fake) = make_client();
         seed_params(&fake, params_all_gates_active(0));
@@ -3886,6 +4094,7 @@ mod tests {
 
     #[test]
     fn claimable_wire_parse_error_emits_query_failed_with_malformed_category() {
+        isolated_capture_test!("claimable_wire_parse_error_emits_query_failed_with_malformed_category");
         // Chain-active seed + malformed JSON response so the DTO
         // deserialise fails on the claim reward, driving the
         // `SettlementReadError::WireParse` path.
@@ -3917,6 +4126,7 @@ mod tests {
 
     #[test]
     fn status_direct_rpc_failure_emits_query_failed_with_empty_session_and_address() {
+        isolated_capture_test!("status_direct_rpc_failure_emits_query_failed_with_empty_session_and_address");
         // `chain_getChainParams` is called BEFORE any settlement-specific
         // gated RPC. Its failure never routes through
         // `SettlementReadError::Rpc`; the emit_query_failed helper is
@@ -3969,6 +4179,7 @@ mod tests {
 
     #[test]
     fn verifier_happy_path_emits_markers_with_address() {
+        isolated_capture_test!("verifier_happy_path_emits_markers_with_address");
         let (client, fake) = make_client();
         seed_params(&fake, params_all_gates_active(0));
         seed_head(&fake, 500_000);
@@ -4007,6 +4218,7 @@ mod tests {
 
     #[test]
     fn verifier_canonical_record_renders_and_null_is_found_false() {
+        isolated_capture_test!("verifier_canonical_record_renders_and_null_is_found_false");
         let (client, fake) = make_client();
         seed_params(&fake, params_all_gates_active(0));
         seed_head(&fake, 500_000);
@@ -4229,7 +4441,7 @@ mod tests {
             client: &SumChainClient<FakeJsonRpcTransport>,
             seed_source: SeedSource,
         ) -> (String, Vec<u8>, Result<()>) {
-            let (logs, _capture) = crate::settlement_cli::capture::begin();
+            let (logs, _capture) = crate::settlement_cli::capture::begin_isolated();
             let mut stdout_buf = Vec::new();
             let result = {
                 let SettlementArgs { cmd, .. } = args;
@@ -4255,6 +4467,7 @@ mod tests {
 
         #[test]
         fn claim_dormant_refuses_and_never_calls_builder_or_submit() {
+            isolated_capture_test!("claim_dormant_refuses_and_never_calls_builder_or_submit");
             let (client, fake) = make_client();
             seed_params(&fake, params_all_dormant());
             seed_head(&fake, 100_000);
@@ -4289,6 +4502,7 @@ mod tests {
 
         #[test]
         fn claim_missing_attestation_refuses_and_never_calls_builder_or_submit() {
+            isolated_capture_test!("claim_missing_attestation_refuses_and_never_calls_builder_or_submit");
             let (client, fake) = make_client();
             seed_params(&fake, params_settlement_active());
             seed_head(&fake, 500_000);
@@ -4321,6 +4535,7 @@ mod tests {
 
         #[test]
         fn claim_authority_mismatch_refuses_and_never_calls_builder_or_submit() {
+            isolated_capture_test!("claim_authority_mismatch_refuses_and_never_calls_builder_or_submit");
             let (client, fake) = make_client();
             seed_params(&fake, params_settlement_active());
             seed_head(&fake, 500_000);
@@ -4357,6 +4572,7 @@ mod tests {
 
         #[test]
         fn claim_immature_refuses_and_never_calls_builder_or_submit() {
+            isolated_capture_test!("claim_immature_refuses_and_never_calls_builder_or_submit");
             let fixture =
                 build_test_claim_tx(&TEST_SEED, "s-1", TEST_CHAIN_ID, TEST_NONCE, TEST_FEE);
             let (client, fake) = make_client();
@@ -4412,6 +4628,7 @@ mod tests {
 
         #[test]
         fn claim_bond_precheck_failed_refuses_and_never_calls_builder_or_submit() {
+            isolated_capture_test!("claim_bond_precheck_failed_refuses_and_never_calls_builder_or_submit");
             let fixture =
                 build_test_claim_tx(&TEST_SEED, "s-1", TEST_CHAIN_ID, TEST_NONCE, TEST_FEE);
             let (client, fake) = make_client();
@@ -4497,6 +4714,7 @@ mod tests {
 
         #[test]
         fn claim_builder_envelope_mismatch_refuses_before_submit() {
+            isolated_capture_test!("claim_builder_envelope_mismatch_refuses_before_submit");
             let fixture = seed_full_happy_path(&FakeJsonRpcTransport::new()); // fixture only, drop the fake
             let (client, fake) = make_client();
             let _ = seed_full_happy_path(&fake);
@@ -4537,6 +4755,7 @@ mod tests {
 
         #[test]
         fn claim_dry_run_calls_builder_but_never_signs_or_submits() {
+            isolated_capture_test!("claim_dry_run_calls_builder_but_never_signs_or_submits");
             let (client, fake) = make_client();
             let _fixture = seed_full_happy_path(&fake);
 
@@ -4575,6 +4794,7 @@ mod tests {
 
         #[test]
         fn claim_happy_path_calls_builder_once_and_submit_once() {
+            isolated_capture_test!("claim_happy_path_calls_builder_once_and_submit_once");
             let (client, fake) = make_client();
             let _fixture = seed_full_happy_path(&fake);
 
@@ -4609,6 +4829,7 @@ mod tests {
 
         #[test]
         fn claim_submitted_hex_round_trips_via_from_hex_not_raw_concat() {
+            isolated_capture_test!("claim_submitted_hex_round_trips_via_from_hex_not_raw_concat");
             let (client, fake) = make_client();
             let fixture = seed_full_happy_path(&fake);
 
@@ -4841,7 +5062,7 @@ mod tests {
             client: &SumChainClient<FakeJsonRpcTransport>,
             seed_source: SeedSource,
         ) -> (String, Vec<u8>, Result<()>) {
-            let (logs, _capture) = crate::settlement_cli::capture::begin();
+            let (logs, _capture) = crate::settlement_cli::capture::begin_isolated();
             let mut stdout_buf = Vec::new();
             let result = {
                 let SettlementArgs { cmd, .. } = args;
@@ -4876,6 +5097,7 @@ mod tests {
         // fields.
         #[test]
         fn register_verifier_build_sign_submit_round_trip() {
+            isolated_capture_test!("register_verifier_build_sign_submit_round_trip");
             let (client, fake) = make_client();
             let fixture = seed_full_happy_path(&fake);
 
@@ -4971,6 +5193,7 @@ mod tests {
         // ── Test 2 — dry-run stops before signing/submitting ───────
         #[test]
         fn register_verifier_dry_run_never_submits() {
+            isolated_capture_test!("register_verifier_dry_run_never_submits");
             let (client, fake) = make_client();
             let _fixture = seed_full_happy_path(&fake);
 
@@ -5007,6 +5230,7 @@ mod tests {
         // ── Test 3 — chain-id mismatch refusal (preflight) ─────────
         #[test]
         fn register_verifier_refuses_on_chain_id_mismatch() {
+            isolated_capture_test!("register_verifier_refuses_on_chain_id_mismatch");
             let (client, fake) = make_client();
             let _fixture = seed_full_happy_path(&fake);
 
@@ -5047,6 +5271,7 @@ mod tests {
         // ── Test 4 — settlement-inactive refusal (preflight) ───────
         #[test]
         fn register_verifier_refuses_when_settlement_dormant() {
+            isolated_capture_test!("register_verifier_refuses_when_settlement_dormant");
             let (client, fake) = make_client();
             // Settlement base gate ABSENT (dormant); chain-id matches.
             seed_params(
@@ -5094,6 +5319,7 @@ mod tests {
         // ── Test 5 — bonding-inactive refusal (preflight) ──────────
         #[test]
         fn register_verifier_refuses_when_bonding_dormant() {
+            isolated_capture_test!("register_verifier_refuses_when_bonding_dormant");
             let (client, fake) = make_client();
             // Settlement base gate ACTIVE, but verifier-bonding ABSENT.
             seed_params(
@@ -5192,6 +5418,7 @@ mod tests {
         // ── Test 8 — --bond 0 refused locally, before any RPC ──────
         #[test]
         fn register_verifier_bond_zero_refused_locally() {
+            isolated_capture_test!("register_verifier_bond_zero_refused_locally");
             let (client, fake) = make_client();
             // Seed a full happy path; NONE of it must be reached.
             let _fixture = seed_full_happy_path(&fake);
@@ -5237,6 +5464,7 @@ mod tests {
         // than the bond-zero error.
         #[test]
         fn register_verifier_bond_failures_precede_builder_signer_and_submit() {
+            isolated_capture_test!("register_verifier_bond_failures_precede_builder_signer_and_submit");
             // (a) missing --bond: clap rejects before the handler is
             //     entered, so no transport/seed is ever touched.
             #[derive(Debug, clap::Parser)]
@@ -5318,6 +5546,7 @@ mod tests {
         // signs, and never invokes `sum_sendRawTransaction`.
         #[test]
         fn register_verifier_dry_run_derives_address_but_never_signs_or_submits() {
+            isolated_capture_test!("register_verifier_dry_run_derives_address_but_never_signs_or_submits");
             let (client, fake) = make_client();
             let fixture = seed_full_happy_path(&fake);
 
@@ -6733,6 +6962,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod capture {
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
     pub(crate) type Buf = Arc<Mutex<Vec<u8>>>;
@@ -6838,11 +7068,12 @@ pub(crate) mod capture {
     ///
     /// Every callsite's cached interest is rebuilt first, under the installed
     /// subscriber, so one left at `never` by a registration that overlapped
-    /// installation records in this capture. What remains is a first
-    /// registration that read the no-op dispatcher before installation and
-    /// stores its interest only after this rebuild: a sibling thread stalled
-    /// inside that registration from before installation until after this
-    /// point.
+    /// installation records in this capture. What a rebuild cannot cover is a
+    /// first registration that read the no-op dispatcher before installation
+    /// and stores its interest only after this rebuild: a sibling thread
+    /// stalled inside that registration from before installation until after
+    /// this point. Marker captures close that window by running in an
+    /// isolated child ([`isolated`], [`begin_isolated`]).
     pub(crate) fn begin() -> (Buf, CaptureGuard) {
         init();
         tracing::callsite::rebuild_interest_cache();
@@ -6862,5 +7093,114 @@ pub(crate) mod capture {
     /// Whether this thread currently has a capture target. Test-support only.
     pub(crate) fn has_target() -> bool {
         TARGET.with(|t| t.borrow().is_some())
+    }
+
+    // ── Isolated children for marker captures (issue #115) ─────────────
+    //
+    // Where a stale `never` can come from (tracing-core 0.1.36, tracing
+    // 0.1.44): the event macros test the global max level before they touch a
+    // callsite, and that level is OFF until a dispatcher is constructed, so
+    // before installation no callsite registers at all. `init` constructs the
+    // subscriber's dispatcher, which raises the level (`rebuild_interest`),
+    // and only then stores it as the global default. A first registration
+    // that falls between those two steps reads the no-op dispatcher and
+    // computes `never`; if it stores that after a later `begin` rebuilt the
+    // cache, the capture loses the callsite's events. After the store, every
+    // registration reads the installed subscriber.
+    //
+    // So the window is a registration on another thread during
+    // installation. Marker callsites are shared by many tests, so in a
+    // parallel test process another test's thread can be that thread.
+    //
+    // A marker-capture test therefore runs its body in a child process of
+    // this test binary that runs only that test, on one test thread, and
+    // installs the subscriber as the test's first statement. During that
+    // installation no other thread in the child runs tracing code: libtest's
+    // own threads do not use tracing, the child runs no other test, and the
+    // test has started no thread yet (`isolated_capture_test!` is its first
+    // statement, which `every_marker_capture_test_runs_in_an_isolated_child`
+    // checks). No registration can fall in the window, so the race is
+    // removed, not made rarer. The child also checks, rather than assumes,
+    // that nothing in it constructed a dispatcher before installation: one
+    // would have raised the level early and let registrations read it.
+
+    /// Names the one test an isolated child runs, as libtest names it.
+    const ISOLATED_TEST_ENV: &str = "OMNI_NODE_ISOLATED_CAPTURE_TEST";
+
+    /// Set in an isolated child once the subscriber is installed.
+    static IN_ISOLATED_CHILD: AtomicBool = AtomicBool::new(false);
+
+    /// The failure an isolated child reports when a dispatcher was constructed
+    /// in it before installation.
+    pub(crate) const TRIPWIRE: &str =
+        "isolated capture child: a tracing dispatcher existed before the capture subscriber was installed";
+
+    /// Run the calling test in an isolated child. `test_path` is the test's
+    /// `module_path!()`-qualified function name.
+    ///
+    /// In the child: checks that no dispatcher has been constructed, installs
+    /// the subscriber and returns `true`; the caller then runs its body. In the
+    /// parent: runs the child, asserts that it ran exactly this test and
+    /// passed, and returns `false`; the caller returns.
+    pub(crate) fn isolated(test_path: &str) -> bool {
+        let path = libtest_path(test_path);
+        match std::env::var(ISOLATED_TEST_ENV) {
+            Ok(child) => {
+                assert_eq!(child, path, "the isolated child for `{child}` reached `{path}`");
+                assert_eq!(
+                    tracing::level_filters::LevelFilter::current(),
+                    tracing::level_filters::LevelFilter::OFF,
+                    "{TRIPWIRE}"
+                );
+                init();
+                IN_ISOLATED_CHILD.store(true, Ordering::SeqCst);
+                true
+            }
+            Err(_) => {
+                let out = run_child(test_path, &[]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    out.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                    "isolated child for `{path}` did not run and pass exactly that test \
+                     ({}):\n{stdout}\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                false
+            }
+        }
+    }
+
+    /// Whether this process is an isolated child.
+    pub(crate) fn is_isolated_child_process() -> bool {
+        std::env::var_os(ISOLATED_TEST_ENV).is_some()
+    }
+
+    /// [`begin`], refused outside an isolated child: every marker capture
+    /// goes through here, so a marker test cannot capture in a shared process.
+    pub(crate) fn begin_isolated() -> (Buf, CaptureGuard) {
+        assert!(
+            IN_ISOLATED_CHILD.load(Ordering::SeqCst),
+            "marker captures run only in an isolated child: start the test with \
+             `isolated_capture_test!`"
+        );
+        begin()
+    }
+
+    /// Run this test binary as an isolated child for `test_path`, with
+    /// `extra` libtest arguments.
+    pub(crate) fn run_child(test_path: &str, extra: &[&str]) -> std::process::Output {
+        let path = libtest_path(test_path);
+        std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([path, "--exact", "--test-threads=1"])
+            .args(extra)
+            .env(ISOLATED_TEST_ENV, path)
+            .output()
+            .expect("run the isolated capture child")
+    }
+
+    /// libtest's name for a test: its module path without the crate name.
+    fn libtest_path(test_path: &str) -> &str {
+        test_path.split_once("::").map_or(test_path, |(_, rest)| rest)
     }
 }
