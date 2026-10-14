@@ -3426,6 +3426,49 @@ mod tests {
         );
     }
 
+    /// A callsite whose cached interest is `never`, as a first registration
+    /// that overlapped installation leaves it, records once a capture begins.
+    /// The callsite is built by hand, as the event macros build theirs, so the
+    /// test can set its interest; no other callsite is touched.
+    #[test]
+    fn a_callsite_cached_as_never_records_once_a_capture_begins() {
+        use tracing::callsite::{Callsite, DefaultCallsite, Identifier};
+        use tracing::field::FieldSet;
+        use tracing::metadata::Kind;
+        use tracing::subscriber::Interest;
+
+        static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
+        static META: tracing::Metadata<'static> = tracing::Metadata::new(
+            "stale_interest_115",
+            module_path!(),
+            tracing::Level::WARN,
+            Some(file!()),
+            Some(line!()),
+            Some(module_path!()),
+            FieldSet::new(&["message"], Identifier(&CALLSITE)),
+            Kind::EVENT,
+        );
+
+        capture::init();
+        let _ = CALLSITE.interest(); // registers it
+        CALLSITE.set_interest(Interest::never());
+        assert!(CALLSITE.interest().is_never());
+
+        let (buf, _guard) = capture::begin();
+        assert!(
+            !CALLSITE.interest().is_never(),
+            "begin must rebuild the cached interest"
+        );
+        // Emit as the event macros do: only when the cached interest allows.
+        if !CALLSITE.interest().is_never() {
+            let field = META.fields().field("message").unwrap();
+            let message: &dyn tracing::Value = &"stale_sentinel_115";
+            tracing::Event::dispatch(&META, &META.fields().value_set(&[(&field, Some(message))]));
+        }
+        let logs = capture::take(&buf);
+        assert!(logs.contains("stale_sentinel_115"), "{logs}");
+    }
+
     /// Unwinding out of a capture must restore the previous target, and the
     /// same thread must be able to capture again afterwards.
     #[test]
@@ -6538,6 +6581,17 @@ mod tests {
 // filtering step inside `tracing` was never isolated, so this harness removes
 // the per-capture subscriber construction rather than trying to out-race it.
 //
+// One such step was isolated later, and it applies to this harness too:
+// tracing-core caches a callsite's interest when the callsite first registers,
+// computed against the dispatcher current at that moment. A first registration
+// on a sibling thread that overlaps installation of the global subscriber can
+// compute it against the no-op dispatcher and store `never` after
+// installation's own rebuild has passed that callsite. The callsite then stays
+// disabled for the rest of the process (`DefaultCallsite::register`, and
+// `Dispatch::new` registering before `set_global_default` stores the new
+// dispatcher; tracing-core 0.1.36). `begin` therefore rebuilds the interest
+// cache before every capture.
+//
 // Design: ONE subscriber for the whole test binary, installed once, whose
 // writer routes to a THREAD-LOCAL buffer. Capture then costs a thread-local
 // swap and never touches global subscriber state.
@@ -6609,11 +6663,12 @@ pub(crate) mod capture {
     /// initializer returns, so a capture can never begin before installation
     /// has completed.
     ///
-    /// Installing the global default also repairs callsites that sibling
-    /// threads already touched while uncaptured: `Dispatch::new` calls
-    /// `callsite::register_dispatch`, which rebuilds interest for every
-    /// registered callsite (tracing-core 0.1.36, `callsite.rs`). No per-event
-    /// rebuild and no marker prewarming is used.
+    /// Installing the global default rebuilds interest for every callsite
+    /// already registered: `Dispatch::new` calls `callsite::register_dispatch`
+    /// (tracing-core 0.1.36, `callsite.rs`). That does not cover a callsite
+    /// whose first registration overlaps the installation, which can still
+    /// cache `never` (see the module comment), so `begin` rebuilds again. No
+    /// per-event rebuild and no marker prewarming is used.
     pub(crate) fn init() {
         INSTALLED.get_or_init(|| {
             let subscriber = tracing_subscriber::fmt()
@@ -6656,8 +6711,17 @@ pub(crate) mod capture {
     ///
     /// The thread-local borrow is released before this returns, so the caller's
     /// closure runs with no borrow and no lock held by the harness.
+    ///
+    /// Every callsite's cached interest is rebuilt first, under the installed
+    /// subscriber, so one left at `never` by a registration that overlapped
+    /// installation records in this capture. What remains is a first
+    /// registration that read the no-op dispatcher before installation and
+    /// stores its interest only after this rebuild: a sibling thread stalled
+    /// inside that registration from before installation until after this
+    /// point.
     pub(crate) fn begin() -> (Buf, CaptureGuard) {
         init();
+        tracing::callsite::rebuild_interest_cache();
         let buf: Buf = Arc::new(Mutex::new(Vec::new()));
         let prev = TARGET.with(|t| t.borrow_mut().replace(buf.clone()));
         (buf, CaptureGuard { prev })
