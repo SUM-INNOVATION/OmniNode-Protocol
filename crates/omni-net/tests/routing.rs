@@ -15,9 +15,15 @@
 //!
 //! Gossip fan-out is exercised in the unit tests rather than here: forming a
 //! gossipsub mesh takes a heartbeat, and a test that waits on one is a test
-//! that fails on a loaded machine for reasons unrelated to routing. Both nodes
-//! bind `127.0.0.1` on an OS-assigned port and are wired by an explicit dial,
-//! so nothing here depends on mDNS, the DHT, or a heartbeat.
+//! that fails on a loaded machine for reasons unrelated to routing. Nodes are
+//! wired by an explicit dial to a loopback address, and run with mDNS off: with
+//! it on, every node of every concurrently running test on the host discovers
+//! and dials every other, so a node under test receives traffic and
+//! connections from nodes it has nothing to do with.
+//!
+//! Every wait is on the condition the next step needs (a listen address from
+//! the swarm, a connection to the expected peer, a router count), never on a
+//! fixed sleep. `DEADLINE` only bounds how long a broken run takes to fail.
 
 use std::time::Duration;
 
@@ -33,44 +39,61 @@ const DEADLINE: Duration = Duration::from_secs(20);
 
 // ── Harness ───────────────────────────────────────────────────────────────────
 
+/// A node with mDNS off, so it connects only to what the test dials.
 async fn new_node() -> OmniNet {
-    OmniNet::new(NetConfig::default())
-        .await
-        .expect("OmniNet::new on an OS-assigned port")
-}
-
-fn is_loopback(addr: &Multiaddr) -> bool {
-    addr.iter()
-        .any(|p| matches!(p, Protocol::Ip4(ip) if ip.is_loopback()))
-}
-
-/// Wait on a *control* subscription until the node reports a loopback listen
-/// address, and return it with the node's peer id appended so it can be
-/// dialled directly.
-async fn dialable_addr(net: &OmniNet, control: &mut Subscription) -> Multiaddr {
-    let peer_id = net.local_peer_id();
-    let found = tokio::time::timeout(DEADLINE, async {
-        while let Some(event) = control.recv().await {
-            if let OmniNetEvent::Listening { addr } = event {
-                if is_loopback(&addr) {
-                    return Some(addr);
-                }
-            }
-        }
-        None
+    OmniNet::new(NetConfig {
+        mdns: false,
+        ..NetConfig::default()
     })
     .await
-    .expect("timed out waiting for a listen address")
-    .expect("event stream closed before a listen address appeared");
+    .expect("OmniNet::new on an OS-assigned port")
+}
 
-    found.with(Protocol::P2p(peer_id))
+/// The node's loopback dial address, with its peer id appended.
+///
+/// The address comes from [`OmniNet::listen_addrs`], which answers from the
+/// swarm's own state. Waiting for an `OmniNetEvent::Listening` on a
+/// subscription instead races the swarm: the event is sent once, as soon as the
+/// listener binds, and a subscription registered after that never sees it.
+/// The node listens on `0.0.0.0`, so its port is reachable on loopback whichever
+/// interface was reported first.
+async fn dialable_addr(net: &OmniNet) -> Multiaddr {
+    let addrs = tokio::time::timeout(DEADLINE, net.listen_addrs())
+        .await
+        .expect("timed out waiting for the swarm to report a listen address")
+        .expect("the swarm reports its listen addresses");
+    let port = addrs
+        .iter()
+        .find_map(|a| {
+            a.iter().find_map(|p| match p {
+                Protocol::Udp(port) => Some(port),
+                _ => None,
+            })
+        })
+        .expect("a QUIC listen address carries a UDP port");
+    format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+        .parse::<Multiaddr>()
+        .expect("loopback QUIC multiaddr")
+        .with(Protocol::P2p(net.local_peer_id()))
+}
+
+/// Wait until `condition` holds, checking it every few milliseconds. For
+/// conditions with no event to wait on, such as a router count: the wait ends
+/// as soon as the condition holds, and `DEADLINE` only bounds a broken run.
+async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(DEADLINE, async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
 }
 
 /// Wait until `control` reports a connection to `expected`.
 ///
-/// It must be that specific peer: mDNS is on by default, so a node in this
-/// suite will also connect to the other tests' nodes running concurrently on
-/// the same host.
+/// It must be that specific peer: a connection to anything else would let a
+/// request go out before the dialled connection exists.
 async fn wait_connected(control: &mut Subscription, expected: PeerId) {
     tokio::time::timeout(DEADLINE, async {
         while let Some(event) = control.recv().await {
@@ -108,10 +131,7 @@ async fn a_shard_consumer_and_a_tensor_consumer_do_not_steal_from_each_other() {
     // traffic arriving. Each consumer must see its own and only its own.
     let server = new_node().await;
     let server_net = server.handle();
-    let mut server_control = server_net
-        .subscribe(Interests::none().control())
-        .expect("server control subscription");
-    let server_addr = dialable_addr(&server, &mut server_control).await;
+    let server_addr = dialable_addr(&server).await;
     let server_peer = server.local_peer_id();
 
     // The two consumers that used to fight over one receiver.
@@ -190,10 +210,7 @@ async fn a_shard_consumer_and_a_tensor_consumer_do_not_steal_from_each_other() {
 async fn a_dropped_consumer_deregisters_and_the_survivor_keeps_receiving() {
     let server = new_node().await;
     let server_net = server.handle();
-    let mut server_control = server_net
-        .subscribe(Interests::none().control())
-        .expect("server control subscription");
-    let server_addr = dialable_addr(&server, &mut server_control).await;
+    let server_addr = dialable_addr(&server).await;
     let server_peer = server.local_peer_id();
 
     // Release the `OmniNet` value itself: it carries an all-interest
@@ -202,7 +219,6 @@ async fn a_dropped_consumer_deregisters_and_the_survivor_keeps_receiving() {
     // catch-all registered. Keeping it would mean every event below had a
     // taker, and "nobody asked for this" could never be observed. The swarm
     // and the router stay alive; `server_net` holds a command sender clone.
-    drop(server_control);
     drop(server);
 
     let store = server_net.subscribe(Interests::none().shard()).unwrap();
@@ -226,11 +242,18 @@ async fn a_dropped_consumer_deregisters_and_the_survivor_keeps_receiving() {
     client_net.dial(server_addr).await.expect("dial");
     wait_connected(&mut client_control, server_peer).await;
 
-    // Traffic for the departed consumer, then traffic for the survivor.
+    // Traffic for the departed consumer, then traffic for the survivor. The
+    // two travel on separate streams, so nothing orders the server's handling
+    // of one before the other: wait until the router has counted the shard
+    // request as unwanted before asserting anything about it.
     client_net
         .request_shard_chunk(server_peer, "cid-orphan".into(), None, None)
         .await
         .expect("shard request");
+    wait_until("the router counts the orphaned shard request", || {
+        server_net.router_counts().unwanted_shard >= 1
+    })
+    .await;
     client_net
         .request_tensor(server_peer, tensor_for("session-survivor"))
         .await
@@ -264,10 +287,7 @@ async fn shutdown_fails_in_flight_requests_and_ends_every_subscription() {
     // three consumers waiting on their router subscriptions.
     let server = new_node().await;
     let server_net = server.handle();
-    let mut server_control = server_net
-        .subscribe(Interests::none().control())
-        .expect("server control subscription");
-    let server_addr = dialable_addr(&server, &mut server_control).await;
+    let server_addr = dialable_addr(&server).await;
     let server_peer = server.local_peer_id();
     // Deliberately no responder task: the server accepts the requests and
     // never answers, so both requests are still in flight at shutdown.
