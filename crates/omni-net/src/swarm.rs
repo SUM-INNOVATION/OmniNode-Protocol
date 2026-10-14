@@ -8,7 +8,7 @@ use libp2p::{
     request_response::{
         self, InboundRequestId, OutboundRequestId, ProtocolSupport, ResponseChannel,
     },
-    swarm::SwarmEvent,
+    swarm::{SwarmEvent, behaviour::toggle::Toggle},
     Multiaddr, PeerId, SwarmBuilder,
 };
 use tokio::sync::mpsc;
@@ -68,6 +68,16 @@ pub enum SwarmCommand {
     /// Send a tensor acknowledgment on a stored response channel.
     SendTensorResponse { channel_id: u64, response: TensorResponse },
 
+    /// Report the addresses the swarm is listening on, from its own state.
+    ///
+    /// Answered at once when the swarm already has at least one; otherwise
+    /// the reply is held and sent with the first address the transport
+    /// reports. Unlike [`OmniNetEvent::Listening`], which is delivered on the
+    /// best-effort event lane, this answer cannot be dropped.
+    ListenAddrs {
+        reply: tokio::sync::oneshot::Sender<Vec<Multiaddr>>,
+    },
+
     /// Exit the event loop cleanly.
     Shutdown,
 }
@@ -125,6 +135,11 @@ pub struct OmniSwarm {
     /// The relay peer we currently hold a reservation with, if any.
     /// Prevents spamming the same relay on repeated StatusChanged::Private.
     active_relay_reservation: Option<PeerId>,
+
+    /// [`SwarmCommand::ListenAddrs`] callers waiting for the first listen
+    /// address. Answered on the next `NewListenAddr`; dropped (so the caller
+    /// sees the loop is gone) on every exit from `run`.
+    listen_waiters: Vec<tokio::sync::oneshot::Sender<Vec<Multiaddr>>>,
 }
 
 impl OmniSwarm {
@@ -145,6 +160,7 @@ impl OmniSwarm {
             .map_err(|msg| anyhow::anyhow!("gossipsub config error: {msg}"))?;
 
         let relay_server_enabled = config.relay_server;
+        let mdns_enabled = config.mdns;
 
         // The `.with_relay_client()` call wraps the QUIC transport in a
         // relay-aware transport that can dial and listen on /p2p-circuit
@@ -181,10 +197,13 @@ impl OmniSwarm {
                 let local_peer_id = key.public().to_peer_id();
 
                 // ── Existing protocols ────────────────────────────────
-                let mdns = mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
-                    local_peer_id,
-                )?;
+                let mdns = Toggle::from(
+                    mdns_enabled
+                        .then(|| {
+                            mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)
+                        })
+                        .transpose()?,
+                );
 
                 let gossipsub = gossipsub::Behaviour::new(
                     gossipsub::MessageAuthenticity::Signed(key.clone()),
@@ -262,6 +281,7 @@ impl OmniSwarm {
             relay_peers: Vec::new(),
             nat_status: NatStatus::Unknown,
             active_relay_reservation: None,
+            listen_waiters: Vec::new(),
         })
     }
 
@@ -376,6 +396,15 @@ impl OmniSwarm {
                                 }
                             } else {
                                 warn!(channel_id, "no pending channel for tensor response");
+                            }
+                        }
+                        Some(SwarmCommand::ListenAddrs { reply }) => {
+                            let addrs: Vec<Multiaddr> = self.inner.listeners().cloned().collect();
+                            if addrs.is_empty() {
+                                self.listen_waiters.push(reply);
+                            } else {
+                                // A caller that stopped waiting is not an error.
+                                let _ = reply.send(addrs);
                             }
                         }
                         Some(SwarmCommand::Shutdown) | None => {
@@ -779,6 +808,14 @@ impl OmniSwarm {
             // ── Transport ─────────────────────────────────────────────────
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(%address, "listening on address");
+                // The swarm records the address before yielding this event,
+                // so `listeners()` already includes it.
+                if !self.listen_waiters.is_empty() {
+                    let addrs: Vec<Multiaddr> = self.inner.listeners().cloned().collect();
+                    for reply in self.listen_waiters.drain(..) {
+                        let _ = reply.send(addrs.clone());
+                    }
+                }
                 if let Err(e) = event_tx.try_send(OmniNetEvent::Listening { addr: address }) {
                     warn!(%e, "event channel full — dropping Listening");
                 }
@@ -824,6 +861,26 @@ impl OmniSwarm {
 // A test that *triggers* the deadlock cannot exist: it either hangs the suite
 // or passes without proving anything. So the property is pinned structurally
 // instead — once by the compiler, once by reading the source.
+
+#[cfg(test)]
+mod mdns_switch {
+    use super::*;
+
+    /// `NetConfig::mdns` decides whether the mDNS behaviour runs; the default
+    /// keeps it on, as before the switch existed.
+    #[tokio::test]
+    async fn mdns_runs_by_default_and_only_when_enabled() {
+        let on = OmniSwarm::build(&NetConfig::default()).expect("default swarm");
+        assert!(on.inner.behaviour().mdns.is_enabled());
+
+        let off = OmniSwarm::build(&NetConfig {
+            mdns: false,
+            ..NetConfig::default()
+        })
+        .expect("swarm without mDNS");
+        assert!(!off.inner.behaviour().mdns.is_enabled());
+    }
+}
 
 #[cfg(test)]
 mod never_await_invariant {

@@ -269,6 +269,26 @@ impl NetHandle {
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot dial"))
     }
 
+    /// The addresses this node is listening on, read from the swarm's own
+    /// state.
+    ///
+    /// If the listener has not reported an address yet, this waits for the
+    /// first one. [`OmniNetEvent::Listening`] carries the same information on
+    /// the shared event lane, where it is delivered best-effort and can be
+    /// missed by a subscriber registered after it was sent; this answer is
+    /// private to the caller and cannot be dropped. Binding `0.0.0.0` yields
+    /// one address per interface, reported as the transport finds them, so an
+    /// early answer may not list every interface yet.
+    pub async fn listen_addrs(&self) -> Result<Vec<Multiaddr>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::ListenAddrs { reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — no listen addresses"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("swarm task stopped before reporting a listen address"))
+    }
+
     /// Signal the swarm loop to shut down gracefully.
     ///
     /// The loop completes every in-flight solicited request with
@@ -557,6 +577,12 @@ impl OmniNet {
     /// [`OmniNet::next_event`].
     pub fn try_next_event(&mut self) -> Option<OmniNetEvent> {
         self.events.try_recv()
+    }
+
+    /// The addresses this node is listening on. See
+    /// [`NetHandle::listen_addrs`].
+    pub async fn listen_addrs(&self) -> Result<Vec<Multiaddr>> {
+        self.handle.listen_addrs().await
     }
 
     /// Signal the swarm loop to shut down gracefully.
@@ -848,6 +874,65 @@ mod local_peer_id_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod listen_addrs_tests {
+    use super::*;
+    use libp2p::multiaddr::Protocol;
+    use omni_types::config::NetConfig;
+    use std::time::Duration;
+
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    fn udp_port(addr: &Multiaddr) -> Option<u16> {
+        addr.iter().find_map(|p| match p {
+            Protocol::Udp(port) => Some(port),
+            _ => None,
+        })
+    }
+
+    /// The listen address is answered from the swarm's state, without reading
+    /// the event lane at all, and every reported address shares the bound port.
+    #[tokio::test]
+    async fn listen_addrs_answers_without_the_event_lane() {
+        let net = OmniNet::new(NetConfig {
+            mdns: false,
+            ..NetConfig::default()
+        })
+        .await
+        .expect("OmniNet::new");
+        let addrs = tokio::time::timeout(DEADLINE, net.listen_addrs())
+            .await
+            .expect("listen_addrs must not hang")
+            .expect("listen addresses");
+        assert!(!addrs.is_empty());
+        let ports: std::collections::BTreeSet<u16> = addrs.iter().filter_map(udp_port).collect();
+        assert_eq!(ports.len(), 1, "one listener, one port: {addrs:?}");
+        assert_ne!(
+            ports.into_iter().next(),
+            Some(0),
+            "the OS-assigned port is reported"
+        );
+        let _ = net.shutdown().await;
+    }
+
+    /// A query queued behind the shutdown fails once the loop has gone,
+    /// instead of waiting for an answer that cannot come.
+    #[tokio::test]
+    async fn listen_addrs_after_shutdown_fails_rather_than_hangs() {
+        let net = OmniNet::new(NetConfig {
+            mdns: false,
+            ..NetConfig::default()
+        })
+        .await
+        .expect("OmniNet::new");
+        net.shutdown().await.expect("shutdown");
+        let result = tokio::time::timeout(DEADLINE, net.listen_addrs())
+            .await
+            .expect("listen_addrs must not hang after shutdown");
+        assert!(result.is_err(), "the loop is gone: {result:?}");
     }
 }
 

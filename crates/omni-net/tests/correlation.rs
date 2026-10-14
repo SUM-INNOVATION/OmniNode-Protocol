@@ -5,9 +5,16 @@
 //! `OutboundRequestId`. These tests close that gap by driving real requests
 //! through a real swarm, where the ids are the ones libp2p actually issued.
 //!
-//! Both nodes bind `127.0.0.1` on an OS-assigned port and are wired together
-//! by an explicit dial, so nothing here depends on mDNS, the DHT, or a
-//! gossipsub heartbeat.
+//! Nodes are wired together by an explicit dial to a loopback address and run
+//! with mDNS off, so nothing here depends on mDNS, the DHT, or a gossipsub
+//! heartbeat. With mDNS on, every node of every concurrently running test on
+//! the host discovers and dials every other, and a request can then travel on
+//! one of those extra connections and fail when it closes.
+//!
+//! Every wait is on the condition the next step needs (a listen address from
+//! the swarm, a connection, a request held by the server, a full event lane),
+//! never on a fixed sleep. `DEADLINE` only bounds how long a broken run takes
+//! to fail.
 
 use std::time::Duration;
 
@@ -21,44 +28,47 @@ const DEADLINE: Duration = Duration::from_secs(20);
 
 // ── Harness ───────────────────────────────────────────────────────────────────
 
+/// A node with mDNS off, so it connects only to what the test dials.
 async fn new_node() -> OmniNet {
-    OmniNet::new(NetConfig::default())
-        .await
-        .expect("OmniNet::new on an OS-assigned port")
-}
-
-/// Drain `net` until it reports a loopback listen address, and return it with
-/// the node's peer id appended so it can be dialled directly.
-async fn dialable_addr(net: &mut OmniNet) -> Multiaddr {
-    let peer_id = net.local_peer_id();
-    let found = tokio::time::timeout(DEADLINE, async {
-        while let Some(event) = net.next_event().await {
-            if let OmniNetEvent::Listening { addr } = event {
-                if is_loopback(&addr) {
-                    return Some(addr);
-                }
-            }
-        }
-        None
+    OmniNet::new(NetConfig {
+        mdns: false,
+        ..NetConfig::default()
     })
     .await
-    .expect("timed out waiting for a listen address")
-    .expect("event stream closed before a listen address appeared");
-
-    found.with(Protocol::P2p(peer_id))
+    .expect("OmniNet::new on an OS-assigned port")
 }
 
-fn is_loopback(addr: &Multiaddr) -> bool {
-    addr.iter()
-        .any(|p| matches!(p, Protocol::Ip4(ip) if ip.is_loopback()))
+/// The node's loopback dial address, with its peer id appended.
+///
+/// The address comes from [`OmniNet::listen_addrs`], which answers from the
+/// swarm's own state rather than from a `Listening` event on the best-effort
+/// event lane. The node listens on `0.0.0.0`, so its port is reachable on
+/// loopback whichever interface was reported first.
+async fn dialable_addr(net: &OmniNet) -> Multiaddr {
+    let addrs = tokio::time::timeout(DEADLINE, net.listen_addrs())
+        .await
+        .expect("timed out waiting for the swarm to report a listen address")
+        .expect("the swarm reports its listen addresses");
+    let port = addrs
+        .iter()
+        .find_map(|a| {
+            a.iter().find_map(|p| match p {
+                Protocol::Udp(port) => Some(port),
+                _ => None,
+            })
+        })
+        .expect("a QUIC listen address carries a UDP port");
+    format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+        .parse::<Multiaddr>()
+        .expect("loopback QUIC multiaddr")
+        .with(Protocol::P2p(net.local_peer_id()))
 }
 
 /// Drain `net` until it reports a connection to `expected`.
 ///
-/// It must be that specific peer: mDNS is on by default, so a node in this
-/// suite will also connect to the other tests' nodes running concurrently on
-/// the same host, and returning on the first `PeerConnected` would let a
-/// request go out before the dialled connection exists.
+/// It must be that specific peer: returning on the first `PeerConnected` from
+/// anything else would let a request go out before the dialled connection
+/// exists.
 async fn wait_connected(net: &mut OmniNet, expected: PeerId) {
     tokio::time::timeout(DEADLINE, async {
         while let Some(event) = net.next_event().await {
@@ -120,7 +130,7 @@ async fn two_requests_to_one_peer_complete_independently() {
     // table by PeerId makes the second request's response overwrite — or be
     // dropped by — the first.
     let mut server = new_node().await;
-    let server_addr = dialable_addr(&mut server).await;
+    let server_addr = dialable_addr(&server).await;
     let server_peer = server.local_peer_id();
     // Hold the first response back so the responses land in the opposite
     // order from the requests.
@@ -156,12 +166,19 @@ async fn two_requests_to_one_peer_complete_independently() {
     assert_eq!(b.data, b"cid-second".to_vec());
 }
 
+/// Concurrent request streams one connection carries: libp2p
+/// request-response's default `max_concurrent_streams` (0.28), which omni-net
+/// does not override. Each flooder can have this many requests outstanding.
+const STREAMS_PER_CONNECTION: usize = 100;
+
+/// The event lane's depth (`omni_net`'s per-subscriber capacity).
+const LANE_CAPACITY: usize = 256;
+
 /// Flood `victim` with inbound tensor requests it will never answer.
 ///
-/// One flooder cannot fill a 256-slot event lane on its own: libp2p's QUIC
-/// transport caps concurrent inbound streams per connection at 128, so each
-/// flooder can only have that many requests outstanding at once. Two
-/// connections are what it takes to actually saturate the lane.
+/// One flooder holds at most [`STREAMS_PER_CONNECTION`] requests open at once,
+/// so filling a [`LANE_CAPACITY`]-deep lane takes
+/// `LANE_CAPACITY / STREAMS_PER_CONNECTION + 1` of them.
 fn spawn_flooder(victim_addr: Multiaddr, victim_peer: PeerId, tag: &'static str) {
     tokio::spawn(async move {
         let mut net = new_node().await;
@@ -194,11 +211,11 @@ async fn a_response_arrives_while_the_ordinary_event_lane_is_saturated() {
     // overflows. Here the client's shared event lane is filled to capacity and
     // never drained, and the response still arrives.
     let mut client = new_node().await;
-    let client_addr = dialable_addr(&mut client).await;
+    let client_addr = dialable_addr(&client).await;
     let client_peer = client.local_peer_id();
 
     let mut server = new_node().await;
-    let server_addr = dialable_addr(&mut server).await;
+    let server_addr = dialable_addr(&server).await;
     let server_peer = server.local_peer_id();
     spawn_echo_responder(server, None);
 
@@ -209,9 +226,24 @@ async fn a_response_arrives_while_the_ordinary_event_lane_is_saturated() {
     // the client's lane. Nothing drains it from here on.
     while client.try_next_event().is_some() {}
 
-    spawn_flooder(client_addr.clone(), client_peer, "flood-a");
-    spawn_flooder(client_addr, client_peer, "flood-b");
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // From here every event the router delivers to this node stays queued in
+    // its only subscription, so new deliveries are the backlog. Wait until the
+    // flood has actually filled the lane rather than for a fixed time: a slow
+    // runner needs longer to connect two flooders and open their streams.
+    let delivered_before = client.router_counts().delivered;
+    let tags = ["flood-a", "flood-b", "flood-c"];
+    let flooders = LANE_CAPACITY / STREAMS_PER_CONNECTION + 1;
+    assert!(flooders <= tags.len(), "{flooders} flooders needed");
+    for tag in tags.into_iter().take(flooders) {
+        spawn_flooder(client_addr.clone(), client_peer, tag);
+    }
+    tokio::time::timeout(DEADLINE, async {
+        while client.router_counts().delivered - delivered_before < 250 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the flood never filled the client's event lane");
 
     let response = client
         .fetch_shard_chunk(server_peer, "cid-under-flood".into(), Some(0), Some(64))
@@ -245,12 +277,11 @@ async fn a_response_arrives_while_the_ordinary_event_lane_is_saturated() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shutting_the_swarm_down_completes_every_in_flight_request() {
-    // The server never answers — it never drains its own events, so the
-    // request sits in its lane forever. The client then shuts down, and must
-    // release its caller rather than leave it waiting on a response that can
-    // no longer arrive.
+    // The server receives the request and never answers. The client then
+    // shuts down, and must release its caller rather than leave it waiting on
+    // a response that can no longer arrive.
     let mut server = new_node().await;
-    let server_addr = dialable_addr(&mut server).await;
+    let server_addr = dialable_addr(&server).await;
     let server_peer = server.local_peer_id();
 
     let mut client = new_node().await;
@@ -261,8 +292,21 @@ async fn shutting_the_swarm_down_completes_every_in_flight_request() {
         .fetch_shard_chunk(server_peer, "cid-never-answered".into(), Some(0), Some(16))
         .await;
 
-    // Let the request reach the wire before pulling the floor out.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Shut down only once the server holds the request: it has been handed to
+    // the server's consumer, so the server keeps its response channel open and
+    // nothing but the client's own shutdown can complete the caller.
+    tokio::time::timeout(DEADLINE, async {
+        while let Some(event) = server.next_event().await {
+            if let OmniNetEvent::ShardRequested { request, .. } = event {
+                if request.cid == "cid-never-answered" {
+                    return;
+                }
+            }
+        }
+        panic!("the server's event stream closed before the request arrived");
+    })
+    .await
+    .expect("the server never received the request");
     client.shutdown().await.expect("shutdown");
 
     let err = pending
@@ -312,7 +356,7 @@ async fn a_cancelled_caller_does_not_wedge_the_swarm() {
     // requests afterwards — the cancelled entry is released, not leaked into
     // the path of the next caller.
     let mut server = new_node().await;
-    let server_addr = dialable_addr(&mut server).await;
+    let server_addr = dialable_addr(&server).await;
     let server_peer = server.local_peer_id();
     spawn_echo_responder(server, None);
 
@@ -340,8 +384,13 @@ async fn a_cancelled_caller_does_not_wedge_the_swarm() {
 async fn a_request_issued_after_shutdown_is_reported_as_never_sent() {
     let client = new_node().await;
     client.shutdown().await.expect("shutdown");
-    // Let the loop actually exit and drop the command receiver.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for the loop to exit and drop its command receiver. Commands are
+    // handled in order, so a query sent after the shutdown is never answered:
+    // it fails exactly when the loop has gone, taking the receiver with it.
+    tokio::time::timeout(DEADLINE, client.listen_addrs())
+        .await
+        .expect("the swarm loop never exited")
+        .expect_err("a query queued behind the shutdown is never answered");
 
     let err = client
         .fetch_shard_chunk(PeerId::random(), "cid-too-late".into(), None, None)
