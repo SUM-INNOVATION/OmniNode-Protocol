@@ -3636,6 +3636,130 @@ mod tests {
         );
     }
 
+    // ── Every settlement read routes its error through the marker (#115) ──
+    //
+    // `SettlementReadError::Dormant` is computed by the client on each gated
+    // read, from the chain params and head it fetches; the fake transport
+    // answers every call of a method alike, so a runtime test can make only
+    // the first read of a subcommand dormant. This test holds the rest
+    // structurally: in each read subcommand, every `omninode_get_*` call must
+    // hand its error to `err_to_anyhow_with_marker` immediately — through
+    // the `.map_err(..)` chained onto the call, or as the scrutinee of a
+    // `match` whose every `Err` arm returns it. A new read that propagates its
+    // error any other way fails here, whatever error it happens to return in
+    // tests, and so does a new query subcommand that this scan does not list.
+
+    /// Index just past the bracket that closes the one at `s[0]`.
+    fn close_of(s: &str, open: char, close: char) -> usize {
+        let mut depth = 0usize;
+        for (i, c) in s.char_indices() {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+        }
+        panic!("unbalanced {open}{close} in scanned source");
+    }
+
+    /// The body of `fn <name>…(…) … { … }` in `src`.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let at = [format!("\nfn {name}<"), format!("\nfn {name}(")]
+            .iter()
+            .find_map(|head| src.find(head.as_str()))
+            .unwrap_or_else(|| panic!("no `fn {name}` in settlement_cli.rs"));
+        let open = at + src[at..].find('{').expect("function body");
+        &src[open..open + close_of(&src[open..], '{', '}')]
+    }
+
+    /// Every `Err(..) =>` arm of the `match` block `arms` (starting at its
+    /// `{`) hands its error to `err_to_anyhow_with_marker`, and there is one.
+    fn every_err_arm_marks(arms: &str) -> bool {
+        let arms = &arms[..close_of(arms, '{', '}')];
+        let mut err_arms = 0;
+        for (i, _) in arms.match_indices("Err(") {
+            // An arm pattern starts its line; `return Err(..)` does not.
+            let line_start = arms[..i].rfind('\n').map_or(0, |n| n + 1);
+            if !arms[line_start..i].trim().is_empty() {
+                continue;
+            }
+            let arrow = arms[i..].find("=>").expect("match arm");
+            let arm = arms[i + arrow + 2..].trim_start();
+            let arm = if arm.starts_with('{') {
+                &arm[..close_of(arm, '{', '}')]
+            } else {
+                arm.split(",\n").next().unwrap_or(arm)
+            };
+            if !arm.contains("err_to_anyhow_with_marker(") {
+                return false;
+            }
+            err_arms += 1;
+        }
+        err_arms > 0
+    }
+
+    const MARKED_READ_SUBCOMMANDS: [&str; 3] = ["run_session", "run_claimable", "run_verifier"];
+
+    #[test]
+    fn the_marker_scan_covers_every_settlement_query_subcommand() {
+        let src = include_str!("settlement_cli.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let mut found = Vec::new();
+        for (at, _) in code.match_indices("\nfn ") {
+            let name: String = code[at + 4..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let body = fn_body(code, &name);
+            if body.contains("emit_query_start(") && body.contains(".omninode_get_") {
+                found.push(name);
+            }
+        }
+        assert_eq!(
+            found, MARKED_READ_SUBCOMMANDS,
+            "add new query subcommands to the marker scan"
+        );
+    }
+
+    #[test]
+    fn every_settlement_read_routes_its_error_through_the_marker_site() {
+        let src = include_str!("settlement_cli.rs");
+        for subcommand in MARKED_READ_SUBCOMMANDS {
+            let body = fn_body(src, subcommand);
+            let mut reads = 0;
+            for (at, _) in body.match_indices(".omninode_get_") {
+                reads += 1;
+                let call = &body[at..];
+                let args = call.find('(').expect("call arguments");
+                let after_call = args + close_of(&call[args..], '(', ')');
+                let next = call[after_call..].trim_start();
+                let routed = if next.starts_with(".map_err(") {
+                    let open = next.find('(').unwrap();
+                    let handler = &next[open..open + close_of(&next[open..], '(', ')')];
+                    handler.contains("err_to_anyhow_with_marker(")
+                } else if next.starts_with('{') && body[..at].trim_end().ends_with("match client") {
+                    every_err_arm_marks(next)
+                } else {
+                    false
+                };
+                let line = call.lines().next().unwrap_or_default();
+                assert!(
+                    routed,
+                    "{subcommand}: `{line}` does not hand its error to \
+                     err_to_anyhow_with_marker, so a dormant gate there would \
+                     return without the DORMANT marker (#115)"
+                );
+            }
+            assert!(
+                reads > 0,
+                "{subcommand}: no settlement reads found; the scan is stale"
+            );
+        }
+    }
+
     // ── View-incomplete branch ─────────────────────────────────────────
 
     #[test]
