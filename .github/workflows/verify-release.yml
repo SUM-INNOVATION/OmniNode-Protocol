@@ -42,7 +42,55 @@ defaults:
     shell: bash
 
 jobs:
+  # Read-only probe (#73, owner-authorized 2026-10-14): can the read-only
+  # GITHUB_TOKEN reach the v0.1.1 DRAFT's assets by their numeric IDs? The
+  # tag lookup above returns 404 for drafts. Same token, same `contents: read`;
+  # nothing is published, edited or promoted. The token is only ever sent in a
+  # request header, never echoed; curl does not forward it on the cross-host
+  # redirect to the asset store.
+  probe-draft-asset-by-id:
+    name: Probe draft assets by ID (read-only token)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      REPO: SUM-INNOVATION/OmniNode-Protocol
+      # IDs and GitHub's own digests of the v0.1.1 draft, read by the
+      # operator with push access (read-only API calls).
+      RELEASE_ID: "345106514"
+      SUMS_ASSET_ID: "458257637"
+      SUMS_SHA256: "f24da5b080ca9301b31e3e9156e9036d67385675b0f5f02d4478498059072092"
+      BIN_ASSET_ID: "458257643"
+      BIN_SHA256: "4efac56e8cac2b58982be0813e4ebf369bec1d649ddf1be9085b0333a7ad4161"
+    steps:
+      - name: Probe by ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${REPO}"
+          ok=0; fail=0
+          probe() {  # label, url, accept, outfile
+            local code
+            code="$(curl -sS -L -o "$4" -D "$4.headers" -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: $3" \
+              -H "X-GitHub-Api-Version: 2022-11-28" "$2")" || code="curl-error"
+            echo "$1: HTTP ${code}"
+            grep -i '^x-accepted-github-permissions:' "$4.headers" | sed 's/^/  /' || true
+            if [ "${code}" = "200" ]; then ok=$((ok+1)); else fail=$((fail+1)); head -c 300 "$4" | tr -d '\r' | sed 's/^/  body: /'; echo; fi
+          }
+          probe "release by id (json)"            "${api}/releases/${RELEASE_ID}"         application/vnd.github+json release.json
+          probe "SHA256SUMS metadata by id (json)" "${api}/releases/assets/${SUMS_ASSET_ID}" application/vnd.github+json sums-meta.json
+          probe "SHA256SUMS download by id"       "${api}/releases/assets/${SUMS_ASSET_ID}" application/octet-stream SHA256SUMS
+          probe "x86_64 default binary download by id" "${api}/releases/assets/${BIN_ASSET_ID}" application/octet-stream bin
+          if [ -s SHA256SUMS ] && [ "$(sha256sum < SHA256SUMS | cut -d' ' -f1)" = "${SUMS_SHA256}" ]; then echo "SHA256SUMS digest matches GitHub's"; fi
+          if [ -s bin ] && [ "$(sha256sum < bin | cut -d' ' -f1)" = "${BIN_SHA256}" ]; then echo "binary digest matches GitHub's"; fi
+          echo "probes ok=${ok} failed=${fail}"
+          [ "${fail}" -eq 0 ]
+
   verify:
+    needs: probe-draft-asset-by-id
     name: Verify ${{ inputs.tag || 'v0.1.1' }} on ${{ matrix.host.arch }} (${{ matrix.host.runner }})
     runs-on: ${{ matrix.host.runner }}
     timeout-minutes: 20
