@@ -28,6 +28,14 @@ pub struct NetConfig {
     /// Whether this node volunteers as a Circuit Relay v2 server.
     /// Enable on nodes with open NATs (VPS, port-forwarded home server).
     pub relay_server: bool,
+    /// Whether this node runs mDNS LAN discovery. Default `true`.
+    ///
+    /// With it on, every node on the local network that answers mDNS is
+    /// discovered, added as a gossipsub explicit peer and dialled. A node
+    /// whose peers are reached only by explicit dial or bootstrap peers can
+    /// turn it off; test harnesses do, so that concurrently running nodes on
+    /// one host do not connect to each other.
+    pub mdns: bool,
 
     /// Stage 12.6 — libp2p mesh identity policy.
     ///
@@ -90,6 +98,7 @@ impl Default for NetConfig {
             listen_port: 0,
             bootstrap_peers: vec![],
             relay_server: false,
+            mdns: true,
             identity: NetIdentity::Ephemeral,
         }
     }
