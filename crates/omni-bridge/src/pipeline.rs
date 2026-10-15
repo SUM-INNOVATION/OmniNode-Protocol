@@ -16,7 +16,7 @@ use crate::errors::PyOmniError;
 
 // ── PipelineConfig ──────────────────────────────────────────────────────────
 
-#[pyclass(name = "PipelineConfig")]
+#[pyclass(name = "PipelineConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyPipelineConfig {
     pub inner: PipelineConfig,
@@ -96,7 +96,7 @@ impl PyPipelineConfig {
 
 // ── PipelineCapability ──────────────────────────────────────────────────────
 
-#[pyclass(name = "PipelineCapability")]
+#[pyclass(name = "PipelineCapability", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyPipelineCapability {
     pub inner: PipelineCapability,

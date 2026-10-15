@@ -9,7 +9,7 @@ use omni_types::model::{LayerRange, ModelManifest, ShardDescriptor};
 
 // ── NetConfig ────────────────────────────────────────────────────────────────
 
-#[pyclass(name = "NetConfig")]
+#[pyclass(name = "NetConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyNetConfig {
     pub inner: NetConfig,
@@ -39,7 +39,7 @@ impl PyNetConfig {
 
 // ── StoreConfig ──────────────────────────────────────────────────────────────
 
-#[pyclass(name = "StoreConfig")]
+#[pyclass(name = "StoreConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyStoreConfig {
     pub inner: StoreConfig,
@@ -111,7 +111,7 @@ impl PyStoreConfig {
 
 // ── LayerRange ───────────────────────────────────────────────────────────────
 
-#[pyclass(name = "LayerRange")]
+#[pyclass(name = "LayerRange", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyLayerRange {
     pub inner: LayerRange,
@@ -147,7 +147,7 @@ impl PyLayerRange {
 
 // ── ShardDescriptor ──────────────────────────────────────────────────────────
 
-#[pyclass(name = "ShardDescriptor")]
+#[pyclass(name = "ShardDescriptor", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyShardDescriptor {
     pub inner: ShardDescriptor,
@@ -206,7 +206,7 @@ impl PyShardDescriptor {
 
 // ── ModelManifest ────────────────────────────────────────────────────────────
 
-#[pyclass(name = "ModelManifest")]
+#[pyclass(name = "ModelManifest", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyModelManifest {
     pub inner: ModelManifest,

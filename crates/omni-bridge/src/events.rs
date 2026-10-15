@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 
 use omni_net::OmniNetEvent;
 
-#[pyclass(name = "NetEvent")]
+#[pyclass(name = "NetEvent", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyNetEvent {
     /// Event kind: "listening", "peer_discovered", "peer_expired",
