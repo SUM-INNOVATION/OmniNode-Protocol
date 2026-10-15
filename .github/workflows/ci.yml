@@ -107,6 +107,18 @@ jobs:
             -p omni-node \
             -p omni-bridge
 
+      # The bridge's interpreter-facing behaviour (exception classes, the
+      # ShardView buffer protocol, dict builders, object lifetimes) can only be
+      # checked from Python, against the extension built for this interpreter.
+      # Gated here so a pyo3 upgrade cannot change it unnoticed.
+      - name: omni-bridge Python tests (maturin develop + pytest)
+        run: |
+          python3 -m venv .venv-bridge
+          . .venv-bridge/bin/activate
+          python -m pip install "maturin>=1.7,<2.0" "pytest>=8,<9" "numpy>=1.24,<3"
+          maturin develop
+          python -m pytest tests/python -q
+
   # ── (1b) The declared minimum Rust actually builds ──────────────────────────
   # libp2p 0.57 (hickory-proto 0.26, RUSTSEC-2026-0119) raised the workspace
   # rust-version to 1.88. Every other job runs `stable`; this one compiles the

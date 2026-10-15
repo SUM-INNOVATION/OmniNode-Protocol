@@ -122,7 +122,11 @@ sumchain-crypto     = "=0.4.0"
 
 # ─── Phase 3: FFI ────────────────────────────────────────────────────────────
 
-pyo3 = { version = "0.23", features = ["extension-module"] }
+# No `extension-module` here: maturin enables `pyo3/extension-module` for the
+# wheel (pyproject.toml [tool.maturin] features), and a plain `cargo test`
+# must link libpython, or omni-bridge's test binary has undefined symbols on
+# Linux.
+pyo3 = { version = "0.23" }
 
 # ─── Phase 4: Pipeline ───────────────────────────────────────────────────────
 

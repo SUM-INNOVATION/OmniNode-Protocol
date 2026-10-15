@@ -362,12 +362,6 @@ impl OmniNet {
         let (event_tx, event_rx) = mpsc::channel::<OmniNetEvent>(CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx)     = mpsc::channel::<SwarmCommand>(CHANNEL_CAPACITY);
 
-        tokio::spawn(async move {
-            if let Err(e) = omni_swarm.run(event_tx, cmd_rx).await {
-                tracing::error!(%e, "swarm event loop exited with error");
-            }
-        });
-
         // The receiver is moved into the router here and is unreachable from
         // anywhere else for the rest of the process's life.
         let (router, router_handle) = EventRouter::new(event_rx);
@@ -378,12 +372,20 @@ impl OmniNet {
             router: router_handle,
             local_peer_id,
         };
-        // Registered before returning, so events emitted between `new` and the
-        // caller's first `next_event` are buffered rather than counted as
-        // unsubscribed.
+        // Registered before the swarm task is spawned, so every event it emits
+        // is buffered for the caller's first `next_event` rather than counted
+        // as unsubscribed, including the one-off `Listening`. Registration is
+        // synchronous and the swarm emits nothing until it runs; registered
+        // after the spawn, this subscription could miss the earliest events.
         let events = handle
             .subscribe(Interests::everything())
             .map_err(|e| anyhow::anyhow!("event router stopped during startup: {e}"))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = omni_swarm.run(event_tx, cmd_rx).await {
+                tracing::error!(%e, "swarm event loop exited with error");
+            }
+        });
 
         Ok(Self { handle, events })
     }
@@ -914,6 +916,44 @@ mod listen_addrs_tests {
             ports.into_iter().next(),
             Some(0),
             "the OS-assigned port is reported"
+        );
+        let _ = net.shutdown().await;
+    }
+
+    /// The default subscription is registered before the swarm runs, so it
+    /// receives the one-off `Listening` and no control event reaches the router
+    /// before any subscriber exists to take it.
+    ///
+    /// Multi-threaded, as the Python bridge's runtime is: there the spawned
+    /// swarm task can run before `new` returns, which is where the old order
+    /// lost `Listening`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_default_subscription_sees_listening_from_the_first_event() {
+        let mut net = OmniNet::new(NetConfig {
+            mdns: false,
+            ..NetConfig::default()
+        })
+        .await
+        .expect("OmniNet::new");
+        let listening = tokio::time::timeout(DEADLINE, async {
+            loop {
+                match net.next_event().await {
+                    Some(OmniNetEvent::Listening { addr }) => break Some(addr),
+                    Some(_) => continue,
+                    None => break None,
+                }
+            }
+        })
+        .await
+        .expect("Listening must reach the default subscription");
+        assert!(
+            listening.is_some(),
+            "the event stream ended before Listening"
+        );
+        assert_eq!(
+            net.router_counts().unwanted_control,
+            0,
+            "a control event reached the router before the default subscription existed"
         );
         let _ = net.shutdown().await;
     }
