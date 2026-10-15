@@ -8,12 +8,20 @@
 //! | [`offer`] | O2 | the client-local 35% offer cap; `PublishBondedOfferV1` / `AcceptWorkUnitV1` op bytes | #104 scope; the C1 op carriers (`compute_pool_wire`, sum-chain #130 / #217) |
 //! | [`manifest`] | O2, O4 | a layer-group unit's one output manifest; root-checked verification of retrieved slot objects | the B0 manifest / object-commitment codecs and statement binding (sum-chain #123 B0-FINAL) |
 //! | [`tokens`] | O3 | the SelectToken result chain: range and EOS checks, stop rule, EOS-excluded output count, token-sequence commitments | the B0 SelectToken statement and `MAX_OUTPUT_TOKENS` |
+//! | [`reads`] | O2 | typed, fail-closed `pool_getUnit` / `pool_getOffer` reads of committed C1 rows | sum-chain's read-only pool RPCs (#130, server at `90c49da1`) |
+//! | [`accept`] | O2 | the accept path: from a unit read and this node's offer read to `AcceptWorkUnitV1`, refusing what the chain's C1 model refuses; the one-active-offer precheck | the C1 model's transition, write-once leaf and capacity rules |
 //!
 //! ## Not here, and why
 //!
 //! * **Proving** (`PartialComputeProofV1` production): needs the RISC Zero
 //!   prover selected by B0; the on-chain verifier and the
 //!   `CommitPartialProofV1` op are sum-chain #131 (C3) and do not exist yet.
+//! * **A live pool.** The reads return `None` on every network today: genesis
+//!   refuses the pool gate and no C1 operation (ordinal 27) has an executor
+//!   (sum-chain #130 / #217), so no block writes pool state. There is also no
+//!   read by identity, and no derivation of an offer's bond id, so this node's
+//!   `offer_bond_id`, its `commit_bond_id` and the `accepted_bytes` stay
+//!   caller-supplied (see [`accept`]).
 //! * **Observation** (`ObservedRetrievalV1` / `AcknowledgeInputRetrievedV1`)
 //!   and the retention read (`pool_getRetentionState`) / output read
 //!   (`pool_getJobOutput`): not on the chain (sum-chain #133 C2, #129).
@@ -35,6 +43,8 @@
 //! sum-chain main; `tests/pool_client_chain_vectors.rs` checks this module
 //! against the chain's frozen official-workload vectors.
 
+pub mod accept;
 pub mod manifest;
 pub mod offer;
+pub mod reads;
 pub mod tokens;

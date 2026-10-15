@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Internal error: compute-pool state is inconsistent: unit row: Deserialization error: io error: unexpected end of file"}}
