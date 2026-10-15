@@ -104,3 +104,36 @@ impl PyShardView {
         format!("ShardView(cid='{}', size={})", self.cid, self.mmap.len())
     }
 }
+#[cfg(test)]
+mod tests {
+    //! The view's Rust side: its length, identity and the bytes it maps. The
+    //! buffer protocol itself (`memoryview`, read-only refusal, lifetime) needs
+    //! an interpreter and is covered by `tests/python/`.
+
+    use super::*;
+
+    #[test]
+    fn a_view_reports_the_mapped_file_and_holds_its_bytes() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("omni-bridge-view-{}-{n}", std::process::id()));
+        let content: Vec<u8> = (0u8..=255).collect();
+        std::fs::write(&path, &content).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: the file is private to this test and not modified while mapped.
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let view = PyShardView::new(mmap, "bafy-test".into());
+        assert_eq!(
+            (view.__len__(), view.size(), view.cid()),
+            (256, 256, "bafy-test")
+        );
+        assert_eq!(&view.mmap[..], &content[..]);
+        assert_eq!((view.shape, view.strides), ([256], [1]));
+        assert_eq!(view.__repr__(), "ShardView(cid='bafy-test', size=256)");
+        drop(view);
+        std::fs::remove_file(&path).unwrap();
+    }
+}

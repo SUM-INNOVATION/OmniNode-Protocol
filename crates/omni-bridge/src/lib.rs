@@ -15,6 +15,23 @@ pub mod shard_view;
 pub mod store;
 pub mod types;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use pyo3::PyResult;
+
+    /// The value of a `PyResult` that must be `Ok`.
+    ///
+    /// Not `Result::expect`: that formats the `PyErr` with `Debug`, which needs
+    /// a Python interpreter, and these unit tests run without one.
+    #[track_caller]
+    pub(crate) fn ok<T>(r: PyResult<T>, what: &str) -> T {
+        match r {
+            Ok(v) => v,
+            Err(_) => panic!("{what}: unexpected Python exception"),
+        }
+    }
+}
+
 /// Native extension module entry point: `omninode._omni_bridge`
 #[pymodule]
 fn _omni_bridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
