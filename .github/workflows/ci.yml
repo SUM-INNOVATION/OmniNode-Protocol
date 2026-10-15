@@ -107,6 +107,18 @@ jobs:
             -p omni-node \
             -p omni-bridge
 
+      # The bridge's interpreter-facing behaviour (exception classes, the
+      # ShardView buffer protocol, dict builders, object lifetimes) can only be
+      # checked from Python, against the extension built for this interpreter.
+      # Gated here so a pyo3 upgrade cannot change it unnoticed.
+      - name: omni-bridge Python tests (maturin develop + pytest)
+        run: |
+          python3 -m venv .venv-bridge
+          . .venv-bridge/bin/activate
+          python -m pip install "maturin>=1.7,<2.0" "pytest>=8,<9" "numpy>=1.24,<3"
+          maturin develop
+          python -m pytest tests/python -q
+
   # ── (2) Default dep-tree: HARD GATE — feature gating keeps submit out ──────
   default-tree-check:
     name: default tree — must NOT contain sumchain-(crypto|primitives)
