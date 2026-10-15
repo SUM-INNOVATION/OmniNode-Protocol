@@ -9,7 +9,6 @@
 
 use std::io;
 
-use async_trait::async_trait;
 use futures::prelude::*;
 
 use crate::framing::{read_length_prefixed, write_length_prefixed};
@@ -72,7 +71,6 @@ impl Default for ShardCodec {
     }
 }
 
-#[async_trait]
 impl libp2p::request_response::Codec for ShardCodec {
     type Protocol = String;
     type Request = ShardRequest;

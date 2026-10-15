@@ -2,7 +2,7 @@
 
 [![license: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
 [![rust edition 2024](https://img.shields.io/badge/rust-2024-orange)](Cargo.toml)
-[![toolchain 1.85](https://img.shields.io/badge/toolchain-1.85-orange)](rust-toolchain.toml)
+[![toolchain 1.88](https://img.shields.io/badge/toolchain-1.88-orange)](rust-toolchain.toml)
 
 **A Trustless, Peer-to-Peer AI Inference Network — Public Utility Infrastructure for AGI**
 
@@ -201,7 +201,7 @@ architecture, and inter-phase dependency graph, see
 ## Quick Start
 
 ```bash
-# Prerequisites: Rust 1.85+ (edition 2024)
+# Prerequisites: Rust 1.88+ (edition 2024)
 git clone https://github.com/SUM-INNOVATION/OmniNode-Protocol.git
 cd OmniNode-Protocol
 cargo build --workspace

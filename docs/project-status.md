@@ -106,7 +106,7 @@ find pointers back to this doc when they need it.
 ## Quick Start
 
 ```bash
-# Prerequisites: Rust 1.85+ (edition 2024)
+# Prerequisites: Rust 1.88+ (edition 2024)
 git clone https://github.com/SUM-INNOVATION/OmniNode-Protocol.git
 cd OmniNode-Protocol
 cargo build --workspace
@@ -1914,7 +1914,7 @@ OmniNode-Protocol/
 │
 ├── Cargo.toml                          # Workspace manifest
 ├── Cargo.lock
-├── rust-toolchain.toml                 # Rust 2024 edition, MSRV 1.85+
+├── rust-toolchain.toml                 # Rust 2024 edition, MSRV 1.88+
 │
 ├── crates/
 │   ├── omni-types/                     # Shared types, errors, config
@@ -2085,7 +2085,7 @@ version      = "0.1.0"
 edition      = "2024"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/SUM-INNOVATION/OmniNode-Protocol"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # Async runtime

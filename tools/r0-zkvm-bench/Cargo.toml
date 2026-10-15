@@ -6,7 +6,7 @@ license     = "MIT OR Apache-2.0"
 publish     = false
 # MSRV is local to this EXCLUDED crate (uses `u*::is_multiple_of`, stable since
 # 1.87). It intentionally does NOT touch the OmniNode workspace `rust-version`
-# (1.85), which this crate is excluded from.
+# (1.88), which this crate is excluded from.
 rust-version = "1.87"
 description  = "OmniNode #101 R0 host-side research crate that ADOPTS the frozen sumchain-wire 0.2.1 B0 wire types (NON-SELECTION; NOT a zkVM harness; performs no proving/measurement; NOT a workspace member; no production crate depends on it)"
 
