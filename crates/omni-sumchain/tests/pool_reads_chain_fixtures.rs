@@ -19,6 +19,7 @@ use std::thread::JoinHandle;
 use omni_sumchain::pool::accept::{
     build_accept, ensure_no_active_offer, AcceptRefusal, PublishRefusal,
 };
+use omni_sumchain::pool::ids::OwnOffer;
 use omni_sumchain::pool::reads::{PoolOffer, PoolReadError, PoolUnit, Reservation, UnitState};
 use omni_sumchain::{SumChainClient, UreqTransport};
 use sumchain_wire::address::Address;
@@ -381,6 +382,44 @@ fn malformed_offer_answers_are_refused() {
 }
 
 // ── The accept path, on decoded real answers ─────────────────────────────────
+//
+// The recorded state (sum-chain `90c49da1`) predates the ratified
+// `offer_bond_id` derivation (G1-1, 2026-10-16): its offers sit under synthetic
+// ids `0x03…`, `0x05…`, `0x0b…`. The accept path now derives this node's id from
+// its chain id, identity and `offer_seq`, so these tests REBIND each recorded
+// offer (and the unit's references to it) to the derived id of the offer's own
+// recorded identity and `offer_seq` — the only id a ratified chain can store it
+// under. Every other recorded field is used verbatim; the read tests above use
+// the recordings unchanged.
+
+/// The chain id the derived ids are taken on. The pool reads do not carry one.
+const CHAIN_ID: u64 = 1;
+
+fn own_of(o: &PoolOffer) -> OwnOffer {
+    OwnOffer {
+        chain_id: CHAIN_ID,
+        identity: o.identity,
+        offer_seq: o.offer_seq,
+    }
+}
+
+/// Move a recorded offer, and the unit's references to it, to the derived id.
+fn rebind(u: &mut PoolUnit, o: &mut PoolOffer) -> OwnOffer {
+    let own = own_of(o);
+    let (old, new) = (o.offer_bond_id, own.offer_bond_id());
+    o.offer_bond_id = new;
+    if let Some(a) = u
+        .assignment
+        .as_mut()
+        .filter(|a| a.winner_offer_bond_id == old)
+    {
+        a.winner_offer_bond_id = new;
+    }
+    if let Some(l) = u.accepted_leaf.as_mut().filter(|l| l.offer_bond_id == old) {
+        l.offer_bond_id = new;
+    }
+    own
+}
 
 fn assigned() -> PoolUnit {
     read_unit("unit_assigned", 1, 3).unwrap().unwrap()
@@ -388,12 +427,18 @@ fn assigned() -> PoolUnit {
 fn offer3() -> PoolOffer {
     read_offer("offer_active_reserved", 3).unwrap().unwrap()
 }
+/// The assigned unit and offer 3, both rebound to offer 3's derived id.
+fn assigned_and_offer3() -> (PoolUnit, PoolOffer, OwnOffer) {
+    let (mut u, mut o) = (assigned(), offer3());
+    let own = rebind(&mut u, &mut o);
+    (u, o, own)
+}
 
 #[test]
 fn an_assigned_unit_is_accepted_up_to_the_offers_remaining_capacity() {
-    let (u, o) = (assigned(), offer3());
+    let (u, o, own) = assigned_and_offer3();
     // Offer 3 has reserved 160 of 1,000: 840 more fit, 841 do not.
-    let data = build_accept(Some(&u), Some(&o), &id(3), [0x44; 32], 840).unwrap();
+    let data = build_accept(Some(&u), Some(&o), &own, [0x44; 32], 840).unwrap();
     assert_eq!(
         ComputePoolOperation::decode_exact(&data.op_bytes).unwrap(),
         ComputePoolOperation::AcceptUnit(AcceptWorkUnitV1 {
@@ -407,7 +452,7 @@ fn an_assigned_unit_is_accepted_up_to_the_offers_remaining_capacity() {
         })
     );
     assert_eq!(
-        build_accept(Some(&u), Some(&o), &id(3), [0x44; 32], 841),
+        build_accept(Some(&u), Some(&o), &own, [0x44; 32], 841),
         Err(AcceptRefusal::CapacityExceeded {
             offered: 1_000,
             reserved: 160,
@@ -419,53 +464,116 @@ fn an_assigned_unit_is_accepted_up_to_the_offers_remaining_capacity() {
 
 #[test]
 fn every_case_the_chain_refuses_is_refused_before_building() {
-    let (u, o) = (assigned(), offer3());
+    let (u, o, own) = assigned_and_offer3();
     assert_eq!(
-        build_accept(None, Some(&o), &id(3), [0x44; 32], 1),
+        build_accept(None, Some(&o), &own, [0x44; 32], 1),
         Err(AcceptRefusal::UnitNotHeld)
     );
-    let accepted = read_unit("unit_accepted", 1, 2).unwrap().unwrap();
+    let mut accepted = read_unit("unit_accepted", 1, 2).unwrap().unwrap();
+    rebind(&mut accepted, &mut offer3());
     assert_eq!(
-        build_accept(Some(&accepted), Some(&o), &id(3), [0x44; 32], 1),
+        build_accept(Some(&accepted), Some(&o), &own, [0x44; 32], 1),
         Err(AcceptRefusal::AlreadyAccepted)
     );
     let blocked = read_unit("unit_blocked_with_input", 1, 4).unwrap().unwrap();
     assert_eq!(
-        build_accept(Some(&blocked), Some(&o), &id(3), [0x44; 32], 1),
+        build_accept(Some(&blocked), Some(&o), &own, [0x44; 32], 1),
         Err(AcceptRefusal::NotAssigned(UnitState::Blocked))
     );
     // Offer 5 is not the assignment's winner.
-    let o5 = read_offer("offer_inactive", 5).unwrap().unwrap();
+    let mut o5 = read_offer("offer_inactive", 5).unwrap().unwrap();
+    let own5 = own_of(&o5);
+    o5.offer_bond_id = own5.offer_bond_id();
     assert!(matches!(
-        build_accept(Some(&u), Some(&o5), &id(5), [0x44; 32], 1),
+        build_accept(Some(&u), Some(&o5), &own5, [0x44; 32], 1),
         Err(AcceptRefusal::AssignedToAnotherOffer { .. })
     ));
     assert!(matches!(
-        build_accept(Some(&u), None, &id(3), [0x44; 32], 1),
+        build_accept(Some(&u), None, &own, [0x44; 32], 1),
         Err(AcceptRefusal::OfferNotHeld(_))
     ));
     // The offer read must be this node's own offer.
     assert!(matches!(
-        build_accept(Some(&u), Some(&o5), &id(3), [0x44; 32], 1),
+        build_accept(Some(&u), Some(&o5), &own, [0x44; 32], 1),
         Err(AcceptRefusal::OfferMismatch { .. })
     ));
     let mut no_row = u.clone();
     no_row.assignment = None;
     assert_eq!(
-        build_accept(Some(&no_row), Some(&o), &id(3), [0x44; 32], 1),
+        build_accept(Some(&no_row), Some(&o), &own, [0x44; 32], 1),
         Err(AcceptRefusal::AssignmentMissing)
     );
 }
 
+/// The id is derived, never supplied: an offer stored under any other id —
+/// such as the recording's synthetic `0x03…` — is not this node's offer.
+#[test]
+fn an_offer_under_an_underived_id_is_not_this_nodes_offer() {
+    let (mut u, o) = (assigned(), offer3());
+    let own = own_of(&o);
+    assert_ne!(o.offer_bond_id, own.offer_bond_id());
+    assert!(matches!(
+        build_accept(Some(&u), Some(&o), &own, [0x44; 32], 1),
+        Err(AcceptRefusal::AssignedToAnotherOffer { .. })
+    ));
+    u.assignment.as_mut().unwrap().winner_offer_bond_id = own.offer_bond_id();
+    assert!(matches!(
+        build_accept(Some(&u), Some(&o), &own, [0x44; 32], 1),
+        Err(AcceptRefusal::OfferMismatch { .. })
+    ));
+}
+
+/// The derived id binds identity and `offer_seq`: a row under this node's id
+/// that names another identity or sequence is refused.
+#[test]
+fn the_row_under_the_derived_id_must_name_this_nodes_identity_and_seq() {
+    let (u, o, own) = assigned_and_offer3();
+    let mut other_identity = o.clone();
+    other_identity.identity = addr(0x77);
+    assert!(matches!(
+        build_accept(Some(&u), Some(&other_identity), &own, [0x44; 32], 1),
+        Err(AcceptRefusal::OfferRowMismatch {
+            field: "identity",
+            ..
+        })
+    ));
+    let mut other_seq = o.clone();
+    other_seq.offer_seq += 1;
+    assert!(matches!(
+        build_accept(Some(&u), Some(&other_seq), &own, [0x44; 32], 1),
+        Err(AcceptRefusal::OfferRowMismatch {
+            field: "offer_seq",
+            ..
+        })
+    ));
+}
+
+/// This node's own offer is read by its derived id.
+#[test]
+fn the_own_offer_read_asks_for_the_derived_id() {
+    let own = own_of(&offer3());
+    let (url, server) = serve_once(r#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_string());
+    assert_eq!(client(url).pool_get_own_offer(&own).unwrap(), None);
+    let sent = server.join().unwrap();
+    assert_eq!(sent["method"], "pool_getOffer");
+    let want: String = own
+        .offer_bond_id()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(sent["params"], serde_json::json!([format!("0x{want}")]));
+}
+
 #[test]
 fn a_reservation_at_the_top_of_the_range_refuses_on_overflow_not_wrap() {
-    let big = read_offer("offer_u128_max", 0x0B).unwrap().unwrap();
+    let mut big = read_offer("offer_u128_max", 0x0B).unwrap().unwrap();
     let mut u = assigned();
     u.assignment.as_mut().unwrap().winner_offer_bond_id = id(0x0B);
+    let own = rebind(&mut u, &mut big);
     // reserved = MAX - 5: 5 more fit exactly, 6 exceed, and 10 overflow.
-    assert!(build_accept(Some(&u), Some(&big), &id(0x0B), [0x44; 32], 5).is_ok());
+    assert!(build_accept(Some(&u), Some(&big), &own, [0x44; 32], 5).is_ok());
     assert!(matches!(
-        build_accept(Some(&u), Some(&big), &id(0x0B), [0x44; 32], 6),
+        build_accept(Some(&u), Some(&big), &own, [0x44; 32], 6),
         Err(AcceptRefusal::Overflow { .. })
     ));
 }
@@ -512,9 +620,12 @@ fn live_server_reads_and_accept_path() {
             reserved: 160
         })
     );
-    assert!(build_accept(Some(&u), Some(&o), &id(3), [0x44; 32], 840).is_ok());
+    // The seeded state predates the derived id; rebind as the tests above do.
+    let (mut u, mut o) = (u, o);
+    let own = rebind(&mut u, &mut o);
+    assert!(build_accept(Some(&u), Some(&o), &own, [0x44; 32], 840).is_ok());
     assert!(matches!(
-        build_accept(Some(&u), Some(&o), &id(3), [0x44; 32], 841),
+        build_accept(Some(&u), Some(&o), &own, [0x44; 32], 841),
         Err(AcceptRefusal::CapacityExceeded { .. })
     ));
     let accepted = c

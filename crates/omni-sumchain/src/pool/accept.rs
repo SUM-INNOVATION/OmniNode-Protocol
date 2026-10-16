@@ -11,12 +11,14 @@
 //! | already accepted | the accepted leaf is write-once (`accept_leaf` → `LeafAlreadyAccepted`) |
 //! | not `assigned` | `UnitState::transition` allows `Accepted` only from `Assigned` |
 //! | assigned to another offer | the accept's offer is derived from the assignment, not carried (`AcceptWorkUnitV1` docs, owner ruling 2026-09-02) |
+//! | the offer row is not this node's | the offer id is derived from the chain id, the sender and `offer_seq` (ratified 2026-10-16, G1-1), so the row under this node's derived id must name the same identity and `offer_seq` |
 //! | over the offer's capacity | `reserve_capacity` / `Reservation::try_reserve`: `reserved + req ≤ offered`, checked, with a missing reservation starting at `reserved = 0` over the offer's `offered_bytes` |
 //!
+//! This node's `offer_bond_id` is never supplied: it is derived from its
+//! [`OwnOffer`] (chain id, identity, `offer_seq`) exactly as the chain derives
+//! it ([`super::ids`]).
+//!
 //! **Still caller-supplied, because nothing on the chain settles them:**
-//! * this node's `offer_bond_id`: the chain derives it from the chain id, the
-//!   sender and `offer_seq` (wire draft §K), but no derivation function exists,
-//!   and there is no read by identity;
 //! * `commit_bond_id`: no C1 operation mints commit bonds, and `B_commit` is
 //!   an unfrozen governance value;
 //! * `accepted_bytes`: no read exposes a unit's reservation requirement.
@@ -27,6 +29,7 @@
 use sumchain_wire::address::Address;
 use sumchain_wire::transaction::ComputePoolTxData;
 
+use super::ids::OwnOffer;
 use super::offer::{accept_unit, OfferError};
 use super::reads::{hex32, PoolOffer, PoolUnit, UnitState};
 
@@ -39,6 +42,12 @@ pub enum AcceptRefusal {
     OfferNotHeld(String),
     #[error("the offer read is for {read}, not this node's offer {own}")]
     OfferMismatch { own: String, read: String },
+    #[error("the offer row under this node's derived id names {field} {read}, not {own}")]
+    OfferRowMismatch {
+        field: &'static str,
+        own: String,
+        read: String,
+    },
     #[error("the unit's current work item is already accepted (the accepted leaf is write-once)")]
     AlreadyAccepted,
     #[error("the unit is {0:?}; only an assigned unit can be accepted")]
@@ -63,19 +72,21 @@ pub enum AcceptRefusal {
     Encode(#[from] OfferError),
 }
 
-/// Build the `AcceptWorkUnitV1` op for `unit`, as this node's offer
-/// `own_offer_bond_id`, or refuse with the reason the chain would.
+/// Build the `AcceptWorkUnitV1` op for `unit`, as this node's offer `own`,
+/// or refuse with the reason the chain would.
 ///
 /// `unit` and `own_offer` are the reads' answers (`None` = not held). The
-/// work item, generation included, comes from the unit read, so an acceptance
-/// cannot name a stale generation.
+/// offer's id is derived from `own`, never supplied. The work item, generation
+/// included, comes from the unit read, so an acceptance cannot name a stale
+/// generation.
 pub fn build_accept(
     unit: Option<&PoolUnit>,
     own_offer: Option<&PoolOffer>,
-    own_offer_bond_id: &[u8; 32],
+    own: &OwnOffer,
     commit_bond_id: [u8; 32],
     accepted_bytes: u128,
 ) -> Result<ComputePoolTxData, AcceptRefusal> {
+    let own_offer_bond_id = &own.offer_bond_id();
     let unit = unit.ok_or(AcceptRefusal::UnitNotHeld)?;
     if unit.accepted_leaf.is_some() {
         return Err(AcceptRefusal::AlreadyAccepted);
@@ -98,6 +109,22 @@ pub fn build_accept(
         return Err(AcceptRefusal::OfferMismatch {
             own: hex32(own_offer_bond_id),
             read: hex32(&offer.offer_bond_id),
+        });
+    }
+    // The id binds identity and `offer_seq`; a row under it that names others
+    // is not this node's offer, however it came to be stored there.
+    if offer.identity != own.identity {
+        return Err(AcceptRefusal::OfferRowMismatch {
+            field: "identity",
+            own: own.identity.to_base58(),
+            read: offer.identity.to_base58(),
+        });
+    }
+    if offer.offer_seq != own.offer_seq {
+        return Err(AcceptRefusal::OfferRowMismatch {
+            field: "offer_seq",
+            own: own.offer_seq.to_string(),
+            read: offer.offer_seq.to_string(),
         });
     }
     let (offered, reserved) = match offer.reservation {
