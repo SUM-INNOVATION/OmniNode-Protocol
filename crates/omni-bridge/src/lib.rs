@@ -15,8 +15,29 @@ pub mod shard_view;
 pub mod store;
 pub mod types;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use pyo3::PyResult;
+
+    /// The value of a `PyResult` that must be `Ok`.
+    ///
+    /// Not `Result::expect`: that formats the `PyErr` with `Debug`, which needs
+    /// a Python interpreter, and these unit tests run without one.
+    #[track_caller]
+    pub(crate) fn ok<T>(r: PyResult<T>, what: &str) -> T {
+        match r {
+            Ok(v) => v,
+            Err(_) => panic!("{what}: unexpected Python exception"),
+        }
+    }
+}
+
 /// Native extension module entry point: `omninode._omni_bridge`
-#[pymodule]
+///
+/// `gil_used = true`: since pyo3 0.28 a module declares itself free-threading
+/// safe by default. This one keeps the GIL until free-threaded Python is
+/// tested against it (the wrappers hold the GIL across their `block_on` calls).
+#[pymodule(gil_used = true)]
 fn _omni_bridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Exceptions ───────────────────────────────────────────────────────
     m.add("OmniError", m.py().get_type::<errors::PyOmniError>())?;

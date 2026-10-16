@@ -16,7 +16,7 @@ use crate::errors::PyOmniError;
 
 // ── PipelineConfig ──────────────────────────────────────────────────────────
 
-#[pyclass(name = "PipelineConfig")]
+#[pyclass(name = "PipelineConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyPipelineConfig {
     pub inner: PipelineConfig,
@@ -96,7 +96,7 @@ impl PyPipelineConfig {
 
 // ── PipelineCapability ──────────────────────────────────────────────────────
 
-#[pyclass(name = "PipelineCapability")]
+#[pyclass(name = "PipelineCapability", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyPipelineCapability {
     pub inner: PipelineCapability,
@@ -442,5 +442,237 @@ impl PyStageExecutor {
             self.inner.session_id(),
             self.inner.micro_batches_completed(),
         )
+    }
+}
+#[cfg(test)]
+mod tests {
+    //! The coordinator and executor wrappers through a whole session, as a
+    //! Python driver would use them: propose, collect offers, schedule, build
+    //! executors from the schedule JSON, report readiness, complete or fail.
+    //! The dict-returning builders need an interpreter and are covered by
+    //! `tests/python/`. Refusals are checked with `is_err()` only.
+
+    use super::*;
+    use crate::test_support::ok;
+
+    const GIB: u64 = 1 << 30;
+
+    fn capability(peer: &str, available_ram: u64, ready: bool) -> PyPipelineCapability {
+        PyPipelineCapability::new(
+            peer.into(),
+            2 * available_ram,
+            available_ram,
+            "linux-x86_64".into(),
+            vec![],
+            vec![(0, 3)],
+            ready,
+        )
+    }
+
+    fn coordinator(micro_batches: u32) -> PyPipelineCoordinator {
+        PyPipelineCoordinator::new(Some(PyPipelineConfig::new(
+            Some(micro_batches),
+            Some(128),
+            None,
+            None,
+            None,
+        )))
+    }
+
+    /// A scheduled two-stage session over four layers; returns the session id
+    /// and the schedule JSON.
+    fn scheduled(c: &mut PyPipelineCoordinator) -> (String, String) {
+        let (sid, msg) = ok(
+            c.propose_session("tiny", &"h".repeat(64), 4, "peer-a"),
+            "proposes",
+        );
+        assert!(!msg.is_empty(), "the proposal is a message to publish");
+        assert_eq!(c.session_state(&sid).as_deref(), Some("Forming"));
+        ok(
+            c.handle_capability_offer(&sid, &capability("peer-a", 8 * GIB, true)),
+            "offer a",
+        );
+        ok(
+            c.handle_capability_offer(&sid, &capability("peer-b", 4 * GIB, true)),
+            "offer b",
+        );
+        // A node that is not pipeline-ready is never scheduled.
+        ok(
+            c.handle_capability_offer(&sid, &capability("peer-c", 64 * GIB, false)),
+            "offer c",
+        );
+        let (json, msg) = ok(c.finalize_schedule(&sid, 64), "schedules");
+        assert!(!msg.is_empty());
+        assert_eq!(c.session_state(&sid).as_deref(), Some("Scheduled"));
+        (sid, json)
+    }
+
+    #[test]
+    fn the_schedule_covers_every_layer_contiguously_and_skips_unready_nodes() {
+        let mut c = coordinator(2);
+        let (sid, json) = scheduled(&mut c);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["session_id"], serde_json::json!(sid));
+        let stages = v["stages"].as_array().unwrap();
+        assert_eq!(stages.len(), 2);
+        let peers: Vec<&str> = stages
+            .iter()
+            .map(|s| s["peer_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            peers,
+            ["peer-a", "peer-b"],
+            "most available RAM first; peer-c is not ready"
+        );
+        let mut next = 0;
+        for s in stages {
+            let (start, end) = (
+                s["layer_range"]["start"].as_u64().unwrap(),
+                s["layer_range"]["end"].as_u64().unwrap(),
+            );
+            assert_eq!(start, next);
+            assert!(end >= start);
+            next = end + 1;
+        }
+        assert_eq!(next, 4);
+        assert_eq!(stages[0]["includes_embedding"], serde_json::json!(true));
+        assert_eq!(stages[1]["includes_output_head"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn executors_built_from_the_schedule_know_their_neighbours() {
+        let mut c = coordinator(2);
+        let (sid, json) = scheduled(&mut c);
+        let first = ok(PyStageExecutor::new(0, &json), "stage 0");
+        let last = ok(PyStageExecutor::new(1, &json), "stage 1");
+        assert_eq!((first.session_id(), first.stage_index()), (sid.as_str(), 0));
+        assert!(first.is_first_stage() && !first.is_last_stage());
+        assert!(!last.is_first_stage() && last.is_last_stage());
+        assert_eq!(first.next_stage_peer_id(), Some("peer-b"));
+        assert_eq!(first.prev_stage_peer_id(), None);
+        assert_eq!(last.prev_stage_peer_id(), Some("peer-a"));
+        assert_eq!(last.next_stage_peer_id(), None);
+
+        let mut e = first;
+        assert!(!e.is_complete());
+        e.mark_micro_batch_completed();
+        assert_eq!(e.micro_batches_completed(), 1);
+        assert!(!e.is_complete());
+        e.mark_micro_batch_completed();
+        assert!(
+            e.is_complete(),
+            "complete after the configured two micro-batches"
+        );
+    }
+
+    #[test]
+    fn an_executor_refuses_an_unknown_stage_or_malformed_schedule() {
+        let mut c = coordinator(1);
+        let (_, json) = scheduled(&mut c);
+        assert!(PyStageExecutor::new(2, &json).is_err());
+        assert!(PyStageExecutor::new(0, "not json").is_err());
+        assert!(PyStageExecutor::new(0, "{}").is_err());
+    }
+
+    #[test]
+    fn a_session_runs_once_every_stage_is_ready_and_then_completes() {
+        let mut c = coordinator(1);
+        let (sid, _) = scheduled(&mut c);
+        assert_eq!(
+            c.handle_stage_ready(&sid, 0).ok(),
+            Some(None),
+            "one of two ready"
+        );
+        assert_eq!(c.session_state(&sid).as_deref(), Some("Scheduled"));
+        let start = ok(c.handle_stage_ready(&sid, 1), "ready");
+        assert!(
+            start.is_some_and(|m| !m.is_empty()),
+            "all ready: start message"
+        );
+        assert_eq!(c.session_state(&sid).as_deref(), Some("Running"));
+        assert_eq!(c.active_session_ids(), vec![sid.clone()]);
+        let done = ok(c.handle_session_complete(&sid, 42), "completes");
+        assert!(!done.is_empty());
+        assert_eq!(c.session_state(&sid).as_deref(), Some("Completed"));
+        assert!(
+            c.active_session_ids().is_empty(),
+            "a completed session is not active"
+        );
+    }
+
+    #[test]
+    fn a_stage_failure_fails_the_session() {
+        let mut c = coordinator(1);
+        let (sid, _) = scheduled(&mut c);
+        let msg = ok(
+            c.handle_stage_failure(&sid, "peer-b", 1, "out of memory"),
+            "failure is reported",
+        );
+        assert!(!msg.is_empty());
+        assert_eq!(c.session_state(&sid).as_deref(), Some("Failed"));
+        assert!(c.active_session_ids().is_empty());
+    }
+
+    #[test]
+    fn unknown_sessions_and_unschedulable_offers_are_refused() {
+        let mut c = coordinator(1);
+        assert!(c
+            .handle_capability_offer("nope", &capability("p", GIB, true))
+            .is_err());
+        assert!(c.finalize_schedule("nope", 64).is_err());
+        assert!(c.handle_stage_ready("nope", 0).is_err());
+        assert_eq!(c.session_state("nope"), None);
+
+        let (sid, _) = ok(c.propose_session("tiny", "h", 4, "peer-a"), "proposes");
+        // No pipeline-ready node: the planner refuses rather than scheduling.
+        ok(
+            c.handle_capability_offer(&sid, &capability("idle", 8 * GIB, false)),
+            "offer",
+        );
+        assert!(c.finalize_schedule(&sid, 64).is_err());
+        assert_eq!(c.session_state(&sid).as_deref(), Some("Forming"));
+    }
+
+    #[test]
+    fn config_and_capability_wrappers_expose_what_they_were_given() {
+        let cfg = PyPipelineConfig::new(Some(3), Some(256), Some(5), Some(4), Some(9));
+        assert_eq!(
+            (
+                cfg.num_micro_batches(),
+                cfg.max_seq_len(),
+                cfg.heartbeat_interval_secs(),
+                cfg.heartbeat_timeout_factor(),
+                cfg.tensor_timeout_secs(),
+            ),
+            (Some(3), 256, 5, 4, 9)
+        );
+        let d = PyPipelineConfig::new(None, None, None, None, None);
+        let def = PipelineConfig::default();
+        assert_eq!(
+            (
+                d.num_micro_batches(),
+                d.max_seq_len(),
+                d.tensor_timeout_secs()
+            ),
+            (
+                def.num_micro_batches,
+                def.max_seq_len,
+                def.tensor_timeout_secs
+            )
+        );
+        let cap = capability("peer-z", 3 * GIB, true);
+        assert_eq!(
+            (
+                cap.peer_id(),
+                cap.available_ram_bytes(),
+                cap.ram_bytes(),
+                cap.pipeline_ready()
+            ),
+            ("peer-z", 3 * GIB, 6 * GIB, true)
+        );
+        assert_eq!(
+            cap.__repr__(),
+            "PipelineCapability(peer='peer-z', ram=3072MB, ready=true)"
+        );
     }
 }

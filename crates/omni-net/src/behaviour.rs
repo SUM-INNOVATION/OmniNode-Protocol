@@ -1,6 +1,6 @@
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, relay,
-    request_response, swarm::NetworkBehaviour,
+    autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response,
+    swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
 };
 
 use crate::codec::ShardCodec;
@@ -27,7 +27,8 @@ use crate::tensor_codec::TensorCodec;
 #[derive(NetworkBehaviour)]
 pub struct OmniNodeBehaviour {
     // ── Existing: LAN mesh (Phase 1–4) ───────────────────────
-    pub mdns:        mdns::tokio::Behaviour,
+    /// Off when [`omni_types::config::NetConfig::mdns`] is `false`.
+    pub mdns:        Toggle<mdns::tokio::Behaviour>,
     pub gossipsub:   gossipsub::Behaviour,
     pub identify:    identify::Behaviour,
     pub shard_xfer:  request_response::Behaviour<ShardCodec>,

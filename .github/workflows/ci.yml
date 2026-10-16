@@ -107,6 +107,54 @@ jobs:
             -p omni-node \
             -p omni-bridge
 
+      # The bridge's interpreter-facing behaviour (exception classes, the
+      # ShardView buffer protocol, dict builders, object lifetimes) can only be
+      # checked from Python, against the extension built for this interpreter.
+      # Gated here so a pyo3 upgrade cannot change it unnoticed.
+      - name: omni-bridge Python tests (maturin develop + pytest)
+        run: |
+          python3 -m venv .venv-bridge
+          . .venv-bridge/bin/activate
+          python -m pip install "maturin>=1.7,<2.0" "pytest>=8,<9" "numpy>=1.24,<3"
+          maturin develop
+          python -m pytest tests/python -q
+
+  # ── (1b) The declared minimum Rust actually builds ──────────────────────────
+  # libp2p 0.57 (hickory-proto 0.26, RUSTSEC-2026-0119) raised the workspace
+  # rust-version to 1.88. Every other job runs `stable`; this one compiles the
+  # default crate list with exactly the declared minimum, so code that needs a
+  # newer Rust fails here instead of at a user's build.
+  msrv-check:
+    name: rust 1.88 (declared minimum) — cargo check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The workspace rust-version is the toolchain checked here
+        run: grep -qx 'rust-version = "1.88"' Cargo.toml
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      # omni-bridge's PyO3 build script needs a Python interpreter.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: cargo +1.88.0 check (default surface, all targets)
+        run: |
+          cargo +1.88.0 check --locked --all-targets \
+            -p omni-net \
+            -p omni-pipeline \
+            -p omni-store \
+            -p omni-types \
+            -p omni-zkml \
+            -p omni-sumchain \
+            -p omni-contributor \
+            -p omni-ops \
+            -p omni-node \
+            -p omni-bridge
+
   # ── (2) Default dep-tree: HARD GATE — feature gating keeps submit out ──────
   default-tree-check:
     name: default tree — must NOT contain sumchain-(crypto|primitives)

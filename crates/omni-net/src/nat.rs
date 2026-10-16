@@ -86,7 +86,14 @@ pub fn build_relay_server(local_peer_id: PeerId, enabled: bool) -> relay::Behavi
             ..Default::default()
         }
     };
-    relay::Behaviour::new(local_peer_id, config)
+    let mut behaviour = relay::Behaviour::new(local_peer_id, config);
+    // libp2p-relay 0.22 (libp2p 0.57) advertises the HOP protocol only once
+    // the node has a confirmed external address. 0.55 always advertised it,
+    // and peers recognise relay-capable nodes by that advertisement, so keep
+    // the 0.55 behaviour explicitly; switching to automatic advertisement is
+    // a separate decision.
+    behaviour.set_status(Some(relay::Status::Enable));
+    behaviour
 }
 
 // ── AutoNAT event handler ────────────────────────────────────────────────────

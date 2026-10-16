@@ -38,6 +38,13 @@ settlement-submit = ["settlement-read", "submit"]
 # duplicate-dispute local gates). Adds no new crates on top of
 # `settlement-submit`.
 settlement-dispute = ["settlement-read", "settlement-submit"]
+# Issues #104 / #105 / #106 — client side of the dormant ComputePool, against
+# the frozen chain wire: the O2 offer cap and op construction, the O2/O4 unit
+# output manifest and root-checked retrieval, and the O3 SelectToken sequence.
+# Pulls only `sumchain-wire` (crates.io, =0.4.0); default builds are unchanged.
+# Nothing here submits: the chain refuses ComputePool transactions while its
+# gate is closed.
+pool-client = ["dep:sumchain-wire"]
 
 [dependencies]
 omni-types          = { workspace = true }
@@ -61,6 +68,9 @@ ureq                = { workspace = true }
 # not touch them.
 sumchain-primitives = { workspace = true, optional = true }
 sumchain-crypto     = { workspace = true, optional = true }
+# Frozen ComputePool / B0 wire types (crates.io =0.4.0), only behind
+# `pool-client`.
+sumchain-wire       = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -269,6 +269,26 @@ impl NetHandle {
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot dial"))
     }
 
+    /// The addresses this node is listening on, read from the swarm's own
+    /// state.
+    ///
+    /// If the listener has not reported an address yet, this waits for the
+    /// first one. [`OmniNetEvent::Listening`] carries the same information on
+    /// the shared event lane, where it is delivered best-effort and can be
+    /// missed by a subscriber registered after it was sent; this answer is
+    /// private to the caller and cannot be dropped. Binding `0.0.0.0` yields
+    /// one address per interface, reported as the transport finds them, so an
+    /// early answer may not list every interface yet.
+    pub async fn listen_addrs(&self) -> Result<Vec<Multiaddr>> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::ListenAddrs { reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — no listen addresses"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("swarm task stopped before reporting a listen address"))
+    }
+
     /// Signal the swarm loop to shut down gracefully.
     ///
     /// The loop completes every in-flight solicited request with
@@ -342,12 +362,6 @@ impl OmniNet {
         let (event_tx, event_rx) = mpsc::channel::<OmniNetEvent>(CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx)     = mpsc::channel::<SwarmCommand>(CHANNEL_CAPACITY);
 
-        tokio::spawn(async move {
-            if let Err(e) = omni_swarm.run(event_tx, cmd_rx).await {
-                tracing::error!(%e, "swarm event loop exited with error");
-            }
-        });
-
         // The receiver is moved into the router here and is unreachable from
         // anywhere else for the rest of the process's life.
         let (router, router_handle) = EventRouter::new(event_rx);
@@ -358,12 +372,20 @@ impl OmniNet {
             router: router_handle,
             local_peer_id,
         };
-        // Registered before returning, so events emitted between `new` and the
-        // caller's first `next_event` are buffered rather than counted as
-        // unsubscribed.
+        // Registered before the swarm task is spawned, so every event it emits
+        // is buffered for the caller's first `next_event` rather than counted
+        // as unsubscribed, including the one-off `Listening`. Registration is
+        // synchronous and the swarm emits nothing until it runs; registered
+        // after the spawn, this subscription could miss the earliest events.
         let events = handle
             .subscribe(Interests::everything())
             .map_err(|e| anyhow::anyhow!("event router stopped during startup: {e}"))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = omni_swarm.run(event_tx, cmd_rx).await {
+                tracing::error!(%e, "swarm event loop exited with error");
+            }
+        });
 
         Ok(Self { handle, events })
     }
@@ -557,6 +579,12 @@ impl OmniNet {
     /// [`OmniNet::next_event`].
     pub fn try_next_event(&mut self) -> Option<OmniNetEvent> {
         self.events.try_recv()
+    }
+
+    /// The addresses this node is listening on. See
+    /// [`NetHandle::listen_addrs`].
+    pub async fn listen_addrs(&self) -> Result<Vec<Multiaddr>> {
+        self.handle.listen_addrs().await
     }
 
     /// Signal the swarm loop to shut down gracefully.
@@ -848,6 +876,103 @@ mod local_peer_id_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod listen_addrs_tests {
+    use super::*;
+    use libp2p::multiaddr::Protocol;
+    use omni_types::config::NetConfig;
+    use std::time::Duration;
+
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    fn udp_port(addr: &Multiaddr) -> Option<u16> {
+        addr.iter().find_map(|p| match p {
+            Protocol::Udp(port) => Some(port),
+            _ => None,
+        })
+    }
+
+    /// The listen address is answered from the swarm's state, without reading
+    /// the event lane at all, and every reported address shares the bound port.
+    #[tokio::test]
+    async fn listen_addrs_answers_without_the_event_lane() {
+        let net = OmniNet::new(NetConfig {
+            mdns: false,
+            ..NetConfig::default()
+        })
+        .await
+        .expect("OmniNet::new");
+        let addrs = tokio::time::timeout(DEADLINE, net.listen_addrs())
+            .await
+            .expect("listen_addrs must not hang")
+            .expect("listen addresses");
+        assert!(!addrs.is_empty());
+        let ports: std::collections::BTreeSet<u16> = addrs.iter().filter_map(udp_port).collect();
+        assert_eq!(ports.len(), 1, "one listener, one port: {addrs:?}");
+        assert_ne!(
+            ports.into_iter().next(),
+            Some(0),
+            "the OS-assigned port is reported"
+        );
+        let _ = net.shutdown().await;
+    }
+
+    /// The default subscription is registered before the swarm runs, so it
+    /// receives the one-off `Listening` and no control event reaches the router
+    /// before any subscriber exists to take it.
+    ///
+    /// Multi-threaded, as the Python bridge's runtime is: there the spawned
+    /// swarm task can run before `new` returns, which is where the old order
+    /// lost `Listening`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_default_subscription_sees_listening_from_the_first_event() {
+        let mut net = OmniNet::new(NetConfig {
+            mdns: false,
+            ..NetConfig::default()
+        })
+        .await
+        .expect("OmniNet::new");
+        let listening = tokio::time::timeout(DEADLINE, async {
+            loop {
+                match net.next_event().await {
+                    Some(OmniNetEvent::Listening { addr }) => break Some(addr),
+                    Some(_) => continue,
+                    None => break None,
+                }
+            }
+        })
+        .await
+        .expect("Listening must reach the default subscription");
+        assert!(
+            listening.is_some(),
+            "the event stream ended before Listening"
+        );
+        assert_eq!(
+            net.router_counts().unwanted_control,
+            0,
+            "a control event reached the router before the default subscription existed"
+        );
+        let _ = net.shutdown().await;
+    }
+
+    /// A query queued behind the shutdown fails once the loop has gone,
+    /// instead of waiting for an answer that cannot come.
+    #[tokio::test]
+    async fn listen_addrs_after_shutdown_fails_rather_than_hangs() {
+        let net = OmniNet::new(NetConfig {
+            mdns: false,
+            ..NetConfig::default()
+        })
+        .await
+        .expect("OmniNet::new");
+        net.shutdown().await.expect("shutdown");
+        let result = tokio::time::timeout(DEADLINE, net.listen_addrs())
+            .await
+            .expect("listen_addrs must not hang after shutdown");
+        assert!(result.is_err(), "the loop is gone: {result:?}");
     }
 }
 

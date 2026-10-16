@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"offer_bond_id":"0x0303030303030303030303030303030303030303030303030303030303030303","identity":"jU2ZiwRwvA6oxkbqz1opzaxWMG1NgW9c","payment_addr":"8KfGeEPJUAa16cX1Sq95Gvra4Va4M3o2a","offered_bytes":"1000","offer_seq":3,"bond_locked":"500","active":true,"reservation":{"offered":"1000","reserved":"160"}}}

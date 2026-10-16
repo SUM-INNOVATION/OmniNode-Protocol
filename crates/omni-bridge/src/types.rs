@@ -9,7 +9,7 @@ use omni_types::model::{LayerRange, ModelManifest, ShardDescriptor};
 
 // ── NetConfig ────────────────────────────────────────────────────────────────
 
-#[pyclass(name = "NetConfig")]
+#[pyclass(name = "NetConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyNetConfig {
     pub inner: NetConfig,
@@ -39,7 +39,7 @@ impl PyNetConfig {
 
 // ── StoreConfig ──────────────────────────────────────────────────────────────
 
-#[pyclass(name = "StoreConfig")]
+#[pyclass(name = "StoreConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyStoreConfig {
     pub inner: StoreConfig,
@@ -111,7 +111,7 @@ impl PyStoreConfig {
 
 // ── LayerRange ───────────────────────────────────────────────────────────────
 
-#[pyclass(name = "LayerRange")]
+#[pyclass(name = "LayerRange", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyLayerRange {
     pub inner: LayerRange,
@@ -147,7 +147,7 @@ impl PyLayerRange {
 
 // ── ShardDescriptor ──────────────────────────────────────────────────────────
 
-#[pyclass(name = "ShardDescriptor")]
+#[pyclass(name = "ShardDescriptor", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyShardDescriptor {
     pub inner: ShardDescriptor,
@@ -206,7 +206,7 @@ impl PyShardDescriptor {
 
 // ── ModelManifest ────────────────────────────────────────────────────────────
 
-#[pyclass(name = "ModelManifest")]
+#[pyclass(name = "ModelManifest", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyModelManifest {
     pub inner: ModelManifest,
@@ -284,5 +284,110 @@ impl PyModelManifest {
 
     fn __len__(&self) -> usize {
         self.inner.shards.len()
+    }
+}
+#[cfg(test)]
+mod tests {
+    //! Constructor, validation and JSON behaviour of the config and model
+    //! wrappers. Only `is_err()` is asserted on refusals: formatting a `PyErr`
+    //! needs a Python interpreter, which these tests do not have. The Python
+    //! suite (`tests/python/`) checks the exception types and messages.
+
+    use super::*;
+    use crate::test_support::ok;
+    use omni_types::model::{LayerRange, ModelManifest, ShardDescriptor};
+
+    #[test]
+    fn net_config_defaults_and_port_override() {
+        let d = PyNetConfig::new(None);
+        assert_eq!(d.listen_port(), NetConfig::default().listen_port);
+        let p = PyNetConfig::new(Some(4242));
+        assert_eq!(p.listen_port(), 4242);
+        assert_eq!(p.__repr__(), "NetConfig(listen_port=4242)");
+    }
+
+    #[test]
+    fn store_config_applies_every_override() {
+        let c = ok(
+            PyStoreConfig::new(Some("/tmp/omni-x".into()), Some(2), Some(1024), Some(4096)),
+            "valid configuration",
+        );
+        assert_eq!(c.store_dir(), "/tmp/omni-x");
+        assert_eq!(
+            (
+                c.layers_per_shard(),
+                c.max_shard_msg_bytes(),
+                c.max_shard_total_bytes()
+            ),
+            (2, 1024, 4096)
+        );
+        assert!(c.__repr__().contains("store_dir='/tmp/omni-x'"));
+    }
+
+    #[test]
+    fn store_config_refuses_zero_limits_through_the_shared_validator() {
+        assert!(PyStoreConfig::new(None, None, Some(0), None).is_err());
+        assert!(PyStoreConfig::new(None, None, None, Some(0)).is_err());
+        // The defaults themselves validate.
+        assert!(PyStoreConfig::new(None, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn layer_range_length_is_inclusive() {
+        let r = PyLayerRange::new(3, 7);
+        assert_eq!((r.start(), r.end(), r.__len__()), (3, 7, 5));
+        assert_eq!(PyLayerRange::new(4, 4).__len__(), 1);
+        assert_eq!(r.__repr__(), "LayerRange(start=3, end=7)");
+    }
+
+    fn manifest() -> ModelManifest {
+        ModelManifest {
+            model_name: "m".into(),
+            model_hash: "h".repeat(64),
+            architecture: "llama".into(),
+            total_layers: 2,
+            quantization: "F16".into(),
+            total_size_bytes: 128,
+            gguf_version: 3,
+            shards: vec![ShardDescriptor {
+                shard_index: 0,
+                cid: "bafy0".into(),
+                layer_range: LayerRange { start: 0, end: 1 },
+                includes_embedding: true,
+                includes_output_head: true,
+                size_bytes: 128,
+                blake3_hash: "b".repeat(64),
+                snip_v2: None,
+            }],
+            snip_v2: None,
+        }
+    }
+
+    #[test]
+    fn manifest_json_round_trips_through_the_wrapper() {
+        let m = PyModelManifest { inner: manifest() };
+        let json = ok(m.to_json(), "serialises");
+        let back = ok(PyModelManifest::from_json(&json), "parses");
+        assert_eq!(back.model_name(), "m");
+        assert_eq!(back.architecture(), "llama");
+        assert_eq!(
+            (back.total_layers(), back.gguf_version(), back.__len__()),
+            (2, 3, 1)
+        );
+        let s = &back.shards()[0];
+        assert_eq!(
+            (s.shard_index(), s.cid(), s.size_bytes()),
+            (0, "bafy0", 128)
+        );
+        assert_eq!((s.layer_range().start(), s.layer_range().end()), (0, 1));
+        assert!(s.includes_embedding() && s.includes_output_head());
+        assert_eq!(back.to_json().ok(), Some(json));
+    }
+
+    #[test]
+    fn manifest_from_json_refuses_malformed_input() {
+        assert!(PyModelManifest::from_json("").is_err());
+        assert!(PyModelManifest::from_json("{\"model_name\": 5}").is_err());
+        assert!(PyModelManifest::from_json("[]").is_err());
     }
 }
