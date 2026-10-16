@@ -37,6 +37,14 @@
 # `scripts/verify-release-local.sh <tag> --expect-sums-sha256 <digest>`,
 # which reads the draft with their own login. The options, and the
 # permission each one needs, are in docs/release-verification-read-only.md.
+#
+# On pull requests that touch this tooling, only the `signature-selftest`
+# job runs. It executes the same §5 script (cosign verify-blob with all
+# three identity checks, plus the SAN check) against v0.1.0, an
+# already-published full release, and a negative control that must reject
+# an altered SHA256SUMS. It verifies v0.1.0's signature only and says
+# nothing about any draft. The full `verify` job runs on `release:
+# published` and workflow_dispatch, never on pull requests.
 
 name: Verify release (hosted, read-only)
 
@@ -66,11 +74,25 @@ on:
         required: false
         default: ""
         type: string
-  push:
-    branches: [ "ci/73-hosted-release-verification" ]
+  pull_request:
+    paths:
+      - '.github/workflows/verify-release.yml'
+      - 'scripts/verify-release-signature.sh'
+      - 'scripts/verify-release-local.sh'
 
 permissions:
   contents: read
+
+env:
+  # Release source is pinned to the canonical repo (not github.repository)
+  # so a fork run can never verify a look-alike bundle.
+  REPO: SUM-INNOVATION/OmniNode-Protocol
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+  # §5 regex, byte-for-byte from the #73 runbook and
+  # docs/stage15.2-release-artifact-workflow.md §4.
+  RUNBOOK_REGEX: 'https://github\.com/SUM-INNOVATION/OmniNode-Protocol/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'
+  # PROD_REGEX, byte-for-byte from release.yml `Verify cosign signature`.
+  RELEASE_YML_REGEX: 'https://github\.com/SUM-INNOVATION/OmniNode-Protocol/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9\.-]+)?$'
 
 concurrency:
   group: verify-release-${{ github.ref }}
@@ -83,6 +105,7 @@ defaults:
 jobs:
   verify:
     name: Verify ${{ github.event.release.tag_name || inputs.tag || 'v0.1.1' }} on ${{ matrix.host.arch }} (${{ matrix.host.runner }})
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.host.runner }}
     timeout-minutes: 20
     permissions:
@@ -100,9 +123,6 @@ jobs:
       # GH_TOKEN is deliberately NOT job-wide: it is set only on the
       # steps that call the GitHub API, so the release binaries under
       # test (§6.3-§6.7) never see any token in their environment.
-      # Release source is pinned to the canonical repo (not github.repository)
-      # so a fork run can never verify a look-alike bundle.
-      REPO: SUM-INNOVATION/OmniNode-Protocol
       TAG: ${{ github.event.release.tag_name || inputs.tag || 'v0.1.1' }}
       SOURCE: ${{ inputs.source || 'release' }}
       RUN_ID: ${{ inputs.run_id }}
@@ -111,13 +131,17 @@ jobs:
       HOST_TRIPLE: ${{ matrix.host.triple }}
       # Snapshots are captured by release.yml on the x86_64 build only.
       SNAPSHOT_TRIPLE: x86_64-unknown-linux-gnu
-      OIDC_ISSUER: https://token.actions.githubusercontent.com
-      # §5 regex, byte-for-byte from the #73 runbook and
-      # docs/stage15.2-release-artifact-workflow.md §4.
-      RUNBOOK_REGEX: 'https://github\.com/SUM-INNOVATION/OmniNode-Protocol/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'
-      # PROD_REGEX, byte-for-byte from release.yml `Verify cosign signature`.
-      RELEASE_YML_REGEX: 'https://github\.com/SUM-INNOVATION/OmniNode-Protocol/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9\.-]+)?$'
     steps:
+      # Only for scripts/verify-release-signature.sh, taken from the same
+      # commit as this workflow file (not the tag under verification, which
+      # may predate the script). No credentials are kept.
+      - name: Checkout (verification scripts only)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts
+
       - name: Host facts + tool check
         run: |
           set -euo pipefail
@@ -285,57 +309,9 @@ jobs:
           cosign-release: "v2.6.5"
 
       - name: §5 cosign verify-blob (production identity regex) + Fulcio SAN
-        working-directory: ${{ runner.temp }}/release-verify/dl
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          cosign version
-          echo "--- runbook §5 regex ---"
-          printf '%s\n' "$RUNBOOK_REGEX"
-          cosign verify-blob \
-            --certificate         SHA256SUMS.cert \
-            --signature           SHA256SUMS.sig \
-            --certificate-identity-regexp "$RUNBOOK_REGEX" \
-            --certificate-oidc-issuer "$OIDC_ISSUER" \
-            SHA256SUMS
-          echo "--- release.yml PROD_REGEX ---"
-          printf '%s\n' "$RELEASE_YML_REGEX"
-          cosign verify-blob \
-            --certificate         SHA256SUMS.cert \
-            --signature           SHA256SUMS.sig \
-            --certificate-identity-regexp "$RELEASE_YML_REGEX" \
-            --certificate-oidc-issuer "$OIDC_ISSUER" \
-            SHA256SUMS
-          echo "--- extra: bind cert to the commit the tag points at ---"
-          REF=$(gh api "repos/$REPO/git/ref/tags/$TAG")
-          OBJ_TYPE=$(jq -r .object.type <<<"$REF"); OBJ_SHA=$(jq -r .object.sha <<<"$REF")
-          if [[ "$OBJ_TYPE" == "tag" ]]; then
-            COMMIT=$(gh api "repos/$REPO/git/tags/$OBJ_SHA" --jq .object.sha)
-          else
-            COMMIT="$OBJ_SHA"
-          fi
-          echo "tag object: $OBJ_TYPE $OBJ_SHA -> commit $COMMIT"
-          cosign verify-blob \
-            --certificate         SHA256SUMS.cert \
-            --signature           SHA256SUMS.sig \
-            --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$TAG" \
-            --certificate-oidc-issuer "$OIDC_ISSUER" \
-            --certificate-github-workflow-repository "$REPO" \
-            --certificate-github-workflow-ref "refs/tags/$TAG" \
-            --certificate-github-workflow-trigger push \
-            --certificate-github-workflow-sha "$COMMIT" \
-            SHA256SUMS
-          echo "--- runbook §5 SAN extraction ---"
-          base64 -d < SHA256SUMS.cert > cert.pem
-          openssl x509 -in cert.pem -noout -ext subjectAltName | tee san.txt
-          openssl x509 -in cert.pem -noout -subject -issuer -startdate -enddate -serial
-          openssl x509 -in cert.pem -noout -text | sed -n '/X509v3 extensions/,/Signature Algorithm/p'
-          WANT="URI:https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$TAG"
-          if ! grep -qxF "    $WANT" san.txt && ! grep -qxF "$WANT" san.txt; then
-            echo "::error::SAN does not equal $WANT"; exit 1
-          fi
-          echo "SAN OK: $WANT"
+        run: '"$GITHUB_WORKSPACE/scripts/verify-release-signature.sh" "$WORKDIR/dl"'
 
       - name: §6.1 sha256sum -c SHA256SUMS
         working-directory: ${{ runner.temp }}/release-verify/dl
@@ -441,3 +417,70 @@ jobs:
               echo "Bind the draft (maintainer, read-only): \`scripts/verify-release-local.sh $TAG --expect-sums-sha256 $SUMS_SHA256\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Pull requests touching this tooling: run the real §5 check (same script,
+  # same pinned cosign) against an already-PUBLISHED release, so cosign is
+  # exercised without reading any draft, plus a negative control.
+  signature-selftest:
+    name: cosign self-test on published v0.1.0 (not a verification of any draft)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      TAG: v0.1.0
+    steps:
+      - name: Checkout (verification scripts only)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Download the published release's signed SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DL="$RUNNER_TEMP/selftest/dl"
+          mkdir -p "$DL"
+          echo "DL=$DL" >> "$GITHUB_ENV"
+          gh release view "$TAG" --repo "$REPO" --json isDraft,isPrerelease,tagName,url | tee "$RUNNER_TEMP/selftest/view.json"
+          jq -e --arg t "$TAG" '.isDraft == false and .tagName == $t' "$RUNNER_TEMP/selftest/view.json" >/dev/null \
+            || { echo "::error::$TAG must be a published (non-draft) release"; exit 1; }
+          gh release download "$TAG" --repo "$REPO" --dir "$DL" \
+            --pattern SHA256SUMS --pattern SHA256SUMS.sig --pattern SHA256SUMS.cert
+          # GitHub's server-side asset digests vs the downloaded bytes.
+          gh api "repos/$REPO/releases/tags/$TAG" \
+            --jq '.assets[] | select(.name == "SHA256SUMS" or .name == "SHA256SUMS.sig" or .name == "SHA256SUMS.cert") | "\(.digest | sub("^sha256:"; ""))  \(.name)"' \
+            > "$RUNNER_TEMP/selftest/api-digests"
+          [[ $(wc -l < "$RUNNER_TEMP/selftest/api-digests") -eq 3 ]] || { echo "::error::expected 3 asset digests"; exit 1; }
+          (cd "$DL" && sha256sum -c "$RUNNER_TEMP/selftest/api-digests")
+
+      - name: §5 cosign install (job-local, pinned)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v2.6.5"
+
+      - name: §5 cosign verify-blob + Fulcio SAN on the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$GITHUB_WORKSPACE/scripts/verify-release-signature.sh" "$DL"'
+
+      - name: Negative control — an altered SHA256SUMS must be rejected
+        run: |
+          set -uo pipefail
+          BAD="$RUNNER_TEMP/selftest/bad"
+          mkdir -p "$BAD"
+          cp "$DL/SHA256SUMS.sig" "$DL/SHA256SUMS.cert" "$BAD/"
+          { cat "$DL/SHA256SUMS"; echo "0000000000000000000000000000000000000000000000000000000000000000  tampered"; } > "$BAD/SHA256SUMS"
+          if cosign verify-blob \
+              --certificate "$BAD/SHA256SUMS.cert" \
+              --signature "$BAD/SHA256SUMS.sig" \
+              --certificate-identity-regexp "$RUNBOOK_REGEX" \
+              --certificate-oidc-issuer "$OIDC_ISSUER" \
+              "$BAD/SHA256SUMS"; then
+            echo "::error::cosign accepted an altered SHA256SUMS"
+            exit 1
+          fi
+          echo "Negative control OK: cosign rejected the altered SHA256SUMS."

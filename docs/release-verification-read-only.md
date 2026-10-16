@@ -36,20 +36,26 @@ access, not by that header.
 | # | Source of the bytes | Permission | Owner decision | What it covers | v0.1.1 |
 | --- | --- | --- | --- | --- | --- |
 | A | The draft, read by `scripts/verify-release-local.sh` with the maintainer's own `gh` login | None new. Uses the push access the maintainer already has. | None: read-only | §4, §5, §6.1, §6.2 and §7 on any host. §6.3–§6.7 only for a Linux arch the host runs natively. | Usable now. On a macOS host, both arches' `--version`/`--help` checks are NOT RUN. |
-| B | `release-bundle` artifact of the release.yml run that built the tag (the exact files the `Publish draft Release` job uploads). Workflow input `source=run-artifacts` | `actions: read` and `contents: read` on the verify job's `GITHUB_TOKEN` | None for the token. Running it needs the workflow on `main` (dispatch) or a push to its branch. | §4–§6 natively on x86_64 and aarch64. Bound to the draft by running A with `--expect-sums-sha256`. | Closed: the artifacts of run 28214844938 expired (14-day retention). Usable for a future tag within 14 days of its release run. |
+| B | `release-bundle` artifact of the release.yml run that built the tag (the exact files the `Publish draft Release` job uploads). Workflow input `source=run-artifacts` | `actions: read` and `contents: read` on the verify job's `GITHUB_TOKEN` | None for the token. Running it needs the workflow on `main` (dispatch). | §4–§6 natively on x86_64 and aarch64. Bound to the draft by running A with `--expect-sums-sha256`. | Closed: the artifacts of run 28214844938 expired (14-day retention). Usable for a future tag within 14 days of its release run. |
 | C | A published pre-release. Workflow input `source=release`, or the `release: published` trigger | `contents: read` on the verify job's `GITHUB_TOKEN` | Publish before native verification, as a pre-release. This amends #73 §8 ("do not promote before verification"). | §4–§6 natively on both arches, plus §7 unchanged before and after | Usable once the owner approves publishing v0.1.1 as a pre-release. |
 | D | The draft, read by the hosted workflow | `contents: write` on the verify job's `GITHUB_TOKEN`, used for GET requests only | Authorize a broader token | Everything, with no publication | Not implemented. The workflow refuses by design. |
 
 Trigger notes:
 
 - `release: published` and `workflow_dispatch` run only once
-  `verify-release.yml` is on the default branch.
-- Until then, the workflow runs on a push to
-  `ci/73-hosted-release-verification` and checks the default tag
-  (`v0.1.1`) from the published release.
+  `verify-release.yml` is on the default branch. Only those two events
+  run the full `verify` job.
 - A release published with a maintainer's credentials triggers
   `release: published`. A release published by a workflow's
   `GITHUB_TOKEN` would not trigger it.
+- **Pull requests that touch this tooling run only `signature-selftest`.**
+  - It runs the same §5 script (`scripts/verify-release-signature.sh`),
+    with the same pinned cosign, against `v0.1.0`, an already-published
+    full release.
+  - A negative control must then reject an altered `SHA256SUMS`.
+  - It shows the signature check executes and passes on a real published
+    release. It says nothing about the `v0.1.1` draft: its signature is
+    verified only by a run of option A, B or C on its own bytes.
 
 ## 3. Sequences
 
@@ -78,8 +84,7 @@ Trigger notes:
    Then the hosted run executes:
    - automatically on `release: published` once on `main`;
    - otherwise via dispatch with `source=release`,
-     `expect_sums_sha256=f24da5b0…`;
-   - or via a branch push.
+     `expect_sums_sha256=f24da5b0…`.
 
    Every job must pass. Only then:
 
@@ -117,7 +122,7 @@ Trigger notes:
 | --- | --- | --- |
 | §7 before | `source=release`: published, `tagName = name = <tag>`, pre-release (gate) or full (evidence only) | draft, pre-release or full; `tagName = name = <tag>` |
 | §4 | 11 expected files and no others; bytes equal GitHub's asset digests (`source=release`) or the artifact digest (`source=run-artifacts`); optional `expect_sums_sha256` | 11 expected files and no others; bytes equal GitHub's asset digests; optional `--expect-sums-sha256` |
-| §5 | runbook regex, release.yml regex, exact identity bound to the tag's commit; SAN | the same |
+| §5 | runbook regex, release.yml regex, exact identity bound to the tag's commit; SAN (`scripts/verify-release-signature.sh`) | the same checks, inline; needs a real `cosign` ≥ 2.4.1 on the host |
 | §6.1, §6.2 | `sha256sum -c` 8 of 8; `file -b` on all 4 binaries | the same (`shasum -a 256` where `sha256sum` is missing) |
 | §6.3–§6.7 | native on both runners; snapshot diffs | native arch only; every other arch reported NOT RUN |
 | §7 after | release metadata and asset digests unchanged (`source=release`) | the same |
