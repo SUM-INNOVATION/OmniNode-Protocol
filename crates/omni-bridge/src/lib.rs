@@ -33,7 +33,11 @@ pub(crate) mod test_support {
 }
 
 /// Native extension module entry point: `omninode._omni_bridge`
-#[pymodule]
+///
+/// `gil_used = true`: since pyo3 0.28 a module declares itself free-threading
+/// safe by default. This one keeps the GIL until free-threaded Python is
+/// tested against it (the wrappers hold the GIL across their `block_on` calls).
+#[pymodule(gil_used = true)]
 fn _omni_bridge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Exceptions ───────────────────────────────────────────────────────
     m.add("OmniError", m.py().get_type::<errors::PyOmniError>())?;

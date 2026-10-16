@@ -126,7 +126,7 @@ sumchain-crypto     = "=0.4.0"
 # wheel (pyproject.toml [tool.maturin] features), and a plain `cargo test`
 # must link libpython, or omni-bridge's test binary has undefined symbols on
 # Linux.
-pyo3 = { version = "0.23" }
+pyo3 = { version = "0.29" }
 
 # ─── Phase 4: Pipeline ───────────────────────────────────────────────────────
 
