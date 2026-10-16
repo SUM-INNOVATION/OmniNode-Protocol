@@ -2960,6 +2960,7 @@ dependencies = [
  "serde_json",
  "sumchain-crypto",
  "sumchain-primitives",
+ "sumchain-wire",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

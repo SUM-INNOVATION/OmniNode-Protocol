@@ -76,6 +76,10 @@ pub mod settlement_submit;
 // Superset of `settlement-submit`; adds no new crates.
 #[cfg(feature = "settlement-dispute")]
 pub mod settlement_dispute;
+// Issues #104 / #105 / #106 — client side of the dormant ComputePool against
+// the frozen chain wire. Pulls only `sumchain-wire`; builds nothing that submits.
+#[cfg(feature = "pool-client")]
+pub mod pool;
 
 pub use client::SumChainClient;
 pub use dto::{

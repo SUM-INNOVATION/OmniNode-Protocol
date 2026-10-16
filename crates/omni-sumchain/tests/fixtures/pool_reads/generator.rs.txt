@@ -1,0 +1,337 @@
+//! OmniNode fixture generator for `pool_getUnit` / `pool_getOffer` (#130).
+//!
+//! NOT part of sum-chain: run from a scratch checkout of the pool-read commit
+//! to record what the real JSON-RPC server answers, over HTTP, for state built
+//! with the real model and store operations (the same harness as
+//! `pool_read_rpcs.rs`, copied verbatim). Two modes:
+//!
+//! * `POOL_FIXTURE_OUT=<dir>`: write each HTTP response body to `<dir>`.
+//! * `POOL_SERVE_READY=<file>` (+ `POOL_SERVE_STOP=<file>`): serve the seeded
+//!   state over HTTP, write the URL to the ready file, and keep serving until
+//!   the stop file exists (at most 10 minutes).
+
+#![allow(dead_code, unused_imports)]
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use sumchain_consensus::PoAEngine;
+use sumchain_crypto::KeyPair;
+use sumchain_genesis::{ChainParams, Genesis};
+use sumchain_primitives::{Address, Block, BlockHeader, Hash};
+use sumchain_rpc::api::SumChainApiServer;
+use sumchain_rpc::server::RpcServer;
+use sumchain_rpc::types::{
+    PoolAcceptedLeafInfo, PoolAssignmentInfo, PoolOfferInfo, PoolRequiredInputInfo,
+    PoolReservationInfo, PoolUnitInfo,
+};
+use sumchain_state::compute_pool::{
+    AcceptedLeaf, AssignmentIndexEntry, BondedOffer, CommitBondId, ComputePoolModel,
+    ExposureInputs, JobId, OfferBondId, RequiredInput, SlotId, UnitId, UnitKey, UnitSizing,
+    UnitState, WorkItemKey, WorkUnit,
+};
+use sumchain_state::compute_pool_store::{
+    active_offer_index_key_bytes, offer_key_bytes, reservation_key_bytes, unit_key_bytes,
+    ComputePoolStore,
+};
+use sumchain_state::{Mempool, MempoolConfig, StateManager};
+use sumchain_storage::candidate::{
+    BlockJournals, CandidateExecution, ExecutionSubject, JournalRecord,
+};
+use sumchain_storage::{cf, Database};
+use tempfile::TempDir;
+use tokio::sync::mpsc;
+
+const INVALID_PARAMS: i32 = -32602;
+const INTERNAL: i32 = -32603;
+
+fn server() -> (RpcServer, Arc<Database>, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(Database::open_default(dir.path()).unwrap());
+    let state = Arc::new(StateManager::new(db.clone(), 1));
+    let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
+    let validator = KeyPair::from_bytes([0x51; 32]);
+    // The production default: the pool gate is closed.
+    let genesis = Genesis::new(
+        1,
+        0,
+        vec![validator.public_key().to_base58()],
+        HashMap::from([(validator.address().to_base58(), 1u128)]),
+        ChainParams::default(),
+    );
+    let engine = Arc::new(
+        PoAEngine::new(
+            db.clone(),
+            state.clone(),
+            mempool.clone(),
+            &genesis,
+            Some(validator),
+        )
+        .unwrap(),
+    );
+    let (tx_sender, _rx) = mpsc::channel(8);
+    let srv = RpcServer::new(
+        db.clone(),
+        state,
+        mempool,
+        engine,
+        tx_sender,
+        Arc::new(|| 0usize),
+    );
+    (srv, db, dir)
+}
+
+fn jid(b: u8) -> JobId {
+    JobId::from_bytes([b; 32])
+}
+fn uid(b: u8) -> UnitId {
+    UnitId::from_bytes([b; 32])
+}
+fn oid(b: u8) -> OfferBondId {
+    OfferBondId::from_bytes([b; 32])
+}
+fn addr(b: u8) -> Address {
+    Address::new([b; 20])
+}
+fn hex32(b: u8) -> String {
+    format!("0x{}", hex::encode([b; 32]))
+}
+
+fn unit(job: JobId, u: UnitId) -> WorkUnit {
+    WorkUnit {
+        job_id: job,
+        unit_id: u,
+        predecessors: vec![],
+        required_inputs: vec![],
+        generation: 0,
+        state: UnitState::Blocked,
+    }
+}
+
+fn offer(id: OfferBondId, identity: Address, active: bool) -> BondedOffer {
+    BondedOffer {
+        offer_bond_id: id,
+        identity,
+        payment_addr: addr(0x50),
+        offered_bytes: 1_000,
+        offer_seq: 3,
+        bond_locked: 500,
+        active,
+    }
+}
+
+/// Job 1 with three units:
+/// * unit 2: assigned to offer 3 and accepted (leaf with commit bond 4);
+/// * unit 3: assigned to offer 3, not accepted;
+/// * unit 4: blocked on unit 2, with one required input.
+///
+/// Offer 3 is active with a reservation; offer 5 is inactive, with none.
+fn model() -> ComputePoolModel {
+    let mut m = ComputePoolModel::new();
+    let j = jid(1);
+    let mut u4 = unit(j, uid(4));
+    u4.predecessors = vec![uid(2)];
+    u4.required_inputs = vec![RequiredInput {
+        predecessor: uid(2),
+        required_output_slot_id: SlotId::from_bytes([0x21; 32]),
+        pred_output_manifest_root: Hash::new([0x22; 32]),
+        required_slot_state_object_root: Hash::new([0x23; 32]),
+    }];
+    let units = vec![unit(j, uid(2)), unit(j, uid(3)), u4];
+    let sizing: Vec<UnitSizing> = units.iter().map(|_| UnitSizing { slots: 0 }).collect();
+    m.create_job(
+        j,
+        addr(9),
+        1,
+        units,
+        &sizing,
+        1,
+        0,
+        1_000,
+        ExposureInputs {
+            q: 100,
+            reprovision_allowance: 10,
+            job_max_retention_files: 0,
+            max_reassignments_per_file: 2,
+            reassign_reimb: 5,
+        },
+        1_000_000,
+    )
+    .unwrap();
+
+    m.publish_offer(offer(oid(3), addr(8), true)).unwrap();
+    m.publish_offer(offer(oid(5), addr(7), false)).unwrap();
+    m.reserve_capacity(oid(3), 1_000, 160).unwrap();
+
+    for u in [uid(2), uid(3)] {
+        let key = UnitKey::new(j, u);
+        m.transition_unit(&key, UnitState::Eligible).unwrap();
+        m.transition_unit(&key, UnitState::Assigned).unwrap();
+        m.put_assignment(AssignmentIndexEntry {
+            key: WorkItemKey::new(j, u, 0),
+            winner_offer_bond_id: oid(3),
+            winner_payment_addr: addr(0x50),
+        })
+        .unwrap();
+    }
+    m.accept_leaf(AcceptedLeaf {
+        key: WorkItemKey::new(j, uid(2), 0),
+        offer_bond_id: oid(3),
+        commit_bond_id: CommitBondId::from_bytes([4; 32]),
+        accepted_bytes: 100,
+    })
+    .unwrap();
+    m.transition_unit(&UnitKey::new(j, uid(2)), UnitState::Accepted)
+        .unwrap();
+    m
+}
+
+/// Commit `after` as block `height` publishes it.
+fn publish(
+    db: &Database,
+    before: Option<&ComputePoolModel>,
+    after: &ComputePoolModel,
+    height: u64,
+) {
+    let header = BlockHeader::new(
+        Hash::hash(b"parent"),
+        height,
+        1_000 + height,
+        Hash::hash(&height.to_be_bytes()),
+        Hash::hash(b"root"),
+        [0u8; 32],
+    );
+    let block = Block::new(header, Vec::new());
+    let mut cand = CandidateExecution::new(db, 1 << 24);
+    let journal = {
+        let mut view = cand.view();
+        let (mutated, journal) =
+            ComputePoolStore::stage_transition(&mut view, before, after).unwrap();
+        assert!(mutated > 0);
+        journal
+    };
+    cand.finish_execution(
+        ExecutionSubject::of(&block).unwrap(),
+        block.header.state_root,
+        Vec::new(),
+        BlockJournals {
+            account: JournalRecord::NothingToUndo,
+            contract: JournalRecord::NothingToUndo,
+            compute_pool: journal,
+            beacon: JournalRecord::NothingToUndo,
+        },
+    )
+    .accept_imported(&block)
+    .unwrap()
+    .publish()
+    .unwrap();
+}
+
+
+use std::io::{Read, Write};
+
+fn seeded_model() -> ComputePoolModel {
+    let mut m = model();
+    // An offer at the top of the u128 range, to exercise decimal parsing.
+    let mut big = offer(oid(0x0B), addr(6), true);
+    big.offered_bytes = u128::MAX;
+    big.bond_locked = u128::MAX;
+    m.publish_offer(big).unwrap();
+    m.reserve_capacity(oid(0x0B), u128::MAX, u128::MAX - 5).unwrap();
+    m
+}
+
+fn free_addr() -> std::net::SocketAddr {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap()
+}
+
+/// One JSON-RPC call over plain HTTP/1.1; returns the response body verbatim.
+fn http_post(addr: std::net::SocketAddr, body: &str) -> String {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).unwrap();
+    let (head, rest) = raw.split_once("\r\n\r\n").expect("an HTTP response");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(!head.to_ascii_lowercase().contains("transfer-encoding: chunked"), "{head}");
+    rest.to_string()
+}
+
+fn call(method: &str, params: serde_json::Value) -> String {
+    serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string()
+}
+
+async fn serve(srv: RpcServer) -> (std::net::SocketAddr, jsonrpsee::server::ServerHandle) {
+    let a = free_addr();
+    let h = srv.start(a).await.unwrap();
+    (a, h)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generate() {
+    let out = std::env::var("POOL_FIXTURE_OUT").ok();
+    let ready = std::env::var("POOL_SERVE_READY").ok();
+    if out.is_none() && ready.is_none() {
+        return;
+    }
+
+    // Seeded state.
+    let (srv, db, _d1) = server();
+    publish(&db, None, &seeded_model(), 1);
+    let (a1, h1) = serve(srv).await;
+
+    if let Some(ready) = ready {
+        std::fs::write(&ready, format!("http://{a1}")).unwrap();
+        let stop = std::env::var("POOL_SERVE_STOP").expect("POOL_SERVE_STOP");
+        for _ in 0..600 {
+            if std::path::Path::new(&stop).exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        h1.stop().unwrap();
+        return;
+    }
+    let out = std::path::PathBuf::from(out.unwrap());
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Fresh database: the production default, the pool gate closed.
+    let (srv2, _db2, _d2) = server();
+    let (a2, h2) = serve(srv2).await;
+    // A database with one undecodable unit row.
+    let (srv3, db3, _d3) = server();
+    publish(&db3, None, &model(), 1);
+    db3.put(cf::COMPUTE_POOL_STATE, &unit_key_bytes(&jid(1), &uid(3)), b"garbage")
+        .unwrap();
+    let (a3, h3) = serve(srv3).await;
+
+    let unit = |j: u8, u: u8| call("pool_getUnit", serde_json::json!([hex32(j), hex32(u)]));
+    let offer_q = |o: u8| call("pool_getOffer", serde_json::json!([hex32(o)]));
+    let cases: Vec<(&str, std::net::SocketAddr, String)> = vec![
+        ("unit_assigned", a1, unit(1, 3)),
+        ("unit_accepted", a1, unit(1, 2)),
+        ("unit_blocked_with_input", a1, unit(1, 4)),
+        ("unit_not_held", a1, unit(1, 9)),
+        ("offer_active_reserved", a1, offer_q(3)),
+        ("offer_inactive", a1, offer_q(5)),
+        ("offer_not_held", a1, offer_q(6)),
+        ("offer_u128_max", a1, offer_q(0x0B)),
+        ("unit_invalid_params", a1, call("pool_getUnit", serde_json::json!(["0x12", "0x34"]))),
+        ("unit_gate_closed", a2, unit(1, 2)),
+        ("offer_gate_closed", a2, offer_q(3)),
+        ("unit_corrupt_row", a3, unit(1, 3)),
+    ];
+    for (name, a, req) in cases {
+        let body = http_post(a, &req);
+        std::fs::write(out.join(format!("{name}.request.json")), &req).unwrap();
+        std::fs::write(out.join(format!("{name}.response.json")), &body).unwrap();
+    }
+    h1.stop().unwrap();
+    h2.stop().unwrap();
+    h3.stop().unwrap();
+}

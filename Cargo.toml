@@ -120,6 +120,14 @@ ureq       = "2.10"
 sumchain-primitives = "=0.4.0"
 sumchain-crypto     = "=0.4.0"
 
+# Issues #104 / #105 / #106 (O2–O4) — the frozen ComputePool op carriers
+# (`compute_pool_wire`), the B0 manifest / object-commitment / workload codecs
+# (`b0`) and `ComputePoolTxData`. `sumchain-primitives` re-exports none of these
+# modules, so the client names the published leaf crate directly. Already in the
+# graph through `sumchain-primitives =0.4.0`; pinned EXACT to the same release.
+# Used by `omni-sumchain` only, and only behind `pool-client`.
+sumchain-wire       = "=0.4.0"
+
 # ─── Phase 3: FFI ────────────────────────────────────────────────────────────
 
 # No `extension-module` here: maturin enables `pyo3/extension-module` for the
