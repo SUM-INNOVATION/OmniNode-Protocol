@@ -1050,6 +1050,39 @@ jobs:
       - name: cargo build -p omni-node (with omni-contributor in graph)
         run: cargo build -p omni-node
 
+  # ── Issues #104 / #105 / #106: pool-client build + test ────────────────────
+  #
+  # The dormant ComputePool client behind `--features pool-client`. Its
+  # omni-sumchain tests only compile with the feature, so no other job runs
+  # them: the recorded chain vectors and fixtures, the relay-tamper suite
+  # (#104) and the no-lifecycle-dependence suite (#106). Tests that need a
+  # live chain stay `#[ignore]`d and are not run here. Tests only; no clippy
+  # gate.
+  pool-client-build-test:
+    name: --features pool-client — omni-sumchain build + test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo (with pool-client feature)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pool-client-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pool-client-
+
+      - name: cargo test -p omni-sumchain --features pool-client
+        run: cargo test -p omni-sumchain --features pool-client --locked
+
   # ── (5) Stage 6 byte-stability ──────────────────────────────────────────────
   stage6-fixture-check:
     name: Stage 6 chain-wire + fixture — byte-stable
