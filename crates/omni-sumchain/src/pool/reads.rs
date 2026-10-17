@@ -19,6 +19,7 @@ use serde::Deserialize;
 use sumchain_wire::address::Address;
 use sumchain_wire::compute_pool_wire::WorkItemRef;
 
+use super::ids::OwnOffer;
 use crate::rpc::JsonRpcTransport;
 use crate::SumChainClient;
 
@@ -216,6 +217,17 @@ pub fn get_offer<T: JsonRpcTransport + ?Sized>(
     Ok(Some(offer))
 }
 
+/// `pool_getOffer` for this node's own offer: the id is derived from `own`
+/// (chain id, identity, `offer_seq`), never supplied. [`get_offer`] already
+/// refuses an answer for another id; the accept path also checks the row's
+/// identity and `offer_seq`.
+pub fn get_own_offer<T: JsonRpcTransport + ?Sized>(
+    transport: &T,
+    own: &OwnOffer,
+) -> Result<Option<PoolOffer>, PoolReadError> {
+    get_offer(transport, &own.offer_bond_id())
+}
+
 impl<T: JsonRpcTransport> SumChainClient<T> {
     /// `pool_getUnit` through this client's transport. See [`get_unit`].
     pub fn pool_get_unit(
@@ -232,6 +244,12 @@ impl<T: JsonRpcTransport> SumChainClient<T> {
         offer_bond_id: &[u8; 32],
     ) -> Result<Option<PoolOffer>, PoolReadError> {
         get_offer(self.transport(), offer_bond_id)
+    }
+
+    /// `pool_getOffer` for this node's own offer, by its derived id. See
+    /// [`get_own_offer`].
+    pub fn pool_get_own_offer(&self, own: &OwnOffer) -> Result<Option<PoolOffer>, PoolReadError> {
+        get_own_offer(self.transport(), own)
     }
 }
 

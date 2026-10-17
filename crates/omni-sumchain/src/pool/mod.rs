@@ -10,6 +10,7 @@
 //! | [`tokens`] | O3 | the SelectToken result chain: range and EOS checks, stop rule, EOS-excluded output count, token-sequence commitments | the B0 SelectToken statement and `MAX_OUTPUT_TOKENS` |
 //! | [`reads`] | O2 | typed, fail-closed `pool_getUnit` / `pool_getOffer` reads of committed C1 rows | sum-chain's read-only pool RPCs (#130, server at `90c49da1`) |
 //! | [`accept`] | O2 | the accept path: from a unit read and this node's offer read to `AcceptWorkUnitV1`, refusing what the chain's C1 model refuses; the one-active-offer precheck | the C1 model's transition, write-once leaf and capacity rules |
+//! | [`ids`] | O2 | this node's `offer_bond_id`, derived from the chain id, its identity and `offer_seq` | the ratified derivation (sum-chain G1-1, 2026-10-16) |
 //!
 //! ## Not here, and why
 //!
@@ -18,10 +19,9 @@
 //!   `CommitPartialProofV1` op are sum-chain #131 (C3) and do not exist yet.
 //! * **A live pool.** The reads return `None` on every network today: genesis
 //!   refuses the pool gate and no C1 operation (ordinal 27) has an executor
-//!   (sum-chain #130 / #217), so no block writes pool state. There is also no
-//!   read by identity, and no derivation of an offer's bond id, so this node's
-//!   `offer_bond_id`, its `commit_bond_id` and the `accepted_bytes` stay
-//!   caller-supplied (see [`accept`]).
+//!   (sum-chain #130 / #217), so no block writes pool state. This node's
+//!   `offer_bond_id` is derived ([`ids`]); its `commit_bond_id` and the
+//!   `accepted_bytes` stay caller-supplied (see [`accept`]).
 //! * **Observation** (`ObservedRetrievalV1` / `AcknowledgeInputRetrievedV1`)
 //!   and the retention read (`pool_getRetentionState`) / output read
 //!   (`pool_getJobOutput`): not on the chain (sum-chain #133 C2, #129).
@@ -41,9 +41,12 @@
 //! Everything compiles against `sumchain-wire =0.4.0` from crates.io, whose
 //! `b0`, `compute_pool_wire` and `ComputePoolTxData` are byte-identical to
 //! sum-chain main; `tests/pool_client_chain_vectors.rs` checks this module
-//! against the chain's frozen official-workload vectors.
+//! against the chain's frozen official-workload vectors. The one exception is
+//! [`ids::offer_bond_id`], ratified after 0.4.0: a local copy pinned by the
+//! chain's own KATs until a published `sumchain-wire` carries it.
 
 pub mod accept;
+pub mod ids;
 pub mod manifest;
 pub mod offer;
 pub mod reads;

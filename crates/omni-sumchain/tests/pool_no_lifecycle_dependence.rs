@@ -24,6 +24,7 @@
 #![cfg(feature = "pool-client")]
 
 use omni_sumchain::pool::accept::{build_accept, ensure_no_active_offer};
+use omni_sumchain::pool::ids::OwnOffer;
 use omni_sumchain::pool::manifest::{layer_group_output, verify_retrieved_output};
 use omni_sumchain::pool::reads::{METHOD_GET_OFFER, METHOD_GET_UNIT};
 use omni_sumchain::{FakeJsonRpcTransport, SumChainClient};
@@ -162,12 +163,32 @@ fn decide(file_info: Option<serde_json::Value>) -> Decisions {
 
     let unit = client.pool_get_unit(&id(1), &id(3));
     let offer = client.pool_get_offer(&id(3));
-    let (u, o) = (
+    let (mut u, mut o) = (
         unit.clone().unwrap().expect("held"),
         offer.clone().unwrap().expect("held"),
     );
-    let accept = build_accept(Some(&u), Some(&o), &id(3), [0x44; 32], 840);
-    let over_capacity = build_accept(Some(&u), Some(&o), &id(3), [0x44; 32], 841);
+    // The recorded offer predates the ratified offer_bond_id derivation (G1-1).
+    // Rebind it, and the unit's references to it, to the derived id of its own
+    // recorded identity and offer_seq, as pool_reads_chain_fixtures does.
+    let own = OwnOffer {
+        chain_id: 1,
+        identity: o.identity,
+        offer_seq: o.offer_seq,
+    };
+    let (old, new) = (o.offer_bond_id, own.offer_bond_id());
+    o.offer_bond_id = new;
+    if let Some(a) = u
+        .assignment
+        .as_mut()
+        .filter(|a| a.winner_offer_bond_id == old)
+    {
+        a.winner_offer_bond_id = new;
+    }
+    if let Some(l) = u.accepted_leaf.as_mut().filter(|l| l.offer_bond_id == old) {
+        l.offer_bond_id = new;
+    }
+    let accept = build_accept(Some(&u), Some(&o), &own, [0x44; 32], 840);
+    let over_capacity = build_accept(Some(&u), Some(&o), &own, [0x44; 32], 841);
     let publish_precheck = ensure_no_active_offer(&o.identity, Some(&o));
 
     let out = layer_group_output(5, &[1, -2, 3, -4, 5, -6, 7, -8], &[([1; 8], [-1; 8])]).unwrap();

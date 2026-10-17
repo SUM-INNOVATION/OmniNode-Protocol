@@ -41,10 +41,11 @@ settlement-dispute = ["settlement-read", "settlement-submit"]
 # Issues #104 / #105 / #106 — client side of the dormant ComputePool, against
 # the frozen chain wire: the O2 offer cap and op construction, the O2/O4 unit
 # output manifest and root-checked retrieval, and the O3 SelectToken sequence.
-# Pulls only `sumchain-wire` (crates.io, =0.4.0); default builds are unchanged.
+# Pulls only `sumchain-wire` (crates.io, =0.4.0) and `blake3`; default builds are
+# unchanged.
 # Nothing here submits: the chain refuses ComputePool transactions while its
 # gate is closed.
-pool-client = ["dep:sumchain-wire"]
+pool-client = ["dep:sumchain-wire", "dep:blake3"]
 
 [dependencies]
 omni-types          = { workspace = true }
@@ -71,6 +72,9 @@ sumchain-crypto     = { workspace = true, optional = true }
 # Frozen ComputePool / B0 wire types (crates.io =0.4.0), only behind
 # `pool-client`.
 sumchain-wire       = { workspace = true, optional = true }
+# `pool-client` derives this node's `offer_bond_id` (ratified 2026-10-16) with
+# the chain's BLAKE3 preimage; `sumchain-wire =0.4.0` predates the derivation.
+blake3              = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
