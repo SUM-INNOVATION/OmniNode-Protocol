@@ -88,7 +88,7 @@ bs58       = "0.5"
 # ─── Phase 5 Stage 7a: SUM Chain adapter ─────────────────────────────────────
 # Sync HTTP client for JSON-RPC against the local SUM Chain mirror.
 # Used by `omni-sumchain` only.
-ureq       = "2.10"
+ureq       = "3.4"
 
 # ─── Phase 5 Stage 7b / 9c: SUM Chain primitives ─────────────────────────────
 # Stage 9c: swapped from the private `SUM-INNOVATION/sum-chain` git

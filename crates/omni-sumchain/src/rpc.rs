@@ -107,9 +107,26 @@ pub struct UreqTransport {
     url: String,
 }
 
+/// Largest response body [`UreqTransport`] reads: the 10 MiB limit `ureq` 2's
+/// `into_string` applied.
+const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The agent [`UreqTransport::new`] uses. `ureq` 3 with the settings `ureq` 2's
+/// default agent had, so the move to `ureq` 3 changes no request behaviour:
+/// proxy settings in the environment are not read, the connect timeout is
+/// 30 s, and at most 5 redirects are followed.
+fn default_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .max_redirects(5)
+        .build()
+        .new_agent()
+}
+
 impl UreqTransport {
     pub fn new(url: String) -> Self {
-        Self::with_agent(ureq::Agent::new(), url)
+        Self::with_agent(default_agent(), url)
     }
 
     pub fn with_agent(agent: ureq::Agent, url: String) -> Self {
@@ -142,16 +159,23 @@ impl JsonRpcTransport for UreqTransport {
             ChainClientError::Other(format!("{TRANSPORT_BODY_SERIALIZE}{e}"))
         })?;
 
-        let resp = self
+        // A non-2xx status is an error here too (`ureq`'s default), as in
+        // `ureq` 2.
+        let mut resp = self
             .agent
             .post(&self.url)
-            .set("content-type", "application/json")
-            .send_string(&body_str)
+            .header("content-type", "application/json")
+            .send(&body_str)
             .map_err(|e| ChainClientError::Other(format!("{TRANSPORT_HTTP}{e}")))?;
 
-        let resp_str = resp.into_string().map_err(|e| {
-            ChainClientError::Other(format!("{TRANSPORT_BODY_READ}{e}"))
-        })?;
+        // Strict UTF-8 (no lossy replacement) and the same size limit as
+        // `ureq` 2's `into_string`.
+        let resp_str = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
+            .read_to_string()
+            .map_err(|e| ChainClientError::Other(format!("{TRANSPORT_BODY_READ}{e}")))?;
 
         // Issue #97: the crate enables `serde_json`'s `arbitrary_precision`
         // feature, so this intermediate `Value` preserves the exact integer
