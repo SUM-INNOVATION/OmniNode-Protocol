@@ -99,7 +99,7 @@ pub use posted::{PostedJob, PostedResultLink, POSTED_SCHEMA_VERSION};
 pub use result::{
     ContributorResult, Evidence, MeasuredAccounting, StageContribution, WorkUnitKind,
 };
-pub use run::{run_job, RunJobOptions};
+pub use run::{run_job, run_job_with_publication, RunJobOptions};
 pub use runner::{
     ExternalCommandRunner, InferenceRunner, RunOutput, RunOutputWithActivation,
     RunnerOutputActivation, StubRunner,

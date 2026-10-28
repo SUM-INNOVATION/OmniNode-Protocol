@@ -1,0 +1,112 @@
+# Issue #149 — `run-job`'s idempotent response publication, end to end, on
+# a fresh GitHub-hosted runner, for pull requests that change the code it
+# exercises.
+#
+# It builds the pinned upstreams from their public repositories — SUM Chain
+# (`sumchain`, `setup-local-testnet`) at SUMCHAIN_COMMIT and SNIP
+# (`sum-node`) at SNIP_COMMIT — and runs the ignored test
+# `crates/omni-node/tests/snip_publication_e2e.rs` against them: a
+# one-validator synthetic devnet (chain id 1337; throwaway keys generated on
+# the runner in a temporary directory, never committed, printed or
+# uploaded) and three SNIP archives, all on the runner. The test removes
+# every process and file it created. Read-only token, no secrets, no
+# production endpoint or peer.
+#
+# The paths filter is the trigger: any pull request to main touching the
+# listed files runs it. It is not a required check. `workflow_dispatch`
+# runs it on demand.
+
+name: SNIP publication E2E
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/omni-store/src/snip_v2.rs'
+      - 'crates/omni-store/src/snip_v2_publish.rs'
+      - 'crates/omni-contributor/src/run.rs'
+      - 'crates/omni-contributor/src/snip.rs'
+      - 'crates/omni-node/src/contributor_cli.rs'
+      - 'crates/omni-node/tests/snip_publication_e2e.rs'
+      - '.github/workflows/snip-publication-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snip-publication-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The commits the SwUM lab observed issue #149 against.
+  SUMCHAIN_COMMIT: 896a261bca5a75e1e1d4be6c0340cdb8981ed5ca
+  SNIP_COMMIT: 4cdba14c0322e22606ad2e6bce8d10cdedcf0b73
+
+jobs:
+  e2e:
+    name: run-job publication E2E (synthetic devnet + SNIP archives)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout sum-chain at SUMCHAIN_COMMIT
+        uses: actions/checkout@v4
+        with:
+          repository: SUM-INNOVATION/sum-chain
+          ref: ${{ env.SUMCHAIN_COMMIT }}
+          path: upstream/sum-chain
+          persist-credentials: false
+
+      - name: Checkout SNIP at SNIP_COMMIT
+        uses: actions/checkout@v4
+        with:
+          repository: SUM-INNOVATION/Storage-Node-Interface-Protocol
+          ref: ${{ env.SNIP_COMMIT }}
+          path: upstream/snip
+          persist-credentials: false
+
+      - name: Cache cargo registry and targets
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/sum-chain/target
+            upstream/snip/target
+            target
+          key: ${{ runner.os }}-snip-publication-e2e-${{ env.SUMCHAIN_COMMIT }}-${{ env.SNIP_COMMIT }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-snip-publication-e2e-${{ env.SUMCHAIN_COMMIT }}-${{ env.SNIP_COMMIT }}-
+
+      # sum-chain pins its own toolchain (rust-toolchain.toml); rustup installs
+      # it on first use. RocksDB's bundled build needs <cstdint> force-included
+      # with GCC 13+, as in sum-chain's own CI.
+      - name: Build sum-chain (sumchain, setup-local-testnet)
+        working-directory: upstream/sum-chain
+        env:
+          CXXFLAGS: "-include cstdint"
+        run: cargo build --release --locked --bin sumchain --bin setup-local-testnet
+
+      - name: Build SNIP (sum-node)
+        working-directory: upstream/snip
+        run: cargo build --release --locked --bin sum-node
+
+      - name: Upstream commits and versions
+        run: |
+          git -C upstream/sum-chain rev-parse HEAD
+          git -C upstream/snip rev-parse HEAD
+          upstream/snip/target/release/sum-node --version
+
+      - name: E2E (ignored test, run explicitly)
+        env:
+          OMNI_E2E_SUMCHAIN: ${{ github.workspace }}/upstream/sum-chain/target/release/sumchain
+          OMNI_E2E_SETUP_LOCAL_TESTNET: ${{ github.workspace }}/upstream/sum-chain/target/release/setup-local-testnet
+          OMNI_E2E_SUM_NODE: ${{ github.workspace }}/upstream/snip/target/release/sum-node
+        run: >-
+          cargo test --locked -p omni-node --test snip_publication_e2e --
+          --ignored --nocapture

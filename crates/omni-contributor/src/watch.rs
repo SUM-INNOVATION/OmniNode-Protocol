@@ -273,7 +273,7 @@ fn skip_reason_str(r: &SkipReason) -> String {
 /// In Stage 12.1 this function is fully synchronous + single-threaded;
 /// the CLI wraps it in a blocking task. A future async surface is out
 /// of scope.
-pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
+pub fn run_watch_loop<A: omni_store::SnipV2Publisher, S: discover::JobSource>(
     adapter: &A,
     source: &mut S,
     mut opts: WatchOptions<'_>,

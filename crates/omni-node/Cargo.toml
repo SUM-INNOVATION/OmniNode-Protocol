@@ -147,3 +147,8 @@ chrono     = { workspace = true }
 
 [dev-dependencies]
 tempfile           = { workspace = true }
+# Issue #149 — `tests/snip_publication_e2e.rs` (ignored by default): JSON-RPC
+# to the local devnet, and a hand-built `RegisterFilePendingV2` for the
+# conflicting-registration cases. Both already in the graph.
+ureq               = { workspace = true }
+sumchain-wire      = { workspace = true }

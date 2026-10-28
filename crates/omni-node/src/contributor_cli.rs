@@ -15,8 +15,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 
 use omni_contributor::{
-    canonical::job_hash_hex, run_job, verify::DispatcherSignatureOutcome, verify_result,
-    ContributorJob, ContributorResult, ContributorSigner, ExternalCommandRunner, InferenceRunner,
+    canonical::job_hash_hex, run_job_with_publication, verify::DispatcherSignatureOutcome,
+    verify_result, ContributorJob, ContributorResult, ContributorSigner, ExternalCommandRunner, InferenceRunner,
     RunJobOptions, StubRunner, WorkUnitKind,
 };
 use omni_store::{SnipV2Cli, SnipV2CliConfig};
@@ -2654,6 +2654,12 @@ fn build_snip_adapter(
         seed_path: seed,
         extra_args: Vec::new(),
         allow_non_active: false,
+        // Issue #149: the chain endpoint and signing key are `sum-node`'s
+        // own `SUM_RPC_URL` / `SUM_KEY_FILE`, read by the adapter the same
+        // way `sum-node` reads them, so the publication state it reads is
+        // the chain `sum-node` registers on, as the account it signs with.
+        rpc_url: None,
+        key_file: None,
     })
 }
 
@@ -2830,7 +2836,10 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
     #[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
     let mut captured_external_bytes: Option<(Vec<u8>, Vec<u8>)> = None;
 
-    let result = match args.runner {
+    // Issue #149: `publication` says how the response bytes became Active
+    // on SNIP (ingested now, already Active, or this account's Pending
+    // registration resumed). The result below is written only after that.
+    let (result, publication) = match args.runner {
         RunnerChoice::Stub => {
             let response_bytes = std::fs::read(
                 args.stub_response.as_ref().ok_or_else(|| anyhow!("--stub-response required"))?,
@@ -2841,7 +2850,7 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
                 args.stub_input_tokens,
                 args.stub_output_tokens,
             );
-            run_job(&job, &adapter, &runner, opts)?
+            run_job_with_publication(&job, &adapter, &runner, opts)?
         }
         RunnerChoice::External => {
             let mut runner = ExternalCommandRunner::new(
@@ -2910,6 +2919,7 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
     println!("result_path={}", args.out.display());
     println!("job_id={}", result.job_id);
     println!("response_snip_root={}", result.response_snip_root);
+    println!("response_publication={}", publication.action);
     println!("total_base_units={}", result.measured_accounting.total_base_units);
 
     // Stage 14.2 / 14.3 — opt-in halo2-reference sidecar proof
@@ -2993,8 +3003,8 @@ fn run_external_with_runner<R: InferenceRunner>(
     adapter: &SnipV2Cli,
     runner: &R,
     opts: RunJobOptions<'_>,
-) -> Result<ContributorResult> {
-    Ok(run_job(job, adapter, runner, opts)?)
+) -> Result<(ContributorResult, omni_contributor::snip::PublishedBytes)> {
+    Ok(run_job_with_publication(job, adapter, runner, opts)?)
 }
 
 // ── Stage 14.2: halo2-reference sidecar proof emission ───────────────────────

@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use omni_store::SnipV2Adapter;
+use omni_store::SnipV2Publisher;
 use omni_types::phase5::SnipV2ObjectId;
 
 use crate::canonical::{
@@ -41,12 +41,25 @@ pub struct RunJobOptions<'a> {
 }
 
 /// Full pickup-to-result orchestration.
-pub fn run_job<A: SnipV2Adapter, R: InferenceRunner + ?Sized>(
+pub fn run_job<A: SnipV2Publisher, R: InferenceRunner + ?Sized>(
     job: &ContributorJob,
     adapter: &A,
     runner: &R,
     opts: RunJobOptions<'_>,
 ) -> Result<ContributorResult, ContributorError> {
+    run_job_with_publication(job, adapter, runner, opts).map(|(result, _)| result)
+}
+
+/// [`run_job`], also returning how the response bytes were published
+/// (issue #149): ingested now, already Active (an earlier run, or another
+/// job with identical response bytes), or this account's Pending
+/// registration resumed.
+pub fn run_job_with_publication<A: SnipV2Publisher, R: InferenceRunner + ?Sized>(
+    job: &ContributorJob,
+    adapter: &A,
+    runner: &R,
+    opts: RunJobOptions<'_>,
+) -> Result<(ContributorResult, snip::PublishedBytes), ContributorError> {
     // 1. Schema + identity + expiry checks. Refuses BEFORE we incur
     //    the SNIP fetch + runner cost on a stale or malformed job.
     //    Reuses the same VerifyError variants the verifier uses, so
@@ -128,8 +141,22 @@ pub fn run_job<A: SnipV2Adapter, R: InferenceRunner + ?Sized>(
 
     // 8. Publish response bytes to SNIP. Only reached AFTER all
     //    runner-output validation has passed.
-    let (response_snip_root, response_hash_bytes) =
-        snip::publish_bytes_with_hash(adapter, &run_output.response_bytes, "response")?;
+    //
+    //    Issue #149: idempotent and retry-safe. The response root is the
+    //    canonical SNIP root of the bytes, unchanged; what happens depends
+    //    on the chain's record of it (none → ingest, Active → reuse, this
+    //    account's Pending → resume, anything else → refuse), and this
+    //    returns only once the chain records it Active. Nothing below —
+    //    the signed result included — exists unless it did.
+    let published =
+        snip::publish_bytes_idempotent(adapter, &run_output.response_bytes, "response")?;
+    let (response_snip_root, response_hash_bytes) = (published.root, published.hash);
+    tracing::info!(
+        response_snip_root = %response_snip_root,
+        publication = %published.action,
+        owner = %published.owner,
+        "response bytes are Active on SNIP"
+    );
 
     // 9. Build the result envelope (unsigned).
 
@@ -198,7 +225,7 @@ pub fn run_job<A: SnipV2Adapter, R: InferenceRunner + ?Sized>(
     // (No-op, but keeps the variable used.)
     let _ = StageContribution::default_check();
 
-    Ok(unsigned)
+    Ok((unsigned, published))
 }
 
 impl StageContribution {

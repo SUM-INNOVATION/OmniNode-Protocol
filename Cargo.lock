@@ -2861,11 +2861,13 @@ dependencies = [
  "omni-zkml",
  "serde",
  "serde_json",
+ "sumchain-wire",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
@@ -2943,10 +2945,12 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sumchain-wire",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

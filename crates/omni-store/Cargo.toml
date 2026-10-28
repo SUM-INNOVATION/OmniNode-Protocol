@@ -23,6 +23,17 @@ ciborium   = { workspace = true }
 bincode    = { workspace = true }
 async-trait = { workspace = true }
 anyhow     = { workspace = true }
+# Issue #149 — idempotent Public V2 publication. The chain's own Public V2
+# identity (`storage_metadata::CHUNK_SIZE`, `Hash::merkle_root`, which SNIP's
+# chunker and Merkle tree match byte for byte) and its account derivation
+# (`Address::from_public_key`), from the published wire crate at the version
+# SNIP pins. A pure encoding leaf crate: no signing, state or networking; not
+# `sumchain-crypto` / `sumchain-primitives`, which stay behind `submit`.
+sumchain-wire = { workspace = true }
+# Issue #149 — the read-only `storage_getFileInfoV2` lookup the publication
+# decides from, against the RPC endpoint `sum-node` itself uses. Already in
+# the default graph through `omni-sumchain`.
+ureq       = { workspace = true }
 
 [dev-dependencies]
 # S1's capture-seam tests need an executor and futures::io; `tempfile` is now a
