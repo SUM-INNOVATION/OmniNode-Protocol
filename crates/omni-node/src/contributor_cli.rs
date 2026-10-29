@@ -758,6 +758,18 @@ struct WatchNetworkJobsArgs {
     #[arg(long)]
     max_polls: Option<u64>,
 
+    /// Bounded wait (milliseconds) at exit so a result announcement
+    /// broadcast just before the command stops (for example on
+    /// `--max-jobs`) can leave the node. Each announcement broadcast
+    /// within this window before exit keeps the network running until
+    /// it has had this long since its broadcast, or until no peer it
+    /// was sent to is still connected; with nothing broadcast in the
+    /// window the command exits at once. Same default as
+    /// `announce-result`; capped at 30000. 0 exits immediately, as
+    /// before this option existed, and can lose the last announcement.
+    #[arg(long, default_value_t = 200)]
+    propagation_wait_ms: u64,
+
     #[arg(long, default_value = "sum-node")]
     snip_binary: PathBuf,
 
@@ -3986,7 +3998,12 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
         args.no_prune_state_on_start,
     )?;
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    // Kept outside the blocking task: the node is shut down after the
+    // loop returns, from here.
+    let shutdown_net = net.clone();
+    let propagation_wait = std::time::Duration::from_millis(args.propagation_wait_ms);
+
+    let watched = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut relay = OmniNetRelay::new(net.clone(), handle);
         let mut source = NetworkSource::new(&mut relay, &snip_adapter);
         let mut emitter = StdoutEmitter;
@@ -4066,8 +4083,18 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
             .map_err(|e| anyhow!("{e}"))?;
         Ok(())
     })
-    .await
-    .map_err(|e| anyhow!("watch-network-jobs join: {e}"))?
+    .await;
+
+    // The loop can return straight after its broadcaster published a
+    // result announcement (`--max-jobs`). That publish only queued the
+    // message; dropping the node now — and the process with it — would
+    // lose it. Shut down explicitly, letting anything broadcast within
+    // `--propagation-wait-ms` leave first, and only then return.
+    if let Err(e) = shutdown_net.shutdown_with_drain(propagation_wait).await {
+        tracing::warn!(%e, "watch-network-jobs: network shutdown");
+    }
+
+    watched.map_err(|e| anyhow!("watch-network-jobs join: {e}"))?
 }
 
 async fn run_announce_result(args: AnnounceResultArgs) -> Result<()> {

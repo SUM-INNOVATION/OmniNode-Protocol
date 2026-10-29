@@ -5,6 +5,7 @@ pub mod budget;
 pub mod capability;  // deferred — WAN capability advertisement protocol
 pub mod codec;
 pub mod discovery;
+pub mod drain;
 pub mod events;
 mod framing;
 pub mod gossip;
@@ -20,6 +21,7 @@ pub mod transport;   // deferred — TCP/Noise fallback transport
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
+pub use drain::{DrainOutcome, DrainReport, DEFAULT_SHUTDOWN_DRAIN, MAX_SHUTDOWN_DRAIN};
 pub use events::OmniNetEvent;
 pub use gossip::{
     TOPIC_CAPABILITY, TOPIC_CONTRIBUTOR_JOB, TOPIC_CONTRIBUTOR_RESULT,
@@ -289,17 +291,54 @@ impl NetHandle {
             .map_err(|_| anyhow::anyhow!("swarm task stopped before reporting a listen address"))
     }
 
-    /// Signal the swarm loop to shut down gracefully.
+    /// Shut the swarm loop down gracefully and wait until it has stopped.
+    ///
+    /// Gossip this node published within the last [`DEFAULT_SHUTDOWN_DRAIN`]
+    /// is first given the rest of that window on the network, so a message
+    /// published just before shutdown is not dropped with the swarm. See
+    /// [`NetHandle::shutdown_with_drain`] for the details and to choose the
+    /// bound.
     ///
     /// The loop completes every in-flight solicited request with
     /// [`RequestError::RouterGone`] and closes the event lane; the router then
     /// releases every subscription, so each consumer's `recv()` returns `None`
     /// instead of waiting on a stream that can no longer produce.
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown_with_drain(DEFAULT_SHUTDOWN_DRAIN).await.map(|_| ())
+    }
+
+    /// Shut the swarm loop down after a bounded drain, and wait until it has
+    /// stopped.
+    ///
+    /// `gossipsub` only queues a published message; a connection task writes
+    /// it out later. Dropping the swarm before then loses it, although the
+    /// publish succeeded. So the loop keeps driving the swarm until every
+    /// message this node published within the last `grace` has had `grace` of
+    /// network service since it was published, or until none of the peers it
+    /// was queued for is still connected, whichever is first. With nothing
+    /// published in that window it stops at once; with `grace` zero it never
+    /// waits (the behaviour before the drain existed). The wait never exceeds
+    /// `grace` after this call, and `grace` is capped at
+    /// [`MAX_SHUTDOWN_DRAIN`].
+    ///
+    /// The send queue itself cannot be observed, so the bound is on time, not
+    /// on a delivery acknowledgement; see [`crate::drain`].
+    ///
+    /// Returns once the swarm has been dropped — and with it every connection
+    /// — so a process may exit as soon as this resolves. Commands sent while
+    /// the loop drains are refused, except a further shutdown, which receives
+    /// this drain's report.
+    pub async fn shutdown_with_drain(&self, grace: std::time::Duration) -> Result<DrainReport> {
+        let (done, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SwarmCommand::Shutdown)
+            .send(SwarmCommand::Shutdown {
+                drain: grace,
+                done: Some(done),
+            })
             .await
-            .map_err(|_| anyhow::anyhow!("swarm task already stopped"))
+            .map_err(|_| anyhow::anyhow!("swarm task already stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("swarm task stopped before reporting its shutdown"))
     }
 }
 
@@ -587,9 +626,16 @@ impl OmniNet {
         self.handle.listen_addrs().await
     }
 
-    /// Signal the swarm loop to shut down gracefully.
+    /// Shut the swarm loop down gracefully and wait until it has stopped.
+    /// See [`NetHandle::shutdown`].
     pub async fn shutdown(&self) -> Result<()> {
         self.handle.shutdown().await
+    }
+
+    /// Shut down after a bounded drain of recently published gossip. See
+    /// [`NetHandle::shutdown_with_drain`].
+    pub async fn shutdown_with_drain(&self, grace: std::time::Duration) -> Result<DrainReport> {
+        self.handle.shutdown_with_drain(grace).await
     }
 
     /// Test-only constructor that builds an `OmniNet` from pre-built
