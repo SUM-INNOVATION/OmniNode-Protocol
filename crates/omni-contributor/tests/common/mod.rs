@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use omni_store::SnipV2Adapter;
 use omni_store::snip_v2::SnipV2Error;
 use omni_store::snip_v2_publish::{
     SnipV2FileInfo, SnipV2ResumeOutcome, VISIBILITY_PUBLIC, public_chunk_count, public_object_root,
 };
-use omni_store::{SnipV2Adapter, SnipV2Publisher};
 use omni_types::phase5::{SnipV2Lifecycle, SnipV2ObjectId, SnipV2ObjectRef};
 
 /// The account the mock publishes as.
@@ -37,6 +37,7 @@ pub struct MockCalls {
     pub ingests: usize,
     pub resumes: usize,
     pub lookups: usize,
+    pub downloads: usize,
 }
 
 /// Faults the next calls hit.
@@ -187,6 +188,7 @@ impl SnipV2Adapter for MockSnipStore {
         root: &SnipV2ObjectId,
         output_path: &Path,
     ) -> Result<(), SnipV2Error> {
+        self.calls.lock().unwrap().downloads += 1;
         let guard = self.inner.lock().unwrap();
         let bytes = guard
             .get(root.as_bytes())
@@ -196,9 +198,7 @@ impl SnipV2Adapter for MockSnipStore {
         std::fs::write(output_path, bytes).map_err(SnipV2Error::CommandSpawn)?;
         Ok(())
     }
-}
 
-impl SnipV2Publisher for MockSnipStore {
     fn file_info_v2(&self, root: &SnipV2ObjectId) -> Result<Option<SnipV2FileInfo>, SnipV2Error> {
         self.calls.lock().unwrap().lookups += 1;
         if self.faults.lock().unwrap().rpc_down {

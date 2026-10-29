@@ -39,7 +39,7 @@ use omni_types::phase5::{
     SnipV2Lifecycle, SnipV2ObjectId, SnipV2ObjectRef, SnipV2ParseError,
 };
 
-use crate::snip_v2_publish::{SnipV2FileInfo, SnipV2Publisher, SnipV2ResumeOutcome};
+use crate::snip_v2_publish::{SnipV2FileInfo, SnipV2ResumeOutcome};
 
 /// `sum-node`'s `--rpc-url` default (env `SUM_RPC_URL`).
 pub const SUM_NODE_DEFAULT_RPC_URL: &str = "http://127.0.0.1:9944";
@@ -198,6 +198,16 @@ pub enum SnipV2Error {
 
     #[error("cannot determine the account sum-node signs with: {0}")]
     PublisherAccount(String),
+
+    /// The adapter does not implement a capability idempotent publication
+    /// needs (a [`SnipV2Adapter`] default method).
+    #[error("this SNIP adapter does not provide {capability}; idempotent publication needs it")]
+    Unsupported { capability: &'static str },
+
+    /// The chain records the root Active and matching, but the object could
+    /// not be fetched back, or what came back is not the published bytes.
+    #[error("SNIP V2 root {root} is Active on chain but its content is not confirmed: {detail}")]
+    ContentUnverified { root: String, detail: String },
 }
 
 // ── Pure parsers ──────────────────────────────────────────────────────────────
@@ -282,6 +292,12 @@ pub fn check_lifecycle(
 /// Stage-2 orchestration in [`crate::snip_v2_artifacts`] takes an
 /// `&impl SnipV2Adapter`, so unit tests can substitute an in-memory fake
 /// without spawning the real binary.
+///
+/// Issue #149 adds the three methods idempotent publication
+/// ([`crate::snip_v2_publish::publish_public_idempotent`]) decides from.
+/// They have defaults that return [`SnipV2Error::Unsupported`], so an
+/// existing implementation still compiles unchanged; publishing through
+/// it then refuses clearly instead of registering blindly.
 pub trait SnipV2Adapter {
     fn ingest_public(&self, path: &Path) -> Result<SnipV2ObjectRef, SnipV2Error>;
     fn download_public(
@@ -289,6 +305,37 @@ pub trait SnipV2Adapter {
         root: &SnipV2ObjectId,
         output_path: &Path,
     ) -> Result<(), SnipV2Error>;
+
+    /// The chain's `storage_getFileInfoV2` record of `root`. `Ok(None)` when
+    /// the chain has none; an unreachable RPC or an error answer is `Err`.
+    fn file_info_v2(&self, root: &SnipV2ObjectId) -> Result<Option<SnipV2FileInfo>, SnipV2Error> {
+        let _ = root;
+        Err(SnipV2Error::Unsupported {
+            capability: "storage_getFileInfoV2 (the chain record of a root)",
+        })
+    }
+
+    /// The account (base58) [`Self::ingest_public`] and
+    /// [`Self::resume_public`] sign with: the owner of what they register.
+    fn publisher_account(&self) -> Result<String, SnipV2Error> {
+        Err(SnipV2Error::Unsupported {
+            capability: "the publishing account",
+        })
+    }
+
+    /// `sum-node resume <root> <path>`: the post-registration stages (push,
+    /// manifest push, coverage, activation) for a Pending root. Never
+    /// registers.
+    fn resume_public(
+        &self,
+        root: &SnipV2ObjectId,
+        path: &Path,
+    ) -> Result<SnipV2ResumeOutcome, SnipV2Error> {
+        let _ = (root, path);
+        Err(SnipV2Error::Unsupported {
+            capability: "sum-node resume",
+        })
+    }
 }
 
 // ── Process wrapper ───────────────────────────────────────────────────────────
@@ -311,9 +358,7 @@ impl SnipV2Adapter for SnipV2Cli {
     ) -> Result<(), SnipV2Error> {
         SnipV2Cli::download_public(self, root, output_path)
     }
-}
 
-impl SnipV2Publisher for SnipV2Cli {
     fn file_info_v2(&self, root: &SnipV2ObjectId) -> Result<Option<SnipV2FileInfo>, SnipV2Error> {
         SnipV2Cli::file_info_v2(self, root)
     }
@@ -649,14 +694,25 @@ pub fn snip_account_from_key_file(path: &Path) -> Result<String, SnipV2Error> {
 }
 
 /// The chain account (base58) of an Ed25519 seed, as SNIP and the chain
-/// derive it: `Address::from_public_key` (the last 20 bytes of the BLAKE3
-/// hash of the public key) in checksummed base58.
+/// derive it ([`account_base58_from_public_key`]).
 pub fn snip_account_from_seed(seed: &[u8; 32]) -> Result<String, SnipV2Error> {
     let mut secret = *seed;
     let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut secret)
         .map_err(|e| SnipV2Error::PublisherAccount(format!("invalid Ed25519 seed: {e}")))?;
     let public = libp2p::identity::ed25519::Keypair::from(secret).public().to_bytes();
-    Ok(sumchain_wire::Address::from_public_key(&public).to_base58())
+    Ok(account_base58_from_public_key(&public))
+}
+
+/// The chain's `Address::from_public_key(pk).to_base58()`: the last 20
+/// bytes of `blake3(pk)`, then base58 of those bytes followed by the first
+/// 4 bytes of `blake3(blake3(address))` (SNIP `sum-net` `identity.rs`).
+pub fn account_base58_from_public_key(public_key: &[u8; 32]) -> String {
+    let hash = blake3::hash(public_key);
+    let mut with_checksum = Vec::with_capacity(24);
+    with_checksum.extend_from_slice(&hash.as_bytes()[12..32]);
+    let check = blake3::hash(blake3::hash(&with_checksum).as_bytes());
+    with_checksum.extend_from_slice(&check.as_bytes()[..4]);
+    bs58::encode(with_checksum).into_string()
 }
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
@@ -952,6 +1008,23 @@ mod tests {
             snip_account_from_seed(&rfc8032_1).unwrap(),
             "M3Bdd1Hmimp3FPLDpvH4jimtdYAFG34k9"
         );
+    }
+
+    #[test]
+    fn account_derivation_equals_the_chain_crates() {
+        for seed in [[0u8; 32], [7u8; 32], [0xffu8; 32], *b"0123456789abcdef0123456789abcdef"] {
+            let mut s = seed;
+            let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut s).unwrap();
+            let pk = libp2p::identity::ed25519::Keypair::from(secret).public().to_bytes();
+            assert_eq!(
+                account_base58_from_public_key(&pk),
+                sumchain_wire::Address::from_public_key(&pk).to_base58()
+            );
+            assert_eq!(
+                snip_account_from_seed(&seed).unwrap(),
+                sumchain_wire::Address::from_public_key(&pk).to_base58()
+            );
+        }
     }
 
     #[test]

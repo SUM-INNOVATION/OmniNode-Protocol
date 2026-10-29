@@ -21,9 +21,7 @@ pub use fetch::{FetchManager, FetchOutcome};
 pub use gguf::GgufFile;
 pub use snip_v2::{SnipV2Adapter, SnipV2Cli, SnipV2CliConfig, SnipV2Error};
 pub use snip_v2_artifacts::{PublishReport, RestoreReport};
-pub use snip_v2_publish::{
-    PublicationAction, PublishedPublicObject, SnipV2Publisher, publish_public_idempotent,
-};
+pub use snip_v2_publish::{PublicationAction, PublishedPublicObject, publish_public_idempotent};
 pub use store::ShardStore;
 pub use chunker::ChunkPlan;
 

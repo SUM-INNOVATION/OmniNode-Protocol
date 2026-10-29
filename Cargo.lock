@@ -2934,6 +2934,7 @@ dependencies = [
  "async-trait",
  "bincode 2.0.1",
  "blake3",
+ "bs58",
  "ciborium",
  "cid",
  "futures",

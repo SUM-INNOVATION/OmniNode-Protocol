@@ -39,6 +39,7 @@
 //! - [`error`]     — Typed error surface.
 
 pub mod canonical;
+pub mod checkpoint;
 pub mod discover;
 pub mod error;
 pub mod handoff;
@@ -99,7 +100,10 @@ pub use posted::{PostedJob, PostedResultLink, POSTED_SCHEMA_VERSION};
 pub use result::{
     ContributorResult, Evidence, MeasuredAccounting, StageContribution, WorkUnitKind,
 };
-pub use run::{run_job, run_job_with_publication, RunJobOptions};
+pub use run::{
+    run_job, run_job_checkpointed, run_job_to_file, run_job_with_publication, CheckpointedRun,
+    RunJobOptions,
+};
 pub use runner::{
     ExternalCommandRunner, InferenceRunner, RunOutput, RunOutputWithActivation,
     RunnerOutputActivation, StubRunner,

@@ -18,7 +18,7 @@
 //! | the lookup fails | none | refused; nothing registered |
 //! | none | `sum-node ingest-v2` | [`PublicationAction::Ingested`] once the record reads Active |
 //! | root, visibility, size or chunk count differs | none | refused: [`SnipV2Error::ChainRecordMismatch`] |
-//! | Active | none (reuse) | [`PublicationAction::ReusedActive`] |
+//! | Active | none (reuse) | [`PublicationAction::ReusedActive`] once fetched back and checked |
 //! | Pending, owned by the configured account | `sum-node resume <root> <file>` | [`PublicationAction::Resumed`] once the record reads Active |
 //! | Pending, owned by another account | none | refused: [`SnipV2Error::PendingOwnedByOther`] |
 //! | Abandoned | none | refused: [`SnipV2Error::AbandonedOnChain`] |
@@ -32,42 +32,66 @@
 //! the root is never registered twice and a failed registration is never
 //! retried blindly.
 //!
-//! Success is only a record that reads `Active` and matches the bytes. A root
-//! left Pending or Abandoned, an RPC failure and a root mismatch are errors
-//! that carry what `sum-node` and the chain reported.
+//! Success is only a record that reads `Active` and matches the bytes, and
+//! then the object fetched back (`sum-node download`) and found to be those
+//! bytes: whether the object is published is decided from the chain record
+//! and the fetched content, never from a child process's exit status. A root
+//! left Pending or Abandoned, an RPC failure, a root mismatch and a failed or
+//! wrong fetch are errors that carry what `sum-node` and the chain reported.
 
 use std::io::Read;
 use std::path::Path;
 
 use omni_types::phase5::SnipV2ObjectId;
 use serde::Deserialize;
-use sumchain_wire::Hash;
-use sumchain_wire::storage_metadata::CHUNK_SIZE;
 
 use crate::snip_v2::{SnipV2Adapter, SnipV2Error};
 
 // ── Canonical Public V2 identity ──────────────────────────────────────────────
 
 /// SNIP V2 chunk size in bytes: the chain's `storage_metadata::CHUNK_SIZE`
-/// (1 MiB), which SNIP's chunker uses.
-pub const SNIP_V2_CHUNK_SIZE: u64 = CHUNK_SIZE;
+/// (1 MiB), which SNIP's chunker uses. Pinned to the chain crate by a test.
+pub const SNIP_V2_CHUNK_SIZE: u64 = 1_048_576;
 
 /// `StorageFileInfoV2.visibility` of a Public file.
 pub const VISIBILITY_PUBLIC: u8 = 0;
 
-/// The Public V2 root of `bytes`: the chain's `Hash::merkle_root` over the
-/// BLAKE3 hash of each [`SNIP_V2_CHUNK_SIZE`] chunk, the last one short.
-/// This is what SNIP's `BinaryChunker::chunk_file` and `MerkleTree` compute
-/// (an odd node is paired with itself; a pair hashes as
-/// `blake3(left || right)`; one chunk is its own root; no bytes give the zero
-/// root), so it equals the `merkle_root:` `sum-node ingest-v2` reports for a
-/// Public file holding exactly these bytes.
+/// The Public V2 root of `bytes`: the binary Merkle root over the BLAKE3
+/// hash of each [`SNIP_V2_CHUNK_SIZE`] chunk, the last one short. This is
+/// what SNIP's `BinaryChunker::chunk_file` and `MerkleTree` compute, and the
+/// chain's `Hash::merkle_root` (an odd node is paired with itself; a pair
+/// hashes as `blake3(left || right)`; one chunk is its own root; no bytes give
+/// the zero root), so it equals the `merkle_root:` `sum-node ingest-v2`
+/// reports for a Public file holding exactly these bytes. Tests pin it to the
+/// chain crate's implementation.
 pub fn public_object_root(bytes: &[u8]) -> SnipV2ObjectId {
-    let leaves: Vec<Hash> = bytes
+    let leaves: Vec<[u8; 32]> = bytes
         .chunks(SNIP_V2_CHUNK_SIZE as usize)
-        .map(Hash::hash)
+        .map(|c| *blake3::hash(c).as_bytes())
         .collect();
-    SnipV2ObjectId::from_bytes(*Hash::merkle_root(&leaves).as_bytes())
+    SnipV2ObjectId::from_bytes(merkle_root(&leaves))
+}
+
+/// Binary Merkle root of `leaves`, the last node of an odd level paired
+/// with itself; the zero hash for no leaves.
+fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    if leaves.is_empty() {
+        return [0u8; 32];
+    }
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| {
+                let right = pair.get(1).unwrap_or(&pair[0]);
+                let mut h = blake3::Hasher::new();
+                h.update(&pair[0]);
+                h.update(right);
+                *h.finalize().as_bytes()
+            })
+            .collect();
+    }
+    level[0]
 }
 
 /// Number of Public V2 chunks of a `len`-byte file.
@@ -118,14 +142,14 @@ impl ExpectedPublicObject {
             if filled == 0 {
                 break;
             }
-            leaves.push(Hash::hash(&buf[..filled]));
+            leaves.push(*blake3::hash(&buf[..filled]).as_bytes());
             size_bytes += filled as u64;
             if filled < buf.len() {
                 break;
             }
         }
         Ok(Self {
-            root: SnipV2ObjectId::from_bytes(*Hash::merkle_root(&leaves).as_bytes()),
+            root: SnipV2ObjectId::from_bytes(merkle_root(&leaves)),
             size_bytes,
             chunk_count: leaves.len() as u64,
         })
@@ -185,27 +209,6 @@ pub enum SnipV2ResumeOutcome {
     RootMismatch { diagnostics: String },
 }
 
-/// The publication surface on top of [`SnipV2Adapter`]: the chain's record
-/// of a root, the account publication signs with, and `sum-node resume`.
-pub trait SnipV2Publisher: SnipV2Adapter {
-    /// The chain's `storage_getFileInfoV2` record of `root`. `Ok(None)` when
-    /// the chain has none; an unreachable RPC or an error answer is `Err`.
-    fn file_info_v2(&self, root: &SnipV2ObjectId) -> Result<Option<SnipV2FileInfo>, SnipV2Error>;
-
-    /// The account (base58) [`SnipV2Adapter::ingest_public`] and
-    /// [`Self::resume_public`] sign with: the owner of what they register.
-    fn publisher_account(&self) -> Result<String, SnipV2Error>;
-
-    /// `sum-node resume <root> <path>`: the post-registration stages
-    /// (push, manifest push, coverage, activation) for a Pending root. Never
-    /// registers.
-    fn resume_public(
-        &self,
-        root: &SnipV2ObjectId,
-        path: &Path,
-    ) -> Result<SnipV2ResumeOutcome, SnipV2Error>;
-}
-
 // ── Idempotent publication ────────────────────────────────────────────────────
 
 /// How a published object came to be Active.
@@ -253,8 +256,9 @@ pub struct PublishedPublicObject {
 /// Publish the file at `path` as a Public V2 object, or confirm it is
 /// already, following the decision table in the [module docs](self).
 /// Returns only once the chain records the file's root `Active` with the
-/// file's size, chunk count and Public visibility.
-pub fn publish_public_idempotent<A: SnipV2Publisher + ?Sized>(
+/// file's size, chunk count and Public visibility, and the object fetched
+/// back is the file's bytes.
+pub fn publish_public_idempotent<A: SnipV2Adapter + ?Sized>(
     adapter: &A,
     path: &Path,
 ) -> Result<PublishedPublicObject, SnipV2Error> {
@@ -327,11 +331,13 @@ pub fn publish_public_idempotent<A: SnipV2Publisher + ?Sized>(
                 } else {
                     PublicationAction::ReusedActive
                 };
+                confirm_content(adapter, path, &expected)?;
                 tracing::info!(
                     %root,
                     %action,
                     owner = %info.owner,
-                    "SNIP V2 publication: chain record is Active and matches the bytes"
+                    "SNIP V2 publication: chain record is Active and matches the bytes, \
+                     and the object fetched back is those bytes"
                 );
                 return Ok(PublishedPublicObject {
                     root: expected.root,
@@ -391,6 +397,47 @@ pub fn publish_public_idempotent<A: SnipV2Publisher + ?Sized>(
             }
         }
     }
+}
+
+/// Fetch `expected.root` back and require it to be the bytes of `path`:
+/// the same canonical root, size and chunk count, and byte for byte equal.
+/// Independent of any `sum-node` exit status or outcome line.
+fn confirm_content<A: SnipV2Adapter + ?Sized>(
+    adapter: &A,
+    path: &Path,
+    expected: &ExpectedPublicObject,
+) -> Result<(), SnipV2Error> {
+    let root = expected.root.to_hex();
+    let unverified = |detail: String| SnipV2Error::ContentUnverified {
+        root: root.clone(),
+        detail,
+    };
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let fetched = tempfile::Builder::new()
+        .prefix(".omni-snip-verify-")
+        .tempfile_in(dir)
+        .or_else(|_| tempfile::NamedTempFile::new())?;
+    adapter
+        .download_public(&expected.root, fetched.path())
+        .map_err(|e| unverified(format!("fetching it back failed: {e}")))?;
+    let got = ExpectedPublicObject::from_file(fetched.path())?;
+    if &got != expected {
+        return Err(unverified(format!(
+            "fetched {} bytes in {} chunks with root {}; published {} bytes in {} chunks",
+            got.size_bytes,
+            got.chunk_count,
+            got.root,
+            expected.size_bytes,
+            expected.chunk_count
+        )));
+    }
+    if std::fs::read(fetched.path())? != std::fs::read(path)? {
+        return Err(unverified("the fetched bytes differ from the published bytes".into()));
+    }
+    Ok(())
 }
 
 /// Refuse a record that is not the one these bytes would produce, and return
@@ -476,8 +523,8 @@ mod tests {
 
     // ── Root derivation ─────────────────────────────────────────────────────
 
-    /// SNIP's `MerkleTree::build` (sum-store `merkle.rs`), written out
-    /// independently of `sumchain_wire::Hash::merkle_root`.
+    /// SNIP's `MerkleTree::build` (sum-store `merkle.rs`), written out again
+    /// here, independently of `merkle_root` above.
     fn snip_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
         if leaves.is_empty() {
             return [0u8; 32];
@@ -634,6 +681,7 @@ mod tests {
         ingests: usize,
         resumes: usize,
         account: usize,
+        downloads: usize,
     }
 
     struct Scripted {
@@ -650,6 +698,8 @@ mod tests {
         account: Result<String, String>,
         expected: ExpectedPublicObject,
         calls: RefCell<Calls>,
+        /// What a download of the root returns: `Ok(bytes)` or a failure.
+        served: RefCell<Result<Vec<u8>, String>>,
     }
 
     impl Scripted {
@@ -664,6 +714,7 @@ mod tests {
                 account: Ok(ME.into()),
                 expected: expected.clone(),
                 calls: RefCell::new(Calls::default()),
+                served: RefCell::new(Ok(FIXTURE_BYTES.to_vec())),
             }
         }
 
@@ -733,12 +784,18 @@ mod tests {
             }
         }
 
-        fn download_public(&self, _: &SnipV2ObjectId, _: &Path) -> Result<(), SnipV2Error> {
-            unreachable!("publication never downloads")
+        fn download_public(&self, root: &SnipV2ObjectId, out: &Path) -> Result<(), SnipV2Error> {
+            assert_eq!(*root, self.expected.root);
+            self.calls.borrow_mut().downloads += 1;
+            match &*self.served.borrow() {
+                Ok(bytes) => std::fs::write(out, bytes).map_err(SnipV2Error::CommandSpawn),
+                Err(stderr) => Err(SnipV2Error::DownloadFailed {
+                    code: 1,
+                    stderr: stderr.clone(),
+                }),
+            }
         }
-    }
 
-    impl SnipV2Publisher for Scripted {
         fn file_info_v2(
             &self,
             root: &SnipV2ObjectId,
@@ -797,10 +854,12 @@ mod tests {
         expected: ExpectedPublicObject,
     }
 
+    const FIXTURE_BYTES: &[u8] = b"sixteen bytes!!!";
+
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("response.bin");
-        let bytes = b"sixteen bytes!!!";
+        let bytes = FIXTURE_BYTES;
         std::fs::write(&path, bytes).unwrap();
         Fixture {
             _dir: dir,
@@ -1259,8 +1318,6 @@ mod tests {
             fn download_public(&self, r: &SnipV2ObjectId, p: &Path) -> Result<(), SnipV2Error> {
                 self.0.download_public(r, p)
             }
-        }
-        impl SnipV2Publisher for Forgetful<'_> {
             fn file_info_v2(
                 &self,
                 r: &SnipV2ObjectId,
@@ -1281,5 +1338,147 @@ mod tests {
         let err = publish_public_idempotent(&Forgetful(&s), &f.path).unwrap_err();
         assert!(matches!(err, SnipV2Error::NotRegistered { .. }), "{err}");
         assert_eq!(counts(&s), (2, 1, 0));
+    }
+
+    // ── Content check ───────────────────────────────────────────────────────
+
+    #[test]
+    fn every_success_fetches_the_object_back() {
+        // Ingested, reused and resumed each end with one download.
+        let f = fixture();
+        let s = Scripted::new(&f.expected);
+        s.ingest.borrow_mut().push_back(Ingest::Register {
+            lifecycle: 1,
+            report: Ok(SnipV2Lifecycle::Active),
+        });
+        publish_public_idempotent(&s, &f.path).unwrap();
+        publish_public_idempotent(&s, &f.path).unwrap();
+        assert_eq!(s.calls.borrow().downloads, 2);
+
+        let s = Scripted::new(&f.expected);
+        let s = {
+            let r = s.record(ME, 0);
+            s.with_record(r)
+        };
+        s.resume.borrow_mut().push_back(Resume::To {
+            lifecycle: 1,
+            outcome: Ok(SnipV2ResumeOutcome::Active),
+        });
+        publish_public_idempotent(&s, &f.path).unwrap();
+        assert_eq!(s.calls.borrow().downloads, 1);
+    }
+
+    #[test]
+    fn active_but_unfetchable_is_not_success() {
+        for ingest_first in [false, true] {
+            let f = fixture();
+            let s = Scripted::new(&f.expected);
+            let s = if ingest_first {
+                s.ingest.borrow_mut().push_back(Ingest::Register {
+                    lifecycle: 1,
+                    report: Ok(SnipV2Lifecycle::Active),
+                });
+                s
+            } else {
+                let r = s.record(OTHER, 1);
+                s.with_record(r)
+            };
+            *s.served.borrow_mut() = Err("download: no archive answered".into());
+            let err = publish_public_idempotent(&s, &f.path).unwrap_err();
+            assert!(matches!(err, SnipV2Error::ContentUnverified { .. }), "{err}");
+            assert!(err.to_string().contains("no archive answered"), "{err}");
+        }
+    }
+
+    #[test]
+    fn active_but_serving_other_bytes_is_not_success() {
+        let f = fixture();
+        for wrong in [b"sixteen bytes!!?".to_vec(), Vec::new(), vec![0u8; 17]] {
+            let s = Scripted::new(&f.expected);
+            let s = {
+                let r = s.record(ME, 1);
+                s.with_record(r)
+            };
+            *s.served.borrow_mut() = Ok(wrong);
+            let err = publish_public_idempotent(&s, &f.path).unwrap_err();
+            assert!(matches!(err, SnipV2Error::ContentUnverified { .. }), "{err}");
+            assert_eq!(counts(&s), (1, 0, 0), "nothing registered or resumed");
+        }
+    }
+
+    #[test]
+    fn exit_status_is_never_trusted_for_success() {
+        // sum-node says Active (exit 0, both lines) but the chain has the
+        // record Pending: not success, and the content is never checked.
+        let f = fixture();
+        let s = Scripted::new(&f.expected);
+        s.ingest.borrow_mut().push_back(Ingest::Register {
+            lifecycle: 0,
+            report: Ok(SnipV2Lifecycle::Active),
+        });
+        s.resume.borrow_mut().push_back(Resume::To {
+            lifecycle: 0,
+            outcome: Ok(SnipV2ResumeOutcome::Active),
+        });
+        let err = publish_public_idempotent(&s, &f.path).unwrap_err();
+        assert!(matches!(err, SnipV2Error::StillPending { .. }), "{err}");
+        assert_eq!(s.calls.borrow().downloads, 0);
+    }
+
+    // ── An adapter without the publication capabilities ─────────────────────
+
+    /// An adapter written before #149: ingest and download only.
+    struct OldAdapter {
+        ingests: RefCell<usize>,
+    }
+
+    impl SnipV2Adapter for OldAdapter {
+        fn ingest_public(&self, _: &Path) -> Result<SnipV2ObjectRef, SnipV2Error> {
+            *self.ingests.borrow_mut() += 1;
+            unreachable!("never called without a chain record")
+        }
+        fn download_public(&self, _: &SnipV2ObjectId, _: &Path) -> Result<(), SnipV2Error> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn an_adapter_without_chain_lookup_refuses_and_registers_nothing() {
+        let f = fixture();
+        let a = OldAdapter {
+            ingests: RefCell::new(0),
+        };
+        let err = publish_public_idempotent(&a, &f.path).unwrap_err();
+        assert!(matches!(err, SnipV2Error::Unsupported { .. }), "{err}");
+        assert_eq!(*a.ingests.borrow(), 0);
+        assert!(matches!(
+            a.publisher_account(),
+            Err(SnipV2Error::Unsupported { .. })
+        ));
+        assert!(matches!(
+            a.resume_public(&f.expected.root, &f.path),
+            Err(SnipV2Error::Unsupported { .. })
+        ));
+    }
+
+    // ── Pinned to the chain crate ───────────────────────────────────────────
+
+    #[test]
+    fn root_and_chunk_size_equal_the_chain_crates() {
+        use sumchain_wire::Hash;
+        assert_eq!(
+            SNIP_V2_CHUNK_SIZE,
+            sumchain_wire::storage_metadata::CHUNK_SIZE
+        );
+        const C: usize = 1_048_576;
+        for len in [0, 1, 16, C - 1, C, C + 1, 2 * C, 3 * C + 5, 7 * C + 2] {
+            let bytes = patterned(len);
+            let leaves: Vec<Hash> = bytes.chunks(C).map(Hash::hash).collect();
+            assert_eq!(
+                *public_object_root(&bytes).as_bytes(),
+                *Hash::merkle_root(&leaves).as_bytes(),
+                "len {len}"
+            );
+        }
     }
 }

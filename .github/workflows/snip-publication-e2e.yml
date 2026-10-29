@@ -26,6 +26,8 @@ on:
       - 'crates/omni-store/src/snip_v2_publish.rs'
       - 'crates/omni-contributor/src/run.rs'
       - 'crates/omni-contributor/src/snip.rs'
+      - 'crates/omni-contributor/src/checkpoint.rs'
+      - 'crates/omni-contributor/src/watch.rs'
       - 'crates/omni-node/src/contributor_cli.rs'
       - 'crates/omni-node/tests/snip_publication_e2e.rs'
       - '.github/workflows/snip-publication-e2e.yml'

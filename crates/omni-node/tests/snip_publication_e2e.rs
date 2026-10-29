@@ -22,20 +22,30 @@
 //!
 //! Scenarios, each with its own response bytes unless stated:
 //!
-//! 1. the same job run twice: `ingested`, then `reused_active`;
+//! 1. the same job run three times: `ingested`; then, beside its complete
+//!    checkpoint, nothing recomputed and the same result written again;
+//!    then, without the checkpoint, `reused_active`;
 //! 2. a different job with the same response bytes: `reused_active`;
 //! 3. the chain RPC lost right after the response's registration lands
 //!    (issue #149's observed case): no result, the root left Pending, SNIP's
-//!    reason in the error; the retry `resumed`;
+//!    reason in the error; the retry `resumed` from the checkpoint;
 //! 4. the run killed right after the registration lands: no result; the retry
-//!    `resumed`;
-//! 5. the result write failing after activation: the retry `reused_active`;
+//!    `resumed` from the checkpoint;
+//! 5. the result write failing after activation: the retry signs from the
+//!    checkpoint, with no SNIP call;
 //! 6. conflicting metadata (a registration of the root with another size),
 //!    by another account and by the configured one: refused;
 //! 7. the root Pending, registered by another account: refused;
 //! 8. the chain RPC unreachable from the start (the run fails at its input
 //!    download), and lost after the runner, just before publication (the
-//!    chain lookup fails; nothing is ingested): no result, nothing registered.
+//!    chain lookup fails; nothing is ingested): no result, nothing
+//!    registered; that run's retry publishes from its checkpoint;
+//! 9. `post-job` twice, `publish-result-link` twice and `announce-result`
+//!    (which re-publishes a published link): every repeated publication is
+//!    reused.
+//!
+//! Scenarios 3, 4, 5 and 8 use an external runner that answers different
+//! bytes on its second call; the test asserts it is called exactly once.
 //!
 //! Every produced result passes `verify-result` (`overall=ok`); the response
 //! fetched back by a fresh `sum-node download` hashes to the signed
@@ -632,9 +642,12 @@ impl RunOutcome {
     fn publication(&self) -> Option<&str> {
         kv(&self.stdout, "response_publication")
     }
+
+    fn resumed_from(&self) -> Option<&str> {
+        kv(&self.stdout, "checkpoint_resumed_from")
+    }
 }
 
-/// `omni-node operator contributor run-job` as the `client` account.
 /// `omni-node operator contributor run-job` as the `client` account, without
 /// its runner flags.
 fn run_job_base(dev: &Devnet, job: &JobFiles, out: &Path, rpc_url: &str) -> Command {
@@ -698,12 +711,10 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// An external runner that marks `ran` when invoked, waits for `go`, then
-/// answers `response`: it holds `run-job` between the downloads and the
-/// publication.
-fn gated_runner(dev: &Devnet, response: &[u8], ran: &Path, go: &Path) -> PathBuf {
+/// The external runner's stdout envelope answering `response`.
+fn envelope(response: &[u8]) -> String {
     let signer = ContributorSigner::from_seed_bytes(&CONTRIBUTOR_SEED).unwrap();
-    let envelope = serde_json::json!({
+    serde_json::json!({
         "response_b64": base64(response),
         "measured_input_tokens": INPUT_TOKENS,
         "measured_output_tokens": OUTPUT_TOKENS,
@@ -713,20 +724,92 @@ fn gated_runner(dev: &Devnet, response: &[u8], ran: &Path, go: &Path) -> PathBuf
             "work_unit_kind": "tokens",
             "work_units": INPUT_TOKENS + OUTPUT_TOKENS,
         }],
-    });
-    let script = dev.dir.join("gated-runner.sh");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\n: > '{ran}'\nwhile [ ! -f '{go}' ]; do /bin/sleep 0.1; done\nprintf '%s' '{envelope}'\n",
-            ran = ran.display(),
-            go = go.display(),
-        ),
-    )
-    .unwrap();
+    })
+    .to_string()
+}
+
+fn write_script(path: &Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// An external runner that appends a line to `calls` each time it runs,
+/// waits for `go`, then answers `response`: it holds `run-job` between the
+/// downloads and the publication.
+fn gated_runner(dev: &Devnet, response: &[u8], calls: &Path, go: &Path) -> PathBuf {
+    let script = dev.dir.join("gated-runner.sh");
+    write_script(
+        &script,
+        &format!(
+            "echo call >> '{calls}'\nwhile [ ! -f '{go}' ]; do /bin/sleep 0.1; done\nprintf '%s' '{env}'",
+            calls = calls.display(),
+            go = go.display(),
+            env = envelope(response),
+        ),
+    );
     script
+}
+
+/// An external runner that answers `first` on its first call and `later`
+/// on every later one — a nondeterministic job. It appends a line to
+/// `<name>.calls` each time it runs.
+fn changing_runner(dev: &Devnet, name: &str, first: &[u8], later: &[u8]) -> (PathBuf, PathBuf) {
+    let script = dev.dir.join(format!("{name}.sh"));
+    let calls = dev.dir.join(format!("{name}.calls"));
+    write_script(
+        &script,
+        &format!(
+            "echo call >> '{calls}'\nn=0\nwhile read -r _; do n=$((n+1)); done < '{calls}'\n\
+             if [ \"$n\" -eq 1 ]; then printf '%s' '{a}'; else printf '%s' '{b}'; fi",
+            calls = calls.display(),
+            a = envelope(first),
+            b = envelope(later),
+        ),
+    );
+    (script, calls)
+}
+
+/// How many times a runner that logs to `calls` ran.
+fn runner_calls(calls: &Path) -> usize {
+    std::fs::read_to_string(calls)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+/// `run-job` with an external runner, plus `extra` flags.
+fn run_job_ext(
+    dev: &Devnet,
+    job: &JobFiles,
+    runner: &Path,
+    out: &Path,
+    rpc_url: &str,
+    extra: &[&str],
+) -> RunOutcome {
+    let o = run_job_ext_cmd(dev, job, runner, out, rpc_url, extra)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = output_text(&o);
+    RunOutcome {
+        ok: o.status.success(),
+        stdout,
+        stderr,
+    }
+}
+
+fn run_job_ext_cmd(
+    dev: &Devnet,
+    job: &JobFiles,
+    runner: &Path,
+    out: &Path,
+    rpc_url: &str,
+    extra: &[&str],
+) -> Command {
+    let mut cmd = run_job_base(dev, job, out, rpc_url);
+    cmd.args(["--runner", "external", "--external-command"])
+        .arg(runner)
+        .args(extra);
+    cmd
 }
 
 fn run_job(dev: &Devnet, job: &JobFiles, response: &Path, out: &Path, rpc_url: &str) -> RunOutcome {
@@ -842,12 +925,32 @@ fn run_job_publishes_its_response_idempotently_against_a_real_devnet() {
     let created1 = dev.record(&root1).unwrap().created_at;
     assert_result_verifies(&dev, &job_a, &out_a1, &r1);
 
+    assert_eq!(run.resumed_from(), Some("none"));
+    // Again, beside the first: its checkpoint is complete, so nothing runs
+    // or is sent, and the same result is written again.
     let out_a2 = dev.dir.join("job-a.result.2.json");
     let run = run_job(&dev, &job_a, &resp1, &out_a2, &dev.rpc_url);
     assert!(run.ok, "2nd run: {}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.resumed_from(), Some("result_written"));
+    assert_eq!(
+        std::fs::read(&out_a2).unwrap(),
+        std::fs::read(&out_a1).unwrap(),
+        "the same signed result"
+    );
+    // Again, without the checkpoint (another directory): the job runs, and
+    // the publication finds the response already Active.
+    let elsewhere = dev.dir.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let out_a3 = elsewhere.join("job-a.result.json");
+    let run = run_job(&dev, &job_a, &resp1, &out_a3, &dev.rpc_url);
+    assert!(run.ok, "3rd run: {}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.resumed_from(), Some("none"));
     assert_eq!(run.publication(), Some("reused_active"));
-    assert_result_verifies(&dev, &job_a, &out_a2, &r1);
-    eprintln!("[e2e] 1. same job twice: ingested, then reused_active ({root1})");
+    assert_result_verifies(&dev, &job_a, &out_a3, &r1);
+    eprintln!(
+        "[e2e] 1. same job three times: ingested; checkpoint complete (same result); \
+         reused_active without the checkpoint ({root1})"
+    );
 
     // ── 2. A different job, identical response bytes ─────────────────────
     let job_b = make_job(&dev, &manifest, &manifest_root, b"input-b", "job-b");
@@ -866,11 +969,11 @@ fn run_job_publishes_its_response_idempotently_against_a_real_devnet() {
     // ── 3. RPC lost right after the registration lands (issue #149) ───────
     let r3 = response_bytes(3);
     let root3 = public_object_root(&r3);
-    let resp3 = write_response(&dev, "r3", &r3);
+    let (runner3, calls3) = changing_runner(&dev, "runner3", &r3, &response_bytes(33));
     let job_c = make_job(&dev, &manifest, &manifest_root, b"input-c", "job-c");
     let proxy = RpcProxy::start(dev.rpc_addr);
     let out_c = dev.dir.join("job-c.result.json");
-    let child = run_job_cmd(&dev, &job_c, &resp3, &out_c, &proxy.url)
+    let child = run_job_ext_cmd(&dev, &job_c, &runner3, &out_c, &proxy.url, &[])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -905,9 +1008,15 @@ fn run_job_publishes_its_response_idempotently_against_a_real_devnet() {
     );
 
     proxy.restore();
-    let run = run_job(&dev, &job_c, &resp3, &out_c, &proxy.url);
+    let run = run_job_ext(&dev, &job_c, &runner3, &out_c, &proxy.url, &[]);
     assert!(run.ok, "retry: {}\n{}", run.stdout, run.stderr);
     assert_eq!(run.publication(), Some("resumed"));
+    assert_eq!(run.resumed_from(), Some("publishing"));
+    assert_eq!(runner_calls(&calls3), 1, "the job never ran again");
+    assert!(
+        dev.record(&public_object_root(&response_bytes(33)))
+            .is_none()
+    );
     assert_result_verifies(&dev, &job_c, &out_c, &r3);
     let rec = dev.record(&root3).unwrap();
     assert_eq!((rec.lifecycle, rec.created_at), (1, created3));
@@ -918,12 +1027,12 @@ fn run_job_publishes_its_response_idempotently_against_a_real_devnet() {
     // ── 4. The run killed right after the registration lands ──────────────
     let r4 = response_bytes(4);
     let root4 = public_object_root(&r4);
-    let resp4 = write_response(&dev, "r4", &r4);
+    let (runner4, calls4) = changing_runner(&dev, "runner4", &r4, &response_bytes(44));
     let job_d = make_job(&dev, &manifest, &manifest_root, b"input-d", "job-d");
     let out_d = dev.dir.join("job-d.result.json");
     let mut run_proc = Proc::spawn(
         "run-job (to be killed)",
-        run_job_cmd(&dev, &job_d, &resp4, &out_d, &dev.rpc_url),
+        run_job_ext_cmd(&dev, &job_d, &runner4, &out_d, &dev.rpc_url, &[]),
         &dev.dir.join("job-d.killed.log"),
     );
     wait_until("root4's registration", Duration::from_secs(120), || {
@@ -936,9 +1045,14 @@ fn run_job_publishes_its_response_idempotently_against_a_real_devnet() {
     let rec = dev.record(&root4).unwrap();
     assert_eq!(rec.lifecycle, 0, "killed before activation");
     let created4 = rec.created_at;
-    let run = run_job(&dev, &job_d, &resp4, &out_d, &dev.rpc_url);
+    let run = run_job_ext(&dev, &job_d, &runner4, &out_d, &dev.rpc_url, &[]);
     assert!(run.ok, "retry: {}\n{}", run.stdout, run.stderr);
     assert_eq!(run.publication(), Some("resumed"));
+    assert_eq!(runner_calls(&calls4), 1, "the job never ran again");
+    assert!(
+        dev.record(&public_object_root(&response_bytes(44)))
+            .is_none()
+    );
     assert_result_verifies(&dev, &job_d, &out_d, &r4);
     assert_eq!(dev.record(&root4).unwrap().created_at, created4);
     assert_eq!(dev.registrations_of(&root4), 1, "root4 registered once");
@@ -947,25 +1061,28 @@ fn run_job_publishes_its_response_idempotently_against_a_real_devnet() {
     // ── 5. Activated, then the result write fails ─────────────────────────
     let r5 = response_bytes(5);
     let root5 = public_object_root(&r5);
-    let resp5 = write_response(&dev, "r5", &r5);
+    let (runner5, calls5) = changing_runner(&dev, "runner5", &r5, &response_bytes(55));
     let job_e = make_job(&dev, &manifest, &manifest_root, b"input-e", "job-e");
-    let bad_out = dev.dir.join("no-such-dir").join("job-e.result.json");
-    let run = run_job(&dev, &job_e, &resp5, &bad_out, &dev.rpc_url);
+    // The result path is a directory: the write fails after activation.
+    let bad_out = dev.dir.join("job-e.out-is-a-directory");
+    std::fs::create_dir(&bad_out).unwrap();
+    let run = run_job_ext(&dev, &job_e, &runner5, &bad_out, &dev.rpc_url, &[]);
     assert!(!run.ok, "the result write must fail: {}", run.stdout);
     assert!(run.stderr.contains("write result"), "{}", run.stderr);
-    assert!(!bad_out.exists());
     assert_eq!(
         dev.record(&root5).unwrap().lifecycle,
         1,
         "Active before the write"
     );
     let out_e = dev.dir.join("job-e.result.json");
-    let run = run_job(&dev, &job_e, &resp5, &out_e, &dev.rpc_url);
+    let run = run_job_ext(&dev, &job_e, &runner5, &out_e, &dev.rpc_url, &[]);
     assert!(run.ok, "retry: {}\n{}", run.stdout, run.stderr);
-    assert_eq!(run.publication(), Some("reused_active"));
+    assert_eq!(run.resumed_from(), Some("active"));
+    assert_eq!(run.publication(), Some("ingested"), "recorded by attempt 1");
+    assert_eq!(runner_calls(&calls5), 1, "the job never ran again");
     assert_result_verifies(&dev, &job_e, &out_e, &r5);
     assert_eq!(dev.registrations_of(&root5), 1, "root5 registered once");
-    eprintln!("[e2e] 5. result write failed after activation; retry: reused_active");
+    eprintln!("[e2e] 5. result write failed after activation; retry: signed from the checkpoint");
 
     // ── 6. Conflicting metadata ───────────────────────────────────────────
     for (tag, role) in [(6u8, "funder"), (7u8, "client")] {
@@ -1041,7 +1158,7 @@ fn run_job_publishes_its_response_idempotently_against_a_real_devnet() {
     let root10 = public_object_root(&r10);
     let job_j = make_job(&dev, &manifest, &manifest_root, b"input-j", "job-j");
     let out_j = dev.dir.join("job-j.result.json");
-    let (ran, go) = (dev.dir.join("runner.ran"), dev.dir.join("runner.go"));
+    let (ran, go) = (dev.dir.join("runner.calls"), dev.dir.join("runner.go"));
     let runner = gated_runner(&dev, &r10, &ran, &go);
     let proxy8 = RpcProxy::start(dev.rpc_addr);
     let child = run_job_base(&dev, &job_j, &out_j, &proxy8.url)
@@ -1069,6 +1186,114 @@ fn run_job_publishes_its_response_idempotently_against_a_real_devnet() {
         "[e2e] 8b. RPC lost before publication: {}",
         se.lines().find(|l| l.starts_with("Error")).unwrap_or("")
     );
+    // The restart: the checkpoint was written before any registration, so
+    // the retry publishes the recorded response without running the job.
+    proxy8.restore();
+    let run = run_job_ext(&dev, &job_j, &runner, &out_j, &proxy8.url, &[]);
+    assert!(run.ok, "retry: {}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.resumed_from(), Some("publishing"));
+    assert_eq!(run.publication(), Some("ingested"));
+    assert_eq!(runner_calls(&ran), 1, "the job never ran again");
+    assert_result_verifies(&dev, &job_j, &out_j, &r10);
+    assert_eq!(dev.registrations_of(&root10), 1);
+    eprintln!("[e2e] 8b. retry: ingested from the checkpoint");
+
+    // ── 9. The other publications: post-job, publish-result-link, announce ─
+    let contributor_env = |cmd: &mut Command, key: &str| {
+        cmd.env("SUM_RPC_URL", &dev.rpc_url)
+            .env("SUM_KEY_FILE", &dev.key_files[key])
+            .env("SUM_STORE_DIR", dev.dir.join(format!("store-cli-{key}")))
+            .env("SUM_CHAIN_ID", CHAIN_ID.to_string());
+    };
+    let cli = |key: &str, args: &[&std::ffi::OsStr]| -> (bool, String, String) {
+        let mut cmd = Command::new(&dev.omni_node);
+        contributor_env(&mut cmd, key);
+        cmd.args(["operator", "contributor"]).args(args);
+        let o = cmd.output().unwrap();
+        let (so, se) = output_text(&o);
+        (o.status.success(), so, se)
+    };
+    let sum_node = dev.sum_node.as_os_str();
+    let job_root = public_object_root(&std::fs::read(&job_a.job_path).unwrap());
+    let posted = [dev.dir.join("posted-1.json"), dev.dir.join("posted-2.json")];
+    for p in &posted {
+        let (ok, so, se) = cli(
+            "verifier",
+            &[
+                "post-job".as_ref(),
+                "--job".as_ref(),
+                job_a.job_path.as_os_str(),
+                "--posted-out".as_ref(),
+                p.as_os_str(),
+                "--snip-binary".as_ref(),
+                sum_node,
+            ],
+        );
+        assert!(ok, "post-job: {so}\n{se}");
+        assert_eq!(kv(&so, "job_snip_root"), Some(job_root.to_hex().as_str()));
+    }
+    let seed = dev.dir.join("contributor.seed");
+    let links = [dev.dir.join("link-1.json"), dev.dir.join("link-2.json")];
+    let mut link_roots = Vec::new();
+    for l in &links {
+        let (ok, so, se) = cli(
+            "client",
+            &[
+                "publish-result-link".as_ref(),
+                "--result".as_ref(),
+                out_a1.as_os_str(),
+                "--posted-job".as_ref(),
+                posted[0].as_os_str(),
+                "--link-out".as_ref(),
+                l.as_os_str(),
+                "--seed-file".as_ref(),
+                seed.as_os_str(),
+                "--snip-binary".as_ref(),
+                sum_node,
+            ],
+        );
+        assert!(ok, "publish-result-link: {so}\n{se}");
+        link_roots.push(kv(&so, "link_snip_root").unwrap().to_string());
+    }
+    let result_root = public_object_root(
+        serde_json::to_string_pretty(
+            &serde_json::from_slice::<ContributorResult>(&std::fs::read(&out_a1).unwrap()).unwrap(),
+        )
+        .unwrap()
+        .as_bytes(),
+    );
+    let (ok, so, se) = cli(
+        "client",
+        &[
+            "announce-result".as_ref(),
+            "--posted-result-link".as_ref(),
+            links[0].as_os_str(),
+            "--seed-file".as_ref(),
+            seed.as_os_str(),
+            "--peer-wait-secs".as_ref(),
+            "0".as_ref(),
+            "--propagation-wait-ms".as_ref(),
+            "0".as_ref(),
+            "--snip-binary".as_ref(),
+            sum_node,
+        ],
+    );
+    assert!(ok, "announce-result: {so}\n{se}");
+    assert_eq!(
+        kv(&so, "posted_result_link_snip_root"),
+        Some(link_roots[0].as_str())
+    );
+    for (what, root) in [
+        ("job", job_root),
+        ("result", result_root),
+        ("link", SnipV2ObjectId::from_hex(&link_roots[0]).unwrap()),
+    ] {
+        assert_eq!(dev.registrations_of(&root), 1, "{what} registered once");
+    }
+    eprintln!(
+        "[e2e] 9. post-job twice, publish-result-link twice, announce-result: \
+         every repeated publication reused, each root registered once"
+    );
 
     // ── No duplicate registration, anywhere ───────────────────────────────
     assert_eq!(
@@ -1076,7 +1301,13 @@ fn run_job_publishes_its_response_idempotently_against_a_real_devnet() {
         0,
         "the chain refused no duplicate registration in the whole run"
     );
-    for (n, root) in [(1, &root1), (3, &root3), (4, &root4), (5, &root5)] {
+    for (n, root) in [
+        (1, &root1),
+        (3, &root3),
+        (4, &root4),
+        (5, &root5),
+        (10, &root10),
+    ] {
         assert_eq!(dev.registrations_of(root), 1, "root{n}");
         assert_eq!(dev.activations_of(root), 1, "root{n}");
     }
