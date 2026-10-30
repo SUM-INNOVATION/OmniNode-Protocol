@@ -318,6 +318,11 @@ struct RunJobArgs {
     /// shell (otherwise the subprocess sees an empty environment).
     #[arg(long = "external-env-allow")]
     external_env_allow: Vec<String>,
+    /// `external` runner: wall-clock limit, in seconds, on one run of the
+    /// command (issue #130). Past it the command is killed and the job
+    /// fails with "external runner timed out". Default: no limit.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    external_timeout_secs: Option<u64>,
 
     /// `stub` runner: path to the fixed response bytes file.
     #[arg(long, required_if_eq("runner", "stub"))]
@@ -546,6 +551,11 @@ struct WatchJobsArgs {
 
     #[arg(long = "external-env-allow")]
     external_env_allow: Vec<String>,
+    /// `external` runner: wall-clock limit, in seconds, on one run of the
+    /// command (issue #130). Past it the command is killed and the job
+    /// fails with "external runner timed out". Default: no limit.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    external_timeout_secs: Option<u64>,
 
     #[arg(long, required_if_eq("runner", "stub"))]
     stub_response: Option<PathBuf>,
@@ -711,6 +721,11 @@ struct WatchNetworkJobsArgs {
     external_args: Vec<String>,
     #[arg(long = "external-env-allow")]
     external_env_allow: Vec<String>,
+    /// `external` runner: wall-clock limit, in seconds, on one run of the
+    /// command (issue #130). Past it the command is killed and the job
+    /// fails with "external runner timed out". Default: no limit.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    external_timeout_secs: Option<u64>,
     #[arg(long, required_if_eq("runner", "stub"))]
     stub_response: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
@@ -1083,6 +1098,11 @@ struct RunAssignmentArgs {
     external_args: Vec<String>,
     #[arg(long = "external-env-allow")]
     external_env_allow: Vec<String>,
+    /// `external` runner: wall-clock limit, in seconds, on one run of the
+    /// command (issue #130). Past it the command is killed and the job
+    /// fails with "external runner timed out". Default: no limit.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    external_timeout_secs: Option<u64>,
     #[arg(long, required_if_eq("runner", "stub"))]
     stub_response: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
@@ -2893,6 +2913,7 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
             );
             runner.extra_args = args.external_args;
             runner.env_allowlist = args.external_env_allow;
+            runner.timeout = args.external_timeout_secs.map(std::time::Duration::from_secs);
 
             // Stage 14.3 + 14.6 — determine whether any emit flag
             // is set so we know to wrap the runner in
@@ -3729,6 +3750,7 @@ fn run_watch_jobs(args: WatchJobsArgs) -> Result<()> {
             );
             r.extra_args = args.external_args;
             r.env_allowlist = args.external_env_allow;
+            r.timeout = args.external_timeout_secs.map(std::time::Duration::from_secs);
             AnyRunner::External(r)
         }
     };
@@ -4014,6 +4036,7 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
             );
             r.extra_args = args.external_args;
             r.env_allowlist = args.external_env_allow;
+            r.timeout = args.external_timeout_secs.map(std::time::Duration::from_secs);
             AnyRunner::External(r)
         }
     };
@@ -5305,6 +5328,7 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
             );
             r.extra_args = args.external_args;
             r.env_allowlist = args.external_env_allow;
+            r.timeout = args.external_timeout_secs.map(std::time::Duration::from_secs);
             r.run_with_activations(
                 &empty_manifest,
                 b"",
@@ -7604,6 +7628,29 @@ mod tests {
             ContributorCmd::AssignSessionPlan(a) => a,
             _ => panic!("expected AssignSessionPlan"),
         }
+    }
+
+    /// Issue #130: `--external-timeout-secs` reaches the runner args of
+    /// every command that takes `--runner external`; unset means no limit,
+    /// and 0 is refused rather than meaning "kill at once".
+    #[test]
+    fn external_timeout_secs_is_parsed_and_zero_is_refused() {
+        let common = [
+            "--seed-file", "/tmp/s", "--runner", "external", "--external-command", "/bin/true",
+        ];
+        let run_job = |extra: &[&str]| {
+            let mut argv = vec!["omni-node", "run-job", "--job", "/tmp/j.json", "--out", "/tmp/r.json"];
+            argv.extend(common);
+            argv.extend(extra);
+            TestRoot::try_parse_from(&argv).map(|r| match r.contributor.cmd {
+                ContributorCmd::RunJob(a) => a.external_timeout_secs,
+                _ => panic!("expected RunJob"),
+            })
+        };
+        assert_eq!(run_job(&[]).unwrap(), None);
+        assert_eq!(run_job(&["--external-timeout-secs", "30"]).unwrap(), Some(30));
+        assert!(run_job(&["--external-timeout-secs", "0"]).is_err());
+        assert!(run_job(&["--external-timeout-secs", "-1"]).is_err());
     }
 
     /// Stage 12.8 — `--no-publish-announcements` toggle. Pre-fix,

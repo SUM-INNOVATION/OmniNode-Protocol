@@ -15,9 +15,12 @@
 //! Stage 12.0 does NOT depend on `omni-pipeline` — single-runner
 //! manual flow only.
 
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde::Deserialize;
@@ -193,16 +196,22 @@ pub struct ExternalCommandRunner {
     pub extra_args: Vec<String>,
     pub work_dir: Option<PathBuf>,
     pub env_allowlist: Vec<String>,
-    // Stage 12.0 intentionally does NOT expose a `timeout` field. A
-    // half-implemented timeout that we silently never enforce would
-    // be a worse safety control than no timeout at all (operators
-    // would assume protection that doesn't exist). Operators rely on
-    // the external runtime's own timeout mechanism + the surrounding
-    // process supervisor (systemd, k8s probe, etc.). A real
-    // wall-clock kill switch is a Stage 12.x hardening item that
-    // requires a watcher thread (or platform-specific waitid timeout)
-    // — out of scope here.
+    /// Issue #130: wall-clock limit on one run of the command, from spawn
+    /// until its exit status and both output streams are in. `None` (the
+    /// default): no limit, as before.
+    ///
+    /// When the limit passes, the command's process is killed (`SIGKILL` on
+    /// Unix), reaped, and the run fails with
+    /// [`RunnerError::ExternalTimeout`]; nothing it wrote is used. Only that
+    /// process is killed: processes it started itself are left to it, or to
+    /// the surrounding supervisor. Enforced by polling the child, so the
+    /// kill comes within [`TIMEOUT_POLL`] of the limit.
+    pub timeout: Option<Duration>,
 }
+
+/// How often a run with [`ExternalCommandRunner::timeout`] set checks
+/// whether the command has exited.
+pub const TIMEOUT_POLL: Duration = Duration::from_millis(20);
 
 impl ExternalCommandRunner {
     pub fn new(command: PathBuf) -> Self {
@@ -211,6 +220,7 @@ impl ExternalCommandRunner {
             extra_args: Vec::new(),
             work_dir: None,
             env_allowlist: Vec::new(),
+            timeout: None,
         }
     }
 }
@@ -366,7 +376,7 @@ impl ExternalCommandRunner {
             cmd.arg("--activation-out").arg(path);
         }
 
-        let output = cmd.output()?;
+        let output = output_within(cmd, self.timeout)?;
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -384,6 +394,69 @@ impl ExternalCommandRunner {
         let _ = (activation_in_tmp, activation_out_tmp);
         Ok((envelope, activation_out_path))
     }
+}
+
+/// `cmd.output()`, bounded by `timeout` (issue #130).
+///
+/// Without a timeout this is exactly `cmd.output()`. With one, the child is
+/// spawned with both output pipes drained on their own threads (a command
+/// that fills a pipe must not stall on it), and polled until it exits. Past
+/// the deadline it is killed and reaped, and the run fails with
+/// [`RunnerError::ExternalTimeout`]. The deadline also covers collecting
+/// its output: a pipe held open after the command exited, by a process it
+/// left behind, ends the run the same way. Reader threads still blocked on
+/// such a pipe are not joined; they end when the pipe closes.
+fn output_within(mut cmd: Command, timeout: Option<Duration>) -> Result<Output, RunnerError> {
+    let Some(timeout) = timeout else {
+        return Ok(cmd.output()?);
+    };
+    let deadline = Instant::now() + timeout;
+    let mut child = cmd.spawn()?;
+
+    fn drain<R: Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let res = match pipe {
+                Some(mut p) => p.read_to_end(&mut buf).map(|_| buf),
+                None => Ok(buf),
+            };
+            let _ = tx.send(res);
+        });
+        rx
+    }
+    let stdout_rx = drain(child.stdout.take());
+    let stderr_rx = drain(child.stderr.take());
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RunnerError::ExternalTimeout(timeout));
+        }
+        std::thread::sleep(TIMEOUT_POLL.min(deadline - now));
+    };
+
+    let collect = |rx: &mpsc::Receiver<std::io::Result<Vec<u8>>>| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(res) => res.map_err(RunnerError::Io),
+            Err(_) => Err(RunnerError::ExternalTimeout(timeout)),
+        }
+    };
+    let stdout = collect(&stdout_rx)?;
+    let stderr = collect(&stderr_rx)?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn envelope_to_run_output(envelope: ExternalRunnerEnvelope) -> Result<RunOutput, RunnerError> {
