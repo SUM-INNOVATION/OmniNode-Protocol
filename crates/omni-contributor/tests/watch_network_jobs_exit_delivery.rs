@@ -61,8 +61,8 @@ const DEADLINE: Duration = Duration::from_secs(20);
 /// How long the watcher keeps polling after the contributor has exited.
 const RECEIPT_WINDOW: Duration = Duration::from_secs(1);
 const RUNS: usize = 20;
-/// The old exit path lost the announcement in roughly half of the runs here
-/// (and in two of three reported runs), so the control runs until it sees a
+/// The old exit path lost the announcement in two of three reported runs and
+/// in some runs of this harness, so the opt-in control runs until it sees a
 /// loss, up to this many times.
 const CONTROL_RUNS: usize = 20;
 
@@ -460,7 +460,17 @@ async fn result_announcement_reaches_the_watcher_when_the_contributor_exits_on_m
 
 /// Negative control: `--propagation-wait-ms 0` is the old exit path — the
 /// node is dropped as soon as the loop returns — and loses the announcement.
+///
+/// Opt-in (`cargo test … -- --ignored`): in this end-to-end harness the old
+/// path loses the announcement only sometimes, so the control cannot gate CI.
+/// On a GitHub runner all 20 announcements arrived without the wait in one
+/// attempt of post-merge run 40993101696 and one was lost in the next, and run
+/// on its own on macOS it saw no loss in three runs of 20; the drain test above
+/// passed every time. That the drain itself is what delivers the last message
+/// is shown by `omni-net`'s `without_the_drain_the_same_sequence_loses_the_message`,
+/// which stays in CI.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "end-to-end negative control that does not reproduce the loss reliably; run with --ignored"]
 async fn with_no_propagation_wait_the_announcement_is_lost() {
     let mut watcher = Watcher::start().await;
     let mut first_loss = None;
