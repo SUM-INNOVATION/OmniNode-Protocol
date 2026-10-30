@@ -311,6 +311,7 @@ omni-node operator contributor watch-jobs \
     --max-input-tokens <N> --max-output-tokens <N> --max-total-base-units <N> \
     --runner external|stub \
     [--external-command <bin>] [--external-arg ...] [--external-env-allow ...] \
+    [--external-timeout-secs <N>] \
     [--stub-response <path>] [--stub-input-tokens N] [--stub-output-tokens N] \
     --seed-file <path> --result-out-dir <path> \
     [--accept-model-hash <hex64> ...] [--accept-tokenizer-hash <hex64> ...] \

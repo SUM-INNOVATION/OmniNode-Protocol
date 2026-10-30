@@ -1105,6 +1105,7 @@ omni-node operator contributor verify-result --job ./job.json --result ./result.
 
 - `--runner stub|external` — `stub` reads a fixed response from disk (deterministic; for tests). `external` invokes a subprocess that does the real inference — no framework runtime lives in `omni-node` itself.
 - `--external-command <bin>` — required with `--runner external`. The subprocess gets `--manifest <path>` + `--input <path>` (+ `--activation-out <path>` on Stage 12.4 wired runners) and writes a `deny_unknown_fields` JSON envelope to stdout.
+- `--external-timeout-secs <N>` — optional, with `--runner external` (`run-job`, `watch-jobs`, `watch-network-jobs`, `run-assignment`). A wall-clock limit on one run of the subprocess. Past it, the subprocess is killed and the job fails with `external runner timed out after <N>s`; a watcher reports that job's error and carries on. Unset: no limit. Only the subprocess itself is killed; anything it started on its own is left to it or to the surrounding supervisor.
 - `--seed-file <path>` — 32-byte raw Ed25519 contributor seed. DISTINCT from any chain-attestation seed.
 
 **Cost guardrails:** none at this stage. `watch-jobs` (Stage 12.1) and `watch-network-jobs` (Stage 12.2) add required cost caps; one-off `run-job` invocations are at operator discretion.
