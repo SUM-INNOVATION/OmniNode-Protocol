@@ -45,3 +45,22 @@ fn submit_attestation_without_feature_returns_typed_error() {
         fake.calls()
     );
 }
+
+/// Issue #129: `submit_digest` without the feature fails the same way,
+/// before any chain call.
+#[test]
+fn submit_digest_without_feature_returns_typed_error() {
+    let fake = FakeJsonRpcTransport::new();
+    let client = SumChainClient::with_transport([0u8; 32], fake.clone());
+    let digest = omni_sumchain::InferenceAttestationDigest {
+        session_id: "no-submit-feature-test".into(),
+        model_hash: [0xaa; 32],
+        manifest_root: [0x11; 32],
+        response_hash: [0xbb; 32],
+        proof_root: [0x22; 32],
+    };
+    let err = client.submit_digest(&digest).unwrap_err();
+    let ChainClientError::Other(msg) = err;
+    assert!(msg.contains("submit"), "{msg}");
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
