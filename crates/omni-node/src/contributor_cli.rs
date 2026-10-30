@@ -15,8 +15,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 
 use omni_contributor::{
-    canonical::job_hash_hex, run_job, verify::DispatcherSignatureOutcome, verify_result,
-    ContributorJob, ContributorResult, ContributorSigner, ExternalCommandRunner, InferenceRunner,
+    canonical::job_hash_hex, checkpoint::RunCheckpointStore, run_job_checkpointed,
+    verify::DispatcherSignatureOutcome, verify_result, CheckpointedRun, ContributorJob, ContributorResult, ContributorSigner, ExternalCommandRunner, InferenceRunner,
     RunJobOptions, StubRunner, WorkUnitKind,
 };
 use omni_store::{SnipV2Cli, SnipV2CliConfig};
@@ -351,6 +351,13 @@ struct RunJobArgs {
     /// Optional SNIP seed file.
     #[arg(long)]
     snip_seed: Option<PathBuf>,
+
+    /// Issue #149 — directory of run checkpoints. Default:
+    /// `.omni-run-job` in the directory of `--out`. A run of a job that
+    /// has a checkpoint there resumes from its recorded response and
+    /// never runs the job again.
+    #[arg(long)]
+    checkpoint_dir: Option<PathBuf>,
 
     /// Stage 14.2 — write a sidecar
     /// [`omni_zkml::ProofArtifactBody`] alongside the contributor
@@ -2654,6 +2661,12 @@ fn build_snip_adapter(
         seed_path: seed,
         extra_args: Vec::new(),
         allow_non_active: false,
+        // Issue #149: the chain endpoint and signing key are `sum-node`'s
+        // own `SUM_RPC_URL` / `SUM_KEY_FILE`, read by the adapter the same
+        // way `sum-node` reads them, so the publication state it reads is
+        // the chain `sum-node` registers on, as the account it signs with.
+        rpc_url: None,
+        key_file: None,
     })
 }
 
@@ -2803,6 +2816,20 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
     }
 
     let job = read_job(&args.job)?;
+    // Issue #149 — refuse before any work if the result cannot be written
+    // where asked: the checkpoint lives beside it by default.
+    let out_dir = args
+        .out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    if !out_dir.is_dir() {
+        bail!("the directory of --out does not exist: {}", out_dir.display());
+    }
+    let checkpoints = match args.checkpoint_dir.clone() {
+        Some(dir) => RunCheckpointStore::new(dir),
+        None => RunCheckpointStore::beside(&args.out),
+    };
     let adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
     let signer = ContributorSigner::from_seed_file(&args.seed_file)
         .with_context(|| format!("load seed: {}", args.seed_file.display()))?;
@@ -2830,7 +2857,11 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
     #[cfg(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove"))]
     let mut captured_external_bytes: Option<(Vec<u8>, Vec<u8>)> = None;
 
-    let result = match args.runner {
+    // Issue #149: checkpointed. A first run records the validated response
+    // before any registration; a later run of the same job resumes from it
+    // without running the job again. `run.publication` says how the
+    // response became Active; the result is written only after that.
+    let mut run = match args.runner {
         RunnerChoice::Stub => {
             let response_bytes = std::fs::read(
                 args.stub_response.as_ref().ok_or_else(|| anyhow!("--stub-response required"))?,
@@ -2841,7 +2872,7 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
                 args.stub_input_tokens,
                 args.stub_output_tokens,
             );
-            run_job(&job, &adapter, &runner, opts)?
+            run_job_checkpointed(&job, &adapter, &runner, opts, &checkpoints)?
         }
         RunnerChoice::External => {
             let mut runner = ExternalCommandRunner::new(
@@ -2877,39 +2908,64 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
                 // 14.3 D6 lifecycle). Post-run we extract the
                 // slots before they go out of scope.
                 let capturing = ByteCapturingRunner::new(&runner);
-                let r = run_external_with_runner(&job, &adapter, &capturing, opts)?;
-                let ci = capturing.take_captured_input().ok_or_else(|| {
-                    anyhow!(
+                let r = run_external_with_runner(&job, &adapter, &capturing, opts, &checkpoints)?;
+                // Issue #149 — a run resumed from its checkpoint does not
+                // invoke the runner: the output is the recorded response,
+                // the input the job's (integrity-checked) input object.
+                let resumed = r.resumed_from.is_some();
+                let ci = match capturing.take_captured_input() {
+                    Some(b) => b,
+                    None if resumed => {
+                        let root = omni_types::phase5::SnipV2ObjectId::from_hex(&job.input_snip_root)
+                            .map_err(|e| anyhow!("input_snip_root: {e:?}"))?;
+                        omni_contributor::snip::fetch_bytes_with_integrity_check(
+                            &adapter,
+                            &root,
+                            &job.input_hash,
+                            "input",
+                        )?
+                    }
+                    None => bail!(
                         "proof emission: runner did not capture input bytes \
                          (likely a pre-runner refusal); no sidecar written"
-                    )
-                })?;
-                let co = capturing.take_captured_output().ok_or_else(|| {
-                    anyhow!(
+                    ),
+                };
+                let co = match capturing.take_captured_output() {
+                    Some(b) => b,
+                    None if resumed => r.checkpoint.verified_response()?,
+                    None => bail!(
                         "proof emission: runner did not capture output bytes \
                          (runner returned Err or never produced response); \
                          no sidecar written"
-                    )
-                })?;
+                    ),
+                };
                 captured_external_bytes = Some((ci, co));
                 r
             } else {
-                run_external_with_runner(&job, &adapter, &runner, opts)?
+                run_external_with_runner(&job, &adapter, &runner, opts, &checkpoints)?
             }
             #[cfg(not(any(feature = "halo2-reference-prove", feature = "stage11d-production-prove")))]
             {
-                run_external_with_runner(&job, &adapter, &runner, opts)?
+                run_external_with_runner(&job, &adapter, &runner, opts, &checkpoints)?
             }
         }
     };
 
-    let json = serde_json::to_string_pretty(&result)
-        .context("serialize ContributorResult to JSON")?;
-    std::fs::write(&args.out, json)
+    // Durable and idempotent: the same bytes on every attempt; an `--out`
+    // already holding them is left alone, one holding others is refused.
+    checkpoints
+        .write_result(&mut run.checkpoint, &args.out, run.result_json.as_bytes())
         .with_context(|| format!("write result: {}", args.out.display()))?;
+    let result = run.result.clone();
     println!("result_path={}", args.out.display());
     println!("job_id={}", result.job_id);
     println!("response_snip_root={}", result.response_snip_root);
+    println!("response_publication={}", run.publication.action);
+    println!("checkpoint={}", run.checkpoint.dir.display());
+    println!(
+        "checkpoint_resumed_from={}",
+        run.resumed_from.map(|p| p.as_str()).unwrap_or("none")
+    );
     println!("total_base_units={}", result.measured_accounting.total_base_units);
 
     // Stage 14.2 / 14.3 — opt-in halo2-reference sidecar proof
@@ -2993,8 +3049,9 @@ fn run_external_with_runner<R: InferenceRunner>(
     adapter: &SnipV2Cli,
     runner: &R,
     opts: RunJobOptions<'_>,
-) -> Result<ContributorResult> {
-    Ok(run_job(job, adapter, runner, opts)?)
+    checkpoints: &RunCheckpointStore,
+) -> Result<CheckpointedRun> {
+    Ok(run_job_checkpointed(job, adapter, runner, opts, checkpoints)?)
 }
 
 // ── Stage 14.2: halo2-reference sidecar proof emission ───────────────────────

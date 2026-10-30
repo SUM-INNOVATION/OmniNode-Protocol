@@ -23,8 +23,19 @@ ciborium   = { workspace = true }
 bincode    = { workspace = true }
 async-trait = { workspace = true }
 anyhow     = { workspace = true }
+# Issue #149 — the chain account a key signs as is base58 with a checksum.
+# Already in the graph through libp2p.
+bs58       = { workspace = true }
+# Issue #149 — the read-only `storage_getFileInfoV2` lookup the publication
+# decides from, against the RPC endpoint `sum-node` itself uses. Already in
+# the default graph through `omni-sumchain`.
+ureq       = { workspace = true }
 
 [dev-dependencies]
+# Issue #149 — tests pin the Public V2 root, chunk size and account
+# derivation to the chain's own implementation (=0.4.0, the version SNIP
+# pins). Dev-only: the default dependency graph has no chain crate.
+sumchain-wire = { workspace = true }
 # S1's capture-seam tests need an executor and futures::io; `tempfile` is now a
 # regular dependency (publication staging) so it is not repeated here.
 tokio    = { workspace = true }

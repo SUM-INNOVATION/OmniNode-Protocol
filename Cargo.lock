@@ -2861,11 +2861,13 @@ dependencies = [
  "omni-zkml",
  "serde",
  "serde_json",
+ "sumchain-wire",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
@@ -2932,6 +2934,7 @@ dependencies = [
  "async-trait",
  "bincode 2.0.1",
  "blake3",
+ "bs58",
  "ciborium",
  "cid",
  "futures",
@@ -2943,10 +2946,12 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sumchain-wire",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

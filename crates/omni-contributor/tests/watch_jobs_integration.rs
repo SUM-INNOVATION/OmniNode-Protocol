@@ -598,6 +598,81 @@ fn watch_loop_state_store_dual_writes_accepted_result_and_dedups_across_restart(
 /// state-dir's `results/result-links/<posted_id>.link.json` after
 /// publishing it to SNIP. The CLI flag doc + Stage 12.7 protocol
 /// doc both promise this; this test pins the contract.
+/// Issue #149 — a job marked seen whose run checkpoint is incomplete is
+/// picked up again after a restart and resumed from its checkpoint: the
+/// runner is not called again and the response is registered once.
+#[test]
+fn watch_loop_restart_resumes_an_incomplete_checkpoint_despite_the_seen_marker() {
+    use omni_contributor::{ContributorStateStore, StateNamespace};
+
+    let tmp_jobs = tempfile::tempdir().unwrap();
+    let tmp_out = tempfile::tempdir().unwrap();
+    let tmp_state = tempfile::tempdir().unwrap();
+    let snip = MockSnipStore::new();
+    let job = build_minimal_job(&snip);
+    let posted = publish_job_and_post(&snip, &job, tmp_jobs.path(), None);
+    let now_utc = "2026-05-30T00:00:00Z";
+    let signer = ContributorSigner::from_seed_bytes(&CONTRIBUTOR_SEED).unwrap();
+    let run = |runner: &StubRunner| {
+        let (store, _) = ContributorStateStore::open(tmp_state.path(), false, now_utc).unwrap();
+        let mut source = FilesystemSource::new(tmp_jobs.path().to_path_buf());
+        let mut emitter = CollectEmitter::new();
+        let opts = WatchOptions {
+            poll_interval: Duration::ZERO,
+            max_jobs: None,
+            max_polls: Some(1),
+            filters: no_filters(),
+            caps: liberal_caps(),
+            runner,
+            signer: &signer,
+            result_out_dir: tmp_out.path().to_path_buf(),
+            publish_link: false,
+            emit: &mut emitter,
+            result_broadcaster: None,
+            state_store: Some(&store),
+        };
+        run_watch_loop(&snip, &mut source, opts).unwrap();
+        (emitter.events, store)
+    };
+
+    // First process: the publication fails (chain RPC down) after the
+    // checkpoint is written; the posted job is marked seen.
+    let first = StubRunner::new(signer.pubkey_hex(), b"watch-resp".to_vec(), 7, 13);
+    snip.set_rpc_down(true);
+    let (events, store) = run(&first);
+    assert!(events.iter().any(|e| matches!(e, WatchEvent::Error { .. })), "{events:?}");
+    assert!(store.is_seen(StateNamespace::PostedJobs, &posted.posted_id).unwrap());
+    let result_path = tmp_out.path().join(format!("{}.json", job.job_id));
+    assert!(!result_path.exists());
+    let before = snip.calls();
+
+    // Second process: a runner that would answer differently; it must not
+    // be used. The job resumes from its checkpoint.
+    snip.set_rpc_down(false);
+    let second = StubRunner::new(signer.pubkey_hex(), b"DIFFERENT".to_vec(), 7, 13);
+    let (events, _) = run(&second);
+    assert!(
+        !events.iter().any(|e| matches!(e, WatchEvent::Skip { reason: SkipReason::AlreadySeen, .. })),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| matches!(e, WatchEvent::VerifyOk { .. })), "{events:?}");
+    let result: omni_contributor::ContributorResult =
+        serde_json::from_slice(&std::fs::read(&result_path).unwrap()).unwrap();
+    assert_eq!(
+        result.response_snip_root,
+        omni_store::snip_v2_publish::public_object_root(b"watch-resp").to_hex(),
+        "the first runner's response"
+    );
+    assert_eq!(snip.calls().ingests, before.ingests + 1, "registered once");
+
+    // Third process: the checkpoint is complete, so the seen marker skips.
+    let (events, _) = run(&second);
+    assert!(
+        events.iter().any(|e| matches!(e, WatchEvent::Skip { reason: SkipReason::AlreadySeen, .. })),
+        "{events:?}"
+    );
+}
+
 #[test]
 fn watch_loop_state_store_dual_writes_result_link_when_publish_link_enabled() {
     use omni_contributor::{ContributorStateStore, StateObjectKind};

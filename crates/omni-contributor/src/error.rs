@@ -37,6 +37,10 @@ pub enum ContributorError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Issue #149 — a run checkpoint could not be used.
+    #[error("run checkpoint error: {0}")]
+    Checkpoint(#[from] crate::checkpoint::CheckpointError),
+
     #[error(
         "job carries verification_requirement::Stage11dProductionFixedPointMlpProof, \
          which is NOT a Stage 12.0 v1 variant. Production-proof evidence is reserved \

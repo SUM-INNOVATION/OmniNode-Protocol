@@ -39,7 +39,8 @@ use crate::canonical::{hex_lower, job_hash_hex, posted_result_link_signing_input
 use crate::error::{ContributorError, DiscoverError, SchemaError};
 use crate::job::ContributorJob;
 use crate::posted::{PostedJob, PostedResultLink, POSTED_SCHEMA_VERSION};
-use crate::run::{run_job, RunJobOptions};
+use crate::checkpoint::{RunCheckpointStore, RunPhase, DEFAULT_CHECKPOINT_DIR};
+use crate::run::{run_job_checkpointed, RunJobOptions};
 use crate::runner::InferenceRunner;
 use crate::signing::{verify_signature_hex, ContributorSigner};
 use crate::{discover, snip, verify};
@@ -279,6 +280,10 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
     mut opts: WatchOptions<'_>,
 ) -> Result<(), ContributorError> {
     std::fs::create_dir_all(&opts.result_out_dir)?;
+    // Issue #149 — run checkpoints beside the results: a job picked up
+    // again (after a restart, or a re-post) resumes from its recorded
+    // response instead of running again.
+    let checkpoints = RunCheckpointStore::new(opts.result_out_dir.join(DEFAULT_CHECKPOINT_DIR));
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut jobs_picked: u64 = 0;
@@ -342,6 +347,16 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
             // short-circuit on the cheap path).
             if let Some(store) = opts.state_store {
                 match store.is_seen(crate::state::StateNamespace::PostedJobs, &posted.posted_id) {
+                    // Issue #149 — a job whose run checkpoint is not
+                    // complete (an earlier process was interrupted, or its
+                    // publication failed) is picked up again: it resumes
+                    // from the recorded response, never running the job.
+                    Ok(true)
+                        if checkpoints
+                            .load(&posted.job_hash, &opts.signer.pubkey_hex())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|c| c.checkpoint.phase < RunPhase::ResultWritten) => {}
                     Ok(true) => {
                         seen.insert(posted.posted_id.clone());
                         opts.emit.emit(WatchEvent::Skip {
@@ -586,10 +601,10 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
                 job_id: job.job_id.clone(),
             });
 
-            // 3e. Invoke Stage 12.0 run_job.
+            // 3e. Invoke Stage 12.0 run_job (issue #149: checkpointed).
             let produced_at_utc =
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            let result = match run_job(
+            let mut run = match run_job_checkpointed(
                 &job,
                 adapter,
                 opts.runner,
@@ -599,6 +614,7 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
                     notes: None,
                     job_snip_root: Some(posted.job_snip_root.clone()),
                 },
+                &checkpoints,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -609,6 +625,7 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
                     continue;
                 }
             };
+            let result = run.result.clone();
             opts.emit.emit(WatchEvent::FetchedJob {
                 posted_id: posted.posted_id.clone(),
                 job_id: job.job_id.clone(),
@@ -694,8 +711,8 @@ pub fn run_watch_loop<A: SnipV2Adapter, S: discover::JobSource>(
 
             // 3g. Write accepted result.
             let result_path = opts.result_out_dir.join(format!("{}.json", job.job_id));
-            let result_json = serde_json::to_string_pretty(&result)?;
-            std::fs::write(&result_path, &result_json)?;
+            let result_json = run.result_json.clone();
+            checkpoints.write_result(&mut run.checkpoint, &result_path, result_json.as_bytes())?;
 
             // Stage 12.7 — dual-write the accepted result into
             // `<state>/results/contributor-results/<job_id>.json`.
