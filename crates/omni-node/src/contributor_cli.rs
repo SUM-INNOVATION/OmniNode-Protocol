@@ -286,7 +286,9 @@ struct ValidateJobArgs {
     #[arg(long)]
     snip_binary: Option<PathBuf>,
 
-    /// Optional SNIP seed file path passed through to `sum-node`.
+    /// Optional `sum-node` key file (64 hex characters of an Ed25519
+    /// seed), given to `sum-node` as `SUM_KEY_FILE`. Accepted for symmetry
+    /// with `run-job`; the SNIP probes are not run yet.
     #[arg(long)]
     snip_seed: Option<PathBuf>,
 }
@@ -348,7 +350,12 @@ struct RunJobArgs {
     #[arg(long, default_value = "sum-node")]
     snip_binary: PathBuf,
 
-    /// Optional SNIP seed file.
+    /// Optional `sum-node` key file (64 hex characters of an Ed25519
+    /// seed) that SNIP calls sign with. It is given to `sum-node` as
+    /// `SUM_KEY_FILE`, the variable its global `--key-file` reads; without
+    /// it, `SUM_KEY_FILE` is inherited. `sum-node`'s endpoint, store
+    /// directory and chain id are always inherited: `SUM_RPC_URL`,
+    /// `SUM_STORE_DIR`, `SUM_CHAIN_ID`.
     #[arg(long)]
     snip_seed: Option<PathBuf>,
 
@@ -2664,21 +2671,30 @@ pub async fn dispatch(args: ContributorArgs) -> Result<()> {
     }
 }
 
+/// The SNIP adapter for `--snip-binary` / `--snip-seed`.
+///
+/// `--snip-seed` names a `sum-node` key file (64 hex characters of an
+/// Ed25519 seed). `sum-node` takes its key only through its global
+/// `--key-file` / `SUM_KEY_FILE`, so the file becomes the adapter's key file,
+/// which the adapter hands to every `sum-node` it runs as `SUM_KEY_FILE`
+/// (issue #148: it used to be appended as `--seed <path>`, an argument
+/// `sum-node` does not have). Without `--snip-seed`, `sum-node` and the
+/// adapter read `SUM_KEY_FILE` from the environment.
 fn build_snip_adapter(
     binary: PathBuf,
-    seed: Option<PathBuf>,
+    snip_key_file: Option<PathBuf>,
 ) -> SnipV2Cli {
     SnipV2Cli::new(SnipV2CliConfig {
         binary_path: binary,
-        seed_path: seed,
         extra_args: Vec::new(),
         allow_non_active: false,
-        // Issue #149: the chain endpoint and signing key are `sum-node`'s
-        // own `SUM_RPC_URL` / `SUM_KEY_FILE`, read by the adapter the same
-        // way `sum-node` reads them, so the publication state it reads is
-        // the chain `sum-node` registers on, as the account it signs with.
+        // Issue #149: the chain endpoint is `sum-node`'s own `SUM_RPC_URL`,
+        // read by the adapter the same way `sum-node` reads it, so the
+        // publication state it reads is the chain `sum-node` registers on.
+        // The store directory and chain id are likewise `sum-node`'s
+        // `SUM_STORE_DIR` / `SUM_CHAIN_ID`, inherited from the environment.
         rpc_url: None,
-        key_file: None,
+        key_file: snip_key_file,
     })
 }
 
@@ -7575,6 +7591,44 @@ async fn run_assign_session_plan(args: AssignSessionPlanArgs) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// Issue #148: `--snip-seed` reaches `sum-node` as its key file
+    /// (`SUM_KEY_FILE`, what its global `--key-file` reads), never as an
+    /// argument `sum-node` does not have. The scripted `sum-node` exits 2,
+    /// as clap does, on any argument beyond `download <root> --output <path>`.
+    #[cfg(unix)]
+    #[test]
+    fn snip_seed_is_passed_to_sum_node_as_its_key_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("owner.key");
+        std::fs::write(&key, "07".repeat(32)).unwrap();
+        let out = dir.path().join("out.bin");
+        let root = omni_types::phase5::SnipV2ObjectId::from_bytes([0xab; 32]);
+        let bin = dir.path().join("sum-node");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$#\" = 4 ] && [ \"$1 $2 $3 $4\" = 'download {root} --output {out}' ] \
+                 || {{ echo \"error: unexpected argument in: $*\" >&2; exit 2; }}\n\
+                 [ \"$SUM_KEY_FILE\" = '{key}' ] \
+                 || {{ echo \"SUM_KEY_FILE=$SUM_KEY_FILE\" >&2; exit 7; }}\n\
+                 printf x > '{out}'\n",
+                root = root.to_hex(),
+                out = out.display(),
+                key = key.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adapter = build_snip_adapter(bin, Some(key.clone()));
+        adapter.download_public(&root, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"x");
+        // The adapter's own account checks read the same key.
+        assert_eq!(adapter.key_file(), Some(key));
+    }
 
     /// Wrapper so `try_parse_from` has a single top-level parser.
     /// We pass `assign-session-plan ...` and let the subcommand
