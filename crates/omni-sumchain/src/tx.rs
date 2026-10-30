@@ -4,6 +4,12 @@
 //! `sumchain-primitives` v0.2.0 types (crates.io). Called by
 //! [`crate::SumChainClient::submit_attestation`].
 //!
+//! Issue #129: [`crate::SumChainClient::submit_digest`] runs the same flow
+//! from a caller's own [`InferenceAttestationDigest`], through
+//! [`submit_digest_signed_transaction`]. It has no step 4 (sender ==
+//! verifier holds by construction) and no step 5 conversion. A
+//! `session_id` over [`MAX_SESSION_ID_BYTES`] is refused before step 1.
+//!
 //! # Flow
 //!
 //! Gates (no `sum_getNonce` or `sum_sendRawTransaction` is reached
@@ -55,7 +61,9 @@
 //!     `tx_hash` is propagated unchanged into `SubmissionReceipt::tx_id`.
 
 use omni_types::phase5::InferenceAttestation;
-use omni_zkml::{ChainClientError, SubmissionReceipt};
+use omni_zkml::{
+    ChainClientError, InferenceAttestationDigest, SubmissionReceipt, MAX_SESSION_ID_BYTES,
+};
 use sumchain_primitives::{
     inference_attestation::{
         InferenceAttestationDigest as ChainDigest, InferenceAttestationTxData,
@@ -64,7 +72,7 @@ use sumchain_primitives::{
 };
 
 use crate::client::SumChainClient;
-use crate::dto::BlockFinality;
+use crate::dto::{BlockFinality, ChainParamsInfo};
 use crate::outer_sign::outer_sign_transaction_v2;
 use crate::rpc::JsonRpcTransport;
 
@@ -76,6 +84,72 @@ pub(crate) fn build_and_submit_signed_transaction<T: JsonRpcTransport>(
     client: &SumChainClient<T>,
     attestation: &InferenceAttestation,
 ) -> std::result::Result<SubmissionReceipt, ChainClientError> {
+    // Steps 1–3: activation gates.
+    let params = activation_gates(client)?;
+
+    // ── Step 4: verifier address consistency gate (no RPC) ───────────
+    let derived = client.derived_verifier_address()?;
+    if derived != attestation.verifier_address {
+        return Err(ChainClientError::Other(format!(
+            "verifier address mismatch: attestation was built for \
+             verifier_address = {}, but this SumChainClient is \
+             configured with a seed deriving to {}. The chain enforces \
+             sender == verifier; refusing to submit (no sum_getNonce / \
+             sum_sendRawTransaction call made).",
+            attestation.verifier_address, derived
+        )));
+    }
+
+    // [Gates passed — sum_getNonce and sum_sendRawTransaction unlocked]
+
+    // ── Step 5a: Stage 6 inner pipeline, commitment → digest ─────────
+    let digest_local = omni_zkml::commitment_to_chain_digest(&attestation.commitment)
+        .map_err(|e| {
+            ChainClientError::Other(format!(
+                "Stage 6 commitment_to_chain_digest failed: {e}"
+            ))
+        })?;
+
+    sign_and_send_digest(client, &params, &derived, &digest_local)
+}
+
+/// Issue #129 — submit an inference attestation from its five digest
+/// fields, for callers whose commitment is not an OmniNode
+/// [`InferenceCommitment`](omni_types::phase5::InferenceCommitment).
+///
+/// Same transaction, gates and submission as
+/// [`build_and_submit_signed_transaction`], minus the commitment →
+/// digest conversion:
+///
+/// - `digest.session_id` longer than [`MAX_SESSION_ID_BYTES`] is refused
+///   before any RPC, as the conversion would refuse it;
+/// - the OmniNode and V2 activation gates (steps 1–3) are unchanged;
+/// - sender == verifier holds by construction: the client's one seed signs
+///   the inner digest and the outer transaction, and the transaction is
+///   sent from the address it derives to (step 4's check has nothing else
+///   to compare).
+pub(crate) fn submit_digest_signed_transaction<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
+    digest: &InferenceAttestationDigest,
+) -> std::result::Result<SubmissionReceipt, ChainClientError> {
+    if digest.session_id.len() > MAX_SESSION_ID_BYTES {
+        return Err(ChainClientError::Other(format!(
+            "digest session_id is {} bytes; max allowed is {MAX_SESSION_ID_BYTES}. \
+             Refusing to submit (no RPC call made).",
+            digest.session_id.len()
+        )));
+    }
+    let params = activation_gates(client)?;
+    let derived = client.derived_verifier_address()?;
+    sign_and_send_digest(client, &params, &derived, digest)
+}
+
+/// Steps 1–3: read the chain params (once) and refuse unless the
+/// OmniNode subprotocol and the V2 envelope are both active at the head.
+/// Returns the params for reuse in step 9.
+fn activation_gates<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
+) -> std::result::Result<ChainParamsInfo, ChainClientError> {
     // ── Step 1: fetch chain params once; reuse across gates 1+2+9 ────
     let params = client.get_chain_params()?;
 
@@ -120,31 +194,22 @@ pub(crate) fn build_and_submit_signed_transaction<T: JsonRpcTransport>(
         )));
     }
 
-    // ── Step 4: verifier address consistency gate (no RPC) ───────────
-    let derived = client.derived_verifier_address()?;
-    if derived != attestation.verifier_address {
-        return Err(ChainClientError::Other(format!(
-            "verifier address mismatch: attestation was built for \
-             verifier_address = {}, but this SumChainClient is \
-             configured with a seed deriving to {}. The chain enforces \
-             sender == verifier; refusing to submit (no sum_getNonce / \
-             sum_sendRawTransaction call made).",
-            attestation.verifier_address, derived
-        )));
-    }
+    Ok(params)
+}
 
-    // [Gates passed — sum_getNonce and sum_sendRawTransaction unlocked]
-
-    // ── Step 5: Stage 6 inner pipeline ───────────────────────────────
-    let digest_local = omni_zkml::commitment_to_chain_digest(&attestation.commitment)
-        .map_err(|e| {
-            ChainClientError::Other(format!(
-                "Stage 6 commitment_to_chain_digest failed: {e}"
-            ))
-        })?;
+/// Steps 5b–11: sign `digest_local` with the client's seed, wrap it in a
+/// `TransactionV2` from `derived` (the seed's address) at the chain's
+/// `min_fee` and the account's nonce, outer-sign and send it.
+fn sign_and_send_digest<T: JsonRpcTransport>(
+    client: &SumChainClient<T>,
+    params: &ChainParamsInfo,
+    derived: &str,
+    digest_local: &InferenceAttestationDigest,
+) -> std::result::Result<SubmissionReceipt, ChainClientError> {
+    // ── Step 5b: Stage 6 inner signature over the digest ─────────────
     let inner_sig = omni_zkml::sign_chain_attestation_digest(
         client.seed(),
-        &digest_local,
+        digest_local,
     )
     .map_err(|e| {
         ChainClientError::Other(format!(
@@ -168,7 +233,7 @@ pub(crate) fn build_and_submit_signed_transaction<T: JsonRpcTransport>(
     };
 
     // ── Step 8: fetch nonce for the (now confirmed) verifier ─────────
-    let nonce = client.get_nonce(&derived)?;
+    let nonce = client.get_nonce(derived)?;
 
     // ── Step 9: assemble TransactionV2 ───────────────────────────────
     let pubkey = omni_zkml::signer_pubkey_bytes(client.seed()).map_err(|e| {

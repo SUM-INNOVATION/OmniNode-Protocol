@@ -91,3 +91,9 @@ pub use rpc::{
     JsonRpcTransport, UreqTransport,
 };
 pub use status::map_status_info;
+// Issue #129: the digest type `SumChainClient::submit_digest` takes, the
+// inner signature it makes, and the session-id bound it enforces, so a
+// caller building its own digest needs no direct `omni-zkml` dependency.
+pub use omni_zkml::{
+    sign_chain_attestation_digest, InferenceAttestationDigest, MAX_SESSION_ID_BYTES,
+};
