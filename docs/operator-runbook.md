@@ -1210,6 +1210,8 @@ Both carry the Stage 12.2-pre topic-safety lift, so unknown topics fail loudly w
 
 **Announcer signature is REQUIRED on both announcement types** — different from `PostedJob.poster_signature_hex` (which is legitimately optional for local-CLI handoffs). The inner envelope's own signature (`PostedResultLink.contributor_signature_hex`) is still verified after SNIP fetch.
 
+**Exit drain:** `watch-network-jobs` can stop straight after broadcasting a result announcement (`--max-jobs`). It now shuts its node down with a bounded drain: an announcement broadcast within the last `--propagation-wait-ms` (default 200 ms, as for `announce-result`; capped at 30 s) keeps the network running until it has had that long since its broadcast, or until no peer it was sent to is still connected; with nothing recent it exits at once. `--propagation-wait-ms 0` is the old immediate exit and can lose the last announcement. On exit the node logs `swarm event loop shutting down ... drain="settled" drain_waited_ms=<n>` (`idle` when nothing needed waiting for, `recipients_gone` when every recipient had disconnected, `disabled` for 0).
+
 **Bootstrap connectivity:** A bare `OmniNet::new()` is not yet connected to any peer, so `publish` on an empty mesh is a silent drop. Every `announce-*` and `watch-network-*` subcommand waits for at least one `PeerDiscovered` or `PeerConnected` event before publishing, with a `--peer-wait-secs <N>` (default 30) timeout. `--mesh-stabilize-ms <N>` (default 500) gives gossipsub a chance to form the topic mesh after the first peer event.
 
 **`watch-network-results` filtering:** repeat `--posted-id <hex64>` to subscribe only to results for specific posted jobs. Empty filter = accept any.

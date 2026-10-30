@@ -462,6 +462,7 @@ omni-node operator contributor watch-network-jobs \
     [--max-jobs <N>] [--max-polls <N>] [--poll-interval-secs <N>]
     [--publish-result-link]
     [--listen-port <u16>] [--peer <multiaddr> ...]
+    [--propagation-wait-ms <N>]                   # default 200; bounded exit drain
     [--snip-binary <bin>] [--snip-seed <path>]
 
 omni-node operator contributor announce-result \
@@ -478,6 +479,19 @@ omni-node operator contributor watch-network-results \
 ```
 
 `--listen-port` maps to `NetConfig.listen_port`; arbitrary `--listen <multiaddr>` is Stage 12.3+. `--peer <multiaddr>` repeatable maps to `NetConfig.bootstrap_peers`.
+
+**Exit drain (`watch-network-jobs --propagation-wait-ms`).** A gossipsub publish only queues the message; a connection task writes it out afterwards. When the watch loop returns straight after broadcasting a result announcement (`--max-jobs`), the command now shuts the node down explicitly instead of dropping it: every announcement broadcast within the last `--propagation-wait-ms` (default 200, the `announce-result` default; capped at 30000) keeps the network running until it has had that long since its broadcast, or until no peer it was queued for is still connected. With nothing broadcast in that window the command exits at once. `--propagation-wait-ms 0` restores the old immediate exit, which can lose the last announcement. The bound is on time: gossipsub does not expose its send queue or report per-message delivery, so this is not a delivery acknowledgement. The node logs the drain on exit, e.g. `swarm event loop shutting down released=0 drain="settled" drain_waited_ms=201`. Topics, envelope formats and signatures are unchanged.
+
+```text
+# Contributor that exits after one job and must not lose its result announcement.
+omni-node operator contributor watch-network-jobs \
+    --max-input-tokens 200000 --max-output-tokens 1000000 --max-total-base-units 1200000 \
+    --runner external --external-command /usr/local/bin/my-inference-runner \
+    --seed-file ./contributor.seed --result-out-dir ./results \
+    --publish-result-link --max-jobs 1 \
+    --listen-port 4101 \
+    --propagation-wait-ms 500                      # longer bound for a slow link
+```
 
 ## Out of scope (Stage 12.2)
 

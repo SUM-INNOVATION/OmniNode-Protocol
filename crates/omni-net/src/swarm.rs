@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -11,7 +11,7 @@ use libp2p::{
     swarm::{SwarmEvent, behaviour::toggle::Toggle},
     Multiaddr, PeerId, SwarmBuilder,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use omni_types::config::NetConfig;
@@ -21,6 +21,7 @@ use crate::{
     codec::{ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL},
     tensor_codec::{TensorRequest, TensorResponse, TENSOR_XFER_PROTOCOL},
     discovery,
+    drain::{self, DrainOutcome, DrainReport, DrainStep, RecentPublish, RecentPublishes},
     events::OmniNetEvent,
     gossip::GossipManager,
     nat::{self, NatStatus},
@@ -78,8 +79,33 @@ pub enum SwarmCommand {
         reply: tokio::sync::oneshot::Sender<Vec<Multiaddr>>,
     },
 
-    /// Exit the event loop cleanly.
-    Shutdown,
+    /// Exit the event loop cleanly, after a bounded drain of recently
+    /// published gossip (see [`crate::drain`]).
+    ///
+    /// `drain` is the grace each recent publish is given; zero exits at once,
+    /// as the loop did before the drain existed. `done`, when present, is
+    /// answered with the drain's report once the loop has stopped — after the
+    /// swarm, and with it every connection, has been released.
+    Shutdown {
+        drain: Duration,
+        done: Option<oneshot::Sender<DrainReport>>,
+    },
+}
+
+impl SwarmCommand {
+    /// Short name for logs; never the payload.
+    fn kind(&self) -> &'static str {
+        match self {
+            SwarmCommand::Publish { .. } => "publish",
+            SwarmCommand::Dial { .. } => "dial",
+            SwarmCommand::RequestShard { .. } => "request_shard",
+            SwarmCommand::SendShardResponse { .. } => "send_shard_response",
+            SwarmCommand::RequestTensor { .. } => "request_tensor",
+            SwarmCommand::SendTensorResponse { .. } => "send_tensor_response",
+            SwarmCommand::ListenAddrs { .. } => "listen_addrs",
+            SwarmCommand::Shutdown { .. } => "shutdown",
+        }
+    }
 }
 
 // ── PendingInbound ───────────────────────────────────────────────────────────
@@ -140,6 +166,10 @@ pub struct OmniSwarm {
     /// address. Answered on the next `NewListenAddr`; dropped (so the caller
     /// sees the loop is gone) on every exit from `run`.
     listen_waiters: Vec<tokio::sync::oneshot::Sender<Vec<Multiaddr>>>,
+
+    /// Gossip this node published recently, which a shutdown drains before
+    /// the swarm is dropped. See [`crate::drain`].
+    recent_publishes: RecentPublishes,
 }
 
 impl OmniSwarm {
@@ -282,6 +312,7 @@ impl OmniSwarm {
             nat_status: NatStatus::Unknown,
             active_relay_reservation: None,
             listen_waiters: Vec::new(),
+            recent_publishes: RecentPublishes::new(),
         })
     }
 
@@ -300,16 +331,40 @@ impl OmniSwarm {
     }
 
     /// Publish bytes to a named topic from within the event loop.
+    ///
+    /// Success means gossipsub queued the message for at least one peer, not
+    /// that it left the node. The publish is recorded so that a shutdown
+    /// requested shortly afterwards keeps the swarm running long enough for
+    /// the queue to be written out (see [`crate::drain`]).
     pub fn publish(&mut self, topic: &str, data: Vec<u8>) -> Result<()> {
-        self.gossip
-            .publish(&mut self.inner.behaviour_mut().gossipsub, topic, data)
-            .map(|_| ())
+        let message_id = self
+            .gossip
+            .publish(&mut self.inner.behaviour_mut().gossipsub, topic, data)?;
+        let topic_hash = gossipsub::IdentTopic::new(topic).hash();
+        let recipients = self
+            .inner
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .filter(|(_, topics)| topics.contains(&&topic_hash))
+            .map(|(peer, _)| *peer)
+            .collect();
+        self.recent_publishes.record(RecentPublish {
+            at: Instant::now(),
+            topic: topic.to_string(),
+            message_id,
+            recipients,
+        });
+        Ok(())
     }
 
     /// The core async event loop.
     ///
-    /// Runs until a [`SwarmCommand::Shutdown`] is received or `cmd_rx` is
-    /// dropped. Forwards all meaningful events to `event_tx`.
+    /// Runs until a [`SwarmCommand::Shutdown`] is received or every sender of
+    /// `cmd_rx` is dropped, then drains recently published gossip for at most
+    /// the requested grace ([`crate::drain::DEFAULT_SHUTDOWN_DRAIN`] when the
+    /// senders were dropped) before returning. Forwards all meaningful events
+    /// to `event_tx`, during the drain as well.
     ///
     /// The loop never awaits a consumer. Unsolicited events go out through
     /// `event_tx.try_send`, and solicited results go out through a `oneshot`,
@@ -324,7 +379,7 @@ impl OmniSwarm {
         event_tx:   mpsc::Sender<OmniNetEvent>,
         mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     ) -> Result<()> {
-        loop {
+        let (grace, mut waiters) = loop {
             tokio::select! {
                 // ── Swarm events ──────────────────────────────────────────────
                 event = self.inner.select_next_some() => {
@@ -407,15 +462,151 @@ impl OmniSwarm {
                                 let _ = reply.send(addrs);
                             }
                         }
-                        Some(SwarmCommand::Shutdown) | None => {
-                            let released = self.release_pending_requests();
-                            info!(released, "swarm event loop shutting down");
-                            return Ok(());
+                        Some(SwarmCommand::Shutdown { drain, done }) => {
+                            break (drain, done.into_iter().collect::<Vec<_>>());
                         }
+                        None => break (drain::DEFAULT_SHUTDOWN_DRAIN, Vec::new()),
                     }
                 }
             }
+        };
+
+        let report = self.drain(grace, &event_tx, &mut cmd_rx, &mut waiters).await;
+        let released = self.release_pending_requests();
+        info!(
+            released,
+            drain = report.outcome.as_str(),
+            drain_waited_ms = report.waited.as_millis() as u64,
+            "swarm event loop shutting down"
+        );
+        // Answered only after the swarm is gone, so a caller that exits the
+        // process on this answer cannot cut the drain short.
+        drop(self);
+        for done in waiters {
+            // A caller that stopped waiting is not an error.
+            let _ = done.send(report.clone());
         }
+        Ok(())
+    }
+
+    // ── Private: shutdown drain ──────────────────────────────────────────────
+
+    /// Keep driving the swarm until the gossip this node published recently
+    /// has had `requested` (capped) of network service, then report.
+    ///
+    /// Swarm events are handled exactly as in the main loop. New commands are
+    /// refused — the node is stopping, and accepting a publish would extend
+    /// the drain — except a further `Shutdown`, whose caller is answered with
+    /// this drain's report.
+    async fn drain(
+        &mut self,
+        requested: Duration,
+        event_tx: &mpsc::Sender<OmniNetEvent>,
+        cmd_rx: &mut mpsc::Receiver<SwarmCommand>,
+        waiters: &mut Vec<oneshot::Sender<DrainReport>>,
+    ) -> DrainReport {
+        let grace = drain::effective_grace(requested);
+        if grace < requested {
+            warn!(
+                requested_ms = requested.as_millis() as u64,
+                grace_ms = grace.as_millis() as u64,
+                "shutdown drain capped"
+            );
+        }
+        let started = Instant::now();
+        let publishes_in_window = self.recent_publishes.in_window(started, grace).count();
+        let waited_for_any = publishes_in_window > 0;
+        if waited_for_any {
+            debug!(
+                publishes = publishes_in_window,
+                grace_ms = grace.as_millis() as u64,
+                "draining recently published gossip before shutdown"
+            );
+        }
+        let mut commands_open = true;
+
+        let outcome = loop {
+            let step = drain::next_step(
+                Instant::now(),
+                grace,
+                &self.recent_publishes,
+                waited_for_any,
+                |peer| self.inner.is_connected(peer),
+            );
+            let deadline = match step {
+                DrainStep::Exit(outcome) => break outcome,
+                DrainStep::WaitUntil(deadline) => deadline,
+            };
+            tokio::select! {
+                event = self.inner.select_next_some() => {
+                    self.handle_swarm_event(event, event_tx);
+                }
+                cmd = cmd_rx.recv(), if commands_open => {
+                    match cmd {
+                        Some(SwarmCommand::Shutdown { done, .. }) => waiters.extend(done),
+                        Some(other) => {
+                            warn!(command = other.kind(), "command refused: node is shutting down");
+                        }
+                        None => commands_open = false,
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+            }
+        };
+
+        let (recipients, recipients_connected) = drain::recipients_in_window(
+            started,
+            grace,
+            &self.recent_publishes,
+            |peer| self.inner.is_connected(peer),
+        );
+        let report = DrainReport {
+            outcome,
+            grace,
+            waited: started.elapsed(),
+            publishes_in_window,
+            recipients_connected,
+        };
+        if waited_for_any {
+            // What the drain held the node up for. The send queue itself is
+            // not observable (see `crate::drain`), so this lists what was
+            // inside the window, not what was confirmed delivered.
+            let topics: std::collections::BTreeSet<&str> = self
+                .recent_publishes
+                .in_window(started, grace)
+                .map(|p| p.topic.as_str())
+                .collect();
+            for p in self.recent_publishes.in_window(started, grace) {
+                debug!(
+                    topic = %p.topic,
+                    message_id = %p.message_id,
+                    recipients = p.recipients.len(),
+                    "publish held by shutdown drain"
+                );
+            }
+            if outcome == DrainOutcome::RecipientsGone {
+                warn!(
+                    publishes = publishes_in_window,
+                    recipients,
+                    waited_ms = report.waited.as_millis() as u64,
+                    grace_ms = grace.as_millis() as u64,
+                    ?topics,
+                    "shutdown drain ended early: every peer the recent publishes were \
+                     queued for disconnected; they may not have been delivered"
+                );
+            } else {
+                info!(
+                    publishes = publishes_in_window,
+                    recipients,
+                    recipients_connected,
+                    waited_ms = report.waited.as_millis() as u64,
+                    grace_ms = grace.as_millis() as u64,
+                    ?topics,
+                    "shutdown drain finished: recent publishes kept on the network for the grace period"
+                );
+            }
+        }
+        report
     }
 
     // ── Private: outbound correlation teardown ───────────────────────────────
