@@ -105,8 +105,8 @@ pub use run::{
     RunJobOptions,
 };
 pub use runner::{
-    ExternalCommandRunner, InferenceRunner, RunOutput, RunOutputWithActivation,
-    RunnerOutputActivation, StubRunner,
+    check_external_timeout, ExternalCommandRunner, InferenceRunner, RunOutput,
+    RunOutputWithActivation, RunnerOutputActivation, StubRunner,
 };
 pub use session::{
     AggregatedContributorResult, AggregatedPartialRef, ContributorJoin, ExecutionSession,

@@ -62,5 +62,10 @@ tokio            = { workspace = true, optional = true }
 # feature; default builds still pull zero networking deps.
 libp2p           = { workspace = true, optional = true }
 
+# Issue #130 — poll(2) / fcntl(2) for the bounded external-runner read
+# loop (`ExternalCommandRunner::timeout`). Already in the lock file.
+[target.'cfg(unix)'.dependencies]
+libc             = "0.2"
+
 [dev-dependencies]
 # (None unique to dev; runtime deps cover the tests.)

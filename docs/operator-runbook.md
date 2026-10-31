@@ -1105,6 +1105,12 @@ omni-node operator contributor verify-result --job ./job.json --result ./result.
 
 - `--runner stub|external` — `stub` reads a fixed response from disk (deterministic; for tests). `external` invokes a subprocess that does the real inference — no framework runtime lives in `omni-node` itself.
 - `--external-command <bin>` — required with `--runner external`. The subprocess gets `--manifest <path>` + `--input <path>` (+ `--activation-out <path>` on Stage 12.4 wired runners) and writes a `deny_unknown_fields` JSON envelope to stdout.
+- `--external-timeout-secs <N>` — optional, with `--runner external` (`run-job`, `watch-jobs`, `watch-network-jobs`, `run-assignment`). Unix only. A wall-clock limit on one run of the subprocess, covering its exit and the collection of its stdout and stderr. Past it the job fails with `external runner timed out after <N>s`; a watcher reports that job's error and carries on. Unset: no limit. A value whose deadline overflows the clock is refused at startup. What the timeout stops:
+  - **The subprocess itself** (the process `omni-node` started) is killed with `SIGKILL` and reaped.
+  - **Processes the subprocess started** are not signalled. They stay in `omni-node`'s process group and session, so a supervisor that stops `omni-node`'s process group or cgroup (for example systemd's default `KillMode=control-group`) still stops them. To have them stopped with the subprocess, make the runner stop its own children (for example with a trap in a wrapper script), or run each job under a supervisor that kills the whole group.
+  - **Its stdout and stderr pipes** are closed on `omni-node`'s side as soon as the run ends, by any path. `omni-node` keeps no thread, buffer or open pipe end of a finished run. A leftover process that still writes to those pipes gets `SIGPIPE` / `EPIPE`.
+  - A leftover process that keeps the pipes open after the subprocess itself exited also ends the run at the limit, as a timeout.
+  - The limit holds however fast the subprocess writes. Its output is read in passes of at most 64 KiB per pipe, and the deadline is checked between passes. Output read before the deadline is held in memory, as without a limit.
 - `--seed-file <path>` — 32-byte raw Ed25519 contributor seed. DISTINCT from any chain-attestation seed.
 
 **Cost guardrails:** none at this stage. `watch-jobs` (Stage 12.1) and `watch-network-jobs` (Stage 12.2) add required cost caps; one-off `run-job` invocations are at operator discretion.

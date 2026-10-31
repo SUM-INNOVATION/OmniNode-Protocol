@@ -17,7 +17,8 @@
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde::Deserialize;
@@ -193,15 +194,63 @@ pub struct ExternalCommandRunner {
     pub extra_args: Vec<String>,
     pub work_dir: Option<PathBuf>,
     pub env_allowlist: Vec<String>,
-    // Stage 12.0 intentionally does NOT expose a `timeout` field. A
-    // half-implemented timeout that we silently never enforce would
-    // be a worse safety control than no timeout at all (operators
-    // would assume protection that doesn't exist). Operators rely on
-    // the external runtime's own timeout mechanism + the surrounding
-    // process supervisor (systemd, k8s probe, etc.). A real
-    // wall-clock kill switch is a Stage 12.x hardening item that
-    // requires a watcher thread (or platform-specific waitid timeout)
-    // — out of scope here.
+    /// Issue #130: wall-clock limit on one run of the command, from spawn
+    /// until its exit status and both output streams are in. `None` (the
+    /// default): no limit, as before. Unix only.
+    ///
+    /// A value the runner cannot enforce (zero, or one whose deadline
+    /// overflows the clock) fails the run with
+    /// [`RunnerError::ExternalTimeoutUnsupported`] before anything is
+    /// spawned; [`check_external_timeout`] checks a value up front.
+    ///
+    /// When the limit passes, the run fails with
+    /// [`RunnerError::ExternalTimeout`] and nothing the command wrote is used.
+    /// What is stopped, and what is not:
+    /// - **The command's own process** (the one this runner spawned) is
+    ///   killed with `SIGKILL` and reaped, if it is still running.
+    /// - **Processes it started** are not signalled. They stay in
+    ///   `omni-node`'s process group and session (the command is not moved
+    ///   into a group of its own), so a supervisor that stops `omni-node`'s
+    ///   process group or cgroup still stops them.
+    /// - **Its stdout and stderr pipes** are closed on `omni-node`'s side when
+    ///   the run returns, by any path. Nothing keeps reading them: no thread
+    ///   or buffer of the run outlives it, and a descendant that still writes
+    ///   to them gets `SIGPIPE` / `EPIPE`.
+    ///
+    /// The output is read on the calling thread in passes of at most 64 KiB
+    /// per pipe. The child and the deadline are checked between passes, and
+    /// the wait between passes is at most [`TIMEOUT_POLL`], so the kill comes
+    /// within about that interval of the limit however fast the command
+    /// writes. Output read before the deadline is held in memory, as without
+    /// a limit.
+    pub timeout: Option<Duration>,
+}
+
+/// How often a run with [`ExternalCommandRunner::timeout`] set checks
+/// whether the command has exited.
+pub const TIMEOUT_POLL: Duration = Duration::from_millis(20);
+
+/// Issue #130: whether [`ExternalCommandRunner::timeout`] can be set to
+/// `timeout`. Refused, with [`RunnerError::ExternalTimeoutUnsupported`]:
+/// zero; a duration whose deadline (now + `timeout`) overflows the clock;
+/// any duration on a platform other than Unix. A run checks the same before
+/// it spawns anything; callers can check once at startup instead of failing
+/// every run.
+pub fn check_external_timeout(timeout: Duration) -> Result<(), RunnerError> {
+    deadline_after(timeout).map(|_| ())
+}
+
+fn deadline_after(timeout: Duration) -> Result<Instant, RunnerError> {
+    let unsupported = |reason| RunnerError::ExternalTimeoutUnsupported { timeout, reason };
+    if timeout.is_zero() {
+        return Err(unsupported("zero"));
+    }
+    if cfg!(not(unix)) {
+        return Err(unsupported("a bounded run needs Unix"));
+    }
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| unsupported("its deadline overflows the clock"))
 }
 
 impl ExternalCommandRunner {
@@ -211,6 +260,7 @@ impl ExternalCommandRunner {
             extra_args: Vec::new(),
             work_dir: None,
             env_allowlist: Vec::new(),
+            timeout: None,
         }
     }
 }
@@ -366,7 +416,7 @@ impl ExternalCommandRunner {
             cmd.arg("--activation-out").arg(path);
         }
 
-        let output = cmd.output()?;
+        let output = output_within(cmd, self.timeout)?;
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -383,6 +433,259 @@ impl ExternalCommandRunner {
         // Hold tempfiles alive until after stdout has been parsed.
         let _ = (activation_in_tmp, activation_out_tmp);
         Ok((envelope, activation_out_path))
+    }
+}
+
+/// `cmd.output()`, bounded by `timeout` (issue #130).
+///
+/// Without a timeout this is exactly `cmd.output()`. With one, an
+/// unsupported value is refused before spawning; otherwise see
+/// [`bounded::output_until`].
+fn output_within(mut cmd: Command, timeout: Option<Duration>) -> Result<Output, RunnerError> {
+    let Some(timeout) = timeout else {
+        return Ok(cmd.output()?);
+    };
+    let deadline = deadline_after(timeout)?;
+    #[cfg(unix)]
+    {
+        bounded::output_until(cmd, deadline, timeout)
+    }
+    #[cfg(not(unix))]
+    {
+        // `deadline_after` refuses every timeout off Unix.
+        let _ = deadline;
+        unreachable!("a bounded run needs Unix")
+    }
+}
+
+#[cfg(unix)]
+mod bounded {
+    use std::io::{self, Read};
+    use std::os::unix::io::AsRawFd;
+    use std::process::{Child, Command, ExitStatus, Output};
+    use std::time::{Duration, Instant};
+
+    use super::TIMEOUT_POLL;
+    use crate::error::RunnerError;
+
+    /// One output pipe of the child, read without blocking on this thread.
+    /// `src` becomes `None` (closing the reading end) at end of file.
+    struct Pipe<R> {
+        src: Option<R>,
+        buf: Vec<u8>,
+    }
+
+    impl<R: Read + AsRawFd> Pipe<R> {
+        fn new(src: Option<R>) -> io::Result<Self> {
+            if let Some(r) = &src {
+                set_nonblocking(r.as_raw_fd())?;
+            }
+            Ok(Self {
+                src,
+                buf: Vec::new(),
+            })
+        }
+
+        fn fd(&self) -> Option<i32> {
+            self.src.as_ref().map(AsRawFd::as_raw_fd)
+        }
+
+        /// Reads what is available now, at most [`PUMP_READS`] reads of
+        /// [`PUMP_CHUNK`] bytes. A command that writes faster than it is
+        /// read therefore cannot keep one pass going: the caller gets back to
+        /// its child and deadline checks after every pass.
+        fn pump(&mut self) -> io::Result<()> {
+            let mut chunk = [0u8; PUMP_CHUNK];
+            for _ in 0..PUMP_READS {
+                let Some(r) = self.src.as_mut() else {
+                    break;
+                };
+                match r.read(&mut chunk) {
+                    Ok(0) => self.src = None,
+                    Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Bytes per read of a pipe.
+    const PUMP_CHUNK: usize = 8192;
+    /// Reads per pipe in one pass of the collect loop (at most 64 KiB).
+    const PUMP_READS: usize = 8;
+
+    fn set_nonblocking(fd: i32) -> io::Result<()> {
+        // SAFETY: `fd` is the reading end of a pipe owned by a live
+        // `ChildStdout` / `ChildStderr`; F_GETFL / F_SETFL only change its
+        // status flags (the child's writing end is a separate description).
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits until one of `fds` is readable or `wait` has passed.
+    fn wait_readable(fds: &[i32], wait: Duration) -> io::Result<()> {
+        if fds.is_empty() {
+            std::thread::sleep(wait);
+            return Ok(());
+        }
+        let mut pfds: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|&fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // `wait` is at most TIMEOUT_POLL, so this cannot overflow.
+        let ms = wait.as_millis().clamp(1, TIMEOUT_POLL.as_millis()) as libc::c_int;
+        // SAFETY: `pfds` is a valid, exclusively borrowed array of
+        // `pfds.len()` pollfd entries for the duration of the call.
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    enum Stop {
+        Deadline,
+        Io(io::Error),
+    }
+
+    /// Spawns `cmd` and collects its exit status and both output streams by
+    /// `deadline`. Both pipes are read on this thread only, so when this
+    /// returns, by any path, they are closed and their buffers freed: no
+    /// reader thread exists to outlive the run. If the deadline passes first
+    /// (the command is still running, or something it left behind still
+    /// holds a pipe open), the command's own process is killed (`SIGKILL`)
+    /// and reaped if still running, and the run fails with
+    /// [`RunnerError::ExternalTimeout`]. Processes it started are not
+    /// signalled (see `ExternalCommandRunner::timeout`).
+    pub(super) fn output_until(
+        mut cmd: Command,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<Output, RunnerError> {
+        let mut child = cmd.spawn()?;
+        let res = Pipe::new(child.stdout.take())
+            .and_then(|out| Ok((out, Pipe::new(child.stderr.take())?)))
+            .map_err(Stop::Io)
+            .and_then(|(mut out, mut err)| {
+                let status = collect(&mut child, &mut out, &mut err, deadline)?;
+                Ok(Output {
+                    status,
+                    stdout: out.buf,
+                    stderr: err.buf,
+                })
+            });
+        match res {
+            Ok(output) => Ok(output),
+            Err(stop) => {
+                // `kill` does nothing for a child already reaped by `try_wait`.
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(match stop {
+                    Stop::Deadline => RunnerError::ExternalTimeout(timeout),
+                    Stop::Io(e) => RunnerError::Io(e),
+                })
+            }
+        }
+    }
+
+    fn collect<O: Read + AsRawFd, E: Read + AsRawFd>(
+        child: &mut Child,
+        out: &mut Pipe<O>,
+        err: &mut Pipe<E>,
+        deadline: Instant,
+    ) -> Result<ExitStatus, Stop> {
+        let mut status = None;
+        loop {
+            if status.is_none() {
+                status = child.try_wait().map_err(Stop::Io)?;
+            }
+            if let Some(s) = status {
+                if out.src.is_none() && err.src.is_none() {
+                    return Ok(s);
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Stop::Deadline);
+            }
+            let fds: Vec<i32> = out.fd().into_iter().chain(err.fd()).collect();
+            wait_readable(&fds, TIMEOUT_POLL.min(deadline - now)).map_err(Stop::Io)?;
+            out.pump().map_err(Stop::Io)?;
+            err.pump().map_err(Stop::Io)?;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A pipe whose writer is always ahead of the reader: `chunks` full
+        /// reads in a row, and only then nothing for now (`WouldBlock`).
+        struct AlwaysAhead {
+            chunks: usize,
+            reads: usize,
+        }
+
+        impl Read for AlwaysAhead {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.chunks == 0 {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                self.chunks -= 1;
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+
+        impl AsRawFd for AlwaysAhead {
+            fn as_raw_fd(&self) -> i32 {
+                -1 // never polled in this test
+            }
+        }
+
+        /// One pass reads a bounded amount even when the data never runs
+        /// out before the pass would end, so the collect loop gets back to
+        /// its child and deadline checks; later passes take the rest, in
+        /// order and complete.
+        #[test]
+        fn one_pass_reads_a_bounded_amount_from_a_pipe_that_never_runs_dry() {
+            let chunks = 1000; // 8 MB in 8 KiB reads
+            let mut pipe = Pipe {
+                src: Some(AlwaysAhead { chunks, reads: 0 }),
+                buf: Vec::new(),
+            };
+            pipe.pump().unwrap();
+            let reads = pipe.src.as_ref().unwrap().reads;
+            assert!(
+                reads <= PUMP_READS && pipe.buf.len() <= PUMP_READS * PUMP_CHUNK,
+                "one pass made {reads} reads and took {} bytes",
+                pipe.buf.len()
+            );
+            let mut passes = 1;
+            while pipe.src.as_ref().unwrap().chunks > 0 {
+                pipe.pump().unwrap();
+                passes += 1;
+                assert!(passes <= chunks, "a pass made no progress");
+            }
+            assert_eq!(pipe.buf.len(), chunks * PUMP_CHUNK);
+            assert!(pipe.buf.iter().all(|&b| b == b'x'));
+        }
     }
 }
 

@@ -311,6 +311,7 @@ omni-node operator contributor watch-jobs \
     --max-input-tokens <N> --max-output-tokens <N> --max-total-base-units <N> \
     --runner external|stub \
     [--external-command <bin>] [--external-arg ...] [--external-env-allow ...] \
+    [--external-timeout-secs <N>] \
     [--stub-response <path>] [--stub-input-tokens N] [--stub-output-tokens N] \
     --seed-file <path> --result-out-dir <path> \
     [--accept-model-hash <hex64> ...] [--accept-tokenizer-hash <hex64> ...] \
@@ -323,6 +324,8 @@ omni-node operator contributor publish-result-link \
 ```
 
 `--source` is `fs` only in 12.1. `--max-polls` is primarily for tests + smoke runs; production typically omits it and lets the loop run until `--max-jobs` is reached or the surrounding process supervisor sends SIGTERM.
+
+`--external-timeout-secs <N>` (issue #130, Unix only) bounds one run of the external command. Past it, that job fails as a runner error and the loop carries on. The timeout kills the command's own process only. Processes it started stay in the watcher's process group for the supervisor to stop, and their stdout and stderr pipes are closed on the watcher's side when the run ends. The operator runbook has the details.
 
 ## Out of scope (Stage 12.1)
 

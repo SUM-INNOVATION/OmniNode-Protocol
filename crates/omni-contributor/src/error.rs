@@ -500,6 +500,13 @@ pub enum RunnerError {
     #[error("external runner timed out after {0:?}")]
     ExternalTimeout(std::time::Duration),
 
+    /// Issue #130: a timeout the runner cannot enforce. Nothing was spawned.
+    #[error("external runner timeout {timeout:?} is not supported ({reason}); nothing was run")]
+    ExternalTimeoutUnsupported {
+        timeout: std::time::Duration,
+        reason: &'static str,
+    },
+
     #[error("runner io error: {0}")]
     Io(#[from] std::io::Error),
 }
