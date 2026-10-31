@@ -21,7 +21,10 @@
 //! environment, else `sum-node`'s default endpoint — and, when its config
 //! sets them, passes them to `sum-node` through those variables, so the
 //! chain it reads and the account it compares owners against are the ones
-//! `sum-node` registers with.
+//! `sum-node` registers with. `sum-node` has no per-subcommand key flag
+//! (issue #148): a key is only ever given to it this way. Its store
+//! directory and chain id likewise come from `SUM_STORE_DIR` and
+//! `SUM_CHAIN_ID` in the inherited environment.
 //!
 //! Layout: a [`SnipV2CliConfig`] plain config, a set of **pure** parser
 //! functions ([`parse_ingest_stdout`], [`check_lifecycle`]) that never touch
@@ -66,8 +69,6 @@ pub mod resume_exit {
 pub struct SnipV2CliConfig {
     /// Path to (or resolvable name of) the `sum-node` binary.
     pub binary_path: PathBuf,
-    /// Optional seed file passed as `--seed <path>` when present.
-    pub seed_path: Option<PathBuf>,
     /// Extra trailing arguments appended verbatim. Default empty.
     pub extra_args: Vec<String>,
     /// Whether `Pending` / `Abandoned` lifecycles are tolerated.
@@ -86,7 +87,6 @@ impl Default for SnipV2CliConfig {
     fn default() -> Self {
         Self {
             binary_path: PathBuf::from("sum-node"),
-            seed_path: None,
             extra_args: Vec::new(),
             allow_non_active: false,
             rpc_url: None,
@@ -425,9 +425,6 @@ impl SnipV2Cli {
     }
 
     fn push_trailing_args(&self, cmd: &mut Command) {
-        if let Some(seed) = &self.config.seed_path {
-            cmd.arg("--seed").arg(seed);
-        }
         for a in &self.config.extra_args {
             cmd.arg(a);
         }
@@ -939,7 +936,6 @@ mod tests {
     fn cli_config_default_uses_sum_node() {
         let c = SnipV2CliConfig::default();
         assert_eq!(c.binary_path, PathBuf::from("sum-node"));
-        assert!(c.seed_path.is_none());
         assert!(c.extra_args.is_empty());
         assert!(!c.allow_non_active);
         assert!(c.rpc_url.is_none());
