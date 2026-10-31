@@ -325,6 +325,8 @@ omni-node operator contributor publish-result-link \
 
 `--source` is `fs` only in 12.1. `--max-polls` is primarily for tests + smoke runs; production typically omits it and lets the loop run until `--max-jobs` is reached or the surrounding process supervisor sends SIGTERM.
 
+`--external-timeout-secs <N>` (issue #130, Unix only) bounds one run of the external command. Past it, that job fails as a runner error and the loop carries on. The timeout kills the command's own process only. Processes it started stay in the watcher's process group for the supervisor to stop, and their stdout and stderr pipes are closed on the watcher's side when the run ends. The operator runbook has the details.
+
 ## Out of scope (Stage 12.1)
 
 - SNIP index polling and `PostedJobsIndex` aggregator. Deferred to Stage 12.2+ when a real mutable discovery surface is designed.
