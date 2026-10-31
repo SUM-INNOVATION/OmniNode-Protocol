@@ -14,8 +14,8 @@
 
 use omni_types::phase5::InferenceAttestation;
 use omni_zkml::{
-    AttestationStatus, ChainClient, ChainClientError, OrchestrationClient,
-    SubmissionReceipt,
+    AttestationStatus, ChainClient, ChainClientError, InferenceAttestationDigest,
+    OrchestrationClient, SubmissionReceipt,
 };
 use crate::dto::{
     BlockFinality, BlockHeightInfo, ChainParamsInfo, InferenceAttestationInfo,
@@ -24,7 +24,7 @@ use crate::dto::{
 use crate::rpc::{JsonRpcTransport, UreqTransport};
 use crate::status::map_status_info;
 #[cfg(feature = "submit")]
-use crate::tx::build_and_submit_signed_transaction;
+use crate::tx::{build_and_submit_signed_transaction, submit_digest_signed_transaction};
 
 // ── SumChainClient ────────────────────────────────────────────────────────────
 
@@ -247,6 +247,42 @@ impl<T: JsonRpcTransport> SumChainClient<T> {
         omni_zkml::signer_chain_address_base58(&self.seed).map_err(|e| {
             ChainClientError::Other(format!("seed → address derivation failed: {e}"))
         })
+    }
+
+    /// Issue #129 — submit an inference attestation (tag 21) from its five
+    /// digest fields, for a caller whose commitment is not an OmniNode
+    /// inference session.
+    ///
+    /// The same transaction as
+    /// [`submit_attestation`](ChainClient::submit_attestation) builds for a
+    /// commitment that converts to `digest`, through the same path: the
+    /// OmniNode and V2 activation gates, an inner signature over `digest` by
+    /// this client's seed ([`omni_zkml::sign_chain_attestation_digest`]),
+    /// a `TransactionV2` sent from that seed's address at the chain's
+    /// `min_fee`, outer-signed, and `sum_sendRawTransaction`. Sender ==
+    /// verifier holds by construction. A `session_id` longer than
+    /// [`omni_zkml::MAX_SESSION_ID_BYTES`] is refused before any RPC.
+    ///
+    /// Needs the `submit` feature; without it, returns the same
+    /// "built without the `submit` feature" error as `submit_attestation`.
+    pub fn submit_digest(
+        &self,
+        digest: &InferenceAttestationDigest,
+    ) -> std::result::Result<SubmissionReceipt, ChainClientError> {
+        #[cfg(feature = "submit")]
+        {
+            submit_digest_signed_transaction(self, digest)
+        }
+        #[cfg(not(feature = "submit"))]
+        {
+            let _ = digest;
+            Err(ChainClientError::Other(
+                "omni-sumchain built without the `submit` feature; \
+                 rebuild with --features submit to enable \
+                 sum_sendRawTransaction"
+                    .into(),
+            ))
+        }
     }
 }
 
