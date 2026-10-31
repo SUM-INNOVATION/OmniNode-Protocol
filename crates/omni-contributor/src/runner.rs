@@ -217,8 +217,12 @@ pub struct ExternalCommandRunner {
     ///   or buffer of the run outlives it, and a descendant that still writes
     ///   to them gets `SIGPIPE` / `EPIPE`.
     ///
-    /// The output is read on the calling thread, with the child polled every
-    /// [`TIMEOUT_POLL`], so the kill comes within that interval of the limit.
+    /// The output is read on the calling thread in passes of at most 64 KiB
+    /// per pipe. The child and the deadline are checked between passes, and
+    /// the wait between passes is at most [`TIMEOUT_POLL`], so the kill comes
+    /// within about that interval of the limit however fast the command
+    /// writes. Output read before the deadline is held in memory, as without
+    /// a limit.
     pub timeout: Option<Duration>,
 }
 
@@ -486,10 +490,16 @@ mod bounded {
             self.src.as_ref().map(AsRawFd::as_raw_fd)
         }
 
-        /// Reads everything available now.
+        /// Reads what is available now, at most [`PUMP_READS`] reads of
+        /// [`PUMP_CHUNK`] bytes. A command that writes faster than it is
+        /// read therefore cannot keep one pass going: the caller gets back to
+        /// its child and deadline checks after every pass.
         fn pump(&mut self) -> io::Result<()> {
-            let mut chunk = [0u8; 8192];
-            while let Some(r) = self.src.as_mut() {
+            let mut chunk = [0u8; PUMP_CHUNK];
+            for _ in 0..PUMP_READS {
+                let Some(r) = self.src.as_mut() else {
+                    break;
+                };
                 match r.read(&mut chunk) {
                     Ok(0) => self.src = None,
                     Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
@@ -501,6 +511,11 @@ mod bounded {
             Ok(())
         }
     }
+
+    /// Bytes per read of a pipe.
+    const PUMP_CHUNK: usize = 8192;
+    /// Reads per pipe in one pass of the collect loop (at most 64 KiB).
+    const PUMP_READS: usize = 8;
 
     fn set_nonblocking(fd: i32) -> io::Result<()> {
         // SAFETY: `fd` is the reading end of a pipe owned by a live
@@ -612,6 +627,64 @@ mod bounded {
             wait_readable(&fds, TIMEOUT_POLL.min(deadline - now)).map_err(Stop::Io)?;
             out.pump().map_err(Stop::Io)?;
             err.pump().map_err(Stop::Io)?;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A pipe whose writer is always ahead of the reader: `chunks` full
+        /// reads in a row, and only then nothing for now (`WouldBlock`).
+        struct AlwaysAhead {
+            chunks: usize,
+            reads: usize,
+        }
+
+        impl Read for AlwaysAhead {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.chunks == 0 {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                self.chunks -= 1;
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+
+        impl AsRawFd for AlwaysAhead {
+            fn as_raw_fd(&self) -> i32 {
+                -1 // never polled in this test
+            }
+        }
+
+        /// One pass reads a bounded amount even when the data never runs
+        /// out before the pass would end, so the collect loop gets back to
+        /// its child and deadline checks; later passes take the rest, in
+        /// order and complete.
+        #[test]
+        fn one_pass_reads_a_bounded_amount_from_a_pipe_that_never_runs_dry() {
+            let chunks = 1000; // 8 MB in 8 KiB reads
+            let mut pipe = Pipe {
+                src: Some(AlwaysAhead { chunks, reads: 0 }),
+                buf: Vec::new(),
+            };
+            pipe.pump().unwrap();
+            let reads = pipe.src.as_ref().unwrap().reads;
+            assert!(
+                reads <= PUMP_READS && pipe.buf.len() <= PUMP_READS * PUMP_CHUNK,
+                "one pass made {reads} reads and took {} bytes",
+                pipe.buf.len()
+            );
+            let mut passes = 1;
+            while pipe.src.as_ref().unwrap().chunks > 0 {
+                pipe.pump().unwrap();
+                passes += 1;
+                assert!(passes <= chunks, "a pass made no progress");
+            }
+            assert_eq!(pipe.buf.len(), chunks * PUMP_CHUNK);
+            assert!(pipe.buf.iter().all(|&b| b == b'x'));
         }
     }
 }

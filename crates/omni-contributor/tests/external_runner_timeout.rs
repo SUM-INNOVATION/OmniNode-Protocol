@@ -224,6 +224,33 @@ fn a_large_output_does_not_stall_a_bounded_run() {
     assert_eq!(out.response_bytes, b"ok");
 }
 
+/// A command that never stops writing (to both pipes) still ends at its
+/// deadline: reading its output never holds the run past it. The rate is
+/// kept moderate so the output held until the deadline stays small; the
+/// unit test `one_pass_reads_a_bounded_amount_from_a_pipe_that_never_runs_dry`
+/// covers a writer that is always ahead of the reader.
+#[test]
+fn a_runner_that_never_stops_writing_still_ends_at_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = "x".repeat(100);
+    let cmd = script(
+        dir.path(),
+        &format!("while :; do echo '{line}'; echo '{line}' >&2; done"),
+    );
+    let limit = Duration::from_secs(2);
+    let started = Instant::now();
+    let res = runner(cmd, Some(limit)).run(&manifest(dir.path()), b"input");
+    let took = started.elapsed();
+    assert!(
+        matches!(res, Err(RunnerError::ExternalTimeout(d)) if d == limit),
+        "{res:?}"
+    );
+    assert!(
+        took >= limit && took < limit + Duration::from_secs(5),
+        "returned after {took:?}"
+    );
+}
+
 /// Exit status and failure output are reported as without a timeout.
 #[test]
 fn a_failing_runner_still_reports_its_exit_code() {
