@@ -262,6 +262,8 @@ pub enum SetFetchEvent<'a> {
 /// Why a [`fetch_set`] stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum SetFetchFailure {
+    #[error("model hash {0:?} is not 64 lowercase hex characters")]
+    InvalidModelHash(String),
     #[error("model {0} appears more than once in the set")]
     Duplicate(String),
     #[error("no manifest root is known for model {0}")]
@@ -300,13 +302,18 @@ pub struct SetFetchError {
 /// every shard of every model in `model_hashes`, with one progress surface
 /// and one failure surface.
 ///
-/// 1. Every hash is checked for duplicates and resolved through `resolver`
-///    before anything is downloaded, so an unknown model fails the set at once.
-/// 2. Model by model, in request order: the manifest is restored from SNIP V2
-///    into `manifest_dir/<model_hash>.manifest.json`, must name the requested
-///    `model_hash`, and then its shards are restored with
-///    [`restore_from_snip`] (streaming verification, no-clobber publication,
-///    verified cache hits skipped).
+/// 1. Before anything is downloaded, every hash must be a model hash (64
+///    lowercase hex characters; it names the manifest file), appear once, and
+///    resolve through `resolver`, so a bad or unknown model fails the set at
+///    once.
+/// 2. Model by model, in request order: the manifest is downloaded into an
+///    attempt-owned staging directory inside `manifest_dir` (which must
+///    exist), parsed, and must name the requested `model_hash`; only then is
+///    it moved to `manifest_dir/<model_hash>.manifest.json`, replacing a
+///    previous copy. A refused or failed manifest leaves `manifest_dir` as it
+///    was. Then its shards are restored with [`restore_from_snip`]
+///    (streaming verification, no-clobber publication, verified cache hits
+///    skipped).
 ///
 /// Returns the manifests in request order. On failure, see [`SetFetchError`].
 /// Activating the set (for example at a model epoch) is the caller's step:
@@ -330,6 +337,13 @@ pub fn fetch_set<A: SnipV2Adapter, R: ManifestResolver>(
     let mut roots = Vec::with_capacity(requested);
     let mut seen = std::collections::HashSet::new();
     for (index, &model_hash) in model_hashes.iter().enumerate() {
+        if !is_model_hash(model_hash) {
+            return Err(fail(
+                index,
+                &[],
+                SetFetchFailure::InvalidModelHash(model_hash.to_string()),
+            ));
+        }
         if !seen.insert(model_hash) {
             return Err(fail(
                 index,
@@ -351,27 +365,8 @@ pub fn fetch_set<A: SnipV2Adapter, R: ManifestResolver>(
     let mut manifests = Vec::with_capacity(requested);
     for (index, (&model_hash, root)) in model_hashes.iter().zip(&roots).enumerate() {
         let completed = &model_hashes[..index];
-        let path = manifest_dir.join(format!("{model_hash}.manifest.json"));
-        let manifest = restore_manifest_from_snip(adapter, root, &path).map_err(|source| {
-            fail(
-                index,
-                completed,
-                SetFetchFailure::Manifest {
-                    model_hash: model_hash.to_string(),
-                    source,
-                },
-            )
-        })?;
-        if manifest.model_hash != model_hash {
-            return Err(fail(
-                index,
-                completed,
-                SetFetchFailure::WrongModel {
-                    requested: model_hash.to_string(),
-                    found: manifest.model_hash.clone(),
-                },
-            ));
-        }
+        let manifest = restore_bound_manifest(adapter, root, manifest_dir, model_hash)
+            .map_err(|failure| fail(index, completed, failure))?;
         progress(SetFetchEvent::ManifestRestored {
             index,
             model_hash,
@@ -395,6 +390,46 @@ pub fn fetch_set<A: SnipV2Adapter, R: ManifestResolver>(
         manifests.push(manifest);
     }
     Ok(manifests)
+}
+
+/// A model hash as [`ModelManifest::model_hash`] holds it: BLAKE3, 64
+/// lowercase hex characters. Anything else cannot name a manifest file.
+fn is_model_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Download the manifest at `root` into an attempt-owned staging directory
+/// inside `manifest_dir`, parse it, require it to name `model_hash`, and only
+/// then move it to `manifest_dir/<model_hash>.manifest.json`. Every failure
+/// drops the staging directory, so `manifest_dir` is left as it was.
+fn restore_bound_manifest<A: SnipV2Adapter>(
+    adapter: &A,
+    root: &SnipV2ObjectId,
+    manifest_dir: &Path,
+    model_hash: &str,
+) -> std::result::Result<ModelManifest, SetFetchFailure> {
+    let manifest_error = |source: StoreError| SetFetchFailure::Manifest {
+        model_hash: model_hash.to_string(),
+        source,
+    };
+    let staging = tempfile::Builder::new()
+        .prefix(".fetch-set-")
+        .tempdir_in(manifest_dir)
+        .map_err(|e| manifest_error(e.into()))?;
+    let staged = staging.path().join("manifest.json");
+    let manifest = restore_manifest_from_snip(adapter, root, &staged).map_err(manifest_error)?;
+    if manifest.model_hash != model_hash {
+        return Err(SetFetchFailure::WrongModel {
+            requested: model_hash.to_string(),
+            found: manifest.model_hash,
+        });
+    }
+    std::fs::rename(
+        &staged,
+        manifest_dir.join(format!("{model_hash}.manifest.json")),
+    )
+    .map_err(|e| manifest_error(e.into()))?;
+    Ok(manifest)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1302,5 +1337,98 @@ mod tests {
             events.contains(&"ready 1 (downloaded 1, cached 0)".to_string()),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn fetch_set_refuses_a_model_hash_that_cannot_name_a_manifest_file() {
+        let fake = FakeSnipV2Adapter::new();
+        let a = "a".repeat(64);
+        let (_da, ma) = published_model(&fake, &a, &[(b"a0", (0, 3))]);
+        let base = tempfile::tempdir().unwrap();
+        let manifest_dir = base.path().join("manifests");
+        std::fs::create_dir(&manifest_dir).unwrap();
+        let store = ShardStore::new(base.path().join("shards")).unwrap();
+        let downloads_before = fake.download_calls().len();
+
+        let (upper, short) = ("A".repeat(64), "a".repeat(63));
+        for bad in ["../escape", "a/b", upper.as_str(), short.as_str(), ""] {
+            let resolver: HashMap<String, SnipV2ObjectId> =
+                [(bad.to_string(), root_of(&ma))].into();
+            let err =
+                fetch_set(&fake, &store, &resolver, &manifest_dir, &[bad], |_| {}).unwrap_err();
+            assert!(
+                matches!(&err.failure, SetFetchFailure::InvalidModelHash(h) if h == bad),
+                "{bad:?}: {err}"
+            );
+        }
+        assert_eq!(
+            fake.download_calls().len(),
+            downloads_before,
+            "nothing downloaded"
+        );
+        assert!(
+            !base.path().join("escape.manifest.json").exists(),
+            "nothing is written outside manifest_dir"
+        );
+        assert_eq!(std::fs::read_dir(&manifest_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fetch_set_writes_a_manifest_file_only_once_it_is_verified() {
+        let fake = FakeSnipV2Adapter::new();
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let (_db, mb) = published_model(&fake, &b, &[(b"b0", (0, 3))]);
+        let (_dc, mc) = published_model(&fake, &c, &[(b"c0", (0, 3))]);
+        // Model c's manifest root serves bytes that are not a manifest.
+        fake.set_download_override(root_of(&mc), b"not a manifest".to_vec());
+        // Model a is mapped to model b's manifest.
+        let resolver: HashMap<String, SnipV2ObjectId> =
+            [(a.clone(), root_of(&mb)), (c.clone(), root_of(&mc))].into();
+        let base = tempfile::tempdir().unwrap();
+        let manifest_dir = base.path().join("manifests");
+        std::fs::create_dir(&manifest_dir).unwrap();
+        let store = ShardStore::new(base.path().join("shards")).unwrap();
+        // A manifest file already present for c must survive a refused fetch.
+        let existing_c = manifest_dir.join(format!("{c}.manifest.json"));
+        std::fs::write(&existing_c, b"previous").unwrap();
+
+        let err = fetch_set(
+            &fake,
+            &store,
+            &resolver,
+            &manifest_dir,
+            &[a.as_str()],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err.failure, SetFetchFailure::WrongModel { .. }),
+            "{err}"
+        );
+        let err = fetch_set(
+            &fake,
+            &store,
+            &resolver,
+            &manifest_dir,
+            &[c.as_str()],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err.failure, SetFetchFailure::Manifest { .. }),
+            "{err}"
+        );
+
+        let mut left: Vec<String> = std::fs::read_dir(&manifest_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![format!("{c}.manifest.json")],
+            "no file for the refused model a, no staging left behind"
+        );
+        assert_eq!(std::fs::read(&existing_c).unwrap(), b"previous");
     }
 }
