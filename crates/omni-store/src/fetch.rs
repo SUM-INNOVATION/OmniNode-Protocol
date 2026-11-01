@@ -1,10 +1,17 @@
 //! Outbound shard fetch orchestration.
 //!
 //! [`FetchManager`] tracks in-progress fetches.  Each fetch proceeds as a
-//! sequence of 64 MiB windowed request-response round-trips, reassembles the
-//! chunks, verifies the CID, and stores the shard to disk.
+//! sequence of 64 MiB windowed request-response round-trips. Every piece is
+//! written to an attempt-owned staging file under the store root and hashed
+//! as it arrives (issue #132), so a fetch never holds the shard in memory.
+//! When the last byte is in, the running BLAKE3 must equal the CID; only then
+//! is the staged file published, through the store's verifying, no-clobber
+//! publication path.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::Path;
 
 use libp2p::PeerId;
 use omni_net::{OmniNet, ShardResponse};
@@ -47,7 +54,7 @@ impl ChunkRequester for NetRequester<'_> {
             .map_err(|e| e.to_string())
     }
 }
-use crate::verify;
+use crate::content_id;
 
 /// Tracks in-flight fetches keyed by CID.
 pub struct FetchManager {
@@ -66,10 +73,43 @@ struct FetchState {
     total_bytes: Option<u64>,
     /// Byte offset of the next chunk to request.
     next_offset: u64,
-    /// Accumulated data chunks.
-    buffer: Vec<u8>,
+    /// The bytes received so far, on disk; created with the first accepted
+    /// piece, when the store (and so its root) is known.
+    staged: Option<Staged>,
     /// Shard size from the gossip announcement, when one was seen.
     expected_size: Option<u64>,
+}
+
+/// One fetch's partial shard: an attempt-owned directory under the store
+/// root holding a `partial` file, and the running BLAKE3 of its contents.
+/// Dropping it (a rejected, failed or abandoned fetch) removes the directory.
+struct Staged {
+    dir: tempfile::TempDir,
+    file: File,
+    hasher: blake3::Hasher,
+}
+
+impl Staged {
+    fn new(root: &Path) -> io::Result<Self> {
+        let dir = tempfile::Builder::new()
+            .prefix(".fetch-")
+            .tempdir_in(root)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("partial"))?;
+        Ok(Self {
+            dir,
+            file,
+            hasher: blake3::Hasher::new(),
+        })
+    }
+
+    fn append(&mut self, data: &[u8]) -> io::Result<()> {
+        self.file.write_all(data)?;
+        self.hasher.update(data);
+        Ok(())
+    }
 }
 
 /// Outcome of processing a received chunk.
@@ -171,7 +211,7 @@ impl FetchManager {
                 peer_id,
                 total_bytes: None,
                 next_offset: 0,
-                buffer: Vec::new(),
+                staged: None,
                 expected_size,
             },
         );
@@ -241,25 +281,29 @@ impl FetchManager {
             state.total_bytes = Some(response.total_bytes);
         }
 
-        // Grow only by what actually arrived, and fallibly.
-        //
-        // Reserving `total_bytes` up front would commit the whole declared
-        // size on the first piece — bounded by the cap, but still a single
-        // allocation an attacker chooses the size of. `try_reserve` grows by
-        // the received length and returns an error instead of aborting when
-        // the allocator refuses.
-        // `data.len()` is already a `usize`; no conversion is needed or wanted.
-        if let Err(e) = state.buffer.try_reserve(response.data.len()) {
+        // Write the piece to the staging file and hash it (issue #132). No
+        // allocation grows with the shard: memory holds one message at a
+        // time, and the validated total bounds what a fetch may stage on disk.
+        if state.staged.is_none() {
+            match Staged::new(store.root()) {
+                Ok(staged) => state.staged = Some(staged),
+                Err(e) => {
+                    let msg = format!("cannot stage the shard: {e}");
+                    warn!(cid = %response.cid, error = %msg, "rejecting ShardResponse");
+                    return self.reject(&response.cid, msg);
+                }
+            }
+        }
+        let staged = state.staged.as_mut().expect("created above");
+        if let Err(e) = staged.append(&response.data) {
             let msg = format!(
-                "allocation failed reserving {} bytes: {e}",
-                response.data.len()
+                "cannot stage {} bytes at offset {}: {e}",
+                response.data.len(),
+                state.next_offset
             );
             warn!(cid = %response.cid, error = %msg, "rejecting ShardResponse");
             return self.reject(&response.cid, msg);
         }
-
-        // Append chunk data.
-        state.buffer.extend_from_slice(&response.data);
         // Reuse the position validation already computed with checked
         // arithmetic, rather than redoing `offset + len` unchecked.
         state.next_offset = next_pos;
@@ -293,24 +337,42 @@ impl FetchManager {
             return FetchOutcome::InProgress;
         }
 
-        // All chunks received — verify and store.
+        // All chunks received: the running hash must be the CID, then the
+        // staged file is published. Every early return drops `staged`, which
+        // removes the staging directory.
         let cid = response.cid.clone();
         let state = self.active.remove(&cid).unwrap();
+        let size = state.next_offset;
+        let Staged { dir, file, hasher } = state.staged.expect("every accepted piece is staged");
+        drop(file);
+        let partial = dir.path().join("partial");
+        let hash = hasher.finalize();
 
-        if let Err(e) = verify::verify_cid(&state.buffer, &cid) {
+        let actual = content_id::cid_from_blake3_hash(&hash);
+        if actual != cid {
+            let e = StoreError::IntegrityMismatch {
+                expected: cid.clone(),
+                actual,
+            };
             return FetchOutcome::Failed {
                 cid,
                 error: format!("integrity check failed: {e}"),
             };
         }
 
-        let size = state.buffer.len() as u64;
-        if let Err(e) = store.put(&cid, &state.buffer) {
+        // The store re-verifies the file from disk, syncs it and links it
+        // under its final name without replacing an existing one.
+        let hash_hex = hash.to_hex().to_string();
+        if let Err(e) = store.publish_download(&cid, &hash_hex, |path| {
+            std::fs::rename(&partial, path)?;
+            Ok(())
+        }) {
             return FetchOutcome::Failed {
                 cid,
                 error: format!("failed to write shard: {e}"),
             };
         }
+        drop(dir);
 
         info!(%cid, size, "shard fetch complete and verified");
         FetchOutcome::Complete { cid, size }
@@ -1051,6 +1113,124 @@ mod tests {
         assert!(!m.is_active("cid-a"));
     }
 
+    /// The `.fetch-*` staging directories under the store root.
+    pub(super) fn staging_dirs(st: &ShardStore) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(st.root())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".fetch-")
+            })
+            .collect()
+    }
+
+    /// Issue #132: what an in-progress fetch has received is on disk, in an
+    /// attempt-owned staging directory under the store root, not in memory;
+    /// nothing is published until the whole shard hashes to its CID.
+    #[tokio::test]
+    async fn an_in_progress_fetch_holds_its_bytes_on_disk() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = manager();
+        let data: Vec<u8> = (0..1024u32).map(|i| i as u8).collect();
+        let cid = cid_from_data(&data);
+        seeded(&mut m, &req, &cid, Some(1024)).await;
+
+        let first = resp(&cid, 1024, 0, data[..512].to_vec());
+        assert!(matches!(
+            m.process(&req, &st, &first).await,
+            FetchOutcome::InProgress
+        ));
+        let dirs = staging_dirs(&st);
+        assert_eq!(dirs.len(), 1, "one staging directory per fetch: {dirs:?}");
+        assert_eq!(
+            std::fs::read(dirs[0].join("partial")).unwrap(),
+            &data[..512]
+        );
+        assert!(!st.has(&cid), "nothing is published before verification");
+
+        let rest = resp(&cid, 1024, 512, data[512..].to_vec());
+        match m.process(&req, &st, &rest).await {
+            FetchOutcome::Complete { size, .. } => assert_eq!(size, 1024),
+            _ => panic!("expected Complete"),
+        }
+        assert_eq!(st.get(&cid).unwrap(), data);
+        assert!(
+            staging_dirs(&st).is_empty(),
+            "staging is removed once published"
+        );
+    }
+
+    /// A shard whose bytes do not hash to its CID is refused at its last byte:
+    /// nothing is published and no staging is left behind.
+    #[tokio::test]
+    async fn a_corrupted_multi_piece_shard_publishes_nothing() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = manager();
+        let cid = cid_from_data(&[1u8; 1024]);
+        seeded(&mut m, &req, &cid, Some(1024)).await;
+
+        let good = resp(&cid, 1024, 0, vec![1u8; 512]);
+        assert!(matches!(
+            m.process(&req, &st, &good).await,
+            FetchOutcome::InProgress
+        ));
+        let corrupt = resp(&cid, 1024, 512, vec![2u8; 512]);
+        match m.process(&req, &st, &corrupt).await {
+            FetchOutcome::Failed { error, .. } => assert!(error.contains("integrity"), "{error}"),
+            _ => panic!("expected Failed"),
+        }
+        assert!(!st.has(&cid));
+        assert!(!m.is_active(&cid));
+        assert!(staging_dirs(&st).is_empty());
+    }
+
+    /// A fetch that ends early — rejected mid-stream, unable to send its next
+    /// request, or dropped with its manager — removes its staging at once.
+    #[tokio::test]
+    async fn an_ended_fetch_leaves_no_staging_behind() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = manager();
+
+        seeded(&mut m, &req, "cid-a", None).await;
+        let first = resp("cid-a", 1024, 0, vec![7u8; 512]);
+        assert!(matches!(
+            m.process(&req, &st, &first).await,
+            FetchOutcome::InProgress
+        ));
+        assert_eq!(staging_dirs(&st).len(), 1);
+        let changed_total = resp("cid-a", 2048, 512, vec![7u8; 512]);
+        assert!(matches!(
+            m.process(&req, &st, &changed_total).await,
+            FetchOutcome::Failed { .. }
+        ));
+        assert!(staging_dirs(&st).is_empty(), "rejected mid-stream");
+
+        seeded(&mut m, &req, "cid-b", None).await;
+        let broken = FakeRequester::failing("transport down");
+        let first_b = resp("cid-b", 1024, 0, vec![7u8; 512]);
+        assert!(matches!(
+            m.process(&broken, &st, &first_b).await,
+            FetchOutcome::Failed { .. }
+        ));
+        assert!(staging_dirs(&st).is_empty(), "next request not sent");
+
+        seeded(&mut m, &req, "cid-c", None).await;
+        let first_c = resp("cid-c", 1024, 0, vec![7u8; 512]);
+        assert!(matches!(
+            m.process(&req, &st, &first_c).await,
+            FetchOutcome::InProgress
+        ));
+        assert_eq!(staging_dirs(&st).len(), 1);
+        drop(m);
+        assert!(staging_dirs(&st).is_empty(), "manager dropped mid-fetch");
+    }
+
     #[tokio::test]
     async fn an_unparented_response_is_reported_not_panicked() {
         let (_d, st) = store();
@@ -1076,6 +1256,7 @@ mod tests {
 mod allocation_failure_tests {
     use super::tests::*;
     use super::*;
+    use crate::content_id::cid_from_data;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
@@ -1162,34 +1343,48 @@ mod allocation_failure_tests {
         assert!(Vec::<u8>::new().try_reserve(4 << 20).is_ok());
     }
 
+    /// Issue #132: no allocation grows with the shard. With every allocation
+    /// of 1 MiB or more refused, a 4 MiB shard sent in 512 KiB pieces still
+    /// completes, because each piece goes to disk as it arrives. (The former
+    /// in-memory reassembly buffer could not grow past 1 MiB here and failed
+    /// the fetch with "allocation failed".)
     #[tokio::test]
-    async fn allocation_failure_fails_only_the_affected_fetch() {
+    async fn a_shard_larger_than_any_allowed_allocation_streams_to_disk() {
         let (_d, st) = store();
         let req = FakeRequester::default();
         let mut m = manager();
-        seeded(&mut m, &req, "cid-bad", None).await;
-        seeded(&mut m, &req, "cid-good", None).await;
+        let data: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let cid = cid_from_data(&data);
+        seeded(&mut m, &req, &cid, Some(data.len() as u64)).await;
 
-        // Built before arming, so its own allocation succeeds.
-        let piece = resp("cid-bad", 8 * 1024 * 1024, 0, vec![0u8; 2 * 1024 * 1024]);
+        // Built before arming, so their own allocations succeed.
+        let piece_len = 512 * 1024;
+        let pieces: Vec<ShardResponse> = data
+            .chunks(piece_len)
+            .enumerate()
+            .map(|(i, c)| resp(&cid, data.len() as u64, (i * piece_len) as u64, c.to_vec()))
+            .collect();
 
-        let outcome = {
+        let mut outcomes = Vec::new();
+        {
             let _guard = ArmGuard::new(1024 * 1024);
-            m.process(&req, &st, &piece).await
-        };
-
-        match outcome {
-            FetchOutcome::Failed { cid, error } => {
-                assert_eq!(cid, "cid-bad");
-                assert!(error.contains("allocation failed"), "{error}");
+            for piece in &pieces {
+                outcomes.push(m.process(&req, &st, piece).await);
             }
-            _ => panic!("expected Failed — the reservation could not have succeeded"),
         }
-        // Still alive (a plain `reserve` would have aborted here), the bad
-        // fetch is cleared, and the unrelated one is untouched.
-        assert!(!m.is_active("cid-bad"));
-        assert!(m.is_active("cid-good"), "an unrelated fetch must survive");
-        assert_eq!(m.active_count(), 1);
+
+        for (i, outcome) in outcomes.iter().enumerate() {
+            match outcome {
+                FetchOutcome::Failed { error, .. } => panic!("piece {i} failed: {error}"),
+                FetchOutcome::InProgress if i + 1 < pieces.len() => {}
+                FetchOutcome::Complete { size, .. } if i + 1 == pieces.len() => {
+                    assert_eq!(*size, data.len() as u64)
+                }
+                _ => panic!("piece {i}: unexpected outcome"),
+            }
+        }
+        assert_eq!(st.get(&cid).unwrap(), data);
+        assert!(staging_dirs(&st).is_empty());
     }
 }
 
