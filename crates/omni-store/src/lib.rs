@@ -20,7 +20,10 @@ pub use error::StoreError;
 pub use fetch::{FetchManager, FetchOutcome};
 pub use gguf::GgufFile;
 pub use snip_v2::{SnipV2Adapter, SnipV2Cli, SnipV2CliConfig, SnipV2Error};
-pub use snip_v2_artifacts::{PublishReport, RestoreReport};
+pub use snip_v2_artifacts::{
+    fetch_set, ManifestResolver, PublishReport, RestoreReport, SetFetchError, SetFetchEvent,
+    SetFetchFailure,
+};
 pub use snip_v2_publish::{PublicationAction, PublishedPublicObject, publish_public_idempotent};
 pub use store::ShardStore;
 pub use chunker::ChunkPlan;
@@ -160,5 +163,26 @@ impl OmniStore {
         dest_manifest_path: &Path,
     ) -> Result<ModelManifest> {
         snip_v2_artifacts::restore_manifest_from_snip(adapter, root, dest_manifest_path)
+    }
+
+    /// Fetch a set of models as one operation (issue #132): manifests via
+    /// `resolver`, then every shard, verified. See
+    /// [`snip_v2_artifacts::fetch_set`] for ordering and failure semantics.
+    pub fn fetch_set<A: SnipV2Adapter, R: ManifestResolver>(
+        &self,
+        adapter: &A,
+        resolver: &R,
+        manifest_dir: &Path,
+        model_hashes: &[&str],
+        progress: impl FnMut(SetFetchEvent<'_>),
+    ) -> std::result::Result<Vec<ModelManifest>, SetFetchError> {
+        snip_v2_artifacts::fetch_set(
+            adapter,
+            &self.local,
+            resolver,
+            manifest_dir,
+            model_hashes,
+            progress,
+        )
     }
 }

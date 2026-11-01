@@ -214,6 +214,189 @@ pub fn restore_from_snip<A: SnipV2Adapter>(
     Ok(report)
 }
 
+// ── Fetch a set of models (issue #132) ────────────────────────────────────────
+
+/// Where each model's manifest is published, for [`fetch_set`].
+///
+/// A set names its models by `model_hash`, as SwUM's registry does. Nothing
+/// in OmniNode indexes manifests by model hash, so the caller supplies the
+/// SNIP V2 root of each model's manifest. [`fetch_set`] checks that the
+/// manifest found there is really for the requested model.
+pub trait ManifestResolver {
+    /// The SNIP V2 root of `model_hash`'s manifest, if known.
+    fn manifest_root(&self, model_hash: &str) -> Option<SnipV2ObjectId>;
+}
+
+impl ManifestResolver for std::collections::HashMap<String, SnipV2ObjectId> {
+    fn manifest_root(&self, model_hash: &str) -> Option<SnipV2ObjectId> {
+        self.get(model_hash).copied()
+    }
+}
+
+impl ManifestResolver for std::collections::BTreeMap<String, SnipV2ObjectId> {
+    fn manifest_root(&self, model_hash: &str) -> Option<SnipV2ObjectId> {
+        self.get(model_hash).copied()
+    }
+}
+
+/// Progress of a [`fetch_set`], one event per completed step. `index` is the
+/// model's position in the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetFetchEvent<'a> {
+    /// Every model hash resolved to a manifest root; nothing downloaded yet.
+    Resolved { models: usize },
+    /// The model's manifest is downloaded, parsed and bound to its hash.
+    ManifestRestored {
+        index: usize,
+        model_hash: &'a str,
+        shards: usize,
+    },
+    /// All of the model's shards are in the store, verified.
+    ModelReady {
+        index: usize,
+        model_hash: &'a str,
+        report: RestoreReport,
+    },
+}
+
+/// Why a [`fetch_set`] stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum SetFetchFailure {
+    #[error("model {0} appears more than once in the set")]
+    Duplicate(String),
+    #[error("no manifest root is known for model {0}")]
+    Unresolved(String),
+    #[error("the manifest for model {requested} names model {found}")]
+    WrongModel { requested: String, found: String },
+    #[error("manifest of model {model_hash}: {source}")]
+    Manifest {
+        model_hash: String,
+        #[source]
+        source: StoreError,
+    },
+    #[error("shards of model {model_hash}: {source}")]
+    Shards {
+        model_hash: String,
+        #[source]
+        source: StoreError,
+    },
+}
+
+/// The single failure of a [`fetch_set`]: the model at `index` failed, and
+/// the models in `completed` (request order) were already fully in the store.
+/// Their shards stay cached and verified, so a retry of the same set skips
+/// them; nothing of the failed model is published unverified.
+#[derive(Debug, thiserror::Error)]
+#[error("fetching a set of {requested} models failed at model {index}: {failure}")]
+pub struct SetFetchError {
+    pub requested: usize,
+    pub index: usize,
+    pub completed: Vec<String>,
+    #[source]
+    pub failure: SetFetchFailure,
+}
+
+/// Fetch a set of models as one operation (issue #132): every manifest and
+/// every shard of every model in `model_hashes`, with one progress surface
+/// and one failure surface.
+///
+/// 1. Every hash is checked for duplicates and resolved through `resolver`
+///    before anything is downloaded, so an unknown model fails the set at once.
+/// 2. Model by model, in request order: the manifest is restored from SNIP V2
+///    into `manifest_dir/<model_hash>.manifest.json`, must name the requested
+///    `model_hash`, and then its shards are restored with
+///    [`restore_from_snip`] (streaming verification, no-clobber publication,
+///    verified cache hits skipped).
+///
+/// Returns the manifests in request order. On failure, see [`SetFetchError`].
+/// Activating the set (for example at a model epoch) is the caller's step:
+/// a returned `Ok` means every model of the set is complete locally.
+pub fn fetch_set<A: SnipV2Adapter, R: ManifestResolver>(
+    adapter: &A,
+    store: &ShardStore,
+    resolver: &R,
+    manifest_dir: &Path,
+    model_hashes: &[&str],
+    mut progress: impl FnMut(SetFetchEvent<'_>),
+) -> std::result::Result<Vec<ModelManifest>, SetFetchError> {
+    let requested = model_hashes.len();
+    let fail = |index: usize, completed: &[&str], failure| SetFetchError {
+        requested,
+        index,
+        completed: completed.iter().map(|h| h.to_string()).collect(),
+        failure,
+    };
+
+    let mut roots = Vec::with_capacity(requested);
+    let mut seen = std::collections::HashSet::new();
+    for (index, &model_hash) in model_hashes.iter().enumerate() {
+        if !seen.insert(model_hash) {
+            return Err(fail(
+                index,
+                &[],
+                SetFetchFailure::Duplicate(model_hash.to_string()),
+            ));
+        }
+        let root = resolver.manifest_root(model_hash).ok_or_else(|| {
+            fail(
+                index,
+                &[],
+                SetFetchFailure::Unresolved(model_hash.to_string()),
+            )
+        })?;
+        roots.push(root);
+    }
+    progress(SetFetchEvent::Resolved { models: requested });
+
+    let mut manifests = Vec::with_capacity(requested);
+    for (index, (&model_hash, root)) in model_hashes.iter().zip(&roots).enumerate() {
+        let completed = &model_hashes[..index];
+        let path = manifest_dir.join(format!("{model_hash}.manifest.json"));
+        let manifest = restore_manifest_from_snip(adapter, root, &path).map_err(|source| {
+            fail(
+                index,
+                completed,
+                SetFetchFailure::Manifest {
+                    model_hash: model_hash.to_string(),
+                    source,
+                },
+            )
+        })?;
+        if manifest.model_hash != model_hash {
+            return Err(fail(
+                index,
+                completed,
+                SetFetchFailure::WrongModel {
+                    requested: model_hash.to_string(),
+                    found: manifest.model_hash.clone(),
+                },
+            ));
+        }
+        progress(SetFetchEvent::ManifestRestored {
+            index,
+            model_hash,
+            shards: manifest.shards.len(),
+        });
+        let report = restore_from_snip(adapter, store, &manifest).map_err(|source| {
+            fail(
+                index,
+                completed,
+                SetFetchFailure::Shards {
+                    model_hash: model_hash.to_string(),
+                    source,
+                },
+            )
+        })?;
+        progress(SetFetchEvent::ModelReady {
+            index,
+            model_hash,
+            report,
+        });
+        manifests.push(manifest);
+    }
+    Ok(manifests)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -909,5 +1092,215 @@ mod tests {
         let fake = FakeSnipV2Adapter::new();
         publish_to_snip(&fake, &store, &mut manifest, &manifest_path).unwrap();
         assert_eq!(fake.ingest_calls(), expected);
+    }
+
+    // ── 16. fetch_set (issue #132) ──────────────────────────────────────
+
+    /// Publish a model with `model_hash` and these shard payloads to `fake`;
+    /// returns its published manifest (whose `snip_v2` is the manifest root).
+    fn published_model(
+        fake: &FakeSnipV2Adapter,
+        model_hash: &str,
+        payloads: &[(&[u8], (u32, u32))],
+    ) -> (tempfile::TempDir, ModelManifest) {
+        let (dir, store, mut manifest, manifest_path) = setup_publish_fixture(payloads);
+        manifest.model_hash = model_hash.to_string();
+        manifest::write_manifest(&manifest, &manifest_path).unwrap();
+        publish_to_snip(fake, &store, &mut manifest, &manifest_path).unwrap();
+        (dir, manifest)
+    }
+
+    fn root_of(m: &ModelManifest) -> SnipV2ObjectId {
+        m.snip_v2.as_ref().unwrap().merkle_root
+    }
+
+    fn event_names(events: &[String]) -> Vec<&str> {
+        events.iter().map(String::as_str).collect()
+    }
+
+    fn record(events: &mut Vec<String>) -> impl FnMut(SetFetchEvent<'_>) + '_ {
+        move |e| {
+            events.push(match e {
+                SetFetchEvent::Resolved { models } => format!("resolved {models}"),
+                SetFetchEvent::ManifestRestored { index, shards, .. } => {
+                    format!("manifest {index} ({shards} shards)")
+                }
+                SetFetchEvent::ModelReady { index, report, .. } => format!(
+                    "ready {index} (downloaded {}, cached {})",
+                    report.shards_downloaded, report.shards_skipped_already_cached
+                ),
+            })
+        }
+    }
+
+    #[test]
+    fn fetch_set_restores_every_model_in_request_order_with_one_progress_surface() {
+        let fake = FakeSnipV2Adapter::new();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let (_da, ma) = published_model(&fake, &a, &[(b"a0", (0, 3)), (b"a1", (4, 7))]);
+        let (_db, mb) = published_model(&fake, &b, &[(b"b0", (0, 3))]);
+        let resolver: HashMap<String, SnipV2ObjectId> =
+            [(a.clone(), root_of(&ma)), (b.clone(), root_of(&mb))].into();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ShardStore::new(dir.path().join("shards")).unwrap();
+        let mut events = Vec::new();
+        let got = fetch_set(
+            &fake,
+            &store,
+            &resolver,
+            dir.path(),
+            &[b.as_str(), a.as_str()],
+            record(&mut events),
+        )
+        .unwrap();
+
+        let hashes: Vec<&str> = got.iter().map(|m| m.model_hash.as_str()).collect();
+        assert_eq!(hashes, vec![b.as_str(), a.as_str()], "request order");
+        assert_eq!(
+            event_names(&events),
+            vec![
+                "resolved 2",
+                "manifest 0 (1 shards)",
+                "ready 0 (downloaded 1, cached 0)",
+                "manifest 1 (2 shards)",
+                "ready 1 (downloaded 2, cached 0)",
+            ]
+        );
+        for shard in mb.shards.iter().chain(&ma.shards) {
+            assert!(store
+                .verify_existing(&shard.cid, Some(&shard.blake3_hash))
+                .unwrap());
+        }
+        assert!(dir.path().join(format!("{a}.manifest.json")).exists());
+        assert!(dir.path().join(format!("{b}.manifest.json")).exists());
+    }
+
+    #[test]
+    fn fetch_set_refuses_an_unknown_or_repeated_model_before_any_download() {
+        let fake = FakeSnipV2Adapter::new();
+        let a = "a".repeat(64);
+        let (_da, ma) = published_model(&fake, &a, &[(b"a0", (0, 3))]);
+        let resolver: HashMap<String, SnipV2ObjectId> = [(a.clone(), root_of(&ma))].into();
+        let dir = tempfile::tempdir().unwrap();
+        let store = ShardStore::new(dir.path().join("shards")).unwrap();
+        let downloads_before = fake.download_calls().len();
+
+        let unknown = "c".repeat(64);
+        let err = fetch_set(
+            &fake,
+            &store,
+            &resolver,
+            dir.path(),
+            &[a.as_str(), unknown.as_str()],
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!((err.index, err.completed.len()), (1, 0));
+        assert!(
+            matches!(&err.failure, SetFetchFailure::Unresolved(h) if *h == unknown),
+            "{err}"
+        );
+
+        let err = fetch_set(
+            &fake,
+            &store,
+            &resolver,
+            dir.path(),
+            &[a.as_str(), a.as_str()],
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.index, 1);
+        assert!(
+            matches!(&err.failure, SetFetchFailure::Duplicate(h) if *h == a),
+            "{err}"
+        );
+
+        assert_eq!(
+            fake.download_calls().len(),
+            downloads_before,
+            "nothing downloaded"
+        );
+        assert!(!store.has(&ma.shards[0].cid));
+    }
+
+    #[test]
+    fn fetch_set_refuses_a_manifest_that_names_another_model() {
+        let fake = FakeSnipV2Adapter::new();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let (_db, mb) = published_model(&fake, &b, &[(b"b0", (0, 3))]);
+        // The registry maps model a to model b's manifest.
+        let resolver: HashMap<String, SnipV2ObjectId> = [(a.clone(), root_of(&mb))].into();
+        let dir = tempfile::tempdir().unwrap();
+        let store = ShardStore::new(dir.path().join("shards")).unwrap();
+
+        let err =
+            fetch_set(&fake, &store, &resolver, dir.path(), &[a.as_str()], |_| {}).unwrap_err();
+        assert!(
+            matches!(&err.failure, SetFetchFailure::WrongModel { requested, found } if *requested == a && *found == b),
+            "{err}"
+        );
+        assert!(
+            !store.has(&mb.shards[0].cid),
+            "no shard of the wrong model is fetched"
+        );
+    }
+
+    #[test]
+    fn fetch_set_names_the_failing_model_and_a_retry_skips_the_completed_ones() {
+        let fake = FakeSnipV2Adapter::new();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let (_da, ma) = published_model(&fake, &a, &[(b"a0", (0, 3)), (b"a1", (4, 7))]);
+        let (_db, mb) = published_model(&fake, &b, &[(b"b0", (0, 3))]);
+        let resolver: HashMap<String, SnipV2ObjectId> =
+            [(a.clone(), root_of(&ma)), (b.clone(), root_of(&mb))].into();
+        let dir = tempfile::tempdir().unwrap();
+        let store = ShardStore::new(dir.path().join("shards")).unwrap();
+
+        // Model b's only shard comes back corrupted.
+        let b_shard_root = mb.shards[0].snip_v2.as_ref().unwrap().merkle_root;
+        fake.set_download_override(b_shard_root, b"corrupted".to_vec());
+        let err = fetch_set(
+            &fake,
+            &store,
+            &resolver,
+            dir.path(),
+            &[a.as_str(), b.as_str()],
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.index, 1);
+        assert_eq!(err.completed, vec![a.clone()]);
+        assert!(
+            matches!(&err.failure, SetFetchFailure::Shards { model_hash, .. } if *model_hash == b),
+            "{err}"
+        );
+        assert!(
+            !store.has(&mb.shards[0].cid),
+            "nothing unverified is published"
+        );
+
+        // Once the bytes are right again, the same set completes, and model a
+        // is served from the verified cache.
+        fake.set_download_override(b_shard_root, b"b0".to_vec());
+        let mut events = Vec::new();
+        fetch_set(
+            &fake,
+            &store,
+            &resolver,
+            dir.path(),
+            &[a.as_str(), b.as_str()],
+            record(&mut events),
+        )
+        .unwrap();
+        assert!(
+            events.contains(&"ready 0 (downloaded 0, cached 2)".to_string()),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&"ready 1 (downloaded 1, cached 0)".to_string()),
+            "{events:?}"
+        );
     }
 }

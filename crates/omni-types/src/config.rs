@@ -128,13 +128,14 @@ pub struct StoreConfig {
     /// request-response message: a shard is fetched in several messages, so
     /// the per-message bound does not constrain the accumulated total.
     ///
-    /// **This does not prevent memory exhaustion.** It bounds *one* fetch.
-    /// Shard downloads still buffer the whole shard in memory rather than
-    /// streaming into a staged file, and nothing bounds how many fetches run
-    /// concurrently, so a node's total exposure is this value multiplied by
-    /// the number of simultaneous fetches. Removing whole-shard buffering and
-    /// bounding concurrency are separate pieces of work; until both land,
-    /// treat this as a per-fetch sanity limit, not a memory bound.
+    /// It bounds *one* fetch, and since issue #132 it bounds **disk**, not
+    /// memory. A shard download streams each message into a staging file
+    /// under the store root and hashes it as it arrives, so a fetch holds at
+    /// most one message (`max_shard_msg_bytes`) in memory, and stages at most
+    /// this many bytes on disk until the CID is verified and the shard is
+    /// published. Nothing yet bounds how many fetches run concurrently, so a
+    /// node's total staging exposure is this value multiplied by the number
+    /// of simultaneous fetches.
     ///
     /// Unlike SNIP — where a chunk is protocol-fixed at 1 MiB and the bound
     /// follows from the format — an Omni shard is a model slice whose size
