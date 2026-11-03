@@ -17,8 +17,7 @@ pub const DEFAULT_MAX_SHARD_MSG_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default number of shard fetches a store runs at once (issue #132).
 ///
-/// 4 is the recommended default and awaits the owner's confirmation. It
-/// bounds a store's peer-to-peer fetch staging at 4 ×
+/// 4 bounds a store's peer-to-peer fetch staging at 4 ×
 /// [`DEFAULT_MAX_SHARD_TOTAL_BYTES`] (4 GiB at the defaults). This constant is
 /// the only place the value is written; [`StoreConfig::default`] and the
 /// constructors that take no configuration all read it.
@@ -176,8 +175,7 @@ pub struct StoreConfig {
     pub max_shard_total_bytes: u64,
 
     /// How many shard fetches the store runs at once (issue #132). Must be
-    /// at least 1. Default: [`DEFAULT_MAX_CONCURRENT_FETCHES`] (4), the
-    /// recommended value, which awaits the owner's confirmation.
+    /// at least 1. Default: [`DEFAULT_MAX_CONCURRENT_FETCHES`] (4).
     ///
     /// A fetch started while this many are in flight waits in a first-in,
     /// first-out queue and starts when a slot frees; it is not refused. A
