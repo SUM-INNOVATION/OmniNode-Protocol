@@ -42,4 +42,9 @@ tokio    = { workspace = true }
 futures  = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "=1.1.4", features = ["fs"] }
+# Issue #161: a caret requirement, not an exact pin. Publication uses only the
+# `fs` calls 1.1.4 already has (`open`, `openat`, `linkat` and `unlinkat` with
+# `AtFlags`), and an exact pin stopped downstream projects from resolving one
+# lock file with any crate that needs a later 1.1 patch release. This
+# workspace's own build stays pinned by its Cargo.lock.
+rustix = { version = "1.1.4", features = ["fs"] }
