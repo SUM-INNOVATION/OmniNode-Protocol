@@ -179,6 +179,13 @@ pub fn restore_manifest_from_snip<A: SnipV2Adapter>(
 ///
 /// If any shard in `manifest` lacks a `snip_v2` ref, [`StoreError::ShardLacksSnipRef`]
 /// is returned for that shard.
+///
+/// Each download holds one of the store's fetch slots
+/// ([`ShardStore::max_concurrent_fetches`], issue #132) from before its
+/// staging directory is created until it is published or removed. One call
+/// downloads its shards one at a time; when several threads restore into the
+/// same store, a download that finds every slot held waits in arrival order.
+/// A download that fails, or unwinds from a panic, frees its slot.
 pub fn restore_from_snip<A: SnipV2Adapter>(
     adapter: &A,
     store: &ShardStore,
@@ -199,10 +206,12 @@ pub fn restore_from_snip<A: SnipV2Adapter>(
                 cid: shard.cid.clone(),
             })?;
 
+        let slot = store.download_slot();
         store.publish_download(&shard.cid, &shard.blake3_hash, |path| {
             adapter.download_public(&snip_ref.merkle_root, path)?;
             Ok(())
         })?;
+        drop(slot);
         tracing::info!(
             cid = %shard.cid,
             merkle = %snip_ref.merkle_root,
@@ -313,7 +322,8 @@ pub struct SetFetchError {
 ///    previous copy. A refused or failed manifest leaves `manifest_dir` as it
 ///    was. Then its shards are restored with [`restore_from_snip`]
 ///    (streaming verification, no-clobber publication, verified cache hits
-///    skipped).
+///    skipped), so the shard downloads of concurrent calls on one store share
+///    its fetch-concurrency bound (issue #132).
 ///
 /// Returns the manifests in request order. On failure, see [`SetFetchError`].
 /// Activating the set (for example at a model epoch) is the caller's step:
@@ -1430,5 +1440,339 @@ mod tests {
             "no file for the refused model a, no staging left behind"
         );
         assert_eq!(std::fs::read(&existing_c).unwrap(), b"previous");
+    }
+
+    // ── 17. the fetch-concurrency bound (issue #132) ────────────────────
+
+    /// A thread-safe SNIP V2 fake whose shard downloads wait at a gate until
+    /// the test opens it, so concurrent restores pile up against the store's
+    /// bound. It records how many shard downloads ran at once and how many
+    /// `.publish-*` staging directories existed when each one began.
+    /// Manifest downloads (outside the store) pass straight through.
+    struct GatedAdapter {
+        objects: HashMap<SnipV2ObjectId, Vec<u8>>,
+        fail: HashSet<SnipV2ObjectId>,
+        panic_on: HashSet<SnipV2ObjectId>,
+        store_root: PathBuf,
+        gate: std::sync::Mutex<Gate>,
+        changed: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct Gate {
+        open: bool,
+        entered: usize,
+        running: usize,
+        peak_running: usize,
+        peak_staged: usize,
+    }
+
+    impl GatedAdapter {
+        fn new(store_root: &Path) -> Self {
+            Self {
+                objects: HashMap::new(),
+                fail: HashSet::new(),
+                panic_on: HashSet::new(),
+                store_root: store_root.to_path_buf(),
+                gate: std::sync::Mutex::new(Gate::default()),
+                changed: std::sync::Condvar::new(),
+            }
+        }
+
+        /// Serve `bytes` at a root derived from them; returns the root.
+        fn serve(&mut self, bytes: &[u8]) -> SnipV2ObjectId {
+            let root = SnipV2ObjectId::from_bytes(*blake3::hash(bytes).as_bytes());
+            self.objects.insert(root, bytes.to_vec());
+            root
+        }
+
+        fn open(&self) {
+            self.gate.lock().unwrap().open = true;
+            self.changed.notify_all();
+        }
+
+        fn stats(&self) -> (usize, usize, usize) {
+            let g = self.gate.lock().unwrap();
+            (g.entered, g.peak_running, g.peak_staged)
+        }
+
+        fn staged(&self) -> usize {
+            std::fs::read_dir(&self.store_root)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".publish-")
+                })
+                .count()
+        }
+
+        fn finish(&self) {
+            self.gate.lock().unwrap().running -= 1;
+        }
+    }
+
+    /// Opens the gate when dropped, so a failing assertion releases the
+    /// waiting downloads and the test fails instead of hanging.
+    struct OpenOnDrop<'a>(&'a GatedAdapter);
+
+    impl Drop for OpenOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    impl SnipV2Adapter for GatedAdapter {
+        fn ingest_public(&self, _path: &Path) -> std::result::Result<SnipV2ObjectRef, SnipV2Error> {
+            unreachable!("restores only")
+        }
+
+        fn download_public(
+            &self,
+            root: &SnipV2ObjectId,
+            output_path: &Path,
+        ) -> std::result::Result<(), SnipV2Error> {
+            let shard = output_path.starts_with(&self.store_root);
+            if shard {
+                let staged = self.staged();
+                let mut g = self.gate.lock().unwrap();
+                g.entered += 1;
+                g.running += 1;
+                g.peak_running = g.peak_running.max(g.running);
+                g.peak_staged = g.peak_staged.max(staged);
+                while !g.open {
+                    g = self.changed.wait(g).unwrap();
+                }
+                drop(g);
+                if self.fail.contains(root) {
+                    self.finish();
+                    return Err(SnipV2Error::DownloadFailed {
+                        code: 1,
+                        stderr: "fake forced download failure".into(),
+                    });
+                }
+                if self.panic_on.contains(root) {
+                    self.finish();
+                    panic!("fake download panicked");
+                }
+            }
+            let bytes = self.objects.get(root).expect("served root");
+            std::fs::write(output_path, bytes).map_err(SnipV2Error::CommandSpawn)?;
+            if shard {
+                self.finish();
+            }
+            Ok(())
+        }
+    }
+
+    /// `count` one-shard manifests whose shards `fake` serves.
+    fn served_manifests(fake: &mut GatedAdapter, count: u8) -> Vec<ModelManifest> {
+        (0..count)
+            .map(|i| {
+                let payload = vec![i; 4096];
+                let (_, mut shard) = real_shard(0, &payload, (0, 3));
+                shard.snip_v2 = Some(SnipV2ObjectRef {
+                    merkle_root: fake.serve(&payload),
+                    lifecycle: SnipV2Lifecycle::Active,
+                    plaintext_size_bytes: Some(payload.len() as u64),
+                });
+                empty_manifest(vec![shard])
+            })
+            .collect()
+    }
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting until {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Run `f` on a helper thread and fail, rather than hang, if it does not
+    /// finish: a slot that is never freed would otherwise block forever.
+    fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("did not finish: a fetch slot was never freed")
+    }
+
+    /// `threads` concurrent restores of one-shard manifests into one store
+    /// bounded at `bound`. While the gate is closed, exactly `bound`
+    /// downloads run and the rest wait; then everything completes.
+    fn concurrent_restores(bound: usize, threads: u8) {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ShardStore::with_max_concurrent_fetches(dir.path().join("shards"), bound).unwrap();
+        let mut fake = GatedAdapter::new(store.root());
+        let manifests = served_manifests(&mut fake, threads);
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = manifests
+                .iter()
+                .map(|m| {
+                    let (fake, store) = (&fake, &store);
+                    s.spawn(move || restore_from_snip(fake, store, m))
+                })
+                .collect();
+            let gate = OpenOnDrop(&fake);
+            // Every thread is either downloading or waiting for a slot.
+            wait_until("every restore is downloading or waiting", || {
+                fake.stats().0 + store.downloads().waiting() == threads as usize
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(
+                fake.stats().0,
+                bound,
+                "downloads begun at once with a bound of {bound}"
+            );
+            assert_eq!(store.downloads().waiting(), threads as usize - bound);
+            drop(gate);
+            for h in handles {
+                assert_eq!(h.join().unwrap().unwrap().shards_downloaded, 1);
+            }
+        });
+
+        let (entered, peak_running, peak_staged) = fake.stats();
+        assert_eq!(entered, threads as usize, "every queued download ran");
+        assert_eq!(peak_running, bound);
+        assert!(
+            peak_staged <= bound,
+            "{peak_staged} downloads staged at once with a bound of {bound}"
+        );
+        for m in &manifests {
+            assert!(store
+                .verify_existing(&m.shards[0].cid, Some(&m.shards[0].blake3_hash))
+                .unwrap());
+        }
+        assert_eq!(store.downloads().in_use(), 0);
+        assert_no_staging(&store);
+    }
+
+    /// The key test for the SNIP V2 path: six threads restoring into one
+    /// store bounded at 2. Without the bound all six downloads begin at once.
+    #[test]
+    fn concurrent_restores_never_stage_more_than_the_bound() {
+        concurrent_restores(2, 6);
+    }
+
+    #[test]
+    fn a_bound_of_one_serializes_concurrent_restores() {
+        concurrent_restores(1, 4);
+    }
+
+    /// `fetch_set` restores shards through `restore_from_snip`, so concurrent
+    /// sets on one store share its bound too.
+    #[test]
+    fn concurrent_fetch_sets_share_the_store_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ShardStore::with_max_concurrent_fetches(dir.path().join("shards"), 1).unwrap();
+        let mut fake = GatedAdapter::new(store.root());
+        let mut resolver: HashMap<String, SnipV2ObjectId> = HashMap::new();
+        let mut hashes = Vec::new();
+        for (i, mut m) in served_manifests(&mut fake, 3).into_iter().enumerate() {
+            let model_hash = format!("{i}").repeat(64);
+            m.model_hash = model_hash.clone();
+            let path = dir.path().join(format!("m{i}.cbor"));
+            manifest::write_manifest(&m, &path).unwrap();
+            let root = fake.serve(&std::fs::read(&path).unwrap());
+            resolver.insert(model_hash.clone(), root);
+            hashes.push(model_hash);
+        }
+        let manifest_dir = dir.path().join("manifests");
+        std::fs::create_dir(&manifest_dir).unwrap();
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = hashes
+                .iter()
+                .map(|h| {
+                    let (fake, store, resolver, manifest_dir) =
+                        (&fake, &store, &resolver, &manifest_dir);
+                    s.spawn(move || {
+                        fetch_set(fake, store, resolver, manifest_dir, &[h.as_str()], |_| {})
+                    })
+                })
+                .collect();
+            let gate = OpenOnDrop(&fake);
+            wait_until("every set is downloading or waiting", || {
+                fake.stats().0 + store.downloads().waiting() == 3
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(
+                fake.stats().0,
+                1,
+                "shard downloads begun at once with a bound of 1"
+            );
+            drop(gate);
+            for h in handles {
+                assert_eq!(h.join().unwrap().unwrap().len(), 1);
+            }
+        });
+        assert_eq!(fake.stats(), (3, 1, 1));
+        assert_no_staging(&store);
+    }
+
+    /// A download that fails, and one that panics, each free their slot: with
+    /// a bound of 1, the remaining restore still completes.
+    #[test]
+    fn a_failed_or_panicking_download_frees_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            ShardStore::with_max_concurrent_fetches(dir.path().join("shards"), 1).unwrap(),
+        );
+        let mut fake = GatedAdapter::new(store.root());
+        let manifests = served_manifests(&mut fake, 3);
+        let root = |m: &ModelManifest| m.shards[0].snip_v2.as_ref().unwrap().merkle_root;
+        fake.fail.insert(root(&manifests[0]));
+        fake.panic_on.insert(root(&manifests[1]));
+        fake.open();
+        let fake = std::sync::Arc::new(fake);
+
+        let (store2, fake2) = (store.clone(), fake.clone());
+        let results = within(move || {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = manifests
+                    .iter()
+                    .map(|m| {
+                        let (fake, store) = (&*fake2, &*store2);
+                        s.spawn(move || restore_from_snip(fake, store, m).is_ok())
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().ok())
+                    .collect::<Vec<_>>()
+            })
+        });
+
+        assert_eq!(
+            results,
+            vec![Some(false), None, Some(true)],
+            "failed, panicked, completed"
+        );
+        assert_eq!(fake.stats().0, 3);
+        assert_eq!(store.downloads().in_use(), 0, "every slot was freed");
+        assert_no_staging(&store);
+    }
+
+    #[test]
+    fn a_store_takes_the_default_bound_and_refuses_zero_before_creating_its_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ShardStore::new(dir.path().join("default")).unwrap();
+        assert_eq!(
+            store.max_concurrent_fetches(),
+            omni_types::config::DEFAULT_MAX_CONCURRENT_FETCHES
+        );
+        let refused = dir.path().join("refused");
+        assert!(ShardStore::with_max_concurrent_fetches(refused.clone(), 0).is_err());
+        assert!(!refused.exists());
     }
 }

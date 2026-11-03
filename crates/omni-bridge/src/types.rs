@@ -48,12 +48,13 @@ pub struct PyStoreConfig {
 #[pymethods]
 impl PyStoreConfig {
     #[new]
-    #[pyo3(signature = (store_dir=None, layers_per_shard=None, max_shard_msg_bytes=None, max_shard_total_bytes=None))]
+    #[pyo3(signature = (store_dir=None, layers_per_shard=None, max_shard_msg_bytes=None, max_shard_total_bytes=None, max_concurrent_fetches=None))]
     fn new(
         store_dir: Option<String>,
         layers_per_shard: Option<u32>,
         max_shard_msg_bytes: Option<usize>,
         max_shard_total_bytes: Option<u64>,
+        max_concurrent_fetches: Option<usize>,
     ) -> PyResult<Self> {
         let mut cfg = StoreConfig::default();
         if let Some(d) = store_dir {
@@ -67,6 +68,9 @@ impl PyStoreConfig {
         }
         if let Some(t) = max_shard_total_bytes {
             cfg.max_shard_total_bytes = t;
+        }
+        if let Some(n) = max_concurrent_fetches {
+            cfg.max_concurrent_fetches = n;
         }
 
         // One validation entry point, shared with the Rust constructors, so a
@@ -98,13 +102,19 @@ impl PyStoreConfig {
         self.inner.max_shard_total_bytes
     }
 
+    #[getter]
+    fn max_concurrent_fetches(&self) -> usize {
+        self.inner.max_concurrent_fetches
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "StoreConfig(store_dir='{}', layers_per_shard={}, max_shard_msg_bytes={}, max_shard_total_bytes={})",
+            "StoreConfig(store_dir='{}', layers_per_shard={}, max_shard_msg_bytes={}, max_shard_total_bytes={}, max_concurrent_fetches={})",
             self.inner.store_dir.display(),
             self.inner.layers_per_shard,
             self.inner.max_shard_msg_bytes,
             self.inner.max_shard_total_bytes,
+            self.inner.max_concurrent_fetches,
         )
     }
 }
@@ -309,7 +319,13 @@ mod tests {
     #[test]
     fn store_config_applies_every_override() {
         let c = ok(
-            PyStoreConfig::new(Some("/tmp/omni-x".into()), Some(2), Some(1024), Some(4096)),
+            PyStoreConfig::new(
+                Some("/tmp/omni-x".into()),
+                Some(2),
+                Some(1024),
+                Some(4096),
+                Some(3),
+            ),
             "valid configuration",
         );
         assert_eq!(c.store_dir(), "/tmp/omni-x");
@@ -317,19 +333,36 @@ mod tests {
             (
                 c.layers_per_shard(),
                 c.max_shard_msg_bytes(),
-                c.max_shard_total_bytes()
+                c.max_shard_total_bytes(),
+                c.max_concurrent_fetches()
             ),
-            (2, 1024, 4096)
+            (2, 1024, 4096, 3)
         );
         assert!(c.__repr__().contains("store_dir='/tmp/omni-x'"));
+        assert!(c.__repr__().contains("max_concurrent_fetches=3"));
     }
 
     #[test]
     fn store_config_refuses_zero_limits_through_the_shared_validator() {
-        assert!(PyStoreConfig::new(None, None, Some(0), None).is_err());
-        assert!(PyStoreConfig::new(None, None, None, Some(0)).is_err());
+        assert!(PyStoreConfig::new(None, None, Some(0), None, None).is_err());
+        assert!(PyStoreConfig::new(None, None, None, Some(0), None).is_err());
+        assert!(PyStoreConfig::new(None, None, None, None, Some(0)).is_err());
         // The defaults themselves validate.
-        assert!(PyStoreConfig::new(None, None, None, None).is_ok());
+        assert!(PyStoreConfig::new(None, None, None, None, None).is_ok());
+    }
+
+    /// Issue #132: the fetch-concurrency bound defaults to 4 from Python too.
+    #[test]
+    fn store_config_takes_the_default_fetch_concurrency() {
+        let c = ok(
+            PyStoreConfig::new(None, None, None, None, None),
+            "default configuration",
+        );
+        assert_eq!(
+            c.max_concurrent_fetches(),
+            omni_types::config::DEFAULT_MAX_CONCURRENT_FETCHES
+        );
+        assert_eq!(c.max_concurrent_fetches(), 4);
     }
 
     #[test]

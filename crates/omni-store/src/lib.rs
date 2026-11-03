@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod content_id;
 pub mod error;
 pub mod fetch;
+mod fetch_slots;
 pub mod gguf;
 pub mod manifest;
 pub mod mmap;
@@ -52,9 +53,11 @@ impl OmniStore {
         // must not leave a created store directory behind.
         config.validate().map_err(StoreError::Other)?;
 
-        let local = ShardStore::new(config.store_dir.clone())?;
-        let fetcher =
-            FetchManager::with_limits(config.max_shard_msg_bytes, config.max_shard_total_bytes)?;
+        let local = ShardStore::with_max_concurrent_fetches(
+            config.store_dir.clone(),
+            config.max_concurrent_fetches,
+        )?;
+        let fetcher = FetchManager::from_config(&config)?;
         Ok(Self { config, local, fetcher })
     }
 
