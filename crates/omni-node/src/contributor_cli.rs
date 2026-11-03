@@ -21,6 +21,8 @@ use omni_contributor::{
 };
 use omni_store::{SnipV2Cli, SnipV2CliConfig};
 
+use crate::omninet_args::OmniNetControlArgs;
+
 #[derive(Args)]
 pub struct ContributorArgs {
     #[command(subcommand)]
@@ -667,6 +669,10 @@ struct AnnounceJobArgs {
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
 
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
+
     /// Bootstrap peer multiaddr (repeatable). Mapped to
     /// `NetConfig.bootstrap_peers`.
     #[arg(long = "peer")]
@@ -755,6 +761,10 @@ struct WatchNetworkJobsArgs {
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
 
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
+
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -825,6 +835,10 @@ struct AnnounceResultArgs {
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
 
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
+
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -872,6 +886,10 @@ struct WatchNetworkResultsArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
 
     #[arg(long = "peer")]
     peer: Vec<String>,
@@ -936,6 +954,10 @@ struct OpenSessionArgs {
     /// announce-*). Defaults: ephemeral port, no bootstrap peers.
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -991,6 +1013,10 @@ struct JoinSessionArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -1057,6 +1083,10 @@ struct AssignWorkArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -1123,6 +1153,10 @@ struct RunAssignmentArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -1324,6 +1358,10 @@ struct AggregateSessionArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -1397,6 +1435,10 @@ struct SendHandoffArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -1456,6 +1498,10 @@ struct WatchSessionsArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -1542,6 +1588,10 @@ struct AdvertisePeerArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -1599,6 +1649,10 @@ struct WatchPeerAdvertsArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -1770,6 +1824,10 @@ struct AssignSessionPlanArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -2002,6 +2060,10 @@ struct ApplySessionRepairArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -2112,6 +2174,10 @@ struct ApplySessionReassignArgs {
 
     #[arg(long, default_value_t = 0)]
     listen_port: u16,
+
+    /// OmniNet `--mdns` / `--outbound-allow` (issue #158).
+    #[command(flatten)]
+    omninet: OmniNetControlArgs,
     #[arg(long = "peer")]
     peer: Vec<String>,
 
@@ -3978,12 +4044,12 @@ async fn run_announce_job(args: AnnounceJobArgs) -> Result<()> {
 
     // Open OmniNet and publish.
     let identity = resolve_net_identity(args.net_identity_file.as_deref())?;
-    let net_config = NetConfig {
+    let net_config = args.omninet.apply(NetConfig {
         listen_port: args.listen_port,
         bootstrap_peers: args.peer,
         identity,
         ..NetConfig::default()
-    };
+    });
     let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
@@ -4076,12 +4142,12 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
 
     let snip_adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
     let identity = resolve_net_identity(args.net_identity_file.as_deref())?;
-    let net_config = NetConfig {
+    let net_config = args.omninet.apply(NetConfig {
         listen_port: args.listen_port,
         bootstrap_peers: args.peer,
         identity,
         ..NetConfig::default()
-    };
+    });
     let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
@@ -4264,12 +4330,12 @@ async fn run_announce_result(args: AnnounceResultArgs) -> Result<()> {
         .map_err(|e| anyhow!("invalid NetworkPostedResultAnnouncement: {e}"))?;
 
     let identity = resolve_net_identity(args.net_identity_file.as_deref())?;
-    let net_config = NetConfig {
+    let net_config = args.omninet.apply(NetConfig {
         listen_port: args.listen_port,
         bootstrap_peers: args.peer,
         identity,
         ..NetConfig::default()
-    };
+    });
     let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
@@ -4311,12 +4377,12 @@ async fn run_watch_network_results(args: WatchNetworkResultsArgs) -> Result<()> 
 
     let snip_adapter = build_snip_adapter(args.snip_binary, args.snip_seed);
     let identity = resolve_net_identity(args.net_identity_file.as_deref())?;
-    let net_config = NetConfig {
+    let net_config = args.omninet.apply(NetConfig {
         listen_port: args.listen_port,
         bootstrap_peers: args.peer,
         identity,
         ..NetConfig::default()
-    };
+    });
     let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
@@ -4533,17 +4599,18 @@ async fn open_omninet_with_peer_wait(
     peer_wait_secs: u64,
     mesh_stabilize_ms: u64,
     net_identity_file: Option<&std::path::Path>,
+    omninet: &OmniNetControlArgs,
 ) -> Result<(omni_net::NetHandle, tokio::runtime::Handle)>
 {
     use omni_net::OmniNet;
     use omni_types::config::NetConfig;
     let identity = resolve_net_identity(net_identity_file)?;
-    let net_config = NetConfig {
+    let net_config = omninet.apply(NetConfig {
         listen_port,
         bootstrap_peers: peer,
         identity,
         ..NetConfig::default()
-    };
+    });
     let net = OmniNet::new(net_config)
         .await
         .map_err(|e| anyhow!("OmniNet::new: {e}"))?;
@@ -4633,6 +4700,7 @@ async fn run_open_session(args: OpenSessionArgs) -> Result<()> {
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
         args.net_identity_file.as_deref(),
+        &args.omninet,
     )
     .await?;
     let mut relay = OmniNetRelay::new(net.clone(), handle);
@@ -4733,6 +4801,7 @@ async fn run_join_session(args: JoinSessionArgs) -> Result<()> {
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
         args.net_identity_file.as_deref(),
+        &args.omninet,
     )
     .await?;
     let mut relay = OmniNetRelay::new(net.clone(), handle);
@@ -4863,6 +4932,7 @@ async fn run_assign_work(args: AssignWorkArgs) -> Result<()> {
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
         args.net_identity_file.as_deref(),
+        &args.omninet,
     )
     .await?;
     let mut relay = OmniNetRelay::new(net.clone(), handle);
@@ -5298,6 +5368,7 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
                 args.peer_wait_secs,
                 args.mesh_stabilize_ms,
                 args.net_identity_file.as_deref(),
+                &args.omninet,
             )
             .await?,
         )
@@ -5635,6 +5706,7 @@ async fn run_send_handoff(args: SendHandoffArgs) -> Result<()> {
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
         args.net_identity_file.as_deref(),
+        &args.omninet,
     )
     .await?;
     let mut transport = OmniNetTensorTransport::new(net.clone(), handle);
@@ -5939,6 +6011,7 @@ async fn run_aggregate_session(args: AggregateSessionArgs) -> Result<()> {
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
         args.net_identity_file.as_deref(),
+        &args.omninet,
     )
     .await?;
     let mut relay = OmniNetRelay::new(net.clone(), handle);
@@ -5968,6 +6041,7 @@ async fn run_watch_sessions(args: WatchSessionsArgs) -> Result<()> {
         /* peer_wait_secs = */ 0,
         /* mesh_stabilize_ms = */ 0,
         args.net_identity_file.as_deref(),
+        &args.omninet,
     )
     .await?;
     std::fs::create_dir_all(&args.out_dir)?;
@@ -6947,6 +7021,7 @@ async fn run_advertise_peer(args: AdvertisePeerArgs) -> Result<()> {
         peer_wait_secs,
         mesh_stabilize_ms,
         args.net_identity_file.as_deref(),
+        &args.omninet,
     )
     .await?;
     let libp2p_peer_id_b58 = {
@@ -7095,6 +7170,7 @@ async fn run_watch_peer_adverts(args: WatchPeerAdvertsArgs) -> Result<()> {
         /* peer_wait_secs = */ 0,
         /* mesh_stabilize_ms = */ 0,
         args.net_identity_file.as_deref(),
+        &args.omninet,
     )
     .await?;
     std::fs::create_dir_all(&args.out_dir)?;
@@ -7552,6 +7628,7 @@ async fn run_assign_session_plan(args: AssignSessionPlanArgs) -> Result<()> {
         args.peer_wait_secs,
         args.mesh_stabilize_ms,
         args.net_identity_file.as_deref(),
+        &args.omninet,
     )
     .await?;
     let mut relay = OmniNetRelay::new(net.clone(), handle);
@@ -11270,6 +11347,7 @@ async fn run_apply_session_repair(args: ApplySessionRepairArgs) -> Result<()> {
             args.peer_wait_secs,
             args.mesh_stabilize_ms,
             args.net_identity_file.as_deref(),
+            &args.omninet,
         )
         .await?;
         let relay = OmniNetRelay::new(net.clone(), handle);
@@ -11795,6 +11873,7 @@ async fn run_apply_session_reassign(args: ApplySessionReassignArgs) -> Result<()
             args.peer_wait_secs,
             args.mesh_stabilize_ms,
             args.net_identity_file.as_deref(),
+            &args.omninet,
         )
         .await?;
         let relay = OmniNetRelay::new(net.clone(), handle);
@@ -13355,5 +13434,108 @@ fn write_diff_json_mirror(
                 "event=warn context=state_integrity_diff_json_serialize message={e}"
             );
         }
+    }
+}
+
+/// Issue #158: `--mdns` and `--outbound-allow` on every contributor command
+/// that opens OmniNet.
+#[cfg(test)]
+mod omninet_flag_tests {
+    use super::*;
+    use crate::omninet_args::MdnsMode;
+    use clap::{CommandFactory, Parser};
+    use omni_types::config::NetConfig;
+
+    #[derive(clap::Parser)]
+    struct Root {
+        #[command(flatten)]
+        contributor: ContributorArgs,
+    }
+
+    /// The commands that open OmniNet are the ones with `--listen-port`. Each
+    /// takes both flags; no other command does.
+    #[test]
+    fn every_command_that_opens_omninet_takes_the_flags() {
+        let cmd = Root::command();
+        let mut networked = Vec::new();
+        for sub in cmd.get_subcommands() {
+            let has = |long: &str| sub.get_arguments().any(|a| a.get_long() == Some(long));
+            if has("listen-port") {
+                assert!(has("mdns") && has("outbound-allow"), "{}", sub.get_name());
+                networked.push(sub.get_name().to_string());
+            } else {
+                assert!(!has("mdns") && !has("outbound-allow"), "{}", sub.get_name());
+            }
+        }
+        assert_eq!(networked.len(), 16, "{networked:?}");
+        assert!(networked.iter().any(|n| n == "watch-network-jobs"));
+    }
+
+    fn watch_network_jobs(extra: &[&str]) -> WatchNetworkJobsArgs {
+        let mut argv = vec![
+            "omni-node",
+            "watch-network-jobs",
+            "--max-input-tokens",
+            "1",
+            "--max-output-tokens",
+            "1",
+            "--max-total-base-units",
+            "1",
+            "--stub-response",
+            "/tmp/response.json",
+            "--seed-file",
+            "/tmp/seed",
+            "--result-out-dir",
+            "/tmp/out",
+        ];
+        argv.extend_from_slice(extra);
+        match Root::try_parse_from(argv).expect("parses").contributor.cmd {
+            ContributorCmd::WatchNetworkJobs(args) => args,
+            _ => panic!("parsed into another command"),
+        }
+    }
+
+    #[test]
+    fn watch_network_jobs_carries_the_flags_into_its_net_config() {
+        let args = watch_network_jobs(&[
+            "--mdns",
+            "off",
+            "--outbound-allow",
+            "127.0.0.1,/ip4/192.0.2.7/udp/4001/quic-v1",
+            "--listen-port",
+            "4242",
+        ]);
+        assert_eq!(args.omninet.mdns, MdnsMode::Off);
+        let cfg = args.omninet.apply(NetConfig {
+            listen_port: args.listen_port,
+            ..NetConfig::default()
+        });
+        assert!(!cfg.mdns);
+        assert_eq!(
+            cfg.outbound_allow,
+            vec!["127.0.0.1", "/ip4/192.0.2.7/udp/4001/quic-v1"]
+        );
+        assert_eq!(cfg.listen_port, 4242);
+    }
+
+    #[test]
+    fn watch_network_jobs_without_the_flags_keeps_mdns_on_and_no_allow_list() {
+        let args = watch_network_jobs(&[]);
+        let cfg = args.omninet.apply(NetConfig::default());
+        assert!(cfg.mdns);
+        assert!(cfg.outbound_allow.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_entry_is_refused_by_the_command_line() {
+        let err = Root::try_parse_from([
+            "omni-node",
+            "watch-network-results",
+            "--outbound-allow",
+            "not-an-address",
+        ])
+        .err()
+        .expect("refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 }

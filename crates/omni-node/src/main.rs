@@ -24,9 +24,12 @@ use tracing_subscriber::EnvFilter;
 
 use omni_net::{OmniNet, OmniNetEvent, TOPIC_SHARD, TOPIC_TEST};
 use omni_store::{OmniStore, FetchOutcome, decode_announcement};
-use omni_types::config::{NetConfig, StoreConfig};
+use omni_types::config::StoreConfig;
+
+use crate::omninet_args::OmniNetControlArgs;
 
 mod contributor_cli;
+mod omninet_args;
 mod operator;
 #[cfg(feature = "settlement-read")]
 mod settlement_cli;
@@ -50,24 +53,33 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 enum Command {
     /// Listen indefinitely, serving shard requests and printing events.
-    Listen,
+    Listen {
+        #[command(flatten)]
+        omninet: OmniNetControlArgs,
+    },
 
     /// Ingest a GGUF model: parse, chunk, store shards, announce on mesh.
     Shard {
         /// Path to the GGUF model file.
         path: PathBuf,
+        #[command(flatten)]
+        omninet: OmniNetControlArgs,
     },
 
     /// Fetch a shard by CID from a LAN peer.
     Fetch {
         /// CIDv1 string of the shard to fetch.
         cid: String,
+        #[command(flatten)]
+        omninet: OmniNetControlArgs,
     },
 
     /// Discover a peer on the LAN, publish a test message, then exit.
     Send {
         /// UTF-8 message to broadcast on `omni/test/v1`.
         message: String,
+        #[command(flatten)]
+        omninet: OmniNetControlArgs,
     },
 
     /// SUM Chain operator surface: activation watch, smoke, lifecycle loop.
@@ -93,18 +105,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Listen           => run_listen().await,
-        Command::Shard { path }   => run_shard(path).await,
-        Command::Fetch { cid }    => run_fetch(cid).await,
-        Command::Send { message } => run_send(message).await,
-        Command::Operator(args)   => operator::dispatch(args).await,
+        Command::Listen { omninet }        => run_listen(omninet).await,
+        Command::Shard { path, omninet }   => run_shard(path, omninet).await,
+        Command::Fetch { cid, omninet }    => run_fetch(cid, omninet).await,
+        Command::Send { message, omninet } => run_send(message, omninet).await,
+        Command::Operator(args)            => operator::dispatch(args).await,
     }
 }
 
 // ── Listen mode ───────────────────────────────────────────────────────────────
 
-async fn run_listen() -> Result<()> {
-    let mut net   = OmniNet::new(NetConfig::default()).await?;
+async fn run_listen(omninet: OmniNetControlArgs) -> Result<()> {
+    let mut net   = OmniNet::new(omninet.net_config()).await?;
     let store = OmniStore::new(StoreConfig::default())?;
 
     info!("OmniNode listening — serving shards, press Ctrl-C to stop");
@@ -147,8 +159,8 @@ async fn run_listen() -> Result<()> {
 
 // ── Shard mode ───────────────────────────────────────────────────────────────
 
-async fn run_shard(path: PathBuf) -> Result<()> {
-    let mut net   = OmniNet::new(NetConfig::default()).await?;
+async fn run_shard(path: PathBuf, omninet: OmniNetControlArgs) -> Result<()> {
+    let mut net   = OmniNet::new(omninet.net_config()).await?;
     let store = OmniStore::new(StoreConfig::default())?;
 
     info!(path = %path.display(), "ingesting model");
@@ -213,8 +225,8 @@ async fn serve_loop(net: &mut OmniNet, store: &OmniStore) -> Result<()> {
 
 // ── Fetch mode ───────────────────────────────────────────────────────────────
 
-async fn run_fetch(cid: String) -> Result<()> {
-    let mut net   = OmniNet::new(NetConfig::default()).await?;
+async fn run_fetch(cid: String, omninet: OmniNetControlArgs) -> Result<()> {
+    let mut net   = OmniNet::new(omninet.net_config()).await?;
     let mut store = OmniStore::new(StoreConfig::default())?;
 
     if store.has_shard(&cid) {
@@ -301,8 +313,8 @@ async fn run_fetch(cid: String) -> Result<()> {
 
 // ── Send mode ─────────────────────────────────────────────────────────────────
 
-async fn run_send(message: String) -> Result<()> {
-    let mut node = OmniNet::new(NetConfig::default()).await?;
+async fn run_send(message: String, omninet: OmniNetControlArgs) -> Result<()> {
+    let mut node = OmniNet::new(omninet.net_config()).await?;
 
     const TIMEOUT: Duration = Duration::from_secs(30);
     info!("waiting for a peer on the LAN (timeout: {TIMEOUT:?})");
@@ -373,5 +385,40 @@ fn print_event(event: &OmniNetEvent) {
             info!("HOLE_PUNCH   peer={peer_id}"),
         OmniNetEvent::HolePunchFailed { peer_id, error } =>
             info!("PUNCH_FAIL   peer={peer_id}  error={error}"),
+    }
+}
+
+/// Issue #158: the top-level commands that open OmniNet take `--mdns` and
+/// `--outbound-allow` too.
+#[cfg(test)]
+mod omninet_flag_tests {
+    use super::*;
+    use crate::omninet_args::MdnsMode;
+
+    fn omninet_of(argv: &[&str]) -> OmniNetControlArgs {
+        match Cli::try_parse_from(argv).expect("parses").command {
+            Command::Listen { omninet }
+            | Command::Shard { omninet, .. }
+            | Command::Fetch { omninet, .. }
+            | Command::Send { omninet, .. } => omninet,
+            Command::Operator(_) => panic!("not an OmniNet command"),
+        }
+    }
+
+    #[test]
+    fn listen_shard_fetch_and_send_take_the_flags() {
+        for argv in [
+            vec!["omni-node", "listen"],
+            vec!["omni-node", "shard", "model.gguf"],
+            vec!["omni-node", "fetch", "bafy"],
+            vec!["omni-node", "send", "hello"],
+        ] {
+            assert_eq!(omninet_of(&argv), OmniNetControlArgs::default(), "{argv:?}");
+            let mut with = argv.clone();
+            with.extend(["--mdns", "off", "--outbound-allow", "127.0.0.1"]);
+            let got = omninet_of(&with);
+            assert_eq!(got.mdns, MdnsMode::Off, "{with:?}");
+            assert_eq!(got.outbound_allow, vec!["127.0.0.1"], "{with:?}");
+        }
     }
 }

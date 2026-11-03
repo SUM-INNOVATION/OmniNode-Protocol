@@ -8,9 +8,11 @@ pub mod discovery;
 pub mod drain;
 pub mod events;
 mod framing;
+pub mod gate;
 pub mod gossip;
 pub mod identity;    // Stage 12.6 — persistent libp2p mesh identity
 pub mod nat;
+pub mod policy;
 pub mod request;
 pub mod router;
 pub mod swarm;
