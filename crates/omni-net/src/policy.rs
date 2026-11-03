@@ -10,18 +10,35 @@
 //! # Where it is enforced
 //!
 //! With no allow-list (the default) nothing is checked and the node behaves as
-//! before. With one, [`crate::gate::OutboundGate`] wraps the whole transport
-//! stack (relay client and QUIC) and judges every address handed to
-//! `Transport::dial`, after the swarm has merged the addresses every behaviour
-//! contributed. So no dial reaches a socket unless it passes, whichever part
-//! of the node asked for it: an explicit `--peer` dial, mDNS, Identify,
-//! Kademlia, request-response, gossipsub, AutoNAT, DCUtR hole-punching or a
-//! relay-client dial to a relay. A refused dial fails with `PermissionDenied`
-//! before any packet is sent.
+//! before. With one:
 //!
-//! Not covered here (issue #158, items 2 and 3): refused addresses are not yet
-//! kept out of the peer stores (Kademlia, gossipsub explicit peers), inbound
-//! connections are not judged, and refusals are not counted.
+//! 1. **The transport.** [`crate::gate::OutboundGate`] wraps the whole
+//!    transport stack (relay client and QUIC) and judges every address handed
+//!    to `Transport::dial`, after the swarm has merged the addresses every
+//!    behaviour contributed. So no dial reaches a socket unless it passes,
+//!    whichever part of the node asked for it: an explicit `--peer` dial,
+//!    mDNS, Identify, Kademlia, request-response, gossipsub, AutoNAT, DCUtR
+//!    hole-punching or a relay-client dial to a relay. A refused dial fails
+//!    with `PermissionDenied` before any packet is sent. This is the decisive
+//!    control.
+//! 2. **The peer stores.** A refused address is dropped where it is learned,
+//!    so it is never stored and never offered for a dial again: `--peer`
+//!    bootstrap entries, mDNS discoveries (a peer with no allowed address is
+//!    not made a gossipsub explicit peer or reported as discovered), Identify
+//!    listen addresses (not fed to Kademlia) and Kademlia routing updates
+//!    (removed from the routing table). The address-supplying behaviours
+//!    (mDNS, Identify, Kademlia) are wrapped in [`crate::gate::Gated`], which
+//!    filters the addresses they contribute to a dial and withholds refused
+//!    peer addresses they publish to other behaviours.
+//! 3. **Inbound connections.** [`crate::gate::PolicyBehaviour`] keeps a direct
+//!    inbound connection only from an allowed address, and a relayed one only
+//!    through an allowed relay. Without it an allowed peer could open the
+//!    second route itself by dialling in from an address that is not allowed.
+//!
+//! Every refusal is counted by source ([`PolicyRefusals`]) and logged: at
+//! `warn` the first time a source refuses an address, at `debug` after that.
+//! The effective policy is logged once when the swarm is built
+//! ([`NetPolicy::describe`]).
 //!
 //! # Matching rules
 //!
@@ -48,12 +65,17 @@
 //! not start with a host (`/unix`, `/memory`, ...) is never allowed while an
 //! allow-list is set.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
+use omni_types::config::NetConfig;
+use tracing::{debug, info, warn};
 
 /// The CLI flag that carries the allow-list, named in errors and refusals so
 /// an operator can find the knob that produced them.
@@ -282,10 +304,21 @@ fn same_component(entry: &Protocol<'_>, addr: &Protocol<'_>) -> bool {
     }
 }
 
+/// How a peer pin on an entry is treated when the remote peer is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerPin {
+    /// The address (or the dial) must name the pinned peer.
+    Enforce,
+    /// The peer is not known yet (an inbound connection before its
+    /// handshake). A pinned entry may still match once it is, so only what no
+    /// entry could ever allow is refused now.
+    Defer,
+}
+
 impl AllowEntry {
     /// Does this entry allow `transport` (an address without its `/p2p`
     /// suffix) for `peer`, the peer the address names, if any?
-    fn matches(&self, transport: &[Protocol<'_>], peer: Option<PeerId>) -> bool {
+    fn matches(&self, transport: &[Protocol<'_>], peer: Option<PeerId>, pin: PeerPin) -> bool {
         match self {
             AllowEntry::Network { addr, prefix } => match transport.first() {
                 Some(Protocol::Ip4(ip)) => network_contains(*addr, *prefix, IpAddr::V4(*ip)),
@@ -301,9 +334,10 @@ impl AllowEntry {
                         .iter()
                         .zip(transport)
                         .all(|(e, a)| same_component(e, a));
-                let peer_ok = match wanted {
-                    None => true,
-                    Some(w) => peer == Some(*w),
+                let peer_ok = match (wanted, peer) {
+                    (None, _) => true,
+                    (Some(w), Some(p)) => *w == p,
+                    (Some(_), None) => pin == PeerPin::Defer,
                 };
                 prefix_ok && peer_ok
             }
@@ -351,14 +385,27 @@ impl OutboundAllowList {
     /// (the swarm appends it before the transport sees a dial to a known
     /// peer).
     pub fn allows(&self, addr: &Multiaddr) -> bool {
+        self.decide(addr, None, PeerPin::Enforce)
+    }
+
+    /// Like [`Self::allows`], for an address learned for `peer` (which the
+    /// address itself may not name).
+    pub fn allows_for(&self, addr: &Multiaddr, peer: Option<PeerId>) -> bool {
+        self.decide(addr, peer, PeerPin::Enforce)
+    }
+
+    fn decide(&self, addr: &Multiaddr, peer_hint: Option<PeerId>, pin: PeerPin) -> bool {
         let comps: Vec<Protocol<'_>> = addr.iter().collect();
-        let segment = match comps.iter().position(|p| matches!(p, Protocol::P2pCircuit)) {
-            Some(i) => &comps[..i],
-            None => &comps[..],
+        let (segment, relayed) = match comps.iter().position(|p| matches!(p, Protocol::P2pCircuit))
+        {
+            Some(i) => (&comps[..i], true),
+            None => (&comps[..], false),
         };
         let (transport, peer) = match segment.split_last() {
             Some((Protocol::P2p(p), rest)) => (rest, Some(*p)),
-            _ => (segment, None),
+            // The hint names the destination; a relayed address goes to the
+            // relay, so the hint says nothing about it.
+            _ => (segment, if relayed { None } else { peer_hint }),
         };
         let Some(host) = transport.first() else {
             return false;
@@ -366,7 +413,7 @@ impl OutboundAllowList {
         if !is_host(host) || transport.iter().any(|p| matches!(p, Protocol::P2p(_))) {
             return false;
         }
-        self.entries.iter().any(|e| e.matches(transport, peer))
+        self.entries.iter().any(|e| e.matches(transport, peer, pin))
     }
 }
 
@@ -380,6 +427,389 @@ impl fmt::Display for OutboundAllowList {
         }
         Ok(())
     }
+}
+
+// ── Sources and counters ─────────────────────────────────────────────────────
+
+/// Where a refused address or connection came from. A fixed set, so the
+/// counters stay bounded whatever remote peers send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicySource {
+    /// A `--peer` (bootstrap) entry.
+    Bootstrap,
+    /// mDNS discovery.
+    Mdns,
+    /// Listen addresses a peer advertised through Identify.
+    Identify,
+    /// The Kademlia routing table or its query results.
+    Kad,
+    /// A connection a remote peer opened to this node.
+    Inbound,
+    /// A dial refused at the transport: an address no earlier filter judged,
+    /// such as an explicit dial, an AutoNAT dial-back, a DCUtR hole-punch or
+    /// a relay-client dial.
+    Dial,
+}
+
+impl PolicySource {
+    /// Every source, in counter order.
+    pub const ALL: [PolicySource; 6] = [
+        PolicySource::Bootstrap,
+        PolicySource::Mdns,
+        PolicySource::Identify,
+        PolicySource::Kad,
+        PolicySource::Inbound,
+        PolicySource::Dial,
+    ];
+
+    /// Stable lower-case label used in logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            PolicySource::Bootstrap => "bootstrap",
+            PolicySource::Mdns => "mdns",
+            PolicySource::Identify => "identify",
+            PolicySource::Kad => "kad",
+            PolicySource::Inbound => "inbound",
+            PolicySource::Dial => "dial",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// At which point a refusal happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefusalStage {
+    /// An address was learned and dropped before it was stored or offered
+    /// for any dial.
+    Admission,
+    /// An address was refused as a dial target.
+    Dial,
+    /// A connection opened by a remote peer was refused.
+    Inbound,
+}
+
+impl RefusalStage {
+    /// Stable lower-case label used in logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            RefusalStage::Admission => "admission",
+            RefusalStage::Dial => "dial",
+            RefusalStage::Inbound => "inbound",
+        }
+    }
+}
+
+/// Refusal counts by source. Counts refusals, not distinct addresses: an
+/// address offered again is counted again.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyRefusals {
+    pub bootstrap: u64,
+    pub mdns: u64,
+    pub identify: u64,
+    pub kad: u64,
+    pub inbound: u64,
+    pub dial: u64,
+}
+
+impl PolicyRefusals {
+    /// Sum over every source.
+    pub fn total(&self) -> u64 {
+        PolicySource::ALL.iter().map(|s| self.get(*s)).sum()
+    }
+
+    /// The count for one source.
+    pub fn get(&self, source: PolicySource) -> u64 {
+        match source {
+            PolicySource::Bootstrap => self.bootstrap,
+            PolicySource::Mdns => self.mdns,
+            PolicySource::Identify => self.identify,
+            PolicySource::Kad => self.kad,
+            PolicySource::Inbound => self.inbound,
+            PolicySource::Dial => self.dial,
+        }
+    }
+}
+
+/// How many distinct `(source, address)` refusals are logged at `warn` before
+/// the rest are logged at `debug` only. Counters are never capped.
+const WARN_DEDUP_CAP: usize = 1024;
+
+// ── The policy a swarm runs under ────────────────────────────────────────────
+
+/// The network policy one OmniNet swarm runs under, shared by the transport
+/// gate, the policy behaviours and the swarm's event handling.
+#[derive(Debug)]
+pub struct NetPolicy {
+    mdns: bool,
+    allow: Option<OutboundAllowList>,
+    refusals: [AtomicU64; PolicySource::ALL.len()],
+    warned: Mutex<HashSet<(PolicySource, Multiaddr)>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl NetPolicy {
+    /// A policy from its parts.
+    pub fn new(mdns: bool, allow: Option<OutboundAllowList>) -> Self {
+        Self {
+            mdns,
+            allow,
+            refusals: Default::default(),
+            warned: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// The default: mDNS on, no restriction.
+    pub fn unrestricted() -> Self {
+        Self::new(true, None)
+    }
+
+    /// The policy in a [`NetConfig`]. Fails on a malformed allow-list entry.
+    pub fn from_config(config: &NetConfig) -> Result<Self, PolicyParseError> {
+        Ok(Self::new(
+            config.mdns,
+            OutboundAllowList::parse(&config.outbound_allow)?,
+        ))
+    }
+
+    /// Whether mDNS discovery runs.
+    pub fn mdns_enabled(&self) -> bool {
+        self.mdns
+    }
+
+    /// The allow-list, if one is set.
+    pub fn allow_list(&self) -> Option<&OutboundAllowList> {
+        self.allow.as_ref()
+    }
+
+    /// Whether an allow-list is in force.
+    pub fn is_restricted(&self) -> bool {
+        self.allow.is_some()
+    }
+
+    /// One-line description of the effective policy. It holds the configured
+    /// addresses and nothing else.
+    pub fn describe(&self) -> String {
+        let mdns = if self.mdns { "on" } else { "off" };
+        match &self.allow {
+            None => format!("mdns={mdns} outbound_allow=unrestricted"),
+            Some(list) => {
+                let entries: Vec<String> = list.entries().iter().map(ToString::to_string).collect();
+                format!(
+                    "mdns={mdns} outbound_allow=[{}] (application-level routing control, \
+                     not an OS security boundary)",
+                    entries.join(", ")
+                )
+            }
+        }
+    }
+
+    /// Log the effective policy. Called once, when the swarm is built.
+    pub(crate) fn log_effective(&self) {
+        info!("network policy: {}", self.describe());
+    }
+
+    /// Snapshot of the refusal counters.
+    pub fn refusals(&self) -> PolicyRefusals {
+        let get = |s: PolicySource| self.refusals[s.index()].load(Ordering::Relaxed);
+        PolicyRefusals {
+            bootstrap: get(PolicySource::Bootstrap),
+            mdns: get(PolicySource::Mdns),
+            identify: get(PolicySource::Identify),
+            kad: get(PolicySource::Kad),
+            inbound: get(PolicySource::Inbound),
+            dial: get(PolicySource::Dial),
+        }
+    }
+
+    fn record(&self, source: PolicySource, stage: RefusalStage, addr: &Multiaddr) {
+        self.refusals[source.index()].fetch_add(1, Ordering::Relaxed);
+        let first = {
+            let mut warned = lock(&self.warned);
+            warned.len() < WARN_DEDUP_CAP && warned.insert((source, addr.clone()))
+        };
+        if first {
+            warn!(
+                source = source.label(),
+                stage = stage.label(),
+                %addr,
+                "network policy: address not in {OUTBOUND_ALLOW_FLAG}, refused"
+            );
+        } else {
+            debug!(
+                source = source.label(),
+                stage = stage.label(),
+                %addr,
+                "network policy: address not in {OUTBOUND_ALLOW_FLAG}, refused (repeat)"
+            );
+        }
+    }
+
+    fn judge(
+        &self,
+        source: PolicySource,
+        stage: RefusalStage,
+        addr: &Multiaddr,
+        peer: Option<PeerId>,
+    ) -> bool {
+        match &self.allow {
+            None => true,
+            Some(list) if list.allows_for(addr, peer) => true,
+            Some(_) => {
+                self.record(source, stage, addr);
+                false
+            }
+        }
+    }
+
+    /// Admit an address learned from `source` for `peer` into a peer store
+    /// or event. A refused one is counted and logged; the caller drops it.
+    pub fn admit(&self, source: PolicySource, addr: &Multiaddr, peer: Option<PeerId>) -> bool {
+        self.judge(source, RefusalStage::Admission, addr, peer)
+    }
+
+    /// Admit an address `source` offers as a dial target.
+    pub(crate) fn admit_dial(
+        &self,
+        source: PolicySource,
+        addr: &Multiaddr,
+        peer: Option<PeerId>,
+    ) -> bool {
+        self.judge(source, RefusalStage::Dial, addr, peer)
+    }
+
+    /// Like [`Self::admit`] but uncounted: for echoes of addresses already
+    /// judged where they were first learned.
+    pub(crate) fn allows_quietly(&self, addr: &Multiaddr, peer: Option<PeerId>) -> bool {
+        self.allow
+            .as_ref()
+            .is_none_or(|list| list.allows_for(addr, peer))
+    }
+
+    /// The transport gate's check, counted under [`PolicySource::Dial`].
+    pub(crate) fn check_transport_dial(&self, addr: &Multiaddr) -> bool {
+        self.judge(PolicySource::Dial, RefusalStage::Dial, addr, None)
+    }
+
+    /// Judge a connection a remote peer opened. A relayed connection is
+    /// judged by the relay part of `local_addr` (the circuit it arrived on), a
+    /// direct one by `remote_addr`. `peer` is `None` before the handshake,
+    /// when a peer-pinned entry is given the benefit of the doubt; it is
+    /// judged again once the peer is known.
+    pub(crate) fn inbound_allowed(
+        &self,
+        local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
+        peer: Option<PeerId>,
+    ) -> bool {
+        let Some(list) = &self.allow else {
+            return true;
+        };
+        let relayed = local_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+        let (judged, ok) = if relayed {
+            (local_addr, list.decide(local_addr, None, PeerPin::Enforce))
+        } else {
+            let pin = if peer.is_some() {
+                PeerPin::Enforce
+            } else {
+                PeerPin::Defer
+            };
+            (remote_addr, list.decide(remote_addr, peer, pin))
+        };
+        if !ok {
+            self.record(PolicySource::Inbound, RefusalStage::Inbound, judged);
+        }
+        ok
+    }
+}
+
+/// Run the test `name` (its full path in this test binary) alone, in a child
+/// process, and assert that it passed. Returns `true` in that child, where
+/// the caller runs its body, and `false` in the parent, which should return.
+///
+/// For tests that capture logs: `tracing` keeps process-wide state (callsite
+/// interest, the max-level hint) that other tests' threads update while they
+/// run, which can drop events from a scoped subscriber. Alone in a process,
+/// nothing else touches it.
+#[cfg(test)]
+pub(crate) fn isolated(name: &str) -> bool {
+    const MARK: &str = "OMNI_NET_ISOLATED_TEST";
+    if std::env::var(MARK).as_deref() == Ok(name) {
+        return true;
+    }
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(MARK, name)
+        .output()
+        .expect("spawn the isolated test");
+    assert!(
+        out.status.success(),
+        "isolated test {name} failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 passed"),
+        "isolated test {name} did not run:\n{stdout}"
+    );
+    false
+}
+
+/// Run `f` with a `tracing` subscriber that writes, without colour, into a
+/// buffer; returns `f`'s result and everything logged at `debug` or above.
+/// Use it inside [`isolated`].
+#[cfg(test)]
+pub(crate) fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+        fn make_writer(&'a self) -> Buffer {
+            self.clone()
+        }
+    }
+
+    // `tracing` keeps global state (callsite interest, the max-level hint)
+    // that every registered subscriber feeds. Two tests registering and
+    // dropping scoped subscribers at once can leave a callsite disabled for
+    // the other one, so log captures run one at a time.
+    static CAPTURE: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = lock(&CAPTURE);
+
+    let buffer = Buffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, || {
+        // Another test thread may have cached a callsite's interest while
+        // this subscriber was being registered; recompute it now that the
+        // subscriber is in place, so no event of `f` is filtered out.
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
+    let logs = String::from_utf8_lossy(&lock(&buffer.0)).into_owned();
+    (out, logs)
 }
 
 #[cfg(test)]
@@ -524,5 +954,106 @@ mod tests {
         );
         let again = list(&l.to_string().split(',').collect::<Vec<_>>());
         assert_eq!(again, l);
+    }
+
+    // ── The runtime policy (items 2 and 3) ──────────────────────────────
+
+    fn restricted(items: &[&str]) -> NetPolicy {
+        NetPolicy::new(false, Some(list(items)))
+    }
+
+    #[test]
+    fn the_effective_policy_is_described_with_the_boundary_caveat() {
+        assert_eq!(
+            NetPolicy::unrestricted().describe(),
+            "mdns=on outbound_allow=unrestricted"
+        );
+        assert_eq!(
+            restricted(&["127.0.0.1", "/ip4/192.0.2.7/udp/4001/quic-v1"]).describe(),
+            "mdns=off outbound_allow=[127.0.0.1/32, /ip4/192.0.2.7/udp/4001/quic-v1] \
+             (application-level routing control, not an OS security boundary)"
+        );
+    }
+
+    /// Every source counts its own refusals; the first refusal of an address
+    /// by a source is logged at `warn`, repeats at `debug`.
+    #[test]
+    fn refusals_are_counted_and_logged_by_source() {
+        if !isolated("policy::tests::refusals_are_counted_and_logged_by_source") {
+            return;
+        }
+        let policy = restricted(&["127.0.0.1"]);
+        let refused = ma("/ip4/192.0.2.1/udp/4001/quic-v1");
+        let allowed = ma("/ip4/127.0.0.1/udp/4001/quic-v1");
+        let ((), logs) = capture_logs(|| {
+            for (i, source) in PolicySource::ALL.iter().enumerate() {
+                for _ in 0..=i {
+                    assert!(!policy.admit(*source, &refused, None));
+                }
+                assert!(
+                    policy.admit(*source, &allowed, None),
+                    "allowed is never counted"
+                );
+            }
+        });
+        let r = policy.refusals();
+        assert_eq!(
+            (r.bootstrap, r.mdns, r.identify, r.kad, r.inbound, r.dial),
+            (1, 2, 3, 4, 5, 6)
+        );
+        assert_eq!(r.total(), 21);
+        for source in PolicySource::ALL {
+            let label = format!("source=\"{}\"", source.label());
+            let warned = logs
+                .lines()
+                .filter(|l| l.contains(" WARN ") && l.contains(&label))
+                .count();
+            assert_eq!(warned, 1, "{label} warns once:\n{logs}");
+        }
+        assert!(logs.contains("network policy: address not in --outbound-allow, refused"));
+        assert!(
+            logs.contains("(repeat)"),
+            "repeats are logged at debug:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn an_unrestricted_policy_refuses_and_counts_nothing() {
+        let policy = NetPolicy::unrestricted();
+        let addr = ma("/ip4/192.0.2.1/udp/4001/quic-v1");
+        for source in PolicySource::ALL {
+            assert!(policy.admit(source, &addr, None));
+        }
+        assert!(policy.inbound_allowed(&ma("/ip4/0.0.0.0/udp/1/quic-v1"), &addr, None));
+        assert_eq!(policy.refusals(), PolicyRefusals::default());
+    }
+
+    /// Inbound: a direct connection is judged by the remote address, a
+    /// relayed one by the relay part of the local address; a peer pin is
+    /// deferred until the peer is known.
+    #[test]
+    fn inbound_connections_are_judged_by_their_route() {
+        let (pinned, other, relay) = (peer(), peer(), peer());
+        let policy = restricted(&[
+            "10.0.0.0/8",
+            &format!("/ip4/127.0.0.1/p2p/{pinned}"),
+            "198.51.100.1",
+        ]);
+        let local = ma("/ip4/0.0.0.0/udp/4001/quic-v1");
+        assert!(policy.inbound_allowed(&local, &ma("/ip4/10.1.2.3/udp/9/quic-v1"), None));
+        assert!(!policy.inbound_allowed(&local, &ma("/ip4/192.0.2.1/udp/9/quic-v1"), None));
+        let loopback = ma("/ip4/127.0.0.1/udp/9/quic-v1");
+        assert!(policy.inbound_allowed(&local, &loopback, None), "deferred");
+        assert!(policy.inbound_allowed(&local, &loopback, Some(pinned)));
+        assert!(!policy.inbound_allowed(&local, &loopback, Some(other)));
+        let circuit = |r: &str| {
+            ma(&format!(
+                "/ip4/{r}/udp/4001/quic-v1/p2p/{relay}/p2p-circuit"
+            ))
+        };
+        let source = ma(&format!("/p2p/{other}"));
+        assert!(policy.inbound_allowed(&circuit("198.51.100.1"), &source, Some(other)));
+        assert!(!policy.inbound_allowed(&circuit("203.0.113.1"), &source, Some(other)));
+        assert_eq!(policy.refusals().inbound, 3);
     }
 }

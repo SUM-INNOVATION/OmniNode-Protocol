@@ -54,15 +54,18 @@ pub struct NetConfig {
     /// When set, every address the node dials must match an entry, whichever
     /// part of the node asked for the dial (`--peer`, mDNS, Identify,
     /// Kademlia, AutoNAT, relay, DCUtR); anything else is refused before a
-    /// packet is sent. Each entry is an IP address or CIDR (`127.0.0.1`,
-    /// `10.0.0.0/8`, `::1`) or a multiaddr prefix
-    /// (`/ip4/127.0.0.1/udp/4001/quic-v1`, optionally ending in
-    /// `/p2p/<peer-id>`). The CLI sets it with `--outbound-allow`.
+    /// packet is sent. Refused addresses are kept out of the peer stores (so
+    /// they are not redialled), and an inbound connection is kept only from an
+    /// allowed address (a relayed one only through an allowed relay). Each
+    /// entry is an IP address or CIDR (`127.0.0.1`, `10.0.0.0/8`, `::1`) or a
+    /// multiaddr prefix (`/ip4/127.0.0.1/udp/4001/quic-v1`, optionally ending
+    /// in `/p2p/<peer-id>`). The CLI sets it with `--outbound-allow`.
     ///
     /// Parsed and enforced by `omni-net` (`omni_net::policy`), which refuses
-    /// a malformed entry when the swarm is built. An application-level routing
-    /// control for cooperative networks, not an operating-system security
-    /// boundary: a modified client can ignore it.
+    /// a malformed entry when the swarm is built, logs the effective policy
+    /// and counts refusals by source. An application-level routing control for
+    /// cooperative networks, not an operating-system security boundary: a
+    /// modified client can ignore it.
     pub outbound_allow: Vec<String>,
 
     /// Stage 12.6 — libp2p mesh identity policy.

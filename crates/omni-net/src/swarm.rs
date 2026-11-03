@@ -1,16 +1,16 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use std::sync::Arc;
-
 use libp2p::{
+    Multiaddr, PeerId,
     core::{
-        muxing::StreamMuxerBox,
-        transport::{timeout::TransportTimeout, Boxed},
-        upgrade::Version,
         Transport,
+        muxing::StreamMuxerBox,
+        transport::{Boxed, timeout::TransportTimeout},
+        upgrade::Version,
     },
     dcutr, gossipsub, identify,
     identity::Keypair,
@@ -19,7 +19,7 @@ use libp2p::{
         self, InboundRequestId, OutboundRequestId, ProtocolSupport, ResponseChannel,
     },
     swarm::{SwarmEvent, behaviour::toggle::Toggle},
-    yamux, Multiaddr, PeerId,
+    yamux,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -27,17 +27,17 @@ use tracing::{debug, info, warn};
 use omni_types::config::NetConfig;
 
 use crate::{
-    gate::OutboundGate,
-    policy::OutboundAllowList,
     behaviour::{OmniNodeBehaviour, OmniNodeBehaviourEvent},
-    codec::{ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL},
-    tensor_codec::{TensorRequest, TensorResponse, TENSOR_XFER_PROTOCOL},
+    codec::{SHARD_XFER_PROTOCOL, ShardRequest, ShardResponse},
     discovery,
     drain::{self, DrainOutcome, DrainReport, DrainStep, RecentPublish, RecentPublishes},
     events::OmniNetEvent,
+    gate::{Gated, OutboundGate, PolicyBehaviour},
     gossip::GossipManager,
     nat::{self, NatStatus},
+    policy::{NetPolicy, PolicySource},
     request::{Completion, PendingRequests, RequestError},
+    tensor_codec::{TENSOR_XFER_PROTOCOL, TensorRequest, TensorResponse},
 };
 
 // ── SwarmCommand ──────────────────────────────────────────────────────────────
@@ -182,6 +182,10 @@ pub struct OmniSwarm {
     /// Gossip this node published recently, which a shutdown drains before
     /// the swarm is dropped. See [`crate::drain`].
     recent_publishes: RecentPublishes,
+
+    /// Issue #158: mDNS switch, outbound allow-list and refusal counters,
+    /// shared with the transport gate and the policy behaviours.
+    policy: Arc<NetPolicy>,
 }
 
 impl OmniSwarm {
@@ -207,9 +211,11 @@ impl OmniSwarm {
         let mdns_enabled = config.mdns;
         // Issue #158: a malformed entry fails the build, so a node never runs
         // with a policy other than the one its operator wrote.
-        let outbound_allow = OutboundAllowList::parse(&config.outbound_allow)
-            .map_err(|e| anyhow::anyhow!("NetConfig.outbound_allow: {e}"))?
-            .map(Arc::new);
+        let policy = Arc::new(
+            NetPolicy::from_config(config)
+                .map_err(|e| anyhow::anyhow!("NetConfig.outbound_allow: {e}"))?,
+        );
+        policy.log_effective();
 
         // Stage 12.6 — branch on the operator's identity policy.
         // `Ephemeral` reproduces pre-12.6 behavior (fresh Ed25519
@@ -233,7 +239,7 @@ impl OmniSwarm {
         // gate can sit outside all of it. Relay circuits run over TCP-like
         // streams, so they need Noise + Yamux even though the primary
         // transport is QUIC (which has encryption and multiplexing built in).
-        let (transport, relay_client) = build_transport(&keypair, outbound_allow.clone())?;
+        let (transport, relay_client) = build_transport(&keypair, policy.clone())?;
 
         // ── Existing protocols ────────────────────────────────────────────
         // Disabled mDNS is not constructed at all: no socket, no
@@ -272,12 +278,19 @@ impl OmniSwarm {
         let dcutr = dcutr::Behaviour::new(local_peer_id);
 
         let behaviour = OmniNodeBehaviour {
-            mdns,
+            // Built only under an allow-list, so a default node composes
+            // exactly the behaviours it did before.
+            policy: Toggle::from(
+                policy
+                    .is_restricted()
+                    .then(|| PolicyBehaviour::new(policy.clone())),
+            ),
+            mdns: Gated::new(mdns, PolicySource::Mdns, policy.clone()),
             gossipsub,
-            identify,
+            identify: Gated::new(identify, PolicySource::Identify, policy.clone()),
             shard_xfer,
             tensor_xfer,
-            kademlia,
+            kademlia: Gated::new(kademlia, PolicySource::Kad, policy.clone()),
             autonat,
             relay,
             relay_client,
@@ -305,7 +318,7 @@ impl OmniSwarm {
 
         // ── Seed DHT from bootstrap peers ────────────────────────────────
         if !config.bootstrap_peers.is_empty() {
-            discovery::bootstrap_dht(&mut swarm, &config.bootstrap_peers)?;
+            discovery::bootstrap_dht(&mut swarm, &config.bootstrap_peers, &policy)?;
         }
 
         Ok(Self {
@@ -323,7 +336,14 @@ impl OmniSwarm {
             active_relay_reservation: None,
             listen_waiters: Vec::new(),
             recent_publishes: RecentPublishes::new(),
+            policy,
         })
+    }
+
+    /// The network policy this swarm runs under: the effective mDNS switch
+    /// and allow-list, and the refusal counters (issue #158).
+    pub fn policy(&self) -> Arc<NetPolicy> {
+        self.policy.clone()
     }
 
     /// Subscribe the node to all OmniNode Gossipsub topics.
@@ -676,6 +696,7 @@ impl OmniSwarm {
                 discovery::handle_mdns_event(
                     e,
                     &mut self.inner.behaviour_mut().gossipsub,
+                    &self.policy,
                     event_tx,
                 );
             }
@@ -716,8 +737,16 @@ impl OmniSwarm {
             SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Identify(
                 identify::Event::Received { peer_id, info, .. }
             )) => {
-                // Feed every listen address into Kademlia.
+                // Feed every listen address into Kademlia, except those the
+                // outbound allow-list refuses (issue #158): a refused address
+                // is never stored, so it is never redialled.
                 for addr in &info.listen_addrs {
+                    if !self
+                        .policy
+                        .admit(PolicySource::Identify, addr, Some(peer_id))
+                    {
+                        continue;
+                    }
                     self.inner
                         .behaviour_mut()
                         .kademlia
@@ -757,7 +786,8 @@ impl OmniSwarm {
             SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Kademlia(e)) => {
                 discovery::handle_kademlia_event(
                     e,
-                    &mut self.inner.behaviour_mut().gossipsub,
+                    self.inner.behaviour_mut(),
+                    &self.policy,
                     event_tx,
                 );
             }
@@ -1068,7 +1098,7 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 /// through, so the default node is unchanged.
 fn build_transport(
     keypair: &Keypair,
-    outbound_allow: Option<Arc<OutboundAllowList>>,
+    policy: Arc<NetPolicy>,
 ) -> Result<(Boxed<(PeerId, StreamMuxerBox)>, relay::client::Behaviour)> {
     let quic = quic::tokio::Transport::new(quic::Config::new(keypair))
         .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
@@ -1085,10 +1115,7 @@ fn build_transport(
         .map(|either, _| either.into_inner());
     let stack = TransportTimeout::new(stack, CONNECTION_TIMEOUT).boxed();
 
-    Ok((
-        OutboundGate::new(stack, outbound_allow).boxed(),
-        relay_client,
-    ))
+    Ok((OutboundGate::new(stack, policy).boxed(), relay_client))
 }
 
 // ── Never-await invariant ─────────────────────────────────────────────────────
@@ -1151,13 +1178,12 @@ mod outbound_allow_gate {
             loop {
                 if let SwarmEvent::NewListenAddr { address, .. } =
                     target.inner.select_next_some().await
-                {
-                    if let Some(port) = address.iter().find_map(|p| match p {
+                    && let Some(port) = address.iter().find_map(|p| match p {
                         Protocol::Udp(port) => Some(port),
                         _ => None,
-                    }) {
-                        return port;
-                    }
+                    })
+                {
+                    return port;
                 }
             }
         })
@@ -1277,11 +1303,291 @@ mod outbound_allow_gate {
         assert!(err.to_string().contains("--outbound-allow"), "{err}");
     }
 
+    // ── Items 2 and 3 ───────────────────────────────────────────────────
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Side {
+        A,
+        B,
+    }
+
+    /// Drive both swarms, handing every event to the real
+    /// `handle_swarm_event` (so Identify and Kademlia handling run), until
+    /// `stop` returns `Some` for an event.
+    async fn drive<T>(
+        a: &mut OmniSwarm,
+        b: &mut OmniSwarm,
+        mut stop: impl FnMut(Side, &SwarmEvent<OmniNodeBehaviourEvent>) -> Option<T>,
+    ) -> T {
+        let (tx, _rx) = mpsc::channel(4096);
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let (side, event) = tokio::select! {
+                    e = a.inner.select_next_some() => (Side::A, e),
+                    e = b.inner.select_next_some() => (Side::B, e),
+                };
+                let out = stop(side, &event);
+                match side {
+                    Side::A => a.handle_swarm_event(event, &tx),
+                    Side::B => b.handle_swarm_event(event, &tx),
+                }
+                if let Some(v) = out {
+                    return v;
+                }
+            }
+        })
+        .await
+        .expect("the awaited swarm event never came")
+    }
+
+    /// The addresses `owner`'s Kademlia routing table holds for `peer`.
+    fn kad_addresses(owner: &mut OmniSwarm, peer: PeerId) -> Vec<Multiaddr> {
+        let mut out = Vec::new();
+        for bucket in owner.inner.behaviour_mut().kademlia.kbuckets() {
+            for entry in bucket.iter() {
+                if *entry.node.key.preimage() == peer {
+                    out.extend(entry.node.value.iter().cloned());
+                }
+            }
+        }
+        out
+    }
+
+    fn on_loopback(addr: &Multiaddr) -> bool {
+        addr.iter()
+            .next()
+            .is_some_and(|p| p == Protocol::Ip4(std::net::Ipv4Addr::LOCALHOST))
+    }
+
+    /// Item 2: a node under an allow-list refuses a connection opened from an
+    /// address outside it, before any behaviour sees it, and counts it.
+    #[tokio::test]
+    async fn an_inbound_connection_from_outside_the_allow_list_is_refused() {
+        let mut target = node(&["192.0.2.1"]);
+        let mut dialer = node(&[]);
+        let addr = loopback_addr(&mut target).await;
+        dialer.inner.dial(addr).expect("the dial starts");
+
+        let outcome = drive(&mut target, &mut dialer, |side, e| match (side, e) {
+            (Side::A, SwarmEvent::IncomingConnectionError { .. }) => Some(true),
+            (Side::A, SwarmEvent::ConnectionEstablished { .. }) => Some(false),
+            _ => None,
+        })
+        .await;
+        assert!(
+            outcome,
+            "the target must refuse, not accept, the connection"
+        );
+        assert!(target.policy().refusals().inbound >= 1);
+        assert_eq!(target.inner.connected_peers().count(), 0);
+
+        // The dialer is left without the connection.
+        drive(&mut target, &mut dialer, |side, e| {
+            matches!(
+                (side, e),
+                (Side::B, SwarmEvent::OutgoingConnectionError { .. })
+                    | (Side::B, SwarmEvent::ConnectionClosed { .. })
+            )
+            .then_some(())
+        })
+        .await;
+        assert_eq!(dialer.inner.connected_peers().count(), 0);
+        assert_eq!(target.inner.connected_peers().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_inbound_connection_from_an_allowed_address_is_kept() {
+        let mut target = node(&["127.0.0.1"]);
+        let mut dialer = node(&[]);
+        let addr = loopback_addr(&mut target).await;
+        let dialer_id = dialer.local_peer_id();
+        dialer.inner.dial(addr).expect("the dial starts");
+        drive(&mut target, &mut dialer, |side, e| match (side, e) {
+            (Side::A, SwarmEvent::ConnectionEstablished { peer_id, .. })
+                if *peer_id == dialer_id =>
+            {
+                Some(())
+            }
+            (Side::A, SwarmEvent::IncomingConnectionError { error, .. }) => {
+                panic!("an allowed address was refused: {error}")
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(target.policy().refusals().inbound, 0);
+    }
+
+    /// Item 2: addresses a peer advertises through Identify that the list
+    /// refuses never enter Kademlia, and a later dial to the peer by id never
+    /// offers them to the transport: nothing refused is redialled.
+    #[tokio::test]
+    async fn refused_addresses_are_never_stored_or_redialled() {
+        let mut dialer = node(&["127.0.0.1"]);
+        let mut target = node(&[]);
+        // An address only Identify can teach the dialer, outside its list.
+        let elsewhere: Multiaddr = "/ip4/198.51.100.7/udp/4001/quic-v1".parse().unwrap();
+        target.inner.add_external_address(elsewhere.clone());
+        let target_id = target.local_peer_id();
+        let addr = loopback_addr(&mut target).await;
+        dialer.inner.dial(addr).expect("the dial starts");
+
+        // Until the dialer has processed the target's Identify.
+        drive(&mut dialer, &mut target, |side, e| {
+            matches!(
+                (side, e),
+                (
+                    Side::A,
+                    SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Identify(
+                        identify::Event::Received { .. }
+                    ))
+                )
+            )
+            .then_some(())
+        })
+        .await;
+        let stored = kad_addresses(&mut dialer, target_id);
+        assert!(!stored.is_empty(), "the allowed address is stored");
+        assert!(
+            stored.iter().all(on_loopback),
+            "only allowed addresses reach Kademlia: {stored:?}"
+        );
+
+        // Reconnect by peer id alone: the addresses come from the peer stores.
+        assert!(dialer.inner.disconnect_peer_id(target_id).is_ok());
+        drive(&mut dialer, &mut target, |side, e| {
+            matches!((side, e), (Side::A, SwarmEvent::ConnectionClosed { .. })).then_some(())
+        })
+        .await;
+        dialer.inner.dial(target_id).expect("the dial starts");
+        drive(&mut dialer, &mut target, |side, e| match (side, e) {
+            (Side::A, SwarmEvent::ConnectionEstablished { peer_id, .. })
+                if *peer_id == target_id =>
+            {
+                Some(())
+            }
+            (Side::A, SwarmEvent::OutgoingConnectionError { error, .. }) => {
+                panic!("the redial failed: {error}")
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(
+            dialer.policy().refusals().dial,
+            0,
+            "no refused address was ever offered to the transport"
+        );
+        let refusals = dialer.policy().refusals();
+        assert!(
+            refusals.identify >= 1,
+            "dropped and counted at Identify: {refusals:?}"
+        );
+    }
+
+    /// Item 2: an address Kademlia learns by itself (here, added straight to
+    /// its routing table) is removed again when the list refuses it; a peer
+    /// left with no address leaves the table.
+    #[tokio::test]
+    async fn kademlia_drops_refused_routing_entries() {
+        let mut a = node(&["127.0.0.1"]);
+        let mut idle = node(&[]);
+        let (mixed, refused_only) = (PeerId::random(), PeerId::random());
+        let allowed: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+        let refused: Multiaddr = "/ip4/192.0.2.9/udp/4001/quic-v1".parse().unwrap();
+        {
+            let kad = &mut a.inner.behaviour_mut().kademlia;
+            kad.add_address(&mixed, allowed.clone());
+            kad.add_address(&mixed, refused.clone());
+            kad.add_address(&refused_only, refused.clone());
+        }
+        let mut seen = 0;
+        drive(&mut a, &mut idle, |side, e| {
+            if let (
+                Side::A,
+                SwarmEvent::Behaviour(OmniNodeBehaviourEvent::Kademlia(
+                    libp2p::kad::Event::RoutingUpdated { .. },
+                )),
+            ) = (side, e)
+            {
+                seen += 1;
+            }
+            (seen == 3).then_some(())
+        })
+        .await;
+        assert_eq!(
+            kad_addresses(&mut a, mixed),
+            vec![allowed.with_p2p(mixed).unwrap()]
+        );
+        assert!(kad_addresses(&mut a, refused_only).is_empty());
+        // Each refused entry is counted when it is dropped (and again if
+        // Kademlia offers it for a dial before then).
+        assert!(a.policy().refusals().kad >= 2);
+    }
+
+    /// Item 2: a `--peer` entry outside the list is neither stored nor
+    /// dialled, and the build does not fail.
+    #[tokio::test]
+    async fn a_refused_bootstrap_peer_is_neither_stored_nor_dialled() {
+        let peer = PeerId::random();
+        let mut s = OmniSwarm::build(&NetConfig {
+            mdns: false,
+            outbound_allow: vec!["127.0.0.1".into()],
+            bootstrap_peers: vec![format!("/ip4/192.0.2.1/udp/4001/quic-v1/p2p/{peer}")],
+            ..NetConfig::default()
+        })
+        .expect("a refused bootstrap entry does not fail the build");
+        let r = s.policy().refusals();
+        assert_eq!((r.bootstrap, r.dial), (1, 0), "{r:?}");
+        assert!(kad_addresses(&mut s, peer).is_empty());
+    }
+
+    /// Item 3: the effective policy is logged once when the swarm is built.
+    #[tokio::test]
+    async fn the_effective_policy_is_logged_at_startup() {
+        if !crate::policy::isolated(
+            "swarm::outbound_allow_gate::the_effective_policy_is_logged_at_startup",
+        ) {
+            return;
+        }
+        let (built, logs) = crate::policy::capture_logs(|| {
+            OmniSwarm::build(&NetConfig {
+                mdns: false,
+                outbound_allow: vec!["127.0.0.1".into(), "/ip4/192.0.2.7/udp/4001/quic-v1".into()],
+                ..NetConfig::default()
+            })
+        });
+        built.expect("swarm");
+        let line = "network policy: mdns=off outbound_allow=[127.0.0.1/32, \
+                    /ip4/192.0.2.7/udp/4001/quic-v1] (application-level routing control, \
+                    not an OS security boundary)";
+        assert_eq!(logs.matches(line).count(), 1, "{logs}");
+
+        let (built, logs) = crate::policy::capture_logs(|| OmniSwarm::build(&NetConfig::default()));
+        built.expect("default swarm");
+        assert_eq!(
+            logs.matches("network policy: mdns=on outbound_allow=unrestricted")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    /// No allow-list: no inbound policy behaviour is built and nothing is
+    /// counted, so a default node composes what it did before.
+    #[tokio::test]
+    async fn the_default_node_builds_no_policy_behaviour() {
+        let default = OmniSwarm::build(&NetConfig::default()).unwrap();
+        assert!(!default.inner.behaviour().policy.is_enabled());
+        assert!(!default.policy().is_restricted());
+        assert!(node(&["127.0.0.1"]).inner.behaviour().policy.is_enabled());
+    }
+
     #[tokio::test]
     async fn mdns_off_constructs_no_mdns_and_on_is_the_default() {
-        assert!(OmniSwarm::build(&NetConfig::default())
-            .unwrap()
-            .mdns_enabled());
+        assert!(
+            OmniSwarm::build(&NetConfig::default())
+                .unwrap()
+                .mdns_enabled()
+        );
         assert!(!node(&[]).mdns_enabled());
     }
 }

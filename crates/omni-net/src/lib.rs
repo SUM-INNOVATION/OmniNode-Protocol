@@ -84,6 +84,7 @@ pub struct NetHandle {
     cmd_tx:        mpsc::Sender<SwarmCommand>,
     router:        RouterHandle,
     local_peer_id: PeerId,
+    policy:        std::sync::Arc<policy::NetPolicy>,
 }
 
 impl std::fmt::Debug for NetHandle {
@@ -129,6 +130,17 @@ impl NetHandle {
     /// Local libp2p [`PeerId`]. See [`OmniNet::local_peer_id`].
     pub fn local_peer_id(&self) -> PeerId {
         self.local_peer_id
+    }
+
+    /// The network policy this node runs under (issue #158): its mDNS
+    /// switch, outbound allow-list and [`policy::NetPolicy::describe`].
+    pub fn network_policy(&self) -> std::sync::Arc<policy::NetPolicy> {
+        self.policy.clone()
+    }
+
+    /// Refusals by the outbound allow-list so far, by source (issue #158).
+    pub fn policy_refusals(&self) -> policy::PolicyRefusals {
+        self.policy.refusals()
     }
 
     // ── Phase 1: Gossipsub ──────────────────────────────────────────────
@@ -399,6 +411,7 @@ impl OmniNet {
         // `omni_swarm` into the background task. Cheap copy; the
         // value is immutable for the lifetime of this `OmniNet`.
         let local_peer_id = omni_swarm.local_peer_id();
+        let policy = omni_swarm.policy();
 
         let (event_tx, event_rx) = mpsc::channel::<OmniNetEvent>(CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx)     = mpsc::channel::<SwarmCommand>(CHANNEL_CAPACITY);
@@ -412,6 +425,7 @@ impl OmniNet {
             cmd_tx,
             router: router_handle,
             local_peer_id,
+            policy,
         };
         // Registered before the swarm task is spawned, so every event it emits
         // is buffered for the caller's first `next_event` rather than counted
@@ -452,6 +466,16 @@ impl OmniNet {
     /// The shadow byte accounting. See [`NetHandle::byte_counts`].
     pub fn byte_counts(&self) -> ByteCounts {
         self.handle.byte_counts()
+    }
+
+    /// The network policy. See [`NetHandle::network_policy`].
+    pub fn network_policy(&self) -> std::sync::Arc<policy::NetPolicy> {
+        self.handle.network_policy()
+    }
+
+    /// Refusals so far, by source. See [`NetHandle::policy_refusals`].
+    pub fn policy_refusals(&self) -> policy::PolicyRefusals {
+        self.handle.policy_refusals()
     }
 
     /// Stage 12.5-pre — local libp2p [`PeerId`] for this node.
@@ -660,6 +684,7 @@ impl OmniNet {
             cmd_tx,
             router: router_handle,
             local_peer_id: PeerId::random(),
+            policy: std::sync::Arc::new(policy::NetPolicy::unrestricted()),
         };
         let events = handle
             .subscribe(Interests::everything())
