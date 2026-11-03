@@ -311,7 +311,7 @@ Reassemble → verify BLAKE3 → verify CID → store to disk
 - **Wire format:** `[u32 BE length][bincode payload]` over QUIC substreams
 - **Peak RAM:** ~128 MiB (one send + one receive buffer)
 - **Chunk size:** Configurable via `StoreConfig::max_shard_msg_bytes` (default 64 MiB)
-- **Concurrent fetches:** at most `StoreConfig::max_concurrent_fetches` at once (default 4, the recommended value, awaiting the owner's confirmation; issue #132). Further fetches wait first in, first out, and start as slots free; a completed, failed, cancelled or dropped fetch frees its slot. A store's peer-to-peer staging on disk is therefore at most `max_concurrent_fetches × max_shard_total_bytes` (4 GiB at the defaults). SNIP V2 shard downloads (`restore_from_snip`, `fetch_set`) are bounded by the same value, separately, across all threads using one store.
+- **Concurrent fetches:** at most `StoreConfig::max_concurrent_fetches` at once (default 4; issue #132). Further fetches wait first in, first out, and start as slots free; a completed, failed, cancelled or dropped fetch frees its slot. A store's peer-to-peer staging on disk is therefore at most `max_concurrent_fetches × max_shard_total_bytes` (4 GiB at the defaults). SNIP V2 shard downloads (`restore_from_snip`, `fetch_set`) are bounded by the same value, separately, across all threads using one store.
 - **Safety limit:** Codec rejects any single message > 256 MiB
 - **Request timeout:** 120 seconds per round-trip
 

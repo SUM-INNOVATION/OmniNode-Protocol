@@ -16,11 +16,10 @@
 use clap::{Args, ValueEnum};
 use omni_types::config::NetConfig;
 
-/// Environment variable for `--mdns` (recommended name, not yet ratified).
+/// Environment variable for `--mdns`.
 pub(crate) const MDNS_ENV: &str = "OMNI_MDNS";
 
-/// Environment variable for `--outbound-allow`, comma-separated (recommended
-/// name, not yet ratified).
+/// Environment variable for `--outbound-allow`, comma-separated.
 pub(crate) const OUTBOUND_ALLOW_ENV: &str = "OMNI_OUTBOUND_ALLOW";
 
 /// `--mdns` and `--outbound-allow`.
