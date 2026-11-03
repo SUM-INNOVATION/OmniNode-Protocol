@@ -7,14 +7,24 @@
 //! When the last byte is in, the running BLAKE3 must equal the CID; only then
 //! is the staged file published, through the store's verifying, no-clobber
 //! publication path.
+//!
+//! At most `max_concurrent_fetches` fetches are in flight at once (issue
+//! #132; [`omni_types::config::StoreConfig::max_concurrent_fetches`], default
+//! 4). A fetch started while every slot is held waits in a first-in,
+//! first-out queue, and is started (its first request sent) as soon as a
+//! slot frees. A fetch frees its slot when it completes, fails, is cancelled
+//! ([`FetchManager::cancel`], [`FetchManager::on_request_failed`]) or is
+//! dropped with the manager. A store therefore stages at most
+//! `max_concurrent_fetches × max_shard_total_bytes` for this path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
 use libp2p::PeerId;
 use omni_net::{OmniNet, ShardResponse};
+use omni_types::config::StoreConfig;
 use tracing::{info, warn};
 
 use crate::error::{Result, StoreError};
@@ -56,14 +66,30 @@ impl ChunkRequester for NetRequester<'_> {
 }
 use crate::content_id;
 
-/// Tracks in-flight fetches keyed by CID.
+/// Tracks in-flight fetches keyed by CID, and the fetches waiting for a slot.
 pub struct FetchManager {
     /// Maximum bytes per request-response chunk (default 64 MiB).
     chunk_size: u64,
-    /// In-progress fetches: CID → state.
+    /// In-progress fetches: CID → state. Never more than
+    /// `max_concurrent_fetches` entries.
     active: HashMap<String, FetchState>,
+    /// Fetches waiting for a slot, oldest first. Nothing is requested or
+    /// staged for them yet.
+    queued: VecDeque<Queued>,
+    /// Queued fetches whose first request could not be sent when a slot
+    /// freed, as `FetchOutcome::Failed`, until the caller takes them.
+    failed_starts: Vec<FetchOutcome>,
     /// Hard ceiling on total accumulated bytes for one shard.
     max_shard_total_bytes: u64,
+    /// How many fetches may be in flight at once (issue #132).
+    max_concurrent_fetches: usize,
+}
+
+/// A fetch waiting for a slot.
+struct Queued {
+    peer_id: PeerId,
+    cid: String,
+    expected_size: Option<u64>,
 }
 
 /// State for a single in-progress shard fetch.
@@ -126,8 +152,11 @@ impl FetchManager {
     /// Create a new fetch manager with the given chunk size.
     ///
     /// The total-bytes ceiling defaults to
-    /// [`omni_types::config::DEFAULT_MAX_SHARD_TOTAL_BYTES`]. Use
-    /// [`FetchManager::with_limits`] to set it explicitly.
+    /// [`omni_types::config::DEFAULT_MAX_SHARD_TOTAL_BYTES`] and the
+    /// concurrency bound to
+    /// [`omni_types::config::DEFAULT_MAX_CONCURRENT_FETCHES`]. Use
+    /// [`FetchManager::with_limits`] or [`FetchManager::from_config`] to set
+    /// them explicitly.
     pub fn new(max_shard_msg_bytes: usize) -> Self {
         use omni_types::config::{DEFAULT_MAX_SHARD_MSG_BYTES, DEFAULT_MAX_SHARD_TOTAL_BYTES};
         Self::with_limits(max_shard_msg_bytes, DEFAULT_MAX_SHARD_TOTAL_BYTES).unwrap_or_else(|e| {
@@ -150,22 +179,56 @@ impl FetchManager {
     /// fetcher will accumulate for one shard, whatever a peer claims.
     /// Rejects limits a [`omni_types::config::StoreConfig`] would reject,
     /// through the same rules, so a directly-constructed fetcher cannot hold
-    /// a configuration the store would refuse.
+    /// a configuration the store would refuse. At most
+    /// [`omni_types::config::DEFAULT_MAX_CONCURRENT_FETCHES`] fetches run at
+    /// once.
     pub fn with_limits(max_shard_msg_bytes: usize, max_shard_total_bytes: u64) -> Result<Self> {
+        use omni_types::config::DEFAULT_MAX_CONCURRENT_FETCHES;
+        Self::build(
+            max_shard_msg_bytes,
+            max_shard_total_bytes,
+            DEFAULT_MAX_CONCURRENT_FETCHES,
+        )
+    }
+
+    /// Create a fetch manager with every limit taken from `config`, which is
+    /// validated first.
+    pub fn from_config(config: &StoreConfig) -> Result<Self> {
+        config.validate().map_err(StoreError::Other)?;
+        Self::build(
+            config.max_shard_msg_bytes,
+            config.max_shard_total_bytes,
+            config.max_concurrent_fetches,
+        )
+    }
+
+    fn build(
+        max_shard_msg_bytes: usize,
+        max_shard_total_bytes: u64,
+        max_concurrent_fetches: usize,
+    ) -> Result<Self> {
         omni_types::config::validate_shard_limits(max_shard_msg_bytes, max_shard_total_bytes)
+            .map_err(StoreError::Other)?;
+        omni_types::config::validate_max_concurrent_fetches(max_concurrent_fetches)
             .map_err(StoreError::Other)?;
         Ok(Self {
             chunk_size: max_shard_msg_bytes as u64,
             active: HashMap::new(),
+            queued: VecDeque::new(),
+            failed_starts: Vec::new(),
             max_shard_total_bytes,
+            max_concurrent_fetches,
         })
     }
 
     /// Start fetching a shard from a remote peer.
     ///
-    /// Sends the first chunk request.  Subsequent chunks are requested
-    /// automatically when [`Self::on_chunk_received`] is called.
-    /// Start fetching a shard from a remote peer.
+    /// If a slot is free (and no earlier fetch is waiting), the first chunk
+    /// request is sent now; subsequent chunks are requested automatically
+    /// when [`Self::on_chunk_received`] is called. Otherwise the fetch waits
+    /// in line ([`Self::is_queued`]) and is started when a slot frees. An
+    /// error means the fetch is neither in flight nor queued: the CID is
+    /// already being fetched, or its first request could not be sent.
     pub async fn start_fetch(&mut self, net: &OmniNet, peer_id: PeerId, cid: String) -> Result<()> {
         self.start_fetch_announced(net, peer_id, cid, None).await
     }
@@ -193,36 +256,89 @@ impl FetchManager {
         cid: String,
         expected_size: Option<u64>,
     ) -> Result<()> {
-        if self.active.contains_key(&cid) {
+        if self.active.contains_key(&cid) || self.is_queued(&cid) {
             return Err(StoreError::Other(format!(
                 "fetch already in progress: {cid}"
             )));
         }
 
-        info!(%cid, %peer_id, "starting shard fetch");
+        // Every fetch enters the line; one with a free slot leaves it at once.
+        self.queued.push_back(Queued {
+            peer_id,
+            cid: cid.clone(),
+            expected_size,
+        });
+        self.fill_slots(req).await;
 
-        req.request_chunk(peer_id, cid.clone(), 0, self.chunk_size)
-            .await
-            .map_err(StoreError::Other)?;
-
-        self.active.insert(
-            cid,
-            FetchState {
-                peer_id,
-                total_bytes: None,
-                next_offset: 0,
-                staged: None,
-                expected_size,
-            },
-        );
-
+        if self.is_queued(&cid) {
+            info!(
+                %cid,
+                %peer_id,
+                in_flight = self.active.len(),
+                queued = self.queued.len(),
+                "shard fetch queued: every fetch slot is in use"
+            );
+            return Ok(());
+        }
+        // Not active and not queued: its own first request failed. That is
+        // this call's error, not a later promotion's.
+        if let Some(i) = self
+            .failed_starts
+            .iter()
+            .rposition(|o| matches!(o, FetchOutcome::Failed { cid: c, .. } if *c == cid))
+        {
+            if let FetchOutcome::Failed { error, .. } = self.failed_starts.remove(i) {
+                return Err(StoreError::Other(error));
+            }
+        }
         Ok(())
+    }
+
+    /// Start queued fetches, oldest first, while slots are free.
+    ///
+    /// A queued fetch leaves the line only once its first request is sent
+    /// (it becomes active) or has failed (it is recorded in
+    /// `failed_starts`). If this future is dropped while a request is being
+    /// sent, that fetch stays first in line and holds no slot.
+    async fn fill_slots<R: ChunkRequester>(&mut self, req: &R) {
+        while self.active.len() < self.max_concurrent_fetches {
+            let Some(next) = self.queued.front() else {
+                break;
+            };
+            let (peer_id, cid) = (next.peer_id, next.cid.clone());
+            let sent = req
+                .request_chunk(peer_id, cid.clone(), 0, self.chunk_size)
+                .await;
+            let next = self.queued.pop_front().expect("still first in line");
+            match sent {
+                Ok(()) => {
+                    info!(%cid, %peer_id, "starting shard fetch");
+                    self.active.insert(
+                        cid,
+                        FetchState {
+                            peer_id,
+                            total_bytes: None,
+                            next_offset: 0,
+                            staged: None,
+                            expected_size: next.expected_size,
+                        },
+                    );
+                }
+                Err(e) => {
+                    warn!(%cid, %peer_id, error = %e, "shard fetch could not start");
+                    self.failed_starts
+                        .push(FetchOutcome::Failed { cid, error: e });
+                }
+            }
+        }
     }
 
     /// Process a received shard chunk.
     ///
     /// Returns a [`FetchOutcome`] indicating whether the fetch is complete,
-    /// still in progress, or has failed.
+    /// still in progress, or has failed. A fetch that ends frees its slot,
+    /// and the oldest queued fetch is started in it before this returns; if
+    /// that start fails, see [`Self::take_failed_starts`].
     pub async fn on_chunk_received(
         &mut self,
         net: &OmniNet,
@@ -234,6 +350,18 @@ impl FetchManager {
 
     /// The whole handler, independent of how the next request is sent.
     async fn process<R: ChunkRequester>(
+        &mut self,
+        req: &R,
+        store: &ShardStore,
+        response: &ShardResponse,
+    ) -> FetchOutcome {
+        let outcome = self.process_response(req, store, response).await;
+        // A fetch that ended has left `active`: its slot goes to the queue.
+        self.fill_slots(req).await;
+        outcome
+    }
+
+    async fn process_response<R: ChunkRequester>(
         &mut self,
         req: &R,
         store: &ShardStore,
@@ -378,7 +506,6 @@ impl FetchManager {
         FetchOutcome::Complete { cid, size }
     }
 
-    /// Check if a fetch is currently active for the given CID.
     /// Abandon an in-progress fetch and report it failed.
     ///
     /// Dropping the state is what makes recovery possible: the accumulated
@@ -392,13 +519,98 @@ impl FetchManager {
         }
     }
 
+    /// Cancel the fetch of `cid`, in flight or queued. An in-flight fetch
+    /// loses its staging and frees its slot, which goes to the oldest queued
+    /// fetch. Returns whether there was such a fetch.
+    pub async fn cancel(&mut self, net: &OmniNet, cid: &str) -> bool {
+        self.cancel_with(&NetRequester(net), cid).await
+    }
+
+    async fn cancel_with<R: ChunkRequester>(&mut self, req: &R, cid: &str) -> bool {
+        let found = if self.active.remove(cid).is_some() {
+            info!(%cid, "shard fetch cancelled");
+            true
+        } else if let Some(i) = self.queued.iter().position(|q| q.cid == cid) {
+            self.queued.remove(i);
+            info!(%cid, "queued shard fetch cancelled");
+            true
+        } else {
+            false
+        };
+        self.fill_slots(req).await;
+        found
+    }
+
+    /// A request to `peer_id` failed in the transport
+    /// (`OmniNetEvent::ShardRequestFailed`, which names no CID). Every fetch
+    /// in flight from that peer fails, freeing its slot for the queue; they
+    /// can be started again, from this peer or another. Returns their
+    /// outcomes; queued fetches from that peer stay in line.
+    pub async fn on_request_failed(
+        &mut self,
+        net: &OmniNet,
+        peer_id: PeerId,
+        error: &str,
+    ) -> Vec<FetchOutcome> {
+        self.request_failed_with(&NetRequester(net), peer_id, error)
+            .await
+    }
+
+    async fn request_failed_with<R: ChunkRequester>(
+        &mut self,
+        req: &R,
+        peer_id: PeerId,
+        error: &str,
+    ) -> Vec<FetchOutcome> {
+        let mut cids: Vec<String> = self
+            .active
+            .iter()
+            .filter(|(_, state)| state.peer_id == peer_id)
+            .map(|(cid, _)| cid.clone())
+            .collect();
+        cids.sort();
+        let failed = cids
+            .into_iter()
+            .map(|cid| {
+                warn!(%cid, %peer_id, %error, "shard request failed");
+                self.reject(&cid, format!("shard request to {peer_id} failed: {error}"))
+            })
+            .collect();
+        self.fill_slots(req).await;
+        failed
+    }
+
+    /// Take the queued fetches that could not start when a slot freed (their
+    /// first request could not be sent), as `FetchOutcome::Failed`. They are
+    /// neither in flight nor queued any more.
+    pub fn take_failed_starts(&mut self) -> Vec<FetchOutcome> {
+        std::mem::take(&mut self.failed_starts)
+    }
+
+    /// Check if a fetch is currently in flight for the given CID.
     pub fn is_active(&self, cid: &str) -> bool {
         self.active.contains_key(cid)
     }
 
-    /// Number of in-progress fetches.
+    /// Whether a fetch for `cid` is waiting for a slot.
+    pub fn is_queued(&self, cid: &str) -> bool {
+        self.queued.iter().any(|q| q.cid == cid)
+    }
+
+    /// Number of in-progress fetches. Never more than
+    /// [`Self::max_concurrent_fetches`].
     pub fn active_count(&self) -> usize {
         self.active.len()
+    }
+
+    /// Number of fetches waiting for a slot.
+    pub fn queued_count(&self) -> usize {
+        self.queued.len()
+    }
+
+    /// How many fetches may be in flight at once.
+    pub fn max_concurrent_fetches(&self) -> usize {
+        self.max_concurrent_fetches
     }
 }
 
@@ -1242,6 +1454,476 @@ mod tests {
             FetchOutcome::Failed { .. }
         ));
         assert_eq!(m.active_count(), 0);
+    }
+
+    // ── the fetch-concurrency bound (issue #132) ────────────────────────
+
+    /// A manager that runs at most `n` fetches at once.
+    fn capped(n: usize) -> FetchManager {
+        use omni_types::config::StoreConfig;
+        FetchManager::from_config(&StoreConfig {
+            max_shard_msg_bytes: 64 * 1024,
+            max_shard_total_bytes: MAX,
+            max_concurrent_fetches: n,
+            ..StoreConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// `count` distinct 1 KiB shards, as (CID, bytes), in start order.
+    fn shards(count: u8) -> Vec<(String, Vec<u8>)> {
+        (0..count)
+            .map(|i| {
+                let data: Vec<u8> = (0..1024u32).map(|j| (j as u8) ^ i).collect();
+                (cid_from_data(&data), data)
+            })
+            .collect()
+    }
+
+    /// The CIDs of the first requests (offset 0) sent so far, in order.
+    fn first_requests(req: &FakeRequester) -> Vec<String> {
+        req.sent
+            .borrow()
+            .iter()
+            .filter(|(_, offset, _)| *offset == 0)
+            .map(|(cid, _, _)| cid.clone())
+            .collect()
+    }
+
+    /// The honest answer to request `index`: at most 512 bytes from the
+    /// requested offset, so every 1 KiB shard takes two pieces.
+    fn answer(req: &FakeRequester, shards: &[(String, Vec<u8>)], index: usize) -> ShardResponse {
+        let (cid, offset, _) = req.sent.borrow()[index].clone();
+        let data = &shards.iter().find(|(c, _)| *c == cid).unwrap().1;
+        let start = offset as usize;
+        let end = (start + 512).min(data.len());
+        resp(&cid, data.len() as u64, offset, data[start..end].to_vec())
+    }
+
+    /// Answer every request from index `from` on, oldest first, until none
+    /// is left unanswered. After each piece, check that no more than `cap`
+    /// fetches are in flight or staged. Returns the CIDs in completion order
+    /// and the peak number of staging directories seen.
+    async fn serve_all(
+        m: &mut FetchManager,
+        req: &FakeRequester,
+        st: &ShardStore,
+        shards: &[(String, Vec<u8>)],
+        cap: usize,
+        from: usize,
+    ) -> (Vec<String>, usize) {
+        let (mut served, mut peak) = (from, 0);
+        let mut completed = Vec::new();
+        while served < req.count() {
+            let piece = answer(req, shards, served);
+            served += 1;
+            match m.process(req, st, &piece).await {
+                FetchOutcome::InProgress => {}
+                FetchOutcome::Complete { cid, .. } => completed.push(cid),
+                FetchOutcome::Failed { cid, error } => panic!("{cid} failed: {error}"),
+            }
+            let staged = staging_dirs(st).len();
+            peak = peak.max(staged);
+            assert!(
+                staged <= cap,
+                "{staged} fetches staged at once with a bound of {cap}"
+            );
+            assert!(m.active_count() <= cap, "{} in flight", m.active_count());
+        }
+        (completed, peak)
+    }
+
+    /// The key test. With a bound of 2, five fetches started at once: two are
+    /// in flight, three wait without sending anything, and at no point are
+    /// more than two staged on disk. The waiting ones start in the order they
+    /// were started and all complete. Without the bound, the third piece
+    /// served creates a third staging directory.
+    #[tokio::test]
+    async fn never_more_than_the_bound_are_staged_and_queued_fetches_complete() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = capped(2);
+        let set = shards(5);
+        for (cid, data) in &set {
+            m.begin(&req, PeerId::random(), cid.clone(), Some(data.len() as u64))
+                .await
+                .expect("an excess fetch queues, it is not refused");
+        }
+        assert_eq!((m.active_count(), m.queued_count()), (2, 3));
+        assert_eq!(req.count(), 2, "a queued fetch sends nothing");
+        assert!(m.is_queued(&set[2].0) && !m.is_active(&set[2].0));
+
+        let (completed, peak) = serve_all(&mut m, &req, &st, &set, 2, 0).await;
+
+        let order: Vec<String> = set.iter().map(|(cid, _)| cid.clone()).collect();
+        assert_eq!(
+            first_requests(&req),
+            order,
+            "queued fetches start first in, first out"
+        );
+        assert_eq!(completed, order, "every queued fetch completes");
+        assert_eq!(peak, 2, "the bound was reached, so it was exercised");
+        for (cid, data) in &set {
+            assert_eq!(&st.get(cid).unwrap(), data);
+        }
+        assert_eq!((m.active_count(), m.queued_count()), (0, 0));
+        assert!(staging_dirs(&st).is_empty());
+    }
+
+    /// A bound of 1 runs the fetches strictly one after another: the next one
+    /// sends its first request only after the previous one has completed.
+    #[tokio::test]
+    async fn a_bound_of_one_serializes_fetches() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = capped(1);
+        let set = shards(3);
+        for (cid, _) in &set {
+            m.begin(&req, PeerId::random(), cid.clone(), None)
+                .await
+                .unwrap();
+        }
+        assert_eq!((m.active_count(), m.queued_count()), (1, 2));
+
+        let (completed, peak) = serve_all(&mut m, &req, &st, &set, 1, 0).await;
+
+        let sequence: Vec<String> = req
+            .sent
+            .borrow()
+            .iter()
+            .map(|(c, _, _)| c.clone())
+            .collect();
+        let expected: Vec<String> = set
+            .iter()
+            .flat_map(|(cid, _)| [cid.clone(), cid.clone()])
+            .collect();
+        assert_eq!(
+            sequence, expected,
+            "each fetch's two pieces, one fetch at a time"
+        );
+        assert_eq!(completed.len(), 3);
+        assert_eq!(peak, 1);
+    }
+
+    /// A fetch that fails, whichever way, frees its slot, and the oldest
+    /// waiting fetch is started in it before the failure is returned.
+    #[tokio::test]
+    async fn a_failed_fetch_frees_its_slot_for_the_next_in_line() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = capped(1);
+        let set = shards(4);
+        for (cid, _) in &set {
+            m.begin(&req, PeerId::random(), cid.clone(), None)
+                .await
+                .unwrap();
+        }
+        let failed = |o: FetchOutcome, want: &str| match o {
+            FetchOutcome::Failed { cid, .. } => assert_eq!(cid, want),
+            _ => panic!("expected {want} to fail"),
+        };
+
+        // 1. The serving peer reports an error.
+        let mut refused = resp(&set[0].0, 0, 0, Vec::new());
+        refused.error = Some("no such shard".into());
+        failed(m.process(&req, &st, &refused).await, &set[0].0);
+        assert!(m.is_active(&set[1].0), "the next in line started");
+
+        // 2. Rejected mid-stream: a changed total after one staged piece.
+        let first = answer(&req, &set, req.count() - 1);
+        assert!(matches!(
+            m.process(&req, &st, &first).await,
+            FetchOutcome::InProgress
+        ));
+        assert_eq!(staging_dirs(&st).len(), 1);
+        let changed = resp(&set[1].0, 2048, 512, vec![0u8; 512]);
+        failed(m.process(&req, &st, &changed).await, &set[1].0);
+        assert!(m.is_active(&set[2].0));
+        assert!(staging_dirs(&st).is_empty());
+
+        // 3. Integrity: the whole shard arrives but does not hash to its CID.
+        let wrong = resp(&set[2].0, 1024, 0, vec![0xEE; 1024]);
+        failed(m.process(&req, &st, &wrong).await, &set[2].0);
+        assert!(!st.has(&set[2].0));
+        assert!(m.is_active(&set[3].0));
+
+        // 4. The next request cannot be sent.
+        let broken = FakeRequester::failing("transport down");
+        let first = answer(&req, &set, req.count() - 1);
+        failed(m.process(&broken, &st, &first).await, &set[3].0);
+        assert_eq!((m.active_count(), m.queued_count()), (0, 0));
+        assert!(staging_dirs(&st).is_empty());
+    }
+
+    /// A queued fetch whose first request cannot be sent when its turn comes
+    /// is reported through `take_failed_starts`, not lost; the one after it
+    /// still gets the slot.
+    #[tokio::test]
+    async fn a_queued_fetch_that_cannot_start_is_reported_and_the_next_one_starts() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = capped(1);
+        let set = shards(2);
+        for (cid, _) in &set {
+            m.begin(&req, PeerId::random(), cid.clone(), None)
+                .await
+                .unwrap();
+        }
+        let broken = FakeRequester::failing("transport down");
+        let mut refused = resp(&set[0].0, 0, 0, Vec::new());
+        refused.error = Some("gone".into());
+        // The slot frees while the transport is down: the waiting fetch
+        // cannot start.
+        assert!(matches!(
+            m.process(&broken, &st, &refused).await,
+            FetchOutcome::Failed { .. }
+        ));
+        let reported = m.take_failed_starts();
+        assert_eq!(reported.len(), 1);
+        assert!(matches!(&reported[0], FetchOutcome::Failed { cid, error }
+            if *cid == set[1].0 && error.contains("transport down")));
+        assert_eq!((m.active_count(), m.queued_count()), (0, 0));
+        assert!(m.take_failed_starts().is_empty(), "reported once");
+
+        // A start that fails for want of a transport is still this call's
+        // error when a slot is free, as before the bound.
+        let err = m
+            .begin(&broken, PeerId::random(), set[1].0.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("transport down"), "{err}");
+        assert!(m.take_failed_starts().is_empty());
+        assert!(!m.is_active(&set[1].0) && !m.is_queued(&set[1].0));
+    }
+
+    /// A cancelled fetch frees its slot: in flight, its staging is removed
+    /// and the oldest waiting fetch starts; queued, it simply leaves the line.
+    #[tokio::test]
+    async fn a_cancelled_fetch_frees_its_slot() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = capped(1);
+        let set = shards(3);
+        for (cid, _) in &set {
+            m.begin(&req, PeerId::random(), cid.clone(), None)
+                .await
+                .unwrap();
+        }
+        let first = answer(&req, &set, 0);
+        assert!(matches!(
+            m.process(&req, &st, &first).await,
+            FetchOutcome::InProgress
+        ));
+        assert_eq!(staging_dirs(&st).len(), 1);
+
+        assert!(m.cancel_with(&req, &set[2].0).await, "a queued fetch");
+        assert!(!m.is_queued(&set[2].0));
+        assert!(
+            m.is_active(&set[0].0),
+            "cancelling a queued fetch frees nothing"
+        );
+
+        assert!(m.cancel_with(&req, &set[0].0).await, "an in-flight fetch");
+        assert!(staging_dirs(&st).is_empty(), "its staging is removed");
+        assert!(m.is_active(&set[1].0), "and the next in line starts");
+        assert_eq!(
+            first_requests(&req),
+            vec![set[0].0.clone(), set[1].0.clone()]
+        );
+
+        assert!(!m.cancel_with(&req, "never-started").await);
+
+        // Only set[1]'s first request is still unanswered.
+        let (completed, _) = serve_all(&mut m, &req, &st, &set, 1, req.count() - 1).await;
+        assert_eq!(completed, vec![set[1].0.clone()]);
+        assert!(!st.has(&set[0].0) && !st.has(&set[2].0));
+    }
+
+    /// `ShardRequestFailed` names a peer, not a CID: every fetch in flight
+    /// from that peer fails and frees its slot; the others are untouched.
+    #[tokio::test]
+    async fn a_transport_failure_fails_that_peers_fetches_and_frees_their_slots() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = capped(2);
+        let set = shards(4);
+        let (p, q) = (PeerId::random(), PeerId::random());
+        for (i, (cid, _)) in set.iter().enumerate() {
+            let peer = if i == 1 { q } else { p };
+            m.begin(&req, peer, cid.clone(), None).await.unwrap();
+        }
+        // set[0] (p) and set[1] (q) are in flight; set[2], set[3] (p) wait.
+        let first = answer(&req, &set, 0);
+        assert!(matches!(
+            m.process(&req, &st, &first).await,
+            FetchOutcome::InProgress
+        ));
+
+        let failed = m.request_failed_with(&req, p, "timeout").await;
+        assert_eq!(failed.len(), 1);
+        assert!(matches!(&failed[0], FetchOutcome::Failed { cid, error }
+            if *cid == set[0].0 && error.contains("timeout")));
+        assert!(staging_dirs(&st).is_empty());
+        assert!(m.is_active(&set[1].0), "another peer's fetch is untouched");
+        assert!(
+            m.is_active(&set[2].0),
+            "the freed slot went to the next in line"
+        );
+        assert!(m.is_queued(&set[3].0));
+    }
+
+    /// Answers like `FakeRequester`, except that the first request for
+    /// `stall` never completes, as a send to a full channel would not.
+    struct StallingRequester<'a> {
+        inner: &'a FakeRequester,
+        stall: String,
+    }
+
+    impl ChunkRequester for StallingRequester<'_> {
+        async fn request_chunk(
+            &self,
+            peer_id: PeerId,
+            cid: String,
+            offset: u64,
+            len: u64,
+        ) -> std::result::Result<(), String> {
+            if cid == self.stall && offset == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.inner.request_chunk(peer_id, cid, offset, len).await
+        }
+    }
+
+    /// A dropped fetch frees its slot. Here the future that was starting a
+    /// queued fetch is dropped mid-send: the fetch holds no slot and keeps
+    /// its place, first in line. Dropping the manager then removes the
+    /// staging of everything it held.
+    #[tokio::test]
+    async fn a_dropped_fetch_holds_no_slot() {
+        let (_d, st) = store();
+        let req = FakeRequester::default();
+        let mut m = capped(1);
+        let set = shards(3);
+        for (cid, _) in &set[..2] {
+            m.begin(&req, PeerId::random(), cid.clone(), None)
+                .await
+                .unwrap();
+        }
+        let stalling = StallingRequester {
+            inner: &req,
+            stall: set[1].0.clone(),
+        };
+        let first = answer(&req, &set, 0);
+        assert!(matches!(
+            m.process(&req, &st, &first).await,
+            FetchOutcome::InProgress
+        ));
+        let last = answer(&req, &set, 1);
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            m.process(&stalling, &st, &last),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the start of the queued fetch never completes"
+        );
+        assert!(st.has(&set[0].0), "the finished fetch was published");
+        assert_eq!(m.active_count(), 0, "the dropped start holds no slot");
+        assert!(m.is_queued(&set[1].0), "and keeps its place in line");
+
+        // The next call fills the free slot, oldest first.
+        m.begin(&req, PeerId::random(), set[2].0.clone(), None)
+            .await
+            .unwrap();
+        assert!(m.is_active(&set[1].0) && m.is_queued(&set[2].0));
+        let piece = answer(&req, &set, req.count() - 1);
+        assert!(matches!(
+            m.process(&req, &st, &piece).await,
+            FetchOutcome::InProgress
+        ));
+        assert_eq!(staging_dirs(&st).len(), 1);
+        drop(m);
+        assert!(
+            staging_dirs(&st).is_empty(),
+            "the dropped manager left nothing"
+        );
+    }
+
+    /// One fetch per CID, whether it is in flight or waiting.
+    #[tokio::test]
+    async fn a_cid_already_in_flight_or_queued_is_refused() {
+        let req = FakeRequester::default();
+        let mut m = capped(1);
+        let set = shards(2);
+        for (cid, _) in &set {
+            m.begin(&req, PeerId::random(), cid.clone(), None)
+                .await
+                .unwrap();
+        }
+        for (cid, _) in &set {
+            let err = m
+                .begin(&req, PeerId::random(), cid.clone(), None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("already in progress"), "{err}");
+        }
+        assert_eq!((m.active_count(), m.queued_count()), (1, 1));
+    }
+
+    #[test]
+    fn every_constructor_takes_the_default_bound_of_four_unless_configured() {
+        use omni_types::config::{StoreConfig, DEFAULT_MAX_CONCURRENT_FETCHES};
+        assert_eq!(DEFAULT_MAX_CONCURRENT_FETCHES, 4);
+        assert_eq!(FetchManager::new(64 * 1024).max_concurrent_fetches(), 4);
+        assert_eq!(
+            FetchManager::with_limits(64 * 1024, MAX)
+                .unwrap()
+                .max_concurrent_fetches(),
+            4
+        );
+        assert_eq!(
+            FetchManager::from_config(&StoreConfig::default())
+                .unwrap()
+                .max_concurrent_fetches(),
+            4
+        );
+        assert_eq!(capped(7).max_concurrent_fetches(), 7);
+        let zero = StoreConfig {
+            max_concurrent_fetches: 0,
+            ..StoreConfig::default()
+        };
+        assert!(FetchManager::from_config(&zero).is_err());
+    }
+
+    #[test]
+    fn omni_store_applies_the_configured_bound_to_both_download_paths() {
+        use omni_types::config::StoreConfig;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let dir = tmp.path().join("refused");
+        let zero = StoreConfig {
+            store_dir: dir.clone(),
+            max_concurrent_fetches: 0,
+            ..StoreConfig::default()
+        };
+        let err = crate::OmniStore::new(zero)
+            .err()
+            .expect("zero must be refused");
+        assert!(format!("{err}").contains("max_concurrent_fetches"), "{err}");
+        assert!(
+            !dir.exists(),
+            "refused before the store directory is created"
+        );
+
+        let three = StoreConfig {
+            store_dir: tmp.path().join("store"),
+            max_concurrent_fetches: 3,
+            ..StoreConfig::default()
+        };
+        let s = crate::OmniStore::new(three).unwrap();
+        assert_eq!(s.fetcher.max_concurrent_fetches(), 3);
+        assert_eq!(s.local.max_concurrent_fetches(), 3);
     }
 }
 
