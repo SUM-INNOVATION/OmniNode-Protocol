@@ -15,6 +15,15 @@ pub const DEFAULT_MAX_SHARD_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 /// Default per-message ceiling for a shard range request.
 pub const DEFAULT_MAX_SHARD_MSG_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default number of shard fetches a store runs at once (issue #132).
+///
+/// 4 is the recommended default and awaits the owner's confirmation. It
+/// bounds a store's peer-to-peer fetch staging at 4 ×
+/// [`DEFAULT_MAX_SHARD_TOTAL_BYTES`] (4 GiB at the defaults). This constant is
+/// the only place the value is written; [`StoreConfig::default`] and the
+/// constructors that take no configuration all read it.
+pub const DEFAULT_MAX_CONCURRENT_FETCHES: usize = 4;
+
 #[derive(Debug, Clone)]
 pub struct NetConfig {
     /// UDP port for QUIC listener. 0 = OS-assigned.
@@ -153,15 +162,34 @@ pub struct StoreConfig {
     /// under the store root and hashes it as it arrives, so a fetch holds at
     /// most one message (`max_shard_msg_bytes`) in memory, and stages at most
     /// this many bytes on disk until the CID is verified and the shard is
-    /// published. Nothing yet bounds how many fetches run concurrently, so a
-    /// node's total staging exposure is this value multiplied by the number
-    /// of simultaneous fetches.
+    /// published. [`StoreConfig::max_concurrent_fetches`] bounds how many
+    /// fetches run at once, so a store's peer-to-peer staging is at most
+    /// `max_concurrent_fetches × max_shard_total_bytes`.
     ///
     /// Unlike SNIP — where a chunk is protocol-fixed at 1 MiB and the bound
     /// follows from the format — an Omni shard is a model slice whose size
     /// depends on the GGUF tensor layout and `layers_per_shard`, so no
     /// format-derived ceiling exists. Operators may lower this.
     pub max_shard_total_bytes: u64,
+
+    /// How many shard fetches the store runs at once (issue #132). Must be
+    /// at least 1. Default: [`DEFAULT_MAX_CONCURRENT_FETCHES`] (4), the
+    /// recommended value, which awaits the owner's confirmation.
+    ///
+    /// A fetch started while this many are in flight waits in a first-in,
+    /// first-out queue and starts when a slot frees; it is not refused. A
+    /// fetch that completes, fails, is cancelled or is dropped frees its
+    /// slot. `1` runs fetches one after another.
+    ///
+    /// The bound applies to each of the store's two download paths:
+    /// - peer-to-peer fetches (`FetchManager`), whose staging is therefore at
+    ///   most `max_concurrent_fetches × max_shard_total_bytes`;
+    /// - SNIP V2 shard downloads (`restore_from_snip`, and so `fetch_set`),
+    ///   shared by every thread that uses the same store.
+    ///
+    /// The two paths do not share one budget, so a process that runs both on
+    /// one store at the same time can have twice this many downloads staged.
+    pub max_concurrent_fetches: usize,
 }
 
 /// The single validation entry point for [`StoreConfig`].
@@ -176,8 +204,20 @@ pub struct StoreConfig {
 /// size is unusual, not invalid.
 impl StoreConfig {
     pub fn validate(&self) -> Result<(), String> {
-        validate_shard_limits(self.max_shard_msg_bytes, self.max_shard_total_bytes)
+        validate_shard_limits(self.max_shard_msg_bytes, self.max_shard_total_bytes)?;
+        validate_max_concurrent_fetches(self.max_concurrent_fetches)
     }
+}
+
+/// The concurrency rule on its own: at least one fetch must be able to run.
+///
+/// `FetchManager` and `ShardStore` validate through this, so neither can be
+/// built with a bound a [`StoreConfig`] would have rejected.
+pub fn validate_max_concurrent_fetches(max_concurrent_fetches: usize) -> Result<(), String> {
+    if max_concurrent_fetches == 0 {
+        return Err("max_concurrent_fetches must be greater than zero".to_string());
+    }
+    Ok(())
 }
 
 /// The limit rules themselves, callable without a whole [`StoreConfig`].
@@ -210,6 +250,7 @@ impl Default for StoreConfig {
             layers_per_shard: 4,
             max_shard_msg_bytes: DEFAULT_MAX_SHARD_MSG_BYTES,
             max_shard_total_bytes: DEFAULT_MAX_SHARD_TOTAL_BYTES,
+            max_concurrent_fetches: DEFAULT_MAX_CONCURRENT_FETCHES,
         }
     }
 }
@@ -268,6 +309,32 @@ mod tests {
         assert_eq!(cfg.layers_per_shard, 4);
         assert_eq!(cfg.max_shard_msg_bytes, 64 * 1024 * 1024);
         assert!(cfg.store_dir.ends_with("store"));
+    }
+
+    /// Issue #132: the fetch-concurrency bound defaults to 4, from the one
+    /// constant, and the default configuration validates.
+    #[test]
+    fn the_fetch_concurrency_default_is_four_and_validates() {
+        assert_eq!(DEFAULT_MAX_CONCURRENT_FETCHES, 4);
+        let cfg = StoreConfig::default();
+        assert_eq!(cfg.max_concurrent_fetches, DEFAULT_MAX_CONCURRENT_FETCHES);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn a_zero_fetch_concurrency_is_refused_and_one_is_allowed() {
+        let mut cfg = StoreConfig {
+            max_concurrent_fetches: 0,
+            ..StoreConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("max_concurrent_fetches"), "{err}");
+        assert!(validate_max_concurrent_fetches(0).is_err());
+
+        cfg.max_concurrent_fetches = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.max_concurrent_fetches = 64;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

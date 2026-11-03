@@ -68,14 +68,23 @@ def test_store_config_overrides_and_validation(tmp_path):
         layers_per_shard=2,
         max_shard_msg_bytes=1024,
         max_shard_total_bytes=4096,
+        max_concurrent_fetches=3,
     )
     assert (c.store_dir, c.layers_per_shard) == (str(tmp_path), 2)
     assert (c.max_shard_msg_bytes, c.max_shard_total_bytes) == (1024, 4096)
+    assert c.max_concurrent_fetches == 3
 
     with pytest.raises(ValueError, match="max_shard_msg_bytes"):
         StoreConfig(store_dir=str(tmp_path), max_shard_msg_bytes=0)
     with pytest.raises(ValueError, match="max_shard_total_bytes"):
         StoreConfig(store_dir=str(tmp_path), max_shard_total_bytes=0)
+    with pytest.raises(ValueError, match="max_concurrent_fetches"):
+        StoreConfig(store_dir=str(tmp_path), max_concurrent_fetches=0)
+
+
+def test_store_config_fetch_concurrency_defaults_to_four(tmp_path):
+    # Issue #132: at most 4 shard fetches at once unless configured.
+    assert StoreConfig(store_dir=str(tmp_path)).max_concurrent_fetches == 4
 
 
 def test_out_of_range_integers_are_refused_by_type_conversion(tmp_path):

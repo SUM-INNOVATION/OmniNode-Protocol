@@ -4,21 +4,56 @@
 //! writers and writable aliases remain outside the mapping lifetime guarantee.
 
 use crate::error::{Result, StoreError};
+use crate::fetch_slots::{FetchPermit, FetchSlots};
 use crate::publication::PublicationStore;
 use memmap2::Mmap;
+use omni_types::config::DEFAULT_MAX_CONCURRENT_FETCHES;
 use std::path::{Path, PathBuf};
 
 /// Filesystem-backed shard store. New writes require canonical content CIDs;
 /// confined legacy aliases remain readable and deletable.
 pub struct ShardStore {
     files: PublicationStore,
+    /// Bounds the SNIP V2 shard downloads running at once on this store, for
+    /// every thread that uses it (issue #132).
+    downloads: FetchSlots,
 }
 
 impl ShardStore {
+    /// Open (or create) a store whose concurrent SNIP V2 shard downloads are
+    /// bounded by [`DEFAULT_MAX_CONCURRENT_FETCHES`].
     pub fn new(root: PathBuf) -> Result<Self> {
+        Self::with_max_concurrent_fetches(root, DEFAULT_MAX_CONCURRENT_FETCHES)
+    }
+
+    /// Open (or create) a store that runs at most `max_concurrent_fetches`
+    /// SNIP V2 shard downloads at once; further downloads wait in arrival
+    /// order. Zero is refused before the root is created.
+    pub fn with_max_concurrent_fetches(
+        root: PathBuf,
+        max_concurrent_fetches: usize,
+    ) -> Result<Self> {
+        let downloads = FetchSlots::new(max_concurrent_fetches)?;
         Ok(Self {
             files: PublicationStore::new(root, ".shard")?,
+            downloads,
         })
+    }
+
+    /// How many SNIP V2 shard downloads this store runs at once.
+    pub fn max_concurrent_fetches(&self) -> usize {
+        self.downloads.limit()
+    }
+
+    /// A download slot, waiting in line while all are held. Dropping the
+    /// permit frees the slot.
+    pub(crate) fn download_slot(&self) -> FetchPermit<'_> {
+        self.downloads.acquire()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn downloads(&self) -> &FetchSlots {
+        &self.downloads
     }
 
     /// A validated path for interoperability with trusted local tools.
