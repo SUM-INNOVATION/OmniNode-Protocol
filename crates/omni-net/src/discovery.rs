@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::behaviour::OmniNodeBehaviour;
 use crate::events::OmniNetEvent;
+use crate::policy::{NetPolicy, PolicySource};
 
 // ── Kademlia construction ────────────────────────────────────────────────────
 
@@ -51,21 +52,29 @@ fn extract_peer_id(addr: &Multiaddr) -> Result<PeerId> {
 /// Seed the Kademlia routing table from the bootstrap peer list, dial each
 /// peer, and trigger a bootstrap query to discover the wider network.
 ///
-/// Does nothing if `bootstrap_peers` is empty (LAN-only mode).
+/// Does nothing if `bootstrap_peers` is empty (LAN-only mode). An entry the
+/// outbound allow-list refuses (issue #158) is neither stored nor dialled; if
+/// every entry is refused, no bootstrap query is started.
 pub fn bootstrap_dht(
     swarm: &mut Swarm<OmniNodeBehaviour>,
     bootstrap_peers: &[String],
+    policy: &NetPolicy,
 ) -> Result<()> {
     if bootstrap_peers.is_empty() {
         return Ok(());
     }
 
+    let mut admitted = 0usize;
     for addr_str in bootstrap_peers {
         let addr: Multiaddr = addr_str
             .parse()
             .with_context(|| format!("invalid bootstrap multiaddr: {addr_str}"))?;
 
         let peer_id = extract_peer_id(&addr)?;
+        if !policy.admit(PolicySource::Bootstrap, &addr, Some(peer_id)) {
+            continue;
+        }
+        admitted += 1;
 
         // Seed Kademlia routing table with this peer's address.
         swarm
@@ -78,6 +87,11 @@ pub fn bootstrap_dht(
         if let Err(e) = swarm.dial(addr.clone()) {
             warn!(%addr, %e, "failed to dial bootstrap peer — continuing");
         }
+    }
+
+    if admitted == 0 {
+        warn!("every bootstrap peer is outside the outbound allow-list; no kademlia bootstrap");
+        return Ok(());
     }
 
     // Trigger the iterative Kademlia bootstrap query: finds k-closest peers
@@ -102,17 +116,36 @@ pub fn bootstrap_dht(
 /// Peers added to the routing table are wired into Gossipsub and surfaced
 /// as `PeerDiscovered` — the same event type mDNS uses, so downstream
 /// consumers (omni-store, omni-pipeline) don't need WAN-specific logic.
+///
+/// Issue #158: addresses the outbound allow-list refuses are removed from the
+/// routing table at once (the last one removes the peer), so they are never
+/// redialled. A peer left with no allowed address is not wired into Gossipsub
+/// or reported.
 pub fn handle_kademlia_event(
     event: kad::Event,
-    gossipsub: &mut gossipsub::Behaviour,
+    behaviour: &mut OmniNodeBehaviour,
+    policy: &NetPolicy,
     event_tx: &mpsc::Sender<OmniNetEvent>,
 ) {
     match event {
         kad::Event::RoutingUpdated {
             peer, addresses, ..
         } => {
-            gossipsub.add_explicit_peer(&peer);
-            let addrs = addresses.into_vec();
+            let mut addrs = addresses.into_vec();
+            if policy.is_restricted() {
+                let (allowed, refused): (Vec<_>, Vec<_>) = addrs
+                    .into_iter()
+                    .partition(|a| policy.admit(PolicySource::Kad, a, Some(peer)));
+                for addr in &refused {
+                    behaviour.kademlia.remove_address(&peer, addr);
+                }
+                if allowed.is_empty() {
+                    debug!(%peer, "kademlia peer has no allowed address — not wired");
+                    return;
+                }
+                addrs = allowed;
+            }
+            behaviour.gossipsub.add_explicit_peer(&peer);
             info!(%peer, addr_count = addrs.len(), "kademlia routing table updated");
             if let Err(e) = event_tx.try_send(OmniNetEvent::PeerDiscovered {
                 peer_id: peer,
@@ -153,9 +186,14 @@ pub fn handle_kademlia_event(
 /// Wires newly-discovered peers into Gossipsub (via `add_explicit_peer`) and
 /// emits the appropriate [`OmniNetEvent`] for each distinct PeerId.
 /// Called directly from the swarm event loop to keep that loop thin.
+///
+/// Issue #158: a discovered address the outbound allow-list refuses is
+/// dropped; a peer with no allowed address is neither made an explicit
+/// gossipsub peer (which gossipsub would redial every heartbeat) nor reported.
 pub fn handle_mdns_event(
     event: mdns::Event,
     gossipsub: &mut gossipsub::Behaviour,
+    policy: &NetPolicy,
     event_tx: &mpsc::Sender<OmniNetEvent>,
 ) {
     match event {
@@ -164,10 +202,13 @@ pub fn handle_mdns_event(
             // multiple addresses, but we emit one event per peer.
             let mut by_peer: HashMap<PeerId, Vec<_>> = HashMap::new();
             for (peer_id, addr) in list {
-                gossipsub.add_explicit_peer(&peer_id);
+                if !policy.admit(PolicySource::Mdns, &addr, Some(peer_id)) {
+                    continue;
+                }
                 by_peer.entry(peer_id).or_default().push(addr);
             }
             for (peer_id, addrs) in by_peer {
+                gossipsub.add_explicit_peer(&peer_id);
                 info!(%peer_id, addr_count = addrs.len(), "mDNS discovered peer");
                 if let Err(e) =
                     event_tx.try_send(OmniNetEvent::PeerDiscovered { peer_id, addrs })
@@ -191,5 +232,81 @@ pub fn handle_mdns_event(
                 }
             }
         }
+    }
+}
+
+/// Issue #158: refused addresses never reach the peer stores.
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::policy::{NetPolicy, OutboundAllowList};
+
+    fn restricted(items: &[&str]) -> NetPolicy {
+        NetPolicy::new(true, OutboundAllowList::parse(items).unwrap())
+    }
+
+    fn gossipsub() -> gossipsub::Behaviour {
+        gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(libp2p::identity::Keypair::generate_ed25519()),
+            gossipsub::Config::default(),
+        )
+        .unwrap()
+    }
+
+    fn discovered(policy: &NetPolicy, list: Vec<(PeerId, &str)>) -> Vec<(PeerId, Vec<Multiaddr>)> {
+        let (tx, mut rx) = mpsc::channel(16);
+        let list = list
+            .into_iter()
+            .map(|(p, a)| (p, a.parse().unwrap()))
+            .collect();
+        handle_mdns_event(mdns::Event::Discovered(list), &mut gossipsub(), policy, &tx);
+        let mut out = Vec::new();
+        while let Ok(OmniNetEvent::PeerDiscovered { peer_id, addrs }) = rx.try_recv() {
+            out.push((peer_id, addrs));
+        }
+        out.sort_by_key(|(p, _)| *p);
+        out
+    }
+
+    /// An mDNS discovery keeps only allowed addresses, and a peer with none is
+    /// not reported (nor made an explicit gossipsub peer, which gossipsub
+    /// would redial every heartbeat).
+    #[test]
+    fn mdns_drops_refused_addresses_and_peers_with_none_left() {
+        let (mixed, refused_only) = (PeerId::random(), PeerId::random());
+        let policy = restricted(&["127.0.0.1"]);
+        let got = discovered(
+            &policy,
+            vec![
+                (mixed, "/ip4/127.0.0.1/udp/4001/quic-v1"),
+                (mixed, "/ip4/192.168.1.5/udp/4001/quic-v1"),
+                (refused_only, "/ip4/192.168.1.6/udp/4001/quic-v1"),
+            ],
+        );
+        assert_eq!(
+            got,
+            vec![(
+                mixed,
+                vec!["/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap()]
+            )]
+        );
+        assert_eq!(policy.refusals().mdns, 2);
+    }
+
+    #[test]
+    fn mdns_without_an_allow_list_reports_every_address() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let policy = NetPolicy::unrestricted();
+        let got = discovered(
+            &policy,
+            vec![
+                (a, "/ip4/127.0.0.1/udp/4001/quic-v1"),
+                (a, "/ip4/192.168.1.5/udp/4001/quic-v1"),
+                (b, "/ip4/192.168.1.6/udp/4001/quic-v1"),
+            ],
+        );
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.iter().map(|(_, a)| a.len()).sum::<usize>(), 3);
+        assert_eq!(policy.refusals().total(), 0);
     }
 }

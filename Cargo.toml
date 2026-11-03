@@ -159,7 +159,7 @@ async-trait = "0.1"
 
 bytes   = "1.9"
 uuid    = { version = "1.11", features = ["v4"] }
-clap    = { version = "4.5",  features = ["derive"] }
+clap    = { version = "4.5",  features = ["derive", "env"] }
 rand    = "0.9"
 chrono  = { version = "0.4",  features = ["serde"] }
 

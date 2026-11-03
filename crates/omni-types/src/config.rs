@@ -43,8 +43,30 @@ pub struct NetConfig {
     /// discovered, added as a gossipsub explicit peer and dialled. A node
     /// whose peers are reached only by explicit dial or bootstrap peers can
     /// turn it off; test harnesses do, so that concurrently running nodes on
-    /// one host do not connect to each other.
+    /// one host do not connect to each other. `false` constructs no mDNS
+    /// behaviour at all: the node neither announces itself nor discovers
+    /// peers by multicast. The CLI sets it with `--mdns on|off` (issue #158).
     pub mdns: bool,
+
+    /// Outbound address allow-list (issue #158). Empty (the default) means no
+    /// restriction, as before.
+    ///
+    /// When set, every address the node dials must match an entry, whichever
+    /// part of the node asked for the dial (`--peer`, mDNS, Identify,
+    /// Kademlia, AutoNAT, relay, DCUtR); anything else is refused before a
+    /// packet is sent. Refused addresses are kept out of the peer stores (so
+    /// they are not redialled), and an inbound connection is kept only from an
+    /// allowed address (a relayed one only through an allowed relay). Each
+    /// entry is an IP address or CIDR (`127.0.0.1`, `10.0.0.0/8`, `::1`) or a
+    /// multiaddr prefix (`/ip4/127.0.0.1/udp/4001/quic-v1`, optionally ending
+    /// in `/p2p/<peer-id>`). The CLI sets it with `--outbound-allow`.
+    ///
+    /// Parsed and enforced by `omni-net` (`omni_net::policy`), which refuses
+    /// a malformed entry when the swarm is built, logs the effective policy
+    /// and counts refusals by source. An application-level routing control for
+    /// cooperative networks, not an operating-system security boundary: a
+    /// modified client can ignore it.
+    pub outbound_allow: Vec<String>,
 
     /// Stage 12.6 — libp2p mesh identity policy.
     ///
@@ -108,6 +130,7 @@ impl Default for NetConfig {
             bootstrap_peers: vec![],
             relay_server: false,
             mdns: true,
+            outbound_allow: Vec::new(),
             identity: NetIdentity::Ephemeral,
         }
     }
@@ -271,6 +294,17 @@ impl Default for PipelineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #158: the defaults keep mDNS on and set no outbound restriction.
+    #[test]
+    fn net_config_defaults_keep_mdns_on_and_set_no_allow_list() {
+        let cfg = NetConfig::default();
+        assert!(cfg.mdns, "mDNS stays on unless explicitly turned off");
+        assert!(
+            cfg.outbound_allow.is_empty(),
+            "no outbound restriction by default"
+        );
+    }
 
     #[test]
     fn store_config_defaults() {
