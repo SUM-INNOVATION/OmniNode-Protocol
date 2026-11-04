@@ -186,6 +186,11 @@ pub struct OmniSwarm {
     /// Issue #158: mDNS switch, outbound allow-list and refusal counters,
     /// shared with the transport gate and the policy behaviours.
     policy: Arc<NetPolicy>,
+
+    /// Unit tests only: holds one message at the transport until the swarm is
+    /// driven after a stop request. See [`crate::drain::hold`].
+    #[cfg(test)]
+    write_hold: Option<crate::drain::hold::WriteHold>,
 }
 
 impl OmniSwarm {
@@ -240,6 +245,13 @@ impl OmniSwarm {
         // streams, so they need Noise + Yamux even though the primary
         // transport is QUIC (which has encryption and multiplexing built in).
         let (transport, relay_client) = build_transport(&keypair, policy.clone())?;
+        #[cfg(test)]
+        let write_hold = crate::drain::hold::take_for_build();
+        #[cfg(test)]
+        let transport = match &write_hold {
+            Some(hold) => hold.wrap(transport),
+            None => transport,
+        };
 
         // ── Existing protocols ────────────────────────────────────────────
         // Disabled mDNS is not constructed at all: no socket, no
@@ -337,6 +349,8 @@ impl OmniSwarm {
             listen_waiters: Vec::new(),
             recent_publishes: RecentPublishes::new(),
             policy,
+            #[cfg(test)]
+            write_hold,
         })
     }
 
@@ -507,6 +521,10 @@ impl OmniSwarm {
             }
         };
 
+        #[cfg(test)]
+        if let Some(hold) = &self.write_hold {
+            hold.stop_requested();
+        }
         let report = self.drain(grace, &event_tx, &mut cmd_rx, &mut waiters).await;
         let released = self.release_pending_requests();
         info!(

@@ -207,6 +207,16 @@ pub(crate) fn recipients_in_window(
     (peers.len(), connected)
 }
 
+// What the drain does on a live network, deterministically: a test-only hold
+// keeps a message queued at the transport until the swarm is driven after the
+// stop request (`hold`), and the delivery tests run with and without the drain
+// against it (`delivery`).
+#[cfg(test)]
+pub(crate) mod hold;
+
+#[cfg(test)]
+mod delivery;
+
 #[cfg(test)]
 mod tests {
     use super::*;

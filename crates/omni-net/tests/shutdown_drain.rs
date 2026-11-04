@@ -21,6 +21,15 @@
 //! has not arrived yet.
 //!
 //! All nodes run with mDNS off and connect only to what the test dials.
+//!
+//! The negative control — the same sequence without the drain loses the
+//! message — is not here. Under real scheduling the loss is a race the
+//! connection task often wins, so a control that waits for it to be lost is
+//! probabilistic. It lives in `src/drain/delivery.rs` instead, as a unit test
+//! with a test-only transport hold that keeps the final message queued until
+//! the swarm is driven after the stop request: there the loss without the
+//! drain, and the delivery with it, are fixed by the order of operations
+//! rather than by timing.
 
 use std::time::{Duration, Instant};
 
@@ -46,12 +55,6 @@ const RECEIPT_WINDOW: Duration = Duration::from_secs(1);
 /// six runs; twenty deliveries in a row is what "the race is gone" has to mean
 /// here.
 const RUNS: usize = 20;
-
-/// Upper bound on negative-control runs. Without the drain the final message
-/// was lost in every run when this test ran alone and in roughly a third to
-/// half of the runs alongside the drain test, so the control stops at the
-/// first loss and only a broken control runs this many times.
-const CONTROL_RUNS: usize = 40;
 
 const TOPIC: &str = TOPIC_CONTRIBUTOR_RESULT;
 
@@ -237,6 +240,9 @@ async fn one_run(watcher: &mut Watcher, run: usize, drain: Duration) -> RunResul
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// With the default drain, every run's final message reaches the watcher.
+///
+/// Its negative control, `without_the_drain_the_same_sequence_loses_the_message`,
+/// is in `src/drain/delivery.rs`; see the module docs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_message_published_just_before_exit_reaches_a_connected_watcher() {
     let mut watcher = start_watcher().await;
@@ -271,33 +277,6 @@ async fn a_message_published_just_before_exit_reaches_a_connected_watcher() {
     assert!(
         lost.is_empty(),
         "final message lost in runs {lost:?} of {RUNS} despite the drain"
-    );
-}
-
-/// Negative control: with the drain disabled — the loop drops the swarm as
-/// soon as it is asked to stop, as it did before — the same sequence loses
-/// the final message. This is what shows the test above can fail.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn without_the_drain_the_same_sequence_loses_the_message() {
-    let mut watcher = start_watcher().await;
-    let mut first_loss = None;
-    for run in 0..CONTROL_RUNS {
-        let RunResult { received, report } = one_run(&mut watcher, run, Duration::ZERO).await;
-        assert_eq!(report.outcome, DrainOutcome::Disabled, "run {run}: {report:?}");
-        assert!(
-            report.waited < Duration::from_millis(100),
-            "run {run}: a disabled drain does not wait: {report:?}"
-        );
-        eprintln!("no-drain run {run}: received={received}");
-        if !received {
-            first_loss = Some(run);
-            break;
-        }
-    }
-    assert!(
-        first_loss.is_some(),
-        "with the drain disabled all {CONTROL_RUNS} final messages still arrived; \
-         the test above would then pass whether or not the drain works"
     );
 }
 
