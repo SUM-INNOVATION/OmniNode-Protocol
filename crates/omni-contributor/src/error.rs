@@ -509,6 +509,18 @@ pub enum RunnerError {
 
     #[error("runner io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// #131: the manifest is larger than the in-process MLP runner reads.
+    #[error("model manifest is {len} bytes, more than the {limit} the MLP runner reads")]
+    ModelManifestTooLarge { len: u64, limit: u64 },
+
+    /// #131: the manifest's exact bytes are not the model the runner serves.
+    #[error("model manifest BLAKE3 is {got}; the MLP runner serves {expected}")]
+    ModelManifestMismatch { expected: String, got: String },
+
+    /// #131: the model refused the input (size or encoding).
+    #[error("MLP input refused: {0}")]
+    ModelInput(String),
 }
 
 /// Errors produced by the verification pipeline. Each variant maps to

@@ -2815,6 +2815,7 @@ dependencies = [
  "libp2p",
  "libp2p-identity",
  "multiaddr",
+ "omni-fixedpoint-mlp",
  "omni-net",
  "omni-store",
  "omni-types",

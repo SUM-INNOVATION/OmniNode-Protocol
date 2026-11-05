@@ -45,6 +45,7 @@ pub mod error;
 pub mod handoff;
 pub mod handoff_verify;
 pub mod job;
+pub mod mlp;
 pub mod net;
 pub mod peer_advert;
 pub mod peer_routing;
@@ -95,6 +96,9 @@ pub use relay::{ContributorRelay, InMemoryRelay};
 pub use relay::OmniNetRelay;
 pub use job::{
     BaseUnitRewardPolicy, ContributorJob, JobAccounting, VerificationRequirement,
+};
+pub use mlp::{
+    FixedPointMlpRunner, MlpJobError, MAX_MLP_MANIFEST_BYTES, MLP_STAGE_LABEL, MLP_TOKENIZER_ID,
 };
 pub use posted::{PostedJob, PostedResultLink, POSTED_SCHEMA_VERSION};
 pub use result::{
