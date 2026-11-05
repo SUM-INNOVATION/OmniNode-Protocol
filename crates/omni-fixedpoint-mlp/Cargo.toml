@@ -1,0 +1,21 @@
+[package]
+name             = "omni-fixedpoint-mlp"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+rust-version.workspace = true
+
+# #131 item 1(a) — the fixed-point MLP numeric contract
+# (`production-fixedpoint-mlp-v1`) evaluated over a checked layer set, and
+# the accounting numbers derived from a validated model.
+#
+# **No dependencies**, on purpose: omni-contributor's in-process runner uses
+# this crate, and omni-contributor stays free of omni-zkml and of every
+# halo2 crate (CI's default-tree-check). The proof crate
+# (`omni-proofs-halo2-production-mlp`) keeps its own canonical evaluator,
+# unchanged, and its tests check this crate against it.
+#
+# Off-chain only.
+
+[dependencies]

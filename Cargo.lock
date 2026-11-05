@@ -2815,6 +2815,7 @@ dependencies = [
  "libp2p",
  "libp2p-identity",
  "multiaddr",
+ "omni-fixedpoint-mlp",
  "omni-net",
  "omni-store",
  "omni-types",
@@ -2825,6 +2826,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "omni-fixedpoint-mlp"
+version = "0.1.1"
 
 [[package]]
 name = "omni-net"
@@ -2907,6 +2912,7 @@ dependencies = [
  "blake3",
  "halo2_proofs",
  "libp2p-identity",
+ "omni-fixedpoint-mlp",
  "omni-zkml",
  "rand_chacha",
  "serde",

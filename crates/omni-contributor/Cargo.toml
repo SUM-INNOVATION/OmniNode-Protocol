@@ -52,6 +52,9 @@ libp2p-identity  = { workspace = true }   # Ed25519 signing — direct dep
 multiaddr        = { workspace = true }
 base64           = "0.22"                 # ExternalCommandRunner stdout
 tempfile         = { workspace = true }   # SNIP byte wrappers (Option A)
+# #131 — the fixed-point MLP evaluator for the in-process MLP runner
+# (`mlp::FixedPointMlpRunner`). Dependency-free: no omni-zkml, no halo2.
+omni-fixedpoint-mlp = { workspace = true }
 
 # Stage 12.2 — optional libp2p network relay. Default-off; pulled
 # only when --features network is set (via omni-node's CLI build).

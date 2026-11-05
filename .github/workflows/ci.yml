@@ -105,7 +105,8 @@ jobs:
             -p omni-contributor \
             -p omni-ops \
             -p omni-node \
-            -p omni-bridge
+            -p omni-bridge \
+            -p omni-fixedpoint-mlp
 
       # The bridge's interpreter-facing behaviour (exception classes, the
       # ShardView buffer protocol, dict builders, object lifetimes) can only be
@@ -153,7 +154,8 @@ jobs:
             -p omni-contributor \
             -p omni-ops \
             -p omni-node \
-            -p omni-bridge
+            -p omni-bridge \
+            -p omni-fixedpoint-mlp
 
   # ── (2) Default dep-tree: HARD GATE — feature gating keeps submit out ──────
   default-tree-check:

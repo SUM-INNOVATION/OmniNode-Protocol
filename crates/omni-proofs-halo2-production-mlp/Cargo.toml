@@ -80,3 +80,7 @@ blake3 = { workspace = true }
 [dev-dependencies]
 bincode1        = { package = "bincode", version = "1.3" }
 libp2p-identity = { workspace = true }
+# #131 — tests only: `tests/fixedpoint_crate_equivalence.rs` pins the
+# dependency-free evaluator crate to this crate's canonical evaluator,
+# weights, spec file and model identity. Not a runtime dependency.
+omni-fixedpoint-mlp = { workspace = true }
