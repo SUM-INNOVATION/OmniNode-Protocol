@@ -16,7 +16,7 @@ use clap::{Args, Subcommand, ValueEnum};
 
 use omni_contributor::{
     canonical::job_hash_hex, checkpoint::RunCheckpointStore, run_job_checkpointed,
-    verify::DispatcherSignatureOutcome, verify_result, CheckpointedRun, ContributorJob, ContributorResult, ContributorSigner, ExternalCommandRunner, InferenceRunner,
+    verify::DispatcherSignatureOutcome, verify_result, CheckpointedRun, ContributorJob, ContributorResult, ContributorSigner, ExternalCommandRunner, FixedPointMlpRunner, InferenceRunner,
     RunJobOptions, StubRunner, WorkUnitKind,
 };
 use omni_store::{SnipV2Cli, SnipV2CliConfig};
@@ -447,7 +447,15 @@ struct RunJobArgs {
 enum RunnerChoice {
     External,
     Stub,
+    /// #131 — the in-process fixed-point MLP runner for the canonical model
+    /// (`production-fixedpoint-mlp-v1`), with element accounting. `run-job`
+    /// only; the other commands refuse it. The value name is provisional.
+    FixedpointMlp,
 }
+
+/// #131 — the refusal for `--runner fixedpoint-mlp` outside `run-job`.
+const FIXEDPOINT_MLP_RUN_JOB_ONLY: &str =
+    "--runner fixedpoint-mlp is available on `contributor run-job` only";
 
 // ── verify-result ─────────────────────────────────────────────────────────
 
@@ -3005,6 +3013,25 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
             );
             run_job_checkpointed(&job, &adapter, &runner, opts, &checkpoints)?
         }
+        RunnerChoice::FixedpointMlp => {
+            // #131: the canonical model only (no weight-file loader is wired).
+            // The job must carry the model's identity, audit metadata and
+            // counts; the run then requires the manifest's exact bytes to be
+            // the model. No proof sidecar is emitted with this runner.
+            #[cfg(feature = "halo2-reference-prove")]
+            if args.emit_halo2_reference_proof.is_some() {
+                bail!("--emit-halo2-reference-proof is not supported with --runner fixedpoint-mlp");
+            }
+            #[cfg(feature = "stage11d-production-prove")]
+            if args.emit_production_mlp_proof.is_some() {
+                bail!("--emit-production-mlp-proof is not supported with --runner fixedpoint-mlp");
+            }
+            let runner = FixedPointMlpRunner::canonical(signer.pubkey_hex());
+            runner
+                .check_job(&job)
+                .map_err(|e| anyhow!("--runner fixedpoint-mlp: {e}"))?;
+            run_job_checkpointed(&job, &adapter, &runner, opts, &checkpoints)?
+        }
         RunnerChoice::External => {
             let mut runner = ExternalCommandRunner::new(
                 args.external_command
@@ -3125,6 +3152,10 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
                     &job, &result, ci, co, proof_path,
                 )?;
             }
+            (RunnerChoice::FixedpointMlp, _) => {
+                // Unreachable — refused before the run above.
+                bail!("--emit-halo2-reference-proof is not supported with --runner fixedpoint-mlp");
+            }
             (RunnerChoice::External, None) => {
                 // Unreachable — when emit flag is set on External,
                 // the branch above always populates
@@ -3159,6 +3190,10 @@ fn run_run_job(args: RunJobArgs) -> Result<()> {
                 emit_production_mlp_proof_sidecar_from_bytes(
                     &job, &result, ci, co, proof_path,
                 )?;
+            }
+            (RunnerChoice::FixedpointMlp, _) => {
+                // Unreachable — refused before the run above.
+                bail!("--emit-production-mlp-proof is not supported with --runner fixedpoint-mlp");
             }
             (RunnerChoice::External, None) => {
                 bail!(
@@ -3842,6 +3877,7 @@ fn run_watch_jobs(args: WatchJobsArgs) -> Result<()> {
                 args.stub_output_tokens,
             ))
         }
+        RunnerChoice::FixedpointMlp => bail!(FIXEDPOINT_MLP_RUN_JOB_ONLY),
         RunnerChoice::External => {
             let mut r = ExternalCommandRunner::new(
                 args.external_command
@@ -4128,6 +4164,7 @@ async fn run_watch_network_jobs(args: WatchNetworkJobsArgs) -> Result<()> {
                 args.stub_output_tokens,
             ))
         }
+        RunnerChoice::FixedpointMlp => bail!(FIXEDPOINT_MLP_RUN_JOB_ONLY),
         RunnerChoice::External => {
             let mut r = ExternalCommandRunner::new(
                 args.external_command
@@ -5425,6 +5462,7 @@ async fn run_assignment(args: RunAssignmentArgs) -> Result<()> {
             )
             .map_err(|e| anyhow!("runner: {e}"))?
         }
+        RunnerChoice::FixedpointMlp => bail!(FIXEDPOINT_MLP_RUN_JOB_ONLY),
         RunnerChoice::External => {
             let mut r = ExternalCommandRunner::new(
                 args.external_command
@@ -8888,6 +8926,119 @@ mod tests {
             no_such_flag.is_err(),
             "restore-state-cleanup-quarantine must not accept --no-prune-state-on-start"
         );
+    }
+
+    // ── #131 — the in-process fixed-point MLP runner ────────────────────────
+
+    /// A job file and a seed file in `dir`. The job is a plain token job,
+    /// not one for the canonical MLP model.
+    fn write_token_job_and_seed(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let mut job = ContributorJob {
+            schema_version: 1,
+            job_id: String::new(),
+            model_hash: "11".repeat(32),
+            manifest_snip_root: "22".repeat(32),
+            input_snip_root: "33".repeat(32),
+            input_hash: "44".repeat(32),
+            verification_requirement: omni_contributor::VerificationRequirement::AttestationOnly,
+            accounting: omni_contributor::JobAccounting {
+                tokenizer_hash: "55".repeat(32),
+                tokenizer_id: "demo/tokenizer".into(),
+                input_token_count: 7,
+                max_output_token_count: 100,
+                base_unit_reward_policy: omni_contributor::BaseUnitRewardPolicy::Unspecified,
+            },
+            dispatched_at_utc: "2026-11-06T00:00:00Z".into(),
+            expires_at_utc: None,
+            dispatcher_pubkey_hex: None,
+            dispatcher_signature_hex: None,
+            notes: None,
+        };
+        job.job_id = job_hash_hex(&job).unwrap();
+        let job_path = dir.join("job.json");
+        std::fs::write(&job_path, serde_json::to_vec(&job).unwrap()).unwrap();
+        let seed_path = dir.join("seed");
+        std::fs::write(&seed_path, [7u8; 32]).unwrap();
+        (job_path, seed_path)
+    }
+
+    /// `--runner fixedpoint-mlp` parses for run-job, and a job that is not a
+    /// canonical-MLP job is refused before any work runs: nothing is fetched
+    /// (the SNIP binary does not exist) and no result or checkpoint is
+    /// written.
+    #[test]
+    fn run_job_fixedpoint_mlp_refuses_a_job_that_is_not_a_canonical_mlp_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let (job_path, seed_path) = write_token_job_and_seed(dir.path());
+        let out = dir.path().join("result.json");
+        let root = TestRoot::try_parse_from([
+            "omni-node",
+            "run-job",
+            "--job",
+            job_path.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--seed-file",
+            seed_path.to_str().unwrap(),
+            "--runner",
+            "fixedpoint-mlp",
+            "--snip-binary",
+            "/nonexistent/sum-node",
+        ])
+        .expect("--runner fixedpoint-mlp parses");
+        let args = match root.contributor.cmd {
+            ContributorCmd::RunJob(a) => a,
+            _ => panic!("expected RunJob"),
+        };
+        assert_eq!(args.runner, RunnerChoice::FixedpointMlp);
+        let err = super::run_run_job(args).expect_err("not a canonical-MLP job");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--runner fixedpoint-mlp: job model_hash"),
+            "unexpected refusal: {msg}"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let mut left = left;
+        left.sort();
+        assert_eq!(left, vec!["job.json", "seed"], "nothing written");
+    }
+
+    /// The other runner commands refuse it (watch-jobs shown; watch-network-jobs
+    /// and run-assignment have the same arm).
+    #[test]
+    fn watch_jobs_refuses_the_fixedpoint_mlp_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_job, seed_path) = write_token_job_and_seed(dir.path());
+        let root = TestRoot::try_parse_from([
+            "omni-node",
+            "watch-jobs",
+            "--jobs-dir",
+            dir.path().to_str().unwrap(),
+            "--seed-file",
+            seed_path.to_str().unwrap(),
+            "--max-input-tokens",
+            "16",
+            "--max-output-tokens",
+            "8",
+            "--max-total-base-units",
+            "24",
+            "--result-out-dir",
+            dir.path().to_str().unwrap(),
+            "--runner",
+            "fixedpoint-mlp",
+            "--snip-binary",
+            "/nonexistent/sum-node",
+        ])
+        .expect("parses");
+        let args = match root.contributor.cmd {
+            ContributorCmd::WatchJobs(a) => a,
+            _ => panic!("expected WatchJobs"),
+        };
+        let err = super::run_watch_jobs(args).expect_err("refused");
+        assert_eq!(err.to_string(), FIXEDPOINT_MLP_RUN_JOB_ONLY);
     }
 
     // ── Stage 14.2 — halo2-reference sidecar proof emission ─────────────────
