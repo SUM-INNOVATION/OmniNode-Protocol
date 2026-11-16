@@ -116,6 +116,17 @@ It does not show:
 
 Those are the external acceptance #160 left open. It is **NOT yet done**.
 
+### Which scenarios use a real network
+
+| Scenario | Network |
+|---|---|
+| `mdns-off-flag`, `mdns-off-env`, `dial-peer`, `dial-peer-env`, `inbound`, `kad-identify` | **None.** Loopback only. Every node has mDNS off and `--outbound-allow` fenced to loopback. Nothing leaves the machine. |
+| `mdns-on-instances` (only with `--allow-multicast`) | **The local LAN segment, multicast only.** mDNS sends multicast on this host's LAN interfaces. No peer is dialled, because outbound stays fenced to loopback. The record says so in `MULTICAST-NOTICE.txt`. |
+| The two-host procedure below | **Real network.** An isolated segment with two test hosts: mDNS multicast and discovery between them, plus dials across it. |
+| Relay and DCUtR (not covered) | Would need a real network with a relay host and a host behind NAT. |
+
+No production host is used or needed: every host is a test host.
+
 ### Two-host procedure
 
 **Host requirement:** an isolated network segment with two test hosts, H1 and H2,
