@@ -8,6 +8,26 @@ recipient. This runner is the reproducible procedure for the rest: separate
 processes, separate hosts, and a slow or lossy link. It records what happened and
 gives a verdict. It does not close #150; the external acceptance does.
 
+**The limit.** Bounded shutdown draining does not guarantee remote delivery.
+`--propagation-wait-ms` bounds how long the node keeps driving the network after its
+last broadcast. It is not an acknowledgement from the recipient. If a packet is lost
+and QUIC would resend it after the drain ends, the message is lost. The runner saw
+exactly that once on an emulated lossy link (see **Observed results**).
+
+**Scope: test tooling only.** This runner adds:
+- test roles in `crates/omni-contributor/tests/watch_network_jobs_exit_delivery.rs`;
+- `scripts/acceptance/result-delivery.sh`;
+- this document.
+
+No product code changes. Every file under `crates/*/src/` is the same as on `main`,
+including the delivery path:
+- `crates/omni-contributor/src/watch.rs` and `crates/omni-contributor/src/relay.rs`;
+- `crates/omni-net/src/drain.rs` and `crates/omni-net/src/swarm.rs`;
+- `crates/omni-node/src/contributor_cli.rs`.
+
+The deadline fix (no hang) and the redial change below are fixes to the runner, not
+to `omni-node`.
+
 ## What it runs
 
 `scripts/acceptance/result-delivery.sh` drives three ignored test roles in
@@ -171,6 +191,44 @@ but it is not a delivery failure if the receipt is there.
 it once per setup to show that this setup can see a loss. A setup that delivers
 everything without the drain cannot show that the drain matters.
 
+## Observed results (local evidence)
+
+All rows below are local evidence: one macOS arm64 machine, loopback, separate OS
+processes. "Emulated" means through the userspace link proxy. None is external
+acceptance. Every session's pmset sleep check was clean. Runs are 20 per session.
+
+| Commit | Session (UTC, 2026-11-16) | Link | `--propagation-wait-ms` | Result |
+|---|---|---|---|---|
+| `80857da0` | 21:26–21:27 | loopback | 200 | PASS 20/20, all drains `settled` |
+| `80857da0` | 21:27–21:28 | emulated 150 ms + 0..20 ms | 200 | PASS 20/20 |
+| `80857da0` | 21:28–21:31 | emulated 150 ms, 5 % loss | 200 | **FAIL**: run 12 lost (see below); run 9 never connected |
+| `44cd7487` | 21:37 | loopback | 200 | PASS 20/20 |
+| `44cd7487` | 21:37–21:39 | emulated 150 ms + 0..20 ms | 200 | PASS 20/20 |
+| `44cd7487` | 21:39–21:40 | emulated 150 ms, 5 % loss | 200 | PASS 20/20 |
+| `44cd7487` | 21:40–21:42 | emulated 150 ms, 5 % loss | 1000 | PASS 20/20 |
+| `44cd7487` | 21:42–21:45 | emulated 400 ms, 5 % loss | 200 | PASS 20/20 |
+| `44cd7487` | 21:45 | loopback | 0 (control) | FAIL 16/20, 4 lost |
+| `44cd7487` | 21:45–21:46 | emulated 150 ms | 0 (control) | FAIL 8/20, 12 lost |
+| `44cd7487` | 21:47 | loopback, two watchers | 200 | PASS 20/20 at each watcher |
+
+**The loss at `80857da0`.** Through the emulated 150 ms, 5 % loss link with the
+default 200 ms drain, run 12's announcement never reached the watcher. Its drain
+report says `outcome: settled`, `waited_ms: 200`, `recipients_connected: 1`. The drain
+ran its full bound with the recipient still connected, and the message was still
+lost. The session ran `80857da0`. The contributor sequence has not changed since,
+because `407e93ac` touched only how the runner connects.
+
+In the same session, run 9 never connected: its only QUIC handshake failed, and the
+runner did not dial again. That was a setup failure in the runner, not a delivery
+loss. `407e93ac` fixed it by redialling.
+
+The next session of the same scenario, at `44cd7487`, delivered 20 of 20. One loss in
+20 runs, then none in the next 20, says the loss is intermittent. It does not say the
+link is safe.
+
+**Outstanding.** External acceptance is NOT done. It includes repeating the lossy
+scenarios on the two-host setup over several sessions, not one.
+
 ## Evidence classes
 
 - **`loopback` is local evidence** (this machine, loopback). With a delay or loss
@@ -183,6 +241,17 @@ everything without the drain cannot show that the drain matters.
 - **External acceptance** for #150 means the watcher and the contributor on
   separate hosts, over a real network path. For the slow-link case, that is a real
   slow path, or OS-level shaping on a real path. It is still to be done.
+
+## Which scenarios use a real network
+
+| Scenario | Network |
+|---|---|
+| `loopback`, with or without an emulated link | **None.** Loopback only, every OmniNet dial fenced to `127.0.0.1,::1`, mDNS off. Nothing leaves the machine. |
+| `watcher` and `contributor` on two hosts | **Real network.** Two test hosts, over a LAN or WAN path. |
+| The same with OS-level shaping (`tc netem`, dummynet) | **Real network, shaped** by the operator on the test hosts. |
+
+No production host is used or needed: every host is a test host. Fence the OmniNet
+dials of each host to the other with `--outbound-allow`.
 
 ## Running it across hosts
 
@@ -213,11 +282,13 @@ drain outcomes. Keep both directories.
 include. A useful set, each at the default `--propagation-wait-ms 200` with 20 runs,
 plus one `--propagation-wait-ms 0` control each:
 
-1. Two hosts on one LAN, no shaping.
-2. Two hosts over a real slow path, or with OS shaping of about 150 ms one way.
-3. As 2, with 1–5 % loss.
-4. Two watcher hosts at once (`--watcher-addr B1,B2`, no emulated link), for more
-   than one recipient.
+1. **Real network, no shaping:** two hosts on one LAN.
+2. **Real network, slow:** two hosts over a real slow path, or with OS shaping of
+   about 150 ms one way.
+3. **Real network, slow and lossy:** as 2, with 1–5 % loss. Repeat it over several
+   sessions, because the local loss above was intermittent.
+4. **Real network, two recipients:** two watcher hosts at once
+   (`--watcher-addr B1,B2`, no emulated link).
 
 **Host requirements:**
 - UDP reachability from A to B on the watcher's port.
