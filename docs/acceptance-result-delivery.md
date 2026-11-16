@@ -29,7 +29,7 @@ result announcement and the handshake cross the network. The SNIP fetch that
 **Handshake.** Before running the job, the contributor publishes probes on the
 result topic every 100 ms (`OMNI_DELIVERY_PROBE_INTERVAL_MS`). Each watcher answers every probe
 with an ack on `omni/test/v1`. The job starts once every watcher has acked and a further
-`--settle-ms` (default 1000) has passed. So each watcher is known to receive the
+`--settle-ms` (default 1000) has passed. A watcher still unconnected is dialled again every 5 s (`OMNI_DELIVERY_REDIAL_MS`), because on a lossy link a single QUIC handshake can fail outright. So each watcher is known to receive the
 result topic from this contributor, and the probes are outside the drain window
 when the announcement goes out. The watcher's relay ignores probes, because they
 are not announcements.
@@ -157,7 +157,7 @@ Anything else is a **FAIL**: a lost run, a late receipt, a bad signature, a run
 never seen, a contributor that failed, or any process past its deadline. The
 watcher's exit status is its verdict. `loopback` and `contributor` exit non-zero
 unless `RESULT=PASS`. **VOID** (macOS: the machine slept during the session)
-overrides both.
+overrides both. The summary tells a setup failure from a delivery loss: a contributor that never connected shows as `processes_failed` and `deadline_exceeded`, and as a run the watcher never saw (`runs_seen` below `--runs`). A delivery loss shows as `lost`.
 
 With `--propagation-wait-ms` above zero, every drain outcome is expected to be
 `settled`. `recipients_gone` means the watcher went away first. Investigate it,

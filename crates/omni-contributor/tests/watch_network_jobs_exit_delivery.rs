@@ -644,6 +644,7 @@ mod runner {
     const LINK_LOSS_PCT: &str = "OMNI_DELIVERY_LINK_LOSS_PCT";
     const LINK_SEED: &str = "OMNI_DELIVERY_LINK_SEED";
     const DEADLINE_SECS: &str = "OMNI_DELIVERY_DEADLINE_SECS";
+    const REDIAL_MS: &str = "OMNI_DELIVERY_REDIAL_MS";
 
     /// Handshake payloads. A probe goes out on the result topic, so its
     /// arrival shows the result path to the watcher works; the watcher's relay
@@ -1072,6 +1073,7 @@ mod runner {
         let connect_timeout = Duration::from_secs(env_or(CONNECT_TIMEOUT_SECS, 60));
         let settle = env_ms(SETTLE_MS, 0);
         let probe_interval = env_ms(PROBE_INTERVAL_MS, 100);
+        let redial_every = env_ms(REDIAL_MS, 5_000).max(Duration::from_millis(100));
         let watcher_addrs: Vec<Multiaddr> = watchers
             .split(',')
             .map(str::trim)
@@ -1102,20 +1104,41 @@ mod runner {
             let posted_id = announce_job(&snip, &mut jobs, format!("{session}-{run}"));
             println!("delivery-runner role=contributor run={run} peer_id={me} posted_id={posted_id}");
 
-            for a in &watcher_addrs {
-                node.dial(a.clone())
-                    .await
-                    .unwrap_or_else(|e| panic!("run {run}: dial {a}: {e}"));
-            }
+            // Dial every watcher, and dial again any still unconnected every
+            // `OMNI_DELIVERY_REDIAL_MS`: on a lossy link a QUIC handshake can
+            // fail outright, and one failed dial must not end the run.
+            let net = node.handle();
+            let dial_missing = |connected: &BTreeSet<PeerId>| {
+                let net = net.clone();
+                let missing: Vec<Multiaddr> = watcher_addrs
+                    .iter()
+                    .filter(|a| peer_of(a).is_some_and(|p| !connected.contains(&p)))
+                    .cloned()
+                    .collect();
+                async move {
+                    for a in &missing {
+                        let _ = net.dial(a.clone()).await;
+                    }
+                    missing.len() as u64
+                }
+            };
             let mut connected = BTreeSet::new();
+            let mut dials = dial_missing(&connected).await;
             tokio::time::timeout(connect_timeout, async {
+                let mut next_redial = tokio::time::Instant::now() + redial_every;
                 while connected.len() < expected.len() {
-                    match node.next_event().await {
-                        Some(OmniNetEvent::PeerConnected { peer_id }) if expected.contains(&peer_id) => {
-                            connected.insert(peer_id);
+                    tokio::select! {
+                        event = node.next_event() => match event {
+                            Some(OmniNetEvent::PeerConnected { peer_id }) if expected.contains(&peer_id) => {
+                                connected.insert(peer_id);
+                            }
+                            Some(_) => {}
+                            None => panic!("event stream closed"),
+                        },
+                        _ = tokio::time::sleep_until(next_redial) => {
+                            dials += dial_missing(&connected).await;
+                            next_redial += redial_every;
                         }
-                        Some(_) => {}
-                        None => panic!("event stream closed"),
                     }
                 }
             })
@@ -1124,7 +1147,6 @@ mod runner {
             let connected_ms = ms(started.elapsed());
 
             // Handshake: probe on the result topic until every watcher acks.
-            let net = node.handle();
             let mut acked: BTreeSet<PeerId> = BTreeSet::new();
             let mut sent: BTreeMap<u64, Instant> = BTreeMap::new();
             let mut ack_rtt_ms: Option<u64> = None;
@@ -1184,7 +1206,7 @@ mod runner {
             let drain_ended_utc = now_utc();
             json!({
                 "peer_id": me.to_string(), "policy": policy, "posted_id": posted_id,
-                "connected_ms": connected_ms, "probes_sent": probes, "probe_ack_rtt_ms": ack_rtt_ms,
+                "connected_ms": connected_ms, "dials": dials, "probes_sent": probes, "probe_ack_rtt_ms": ack_rtt_ms,
                 "exited_on_max_jobs": exited_on_max_jobs(&events),
                 "link_snip_root": events.iter().find_map(|e| match e {
                     WatchEvent::ResultLinkPublished { link_snip_root, .. } => Some(link_snip_root.clone()),
