@@ -65,6 +65,59 @@ const RUNS: usize = 20;
 /// in some runs of this harness, so the opt-in control runs until it sees a
 /// loss, up to this many times.
 const CONTROL_RUNS: usize = 20;
+/// Whole-test bound for the 20-run tests below. A clean run of the gating test
+/// took 7.2 s (debug build, macOS arm64, 2026-11-16); past this bound the test
+/// binary fails with status 124 instead of hanging.
+const TEST_DEADLINE: Duration = Duration::from_secs(90);
+
+// ── Deadlines ─────────────────────────────────────────────────────────────────
+
+/// Fails the process instead of letting it hang. Unless [`Watchdog::disarm`]
+/// is called first, it prints what overran and exits with status 124 once
+/// `limit` of wall-clock time has passed. Wall clock, so time the machine
+/// spends asleep counts: a run that spans a sleep fails rather than passing.
+/// A panic does not disarm it, so a test whose runtime then hangs on shutdown
+/// (waiting for a stuck blocking task) still ends.
+struct Watchdog {
+    disarm: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl Watchdog {
+    fn arm(what: String, limit: Duration) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let started = std::time::SystemTime::now();
+        std::thread::spawn(move || loop {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if started.elapsed().unwrap_or_default() >= limit {
+                        eprintln!(
+                            "DEADLINE EXCEEDED: {what}: no result within {limit:?} of wall-clock \
+                             time; failing instead of hanging"
+                        );
+                        std::process::exit(124);
+                    }
+                }
+                _ => return,
+            }
+        });
+        Self { disarm: Some(tx) }
+    }
+
+    fn disarm(mut self) {
+        if let Some(tx) = self.disarm.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        // Dropped without `disarm` (a panic): stay armed.
+        if let Some(tx) = self.disarm.take() {
+            std::mem::forget(tx);
+        }
+    }
+}
 
 // ── Network harness ───────────────────────────────────────────────────────────
 
@@ -439,6 +492,12 @@ fn exited_on_max_jobs(events: &[WatchEvent]) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn result_announcement_reaches_the_watcher_when_the_contributor_exits_on_max_jobs() {
+    let watchdog = Watchdog::arm("result_announcement_reaches_the_watcher…".into(), TEST_DEADLINE);
+    every_run_delivers().await;
+    watchdog.disarm();
+}
+
+async fn every_run_delivers() {
     let mut watcher = Watcher::start().await;
     let mut lost = Vec::new();
     for run in 0..RUNS {
@@ -491,6 +550,12 @@ async fn result_announcement_reaches_the_watcher_when_the_contributor_exits_on_m
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "end-to-end negative control that does not reproduce the loss reliably; run with --ignored"]
 async fn with_no_propagation_wait_the_announcement_is_lost() {
+    let watchdog = Watchdog::arm("with_no_propagation_wait…".into(), TEST_DEADLINE);
+    a_run_loses_its_announcement().await;
+    watchdog.disarm();
+}
+
+async fn a_run_loses_its_announcement() {
     let mut watcher = Watcher::start().await;
     let mut first_loss = None;
     for run in 0..CONTROL_RUNS {
@@ -578,6 +643,7 @@ mod runner {
     const LINK_JITTER_MS: &str = "OMNI_DELIVERY_LINK_JITTER_MS";
     const LINK_LOSS_PCT: &str = "OMNI_DELIVERY_LINK_LOSS_PCT";
     const LINK_SEED: &str = "OMNI_DELIVERY_LINK_SEED";
+    const DEADLINE_SECS: &str = "OMNI_DELIVERY_DEADLINE_SECS";
 
     /// Handshake payloads. A probe goes out on the result topic, so its
     /// arrival shows the result path to the watcher works; the watcher's relay
@@ -746,9 +812,15 @@ mod runner {
             return;
         };
         let runs: u64 = env_or(RUNS_EXPECTED, 20);
+        // Default bound: 30 s per run (a clean loopback run takes about 1.5 s) plus
+        // 60 s; the script passes one derived from its own parameters.
+        let watchdog = Watchdog::arm(
+            "runner::watcher".into(),
+            Duration::from_secs(env_or(DEADLINE_SECS, runs * 30 + 60)),
+        );
         let receipt_timeout = env_ms(RECEIPT_TIMEOUT_MS, 10_000);
         let max_run = Duration::from_secs(env_or(MAX_RUN_SECS, 120));
-        let idle_timeout = Duration::from_secs(env_or(IDLE_TIMEOUT_SECS, 600));
+        let idle_timeout = Duration::from_secs(env_or(IDLE_TIMEOUT_SECS, 120));
         let evidence = env_str(EVIDENCE_CLASS).unwrap_or_else(|| UNATTESTED.into());
         let advertise_ip: Ipv4Addr = env_or(ADVERTISE_IP, Ipv4Addr::LOCALHOST);
 
@@ -968,6 +1040,7 @@ mod runner {
              bad_signature={bad_signature} late={late} runs_seen={seen} ended_by={ended_by}"
         );
         let _ = node.shutdown().await;
+        watchdog.disarm();
         assert_eq!(verdict, "PASS", "{summary}");
     }
 
@@ -982,6 +1055,12 @@ mod runner {
             eprintln!("runner::contributor: {WATCHER_ADDRS} is not set; nothing to do");
             return;
         };
+        // Default bound: 60 s for one run (a clean loopback run takes about 1.5 s,
+        // one through a 150 ms emulated link about 3.6 s).
+        let watchdog = Watchdog::arm(
+            "runner::contributor".into(),
+            Duration::from_secs(env_or(DEADLINE_SECS, 60)),
+        );
         let record_path = env_str(RECORD).unwrap_or_else(|| panic!("{RECORD} must be set"));
         let session = env_str(SESSION).unwrap_or_else(|| "adhoc".into());
         assert!(
@@ -1131,6 +1210,7 @@ mod runner {
             r.extend(o.clone());
         }
         Record::open(&record_path).write(record.clone());
+        watchdog.disarm();
         println!(
             "delivery-runner role=contributor run={run} exited_on_max_jobs={} drain={} \
              drain_waited_ms={} recipients_connected={}",
@@ -1232,7 +1312,15 @@ mod runner {
         assert!((0.0..=1.0).contains(&link.loss), "{LINK_LOSS_PCT} must be 0..=100");
         let seed: u64 = env_or(LINK_SEED, 150);
         let rng = Arc::new(Rng::new(seed));
-        let lifetime = Duration::from_secs(env_or(PROXY_LIFETIME_SECS, 3600));
+        // The proxy stops on its own after its lifetime (default: its deadline), and
+        // the watchdog ends it if that does not happen, so an orphaned proxy cannot
+        // outlive its session.
+        let deadline_secs: u64 = env_or(DEADLINE_SECS, 900);
+        let lifetime = Duration::from_secs(env_or(PROXY_LIFETIME_SECS, deadline_secs));
+        let watchdog = Watchdog::arm(
+            "runner::link_proxy".into(),
+            lifetime + Duration::from_secs(10),
+        );
         let listen = env_str(PROXY_LISTEN).unwrap_or_else(|| "127.0.0.1:0".into());
         let front = Arc::new(
             UdpSocket::bind(&listen)
@@ -1317,5 +1405,6 @@ mod runner {
             write_atomically(&path, &format!("{stats}\n"));
         }
         println!("delivery-runner role=link_proxy stats={stats}");
+        watchdog.disarm();
     }
 }

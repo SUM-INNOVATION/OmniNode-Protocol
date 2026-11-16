@@ -63,6 +63,7 @@ compiled in.
 | `--advertise-ip` | `OMNI_DELIVERY_ADVERTISE_IP` | 127.0.0.1 | The IPv4 address the watcher prints for dialling |
 | `--watcher-addr` | `OMNI_DELIVERY_WATCHER_ADDRS` | none | Contributor mode: the watcher multiaddr(s), comma-separated, each with `/p2p/<peer-id>` |
 | `--identity-file` | `OMNI_DELIVERY_IDENTITY_FILE` | ephemeral | Persistent libp2p identity (created 0600), so the watcher's peer id stays stable |
+| `--outbound-allow` | `OMNI_DELIVERY_OUTBOUND_ALLOW` | `loopback`: `127.0.0.1,::1`; otherwise none | OmniNet outbound allow-list (#158) for the watcher and the contributor; across hosts, set it to the other host's address |
 | `--link-delay-ms` | `OMNI_DELIVERY_LINK_DELAY_MS` | 0 | Emulated one-way delay, each direction (the round trip adds 2×) |
 | `--link-jitter-ms` | `OMNI_DELIVERY_LINK_JITTER_MS` | 0 | Uniform 0..N ms added per datagram (can reorder) |
 | `--link-loss-pct` | `OMNI_DELIVERY_LINK_LOSS_PCT` | 0 | Datagram loss, each direction |
@@ -70,9 +71,8 @@ compiled in.
 | `--proxy-listen` | `OMNI_DELIVERY_PROXY_LISTEN` | 127.0.0.1:0 | The proxy's own UDP address |
 | `--proxy-upstream` | `OMNI_DELIVERY_PROXY_UPSTREAM` | none | Proxy mode: the watcher's `host:port` |
 | `--receipt-timeout-ms` | `OMNI_DELIVERY_RECEIPT_TIMEOUT_MS` | 10000 | How long after a contributor disconnects its announcement may still arrive |
-| `--max-run-secs` | `OMNI_DELIVERY_MAX_RUN_SECS` | 120 | A run with no receipt and no disconnect is lost after this |
-| `--connect-timeout-secs` | `OMNI_DELIVERY_CONNECT_TIMEOUT_SECS` | 60 | Contributor: connect and handshake bound |
-| `--idle-timeout-secs` | `OMNI_DELIVERY_IDLE_TIMEOUT_SECS` | 600 | Watcher: give up after this long without a probe |
+| `--run-deadline-secs` | `OMNI_DELIVERY_RUN_DEADLINE_SECS` | derived (see Deadlines) | Bound on one contributor process; also its connect and handshake bound, and how long a run may go without receipt or disconnect |
+| `--start-grace-secs` | `OMNI_DELIVERY_START_GRACE_SECS` | 600 | Watcher mode: how long to wait for the first contributor |
 | `--evidence-class` | `OMNI_DELIVERY_EVIDENCE_CLASS` | see below | Recorded with the result |
 | `--link-note` | `OMNI_DELIVERY_LINK_NOTE` | empty | Free text: the real path, the OS shaping applied, the measured RTT |
 | `--session` | `OMNI_DELIVERY_SESSION` | `s<UTC>-<pid>` | Run label; makes every job unique |
@@ -84,13 +84,37 @@ the contributor's host and dial the watcher through it. They also set the
 contributor's OmniNet `--outbound-allow` to the proxy's address only (#158), so no
 dial can bypass the emulated link. An emulated link takes exactly one watcher.
 
+mDNS is off in every role, and `loopback` keeps every OmniNet dial on loopback
+(`127.0.0.1,::1`), so a local run never reaches another host.
+
+## Deadlines
+
+Nothing in the runner waits without a bound; a stuck process fails instead of
+hanging. The bounds come from a clean baseline (macOS arm64, debug build): 1.45 s
+per run on loopback, and 3.6 s per run through a 150 ms + 0..20 ms emulated link.
+
+- **Expected run time:** `250 ms + --settle-ms + --propagation-wait-ms + 14 × (--link-delay-ms + --link-jitter-ms)`.
+- **Per contributor process:** `max(20 s, 10 × expected)`, unless `--run-deadline-secs` is given.
+- **Watcher and proxy:** `runs × run deadline + 60 s`. Watcher mode adds `--start-grace-secs`.
+- **Watcher idle bound:** twice the run deadline without a probe (watcher mode: at least `--start-grace-secs`).
+
+Each role enforces its own bound on the wall clock and exits with status 124 when it
+overruns. The script also kills any process still running at its bound, so a role
+never outlives its session. Background roles are started with `exec`, so the
+script's kill reaches the test executable itself. The two in-process tests in the
+same file have a 90 s whole-test bound (clean run: 7.2 s).
+
+**Sleep.** On macOS the script reads `pmset -g log`. A session that overlaps a
+system sleep is `RESULT=VOID`, whatever it measured. Elsewhere this check reports
+`unavailable`, and the operator must make sure the hosts stay awake.
+
 ## Records
 
 All records go in `--out`:
 
 - **`session.env`:** mode, session, start time, evidence class, link note, host
   (`hostname`, `uname -sm`), commit and number of uncommitted changes, test
-  executable, and every parameter.
+  executable, and every parameter, with the derived deadlines.
 - **`watcher.jsonl`:** JSON lines:
   - `watcher_start` (its address and OmniNet policy);
   - per run, `probe` (first probe, contributor peer id, posted id);
@@ -110,7 +134,7 @@ All records go in `--out`:
 - **Logs:** `watcher.log`, `contributor-<run>.log`, `proxy.log`.
 - **`summary.txt`:** `session.env`, the contributor tally (records, exits, drain
   outcomes, probe-to-ack round trip min/median/max), proxy counters, the watcher's
-  verdict line and `RESULT=`.
+  verdict line, the elapsed time, the sleep check and `RESULT=` (`PASS`, `FAIL` or `VOID`).
 
 The watcher uses only its own clock, so its timings need no clock sync between
 hosts.
@@ -130,8 +154,10 @@ hosts.
    - every record has `exited_on_max_jobs: true` and a published link root.
 
 Anything else is a **FAIL**: a lost run, a late receipt, a bad signature, a run
-never seen, or a contributor that failed. The watcher's exit status is its verdict;
-`loopback` and `contributor` exit non-zero on a FAIL.
+never seen, a contributor that failed, or any process past its deadline. The
+watcher's exit status is its verdict. `loopback` and `contributor` exit non-zero
+unless `RESULT=PASS`. **VOID** (macOS: the machine slept during the session)
+overrides both.
 
 With `--propagation-wait-ms` above zero, every drain outcome is expected to be
 `settled`. `recipients_gone` means the watcher went away first. Investigate it,
@@ -139,10 +165,7 @@ but it is not a delivery failure if the receipt is there.
 
 **Negative control.** `--propagation-wait-ms 0` is the exit path before #152. Run
 it once per setup to show that this setup can see a loss. A setup that delivers
-everything without the drain cannot show that the drain matters. As local evidence (macOS
-arm64, loopback, separate processes), this control lost announcements on plain
-loopback and lost more through a 150 ms emulated link. With the 200 ms default,
-none were lost.
+everything without the drain cannot show that the drain matters.
 
 ## Evidence classes
 
@@ -164,6 +187,7 @@ Host B, the watcher. Fix the port so it can be opened in the firewall:
 ```sh
 scripts/acceptance/result-delivery.sh watcher \
   --listen-port 4710 --advertise-ip <B's IPv4> --identity-file ./delivery-watcher.key \
+  --outbound-allow <A's IPv4> \
   --runs 20 --evidence-class "external: A=<host>, B=<host>, path=<LAN|WAN|...>" \
   --link-note "<shaping applied, measured RTT>"
 # prints: watcher address: /ip4/<B>/udp/4710/quic-v1/p2p/<peer-id>
@@ -174,6 +198,7 @@ Host A, the contributor:
 ```sh
 scripts/acceptance/result-delivery.sh contributor \
   --watcher-addr /ip4/<B>/udp/4710/quic-v1/p2p/<peer-id> --runs 20 \
+  --outbound-allow <B's IPv4> \
   --evidence-class "external: A=<host>, B=<host>, path=<...>"
 ```
 
